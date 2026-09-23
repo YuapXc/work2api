@@ -1,0 +1,35 @@
+# 交接文档（按用户要求不提交）
+/docs/HANDOFF.md
+
+# 参考仓库（clone 自上游，不提交）
+/.reference/
+
+# Go 构建产物
+/work2api
+/work2api.exe
+/dist/
+/bin/
+*.exe
+*.test
+*.out
+
+# 运行时数据（含凭证/密钥/使用记录，敏感）
+/data/
+*.db
+*.db-shm
+*.db-wal
+.secret_key
+
+# 账号凭据（含 access/refresh token，绝不提交）
+/auths/
+*.info
+
+# 前端
+/webui/node_modules/
+/webui/dist/
+/frontend/node_modules/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store

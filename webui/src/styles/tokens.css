@@ -1,0 +1,288 @@
+/* ============================================================
+   work2api 设计系统 —— 信号台 / Instrument
+   深石油蓝底 + 四语义色，等宽读数，hairline 布线，无投影。
+   本文件在 main.ts 里于 ant-design-vue/dist/reset.css 之后引入，
+   targeted 覆盖胜出。语义即含义，颜色绝不做装饰。
+   ============================================================ */
+
+:root {
+  --ink:     #0C171B;  /* base 背景 */
+  --ink-2:   #0F1E24;  /* 左侧 spine / chrome */
+  --panel:   #13242B;  /* 抬起面板 */
+  --panel-2: #172D35;  /* 嵌套面板 / 表头 */
+  --line:    #24454F;  /* 1px 描边 / 布线 */
+  --line-2:  #1B363E;  /* 更弱分隔线 */
+  --fog:     #7E9BA3;  /* 次要文字 */
+  --paper:   #E6F0EE;  /* 主文字 */
+  --live:    #35D0A5;  /* 健康 / serving / 成功 */
+  --charge:  #E9B44C;  /* 额度 / 警告 / 登录中 */
+  --fault:   #F2795E;  /* 冷却 / 错误 / 禁用 */
+  --route:   #5AA9E6;  /* 链接 / 信息 / 选中 / focus */
+
+  --sans: 'Space Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --mono: 'JetBrains Mono', 'Consolas', 'Menlo', monospace;
+
+  --radius: 6px;
+}
+
+/* ---------- 全局基座 ---------- */
+html, body { margin: 0; }
+body {
+  background: var(--ink);
+  color: var(--paper);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+#app { min-height: 100vh; }
+
+/* 等宽读数：只给数字 / ID / Key / 代码 —— 绝不给文字标签 */
+.mono {
+  font-family: var(--mono);
+  font-feature-settings: 'tnum' 1;
+  letter-spacing: -0.01em;
+}
+
+/* focus 可见环：route 色 */
+*:focus-visible {
+  outline: 2px solid var(--route);
+  outline-offset: 1px;
+  border-radius: 3px;
+}
+
+/* ---------- 暗色滚动条（细、去饱和 route 色） ---------- */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: rgba(90, 169, 230, 0.22);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background-color: rgba(90, 169, 230, 0.4); }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+html { scrollbar-color: rgba(90, 169, 230, 0.3) transparent; scrollbar-width: thin; }
+
+/* ============================================================
+   AntD 定向覆盖（非 scoped，类选择器 + !important 压过默认）
+   ConfigProvider darkAlgorithm 已定基调，这里做仪表台细化。
+   ============================================================ */
+
+/* 布局背景 */
+.ant-layout { background: var(--ink) !important; }
+.ant-layout-content { background: transparent; }
+
+/* ---------- 面板 = 扁平 hairline，无投影（仪表不悬浮） ---------- */
+.ant-card {
+  background: var(--panel) !important;
+  border: 1px solid var(--line) !important;
+  border-radius: var(--radius) !important;
+  box-shadow: none !important;
+}
+.ant-card-head {
+  color: var(--paper) !important;
+  border-bottom: 1px solid var(--line) !important;
+  min-height: 46px;
+  font-weight: 500;
+}
+.ant-card-head-title { font-size: 15px; }
+
+/* ---------- 表格：深色 hairline 行分隔 ---------- */
+.ant-table {
+  background: transparent !important;
+  color: var(--paper) !important;
+  font-size: 13px;
+}
+.ant-table-container, .ant-table-content, .ant-table-body { background: transparent !important; }
+.ant-table-thead > tr > th {
+  background: var(--panel-2) !important;
+  color: var(--fog) !important;
+  font-weight: 500;
+  border-bottom: 1px solid var(--line) !important;
+  font-size: 12px;
+}
+.ant-table-tbody > tr > td {
+  border-bottom: 1px solid var(--line-2) !important;
+  color: var(--paper) !important;
+}
+.ant-table-tbody > tr > td:not(.ant-table-cell-fix-left):not(.ant-table-cell-fix-right) {
+  background: transparent !important;
+}
+.ant-table-tbody > tr:hover > td:not(.ant-table-cell-fix-left):not(.ant-table-cell-fix-right) {
+  background: rgba(90, 169, 230, 0.07) !important;
+}
+.ant-table-cell-fix-left, .ant-table-cell-fix-right { background: var(--panel) !important; }
+.ant-table-tbody > tr:hover > td.ant-table-cell-fix-left,
+.ant-table-tbody > tr:hover > td.ant-table-cell-fix-right { background: var(--panel-2) !important; }
+.ant-table-placeholder, .ant-table-expanded-row-fixed { background: transparent !important; }
+.ant-table-cell { color: var(--paper) !important; }
+/* 数字 / ID / token / key 列：等宽 + 右对齐已由列 align 控制 */
+.ant-table-cell.ant-table-cell-align-right,
+.ant-table td.ant-table-column-sort { font-variant-numeric: tabular-nums; }
+.ant-table-body::-webkit-scrollbar, .ant-table-content::-webkit-scrollbar { height: 8px; width: 8px; }
+.ant-table-body::-webkit-scrollbar-thumb, .ant-table-content::-webkit-scrollbar-thumb {
+  background: rgba(90, 169, 230, 0.3); border-radius: 4px;
+}
+.ant-table code { font-family: var(--mono); color: var(--route); background: transparent; font-size: 12px; }
+
+/* ---------- Tag → 信号色（去装饰，只表状态） ---------- */
+.ant-tag {
+  border-radius: var(--radius);
+  font-size: 12px;
+  font-family: var(--sans);
+  border-width: 1px;
+}
+.ant-tag-green, .ant-tag-success {
+  background: rgba(53, 208, 165, 0.14) !important; color: var(--live) !important; border-color: rgba(53, 208, 165, 0.4) !important;
+}
+.ant-tag-red, .ant-tag-error {
+  background: rgba(242, 121, 94, 0.14) !important; color: var(--fault) !important; border-color: rgba(242, 121, 94, 0.4) !important;
+}
+.ant-tag-orange, .ant-tag-gold, .ant-tag-warning {
+  background: rgba(233, 180, 76, 0.14) !important; color: var(--charge) !important; border-color: rgba(233, 180, 76, 0.4) !important;
+}
+.ant-tag-blue, .ant-tag-geekblue, .ant-tag-cyan {
+  background: rgba(90, 169, 230, 0.14) !important; color: var(--route) !important; border-color: rgba(90, 169, 230, 0.4) !important;
+}
+.ant-tag-purple {
+  background: rgba(126, 155, 163, 0.14) !important; color: #A9C4CB !important; border-color: rgba(126, 155, 163, 0.4) !important;
+}
+.ant-tag-default {
+  background: rgba(126, 155, 163, 0.12) !important; color: var(--fog) !important; border-color: rgba(126, 155, 163, 0.35) !important;
+}
+
+/* ---------- 按钮 ---------- */
+.ant-btn {
+  background: var(--panel-2);
+  border-color: var(--line);
+  color: var(--paper);
+  border-radius: var(--radius);
+  box-shadow: none !important;
+}
+.ant-btn:hover { border-color: var(--route) !important; color: var(--route) !important; }
+.ant-btn-primary {
+  background: var(--route) !important;
+  border-color: var(--route) !important;
+  color: #08171E !important;
+  font-weight: 500;
+}
+.ant-btn-primary:hover { background: #6FB6EC !important; border-color: #6FB6EC !important; color: #08171E !important; }
+.ant-btn-dangerous, .ant-btn-dangerous.ant-btn-default {
+  color: var(--fault) !important; border-color: rgba(242, 121, 94, 0.4) !important; background: rgba(242, 121, 94, 0.08) !important;
+}
+.ant-btn-dangerous:hover { color: #F79079 !important; border-color: var(--fault) !important; }
+.ant-btn-link, .ant-btn-text { background: transparent !important; border: none !important; color: var(--route) !important; }
+.ant-btn-link:hover, .ant-btn-text:hover { color: #6FB6EC !important; background: rgba(90, 169, 230, 0.08) !important; }
+
+/* ---------- 输入 / 选择器 ---------- */
+.ant-input, .ant-input-affix-wrapper, .ant-input-number,
+.ant-select-selector, .ant-input-password, .ant-picker {
+  background: var(--ink-2) !important;
+  border-color: var(--line) !important;
+  color: var(--paper) !important;
+  border-radius: var(--radius) !important;
+}
+.ant-input::placeholder, .ant-input-affix-wrapper input::placeholder { color: var(--fog) !important; }
+.ant-input-number-input, .ant-select-selection-item { color: var(--paper) !important; }
+.ant-select-selection-placeholder,
+.ant-select-dropdown .ant-select-selection-placeholder { color: var(--fog) !important; }
+.ant-select-arrow, .ant-input-number-handler-wrap { color: var(--fog); }
+.ant-input-number-group-addon {
+  background: var(--ink-2) !important; border-color: var(--line) !important; color: var(--fog) !important;
+}
+.ant-input-number-group-wrapper { width: 100%; }
+code, .ant-typography code { font-family: var(--mono); }
+
+/* ---------- Modal（portal 到 body，需同结构覆盖） ---------- */
+.ant-modal .ant-modal-content {
+  background: var(--panel) !important;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+.ant-modal .ant-modal-header { background: transparent !important; border-bottom: 1px solid var(--line); padding-bottom: 12px; }
+.ant-modal .ant-modal-title { color: var(--paper) !important; font-weight: 500; }
+.ant-modal .ant-modal-close { color: var(--fog) !important; }
+.ant-modal .ant-modal-close:hover { color: var(--paper) !important; background: rgba(255, 255, 255, 0.06) !important; }
+.ant-modal .ant-modal-body { color: var(--paper) !important; padding-top: 14px; }
+.ant-modal .ant-form-item-label > label { color: var(--fog) !important; }
+.ant-modal .ant-input, .ant-modal .ant-input-affix-wrapper, .ant-modal .ant-input-number,
+.ant-modal .ant-select-selector, .ant-modal .ant-input-textarea textarea {
+  background: var(--ink-2) !important; border-color: var(--line) !important; color: var(--paper) !important;
+}
+.ant-modal .ant-input-number-group-addon { background: var(--ink-2) !important; border-color: var(--line) !important; color: var(--fog) !important; }
+.ant-modal code { background: rgba(90, 169, 230, 0.12); color: var(--route); padding: 1px 6px; border-radius: 4px; word-break: break-all; font-family: var(--mono); }
+
+/* ---------- Popover / Popconfirm ---------- */
+.ant-popover .ant-popover-inner { background: var(--panel) !important; border: 1px solid var(--line) !important; box-shadow: 0 8px 28px rgba(0,0,0,0.4) !important; }
+.ant-popover .ant-popover-title { color: var(--paper) !important; border-bottom-color: var(--line) !important; }
+.ant-popover .ant-popover-inner-content, .ant-popover-message-title { color: var(--paper) !important; }
+.ant-popconfirm .ant-popconfirm-description { color: var(--fog) !important; }
+.ant-popover .ant-popover-arrow::before { background: var(--panel) !important; }
+.ant-tooltip .ant-tooltip-inner { background: #06121A !important; color: var(--paper) !important; border: 1px solid var(--line); font-size: 12px; }
+.ant-tooltip .ant-tooltip-arrow::before { background: #06121A !important; }
+
+/* ---------- Select 下拉 ---------- */
+.ant-select-dropdown { background: var(--panel) !important; border: 1px solid var(--line); }
+.ant-select-item-option, .ant-select-item-option-content, .ant-select-item-empty { color: var(--paper) !important; }
+.ant-select-item-option-active { background: rgba(90, 169, 230, 0.1) !important; }
+.ant-select-item-option-selected { background: rgba(90, 169, 230, 0.2) !important; color: var(--paper) !important; }
+.ant-select-item-group { color: var(--fog) !important; }
+
+/* ---------- Radio 分段（用于用量页粒度切换） ---------- */
+.ant-radio-group .ant-radio-button-wrapper {
+  background: var(--ink-2) !important; border-color: var(--line) !important; color: var(--fog) !important;
+}
+.ant-radio-group .ant-radio-button-wrapper:hover { color: var(--route) !important; }
+.ant-radio-group .ant-radio-button-wrapper-checked {
+  background: rgba(90, 169, 230, 0.16) !important; border-color: var(--route) !important; color: var(--route) !important; font-weight: 500;
+}
+.ant-radio-group .ant-radio-button-wrapper-checked::before { background: var(--route) !important; }
+
+/* ---------- 分页 ---------- */
+.ant-pagination-total-text, .ant-pagination-item a { color: var(--fog) !important; }
+.ant-pagination-item, .ant-pagination-prev .ant-pagination-item-link, .ant-pagination-next .ant-pagination-item-link {
+  background: var(--ink-2); border-color: var(--line); color: var(--paper);
+}
+.ant-pagination-item-active { border-color: var(--route) !important; background: rgba(90, 169, 230, 0.14) !important; }
+.ant-pagination-item-active a { color: var(--route) !important; }
+
+/* ---------- Alert / Statistic / Progress / Spin / Empty / Switch ---------- */
+.ant-alert { border-radius: var(--radius); }
+.ant-alert-info { background: rgba(90, 169, 230, 0.08) !important; border-color: rgba(90, 169, 230, 0.25) !important; }
+.ant-alert-info .ant-alert-message { color: #BFE0F5 !important; }
+.ant-alert-info .ant-alert-description { color: var(--fog) !important; }
+.ant-alert-info .ant-alert-icon { color: var(--route) !important; }
+.ant-alert-warning { background: rgba(233, 180, 76, 0.1) !important; border-color: rgba(233, 180, 76, 0.35) !important; }
+.ant-alert-warning .ant-alert-message { color: var(--charge) !important; }
+.ant-alert-warning .ant-alert-description { color: #D9C089 !important; }
+.ant-alert-warning .ant-alert-icon { color: var(--charge) !important; }
+.ant-empty-description { color: var(--fog); }
+.ant-statistic-title { color: var(--fog); }
+.ant-statistic-content { color: var(--paper); font-family: var(--mono); }
+.ant-spin-dot-item { background-color: var(--route) !important; }
+.ant-message-notice-content { background: var(--panel) !important; border: 1px solid var(--line) !important; border-radius: var(--radius); box-shadow: 0 8px 24px rgba(0,0,0,0.4); }
+.ant-message .ant-message-notice-content span { color: var(--paper) !important; }
+.ant-switch.ant-switch-checked { background: var(--route) !important; }
+.ant-checkbox-wrapper { color: var(--paper); }
+.ant-form-item-label > label { color: var(--fog); }
+
+/* ---------- 通用视图头（各页统一：标题+实时 meta 左，主操作右） ---------- */
+.view-header {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  gap: 16px; flex-wrap: wrap;
+  padding-bottom: 14px; margin-bottom: 18px;
+  border-bottom: 1px solid var(--line);
+}
+.view-header .vh-title { font-size: 20px; font-weight: 500; color: var(--paper); line-height: 1.15; }
+.view-header .vh-meta { margin-top: 4px; font-size: 12px; color: var(--fog); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.view-header .vh-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.vh-meta .mono { color: var(--paper); }
+
+/* 小 LED 状态点（复用于各页） */
+.led { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.led.live { background: var(--live); box-shadow: 0 0 6px rgba(53,208,165,0.7); }
+.led.fault { background: var(--fault); box-shadow: 0 0 6px rgba(242,121,94,0.6); }
+.led.charge { background: var(--charge); box-shadow: 0 0 6px rgba(233,180,76,0.6); }
+.led.fog { background: var(--fog); }
+.led.route { background: var(--route); box-shadow: 0 0 6px rgba(90,169,230,0.7); }
