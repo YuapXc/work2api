@@ -7,6 +7,10 @@ import type { AccountInfo, Settings } from '@/types'
 import { accountLabel as accountLabelOf, buildLabelMap } from '@/utils/accountLabel'
 import dayjs from 'dayjs'
 
+// embedded：作为供应商钻取页的「账号」标签页嵌入时，隐藏自身的大标题/副标题，
+// 避免与 ProviderView 的页眉重复；工具栏、表格、弹窗与全部逻辑保持不变。
+defineProps<{ embedded?: boolean }>()
+
 const REFRESH_MS = 20000 // 每 20s 自动刷新
 let timer: ReturnType<typeof setInterval> | null = null
 let nowTimer: ReturnType<typeof setInterval> | null = null
@@ -390,7 +394,7 @@ onUnmounted(() => {
 <template>
   <div style="width: 100%">
     <div class="view-header">
-      <div>
+      <div v-if="!embedded">
         <div class="vh-title">账号</div>
         <div class="vh-meta">
           <span class="led" :class="accounts.some((a) => a.healthy && a.enabled) ? 'live' : 'fault'"></span>

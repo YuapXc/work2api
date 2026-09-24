@@ -12,7 +12,10 @@ import (
 	"time"
 
 	"work2api/internal/config"
+	"work2api/internal/core/provider"
 	"work2api/internal/crypto"
+	"work2api/internal/opencode"
+	"work2api/internal/qoder"
 	"work2api/internal/store"
 	"work2api/internal/workbuddy/billing"
 	"work2api/internal/workbuddy/credentials"
@@ -117,7 +120,25 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 		}
 	}
 	o.models = models.New(o.pool, db)
+	registerRuntimes()
 	return o, nil
+}
+
+// registerRuntimes wires the non-default provider inference runtimes (qoder,
+// opencode) into the shared dispatcher. Each is self-contained and stays inert
+// when it has no credentials/config, so registration is unconditional and
+// idempotent per process. workbuddy remains the default (un-namespaced) path.
+var runtimesOnce sync.Once
+
+func registerRuntimes() {
+	runtimesOnce.Do(func() {
+		provider.RegisterRuntime(qoder.New())
+		if oc, err := opencode.New(nil); err != nil {
+			log.Printf("opencode 运行时初始化失败（已跳过）: %v", err)
+		} else {
+			provider.RegisterRuntime(oc)
+		}
+	})
 }
 
 func (o *Orchestrator) hashKey(key string) string {

@@ -5,7 +5,10 @@ import type {
   AppInfo,
   CheckinResponse,
   ModelInfo,
+  OAuthOption,
   Overview,
+  ProviderDetail,
+  ProviderSummary,
   RecordsResponse,
   Settings,
   UsagePoint,
@@ -132,6 +135,45 @@ export const api = {
   models: () => http.get<unknown, { models: ModelInfo[]; source?: 'dynamic' | 'static' }>('/admin/models'),
   modelsRefresh: () =>
     http.post<unknown, { ok: boolean; models: ModelInfo[]; source?: 'dynamic' | 'static' }>('/admin/models/refresh'),
+
+  // ---------- 多供应商（workbuddy / qoder / opencode）统一管理 ----------
+  // 摘要列表：驱动左侧导航的供应商子项与概览页的供应商卡片
+  getProviders: () => http.get<unknown, { providers: ProviderSummary[] }>('/admin/providers'),
+  // 单供应商详情：摘要字段 + accounts[] + models[]
+  getProvider: (name: string) =>
+    http.get<unknown, ProviderDetail>(`/admin/providers/${encodeURIComponent(name)}`),
+  // 供应商签到（qoder 返回逐账号结果；workbuddy 另含 skipped/accounts）
+  providerCheckin: (name: string) =>
+    http.post<unknown, Record<string, unknown>>(`/admin/providers/${encodeURIComponent(name)}/checkin`),
+  // 供应商额度刷新（qoder 返回 quota 或 unsupported；workbuddy 返回 accounts）
+  providerCredits: (name: string) =>
+    http.post<unknown, Record<string, unknown>>(`/admin/providers/${encodeURIComponent(name)}/credits/refresh`),
+
+  // ---------- 供应商逐账号动作（qoder 原生账号）：激活 / 重命名 / 删除 ----------
+  // 设为激活账号（qoder 对应 workbuddy 的优先级：由哪个账号服务请求）
+  providerActivateAccount: (name: string, id: string) =>
+    http.post<unknown, { ok: boolean }>(
+      `/admin/providers/${encodeURIComponent(name)}/accounts/${encodeURIComponent(id)}/activate`),
+  // 重命名账号（body 传 name）
+  providerRenameAccount: (name: string, id: string, name2: string) =>
+    http.post<unknown, { ok: boolean }>(
+      `/admin/providers/${encodeURIComponent(name)}/accounts/${encodeURIComponent(id)}/rename`, { name: name2 }),
+  // 删除账号
+  providerDeleteAccount: (name: string, id: string) =>
+    http.delete<unknown, { ok: boolean }>(
+      `/admin/providers/${encodeURIComponent(name)}/accounts/${encodeURIComponent(id)}`),
+
+  // ---------- 供应商扫码登录（OAuth）：options / begin / poll ----------
+  // 登录可选项（如 qoder 的区域 cn / global），驱动弹窗里的选择项
+  providerOAuthOptions: (name: string) =>
+    http.get<unknown, { options: OAuthOption[] }>(`/admin/providers/${encodeURIComponent(name)}/oauth/options`),
+  // 发起扫码登录：返回 login_id 与可在浏览器打开的授权链接
+  providerOAuthBegin: (name: string, opts: Record<string, unknown>) =>
+    http.post<unknown, { login_id: string; login_url: string }>(`/admin/providers/${encodeURIComponent(name)}/oauth/begin`, opts),
+  // 轮询登录状态：pending 等待授权，ready 成功（含 account），error 失败（含 message）
+  providerOAuthPoll: (name: string, loginId: string) =>
+    http.post<unknown, { status: 'pending' | 'ready' | 'error'; message?: string; account?: Record<string, unknown> }>(
+      `/admin/providers/${encodeURIComponent(name)}/oauth/poll`, { login_id: loginId }),
 
   // 自动签到 / 额度刷新 设置
   getSettings: () => http.get<unknown, Settings>('/admin/settings'),

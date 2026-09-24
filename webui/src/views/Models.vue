@@ -5,6 +5,10 @@ import { api } from '@/api/client'
 import type { ModelInfo } from '@/types'
 import ModelsPanel from '@/components/ModelsPanel.vue'
 
+// embedded：作为供应商钻取页的「模型」标签页嵌入时，隐藏自身的大标题/副标题，
+// 搜索、刷新、表格等保持不变。
+defineProps<{ embedded?: boolean }>()
+
 const models = ref<ModelInfo[]>([])
 const loading = ref(false)
 const source = ref<'dynamic' | 'static'>('dynamic')
@@ -48,7 +52,7 @@ onMounted(load)
 <template>
   <div style="padding-bottom: 36px">
     <div class="view-header">
-      <div>
+      <div v-if="!embedded">
         <div class="vh-title">模型</div>
         <div class="vh-meta">
           <span class="led route"></span>

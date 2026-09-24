@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"time"
 
+	"work2api/internal/core/provider"
 	"work2api/internal/workbuddy/adapters"
 	"work2api/internal/workbuddy/pool"
 	"work2api/internal/workbuddy/upstream"
@@ -39,6 +40,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, ok := payload["messages"]; !ok {
 		writeJSON(w, 400, errBody(400, "messages is required", "invalid_request_error").body)
+		return
+	}
+	// Namespaced models (qoder/*, opencode/*) are served by their own provider
+	// runtime, which owns conversion + upstream; the workbuddy path below only
+	// handles the default (un-namespaced) provider.
+	if s.dispatchRuntime(w, r, provider.ProtocolChat, payload, principal) {
 		return
 	}
 	clientStream := boolVal(payload["stream"])
@@ -154,6 +161,15 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 		return
 	}
 	o := s.o
+	// Route namespaced models to their provider runtime (it does its own
+	// protocol conversion from the original anthropic/responses payload).
+	proto := provider.ProtocolAnthropic
+	if protocol == "responses" {
+		proto = provider.ProtocolResponses
+	}
+	if s.dispatchRuntime(w, r, proto, payload, principal) {
+		return
+	}
 	var chatBody map[string]any
 	var cvErr error
 	if protocol == "anthropic" {

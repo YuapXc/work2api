@@ -108,6 +108,8 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, clean)
 	}
+	// Append models served by non-default provider runtimes (qoder/*, opencode/*).
+	out = append(out, s.o.runtimeModels(r.Context())...)
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": out})
 }
 

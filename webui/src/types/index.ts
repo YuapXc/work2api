@@ -250,6 +250,34 @@ export interface RecordsResponse {
   page_size?: number
 }
 
+/** 供应商摘要（GET /admin/providers 的每一项） */
+export interface ProviderSummary {
+  name: string
+  display_name: string
+  ready: boolean
+  default?: boolean
+  /** 能力标记，驱动动作按钮/列的显隐：accounts/models/checkin/credits/oauth/upload/config/local_detect */
+  capabilities: string[]
+  /** 概览卡片用的摘要数字（各供应商形状不同） */
+  status: Record<string, unknown>
+  /** 未就绪时的配置指引 */
+  notes?: string
+}
+
+/** 供应商详情（GET /admin/providers/{name}）：摘要字段 + 账号/模型行 */
+export interface ProviderDetail extends ProviderSummary {
+  accounts: Record<string, unknown>[]
+  models: Record<string, unknown>[]
+}
+
+/** 扫码登录可选项（GET /admin/providers/{name}/oauth/options 的每一项） */
+export interface OAuthOption {
+  key: string
+  label: string
+  default?: string
+  values: { value: string; label: string }[]
+}
+
 /** 应用（API Key）信息 */
 export interface AppInfo {
   id: number

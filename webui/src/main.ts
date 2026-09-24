@@ -19,6 +19,8 @@ const router = createRouter({
   routes: [
     { path: '/', redirect: '/overview' },
     { path: '/overview', component: () => import('./views/Overview.vue'), meta: { title: '概览' } },
+    // 供应商钻取页（workbuddy / qoder / opencode 各司其职）
+    { path: '/providers/:name', component: () => import('./views/ProviderView.vue'), meta: { title: '供应商' } },
     { path: '/accounts', component: () => import('./views/Accounts.vue'), meta: { title: '账号' } },
     { path: '/models', component: () => import('./views/Models.vue'), meta: { title: '模型' } },
     { path: '/usage', component: () => import('./views/Usage.vue'), meta: { title: '用量' } },

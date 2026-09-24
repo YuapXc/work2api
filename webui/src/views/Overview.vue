@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '@/api/client'
-import type { Overview, UsagePoint } from '@/types'
+import type { Overview, UsagePoint, ProviderSummary } from '@/types'
 import { buildLabelMap, labelOf as labelOfMap } from '@/utils/accountLabel'
 import dayjs from 'dayjs'
 import * as echarts from 'echarts/core'
@@ -29,6 +29,52 @@ const data = ref<Overview>({
 const loading = ref(false)
 // 上游只返回 model_count（不返回完整 models 数组），单独存，供瓦片读数用
 const modelCount = ref(0)
+
+// ---------- 供应商状态卡片 ----------
+const providers = ref<ProviderSummary[]>([])
+async function loadProviders() {
+  try {
+    const res = await api.getProviders()
+    providers.value = res.providers ?? []
+  } catch { /* 拦截器已提示 */ }
+}
+
+// 供应商 LED：未就绪 → fog；workbuddy 看健康账号；其余就绪即 live
+function providerLed(p: ProviderSummary): 'live' | 'fault' | 'fog' {
+  if (!p.ready) return 'fog'
+  if (p.name === 'workbuddy') {
+    const healthy = Number((p.status as any)?.healthy_count ?? 0)
+    return healthy > 0 ? 'live' : 'fault'
+  }
+  return 'live'
+}
+
+// 每张卡片的读数行（各供应商形状不同，按 name 组织）
+function statLines(p: ProviderSummary): { k: string; v: string }[] {
+  const s = (p.status || {}) as Record<string, any>
+  if (p.name === 'workbuddy') {
+    return [
+      { k: '健康账号', v: `${Number(s.healthy_count ?? 0)}/${Number(s.account_count ?? 0)}` },
+      { k: '剩余额度', v: fmtCredits(Number(s.credits_remaining ?? 0)) },
+      { k: '模型', v: fmt(Number(s.model_count ?? 0)) },
+    ]
+  }
+  if (p.name === 'qoder') {
+    return [
+      { k: '区域', v: s.region ? String(s.region) : '—' },
+      { k: '账号', v: fmt(Number(s.account_count ?? 0)) },
+      { k: '模型', v: fmt(Number(s.model_count ?? 0)) },
+    ]
+  }
+  if (p.name === 'opencode') {
+    return [
+      { k: '密钥层', v: fmt(Number(s.account_count ?? 0)) },
+      { k: '模型', v: fmt(Number(s.model_count ?? 0)) },
+      { k: '偏好', v: s.prefer ? String(s.prefer) : (s.anonymous ? '匿名' : '—') },
+    ]
+  }
+  return Object.entries(s).slice(0, 3).map(([k, v]) => ({ k, v: String(v) }))
+}
 
 // 空态默认：/admin/overview 在无数据时可能省略部分字段，统一兜底避免读取 undefined 崩页
 const EMPTY_USAGE = {
@@ -197,8 +243,8 @@ function renderChart() {
 function onResize() { chart?.resize() }
 
 onMounted(async () => {
-  await Promise.allSettled([load(), loadTs()])
-  timer = setInterval(() => { now.value = Date.now() / 1000; Promise.allSettled([load(), loadTs()]) }, REFRESH_MS)
+  await Promise.allSettled([load(), loadTs(), loadProviders()])
+  timer = setInterval(() => { now.value = Date.now() / 1000; Promise.allSettled([load(), loadTs(), loadProviders()]) }, REFRESH_MS)
   window.addEventListener('resize', onResize)
 })
 
@@ -232,7 +278,36 @@ onUnmounted(() => {
       style="margin-bottom: 12px"
     />
 
-    <!-- ========== 状态总线：唯一的大动作 ========== -->
+    <!-- ========== 供应商状态卡片：三路上游各司其职 ========== -->
+    <section v-if="providers.length" class="prov-cards">
+      <div
+        v-for="p in providers"
+        :key="p.name"
+        class="prov-card"
+        :class="{ 'not-ready': !p.ready }"
+        @click="router.push(`/providers/${p.name}`)"
+      >
+        <div class="pc-head">
+          <span class="led" :class="providerLed(p)"></span>
+          <span class="pc-name">{{ p.display_name || p.name }}</span>
+          <span class="pc-state" :class="p.ready ? 'ok' : 'off'">{{ p.ready ? '就绪' : '未配置' }}</span>
+        </div>
+        <!-- 未就绪：给出配置指引而非空白 -->
+        <p v-if="!p.ready && p.notes" class="pc-note">{{ p.notes }}</p>
+        <div v-else class="pc-stats">
+          <div v-for="line in statLines(p)" :key="line.k" class="pc-stat">
+            <span class="pc-k">{{ line.k }}</span>
+            <span class="pc-v mono">{{ line.v }}</span>
+          </div>
+        </div>
+        <div class="pc-foot">
+          <span class="pc-enter">进入{{ p.display_name || p.name }}</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== 状态总线：唯一的大动作（WorkBuddy 账号池视角） ========== -->
+    <div class="section-cap">WorkBuddy 账号池 · 实时链路</div>
     <section class="bus" :class="{ degraded: !gatewayServing }">
       <div class="bus-track">
         <!-- client 节点 -->
@@ -438,6 +513,41 @@ onUnmounted(() => {
 
 <style scoped>
 .overview { width: 100%; }
+
+/* ========== 供应商状态卡片 ========== */
+.prov-cards {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 20px;
+}
+.prov-card {
+  position: relative; background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 16px 18px; cursor: pointer;
+  display: flex; flex-direction: column; gap: 12px;
+  transition: border-color 0.15s ease;
+}
+.prov-card:hover { border-color: var(--route); }
+.prov-card.not-ready { opacity: 0.92; }
+.pc-head { display: flex; align-items: center; gap: 9px; }
+.pc-name { font-size: 15px; font-weight: 500; color: var(--paper); }
+.pc-state { margin-left: auto; font-size: 12px; }
+.pc-state.ok { color: var(--live); }
+.pc-state.off { color: var(--fog); }
+.pc-note { font-size: 12.5px; color: var(--fog); line-height: 1.55; margin: 0; min-height: 46px; }
+.pc-stats { display: flex; gap: 0; border: 1px solid var(--line-2); border-radius: var(--radius); overflow: hidden; }
+.pc-stat {
+  flex: 1; padding: 10px 12px; border-left: 1px solid var(--line-2);
+  display: flex; flex-direction: column; gap: 4px; min-width: 0;
+}
+.pc-stat:first-child { border-left: none; }
+.pc-k { font-size: 11px; color: var(--fog); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pc-v { font-size: 17px; font-weight: 500; color: var(--paper); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pc-foot { margin-top: auto; }
+.pc-enter { font-size: 13px; color: var(--route); }
+.prov-card:hover .pc-enter { color: #6FB6EC; }
+@media (max-width: 900px) {
+  .prov-cards { grid-template-columns: 1fr; }
+}
+
+.section-cap { font-size: 12px; color: var(--fog); margin-bottom: 8px; letter-spacing: 0.02em; }
 
 /* ========== 状态总线 ========== */
 .bus {

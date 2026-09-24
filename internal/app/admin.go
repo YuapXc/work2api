@@ -9,8 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"work2api/internal/workbuddy/siterouting"
 )
 
 func roundN(v float64, places int) float64 {
@@ -59,6 +57,7 @@ func (s *Server) mountAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/models/benchmarks/refresh", s.adminBenchmarksRefresh)
 	mux.HandleFunc("GET /admin/settings", s.adminGetSettings)
 	mux.HandleFunc("POST /admin/settings", s.adminSaveSettings)
+	s.mountProviderAdmin(mux)
 }
 
 func (s *Server) accountsForDisplay() []map[string]any {
@@ -447,41 +446,10 @@ func (s *Server) adminRefreshCredits(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "accounts": s.accountsForDisplay()})
 }
 
+// adminCheckin is the legacy global (workbuddy) checkin endpoint, kept for the
+// existing WebUI. It delegates to the shared workbuddy checkin helper.
 func (s *Server) adminCheckin(w http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
-	results := []map[string]any{}
-	skipped := []string{}
-	today := time.Now().Format("2006-01-02")
-	dates, _ := s.o.db.CheckinDates()
-	for _, a := range s.o.pool.Accounts() {
-		mgr := s.o.managers[a.UID]
-		if mgr == nil {
-			continue
-		}
-		// 国际站 WorkBuddy 没有签到活动，跳过——否则每次都对不存在的接口发起
-		// 注定失败的请求，并在结果里制造无意义的「失败」噪音。
-		if a.Provider == "workbuddy" && siterouting.ProfileSite(a.Profile) == "international" {
-			continue
-		}
-		// 已签到的账号跳过，避免重复请求上游（重复扣积分/重复奖励）
-		if dates[a.UID] == today {
-			skipped = append(skipped, a.UID)
-			results = append(results, map[string]any{"uid": a.UID, "ok": false, "message": "今日已签到", "already": true})
-			continue
-		}
-		res, err := billingCheckin(ctx, mgr)
-		if err == nil && (res.OK || res.Already) {
-			_ = s.o.db.SetCheckinDate(a.UID, today)
-		}
-		msg := res.Message
-		if err != nil && msg == "" {
-			msg = err.Error()
-		}
-		results = append(results, map[string]any{"uid": a.UID, "ok": res.OK, "message": msg, "already": res.Already})
-	}
-	// 签到后刷新额度（含自动解冻），与上游 do_checkin 一致
-	s.o.refreshAllCredits(ctx)
-	writeJSON(w, 200, map[string]any{"ok": true, "results": results, "skipped": skipped, "accounts": s.accountsForDisplay()})
+	writeJSON(w, 200, s.runWorkbuddyCheckin(context.Background()))
 }
 
 func (s *Server) adminUsageSummary(w http.ResponseWriter, r *http.Request) {

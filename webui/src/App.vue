@@ -3,7 +3,8 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { message, theme } from 'ant-design-vue'
 import { KeyOutlined } from '@ant-design/icons-vue'
-import { setAdminToken } from '@/api/client'
+import { setAdminToken, api } from '@/api/client'
+import type { ProviderSummary } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -22,11 +23,9 @@ const darkTheme = {
   },
 }
 
-// 导航项 = 仪表开关。标签固定：概览 / 账号 / 模型 / 用量 / 记录 / 应用
-const menuItems = [
-  { key: '/overview', label: '概览' },
-  { key: '/accounts', label: '账号' },
-  { key: '/models', label: '模型' },
+// 导航项 = 仪表开关。供应商分组在概览与用量之间动态渲染。
+const topItems = [{ key: '/overview', label: '概览' }]
+const bottomItems = [
   { key: '/usage', label: '用量' },
   { key: '/records', label: '记录' },
   { key: '/apps', label: '应用' },
@@ -35,6 +34,29 @@ const menuItems = [
 const activeKey = computed(() => route.path)
 function go(key: string) {
   if (route.path !== key) router.push(key)
+}
+
+// ---------- 供应商列表（驱动导航子项 + 状态 LED） ----------
+const providers = ref<ProviderSummary[]>([])
+let provTimer: ReturnType<typeof setInterval> | null = null
+
+async function loadProviders() {
+  try {
+    const res = await api.getProviders()
+    providers.value = res.providers ?? []
+  } catch {
+    // 拦截器已提示；保留上次结果，避免导航子项闪烁消失
+  }
+}
+
+// 供应商 LED：未就绪 → fog；workbuddy 看健康账号；其余就绪即 live
+function providerLed(p: ProviderSummary): 'live' | 'fault' | 'fog' {
+  if (!p.ready) return 'fog'
+  if (p.name === 'workbuddy') {
+    const healthy = Number((p.status as Record<string, unknown>)?.healthy_count ?? 0)
+    return healthy > 0 ? 'live' : 'fault'
+  }
+  return 'live'
 }
 
 // 管理台登录门：进管理页先校验 Token，未通过只渲染登录页
@@ -134,10 +156,13 @@ const gatewayServing = computed(() => (healthyCount.value ?? 0) > 0)
 onMounted(() => {
   checkAuth()
   refreshHealth()
+  loadProviders()
   healthTimer = setInterval(refreshHealth, 30000)
+  provTimer = setInterval(loadProviders, 30000)
 })
 onUnmounted(() => {
   if (healthTimer) clearInterval(healthTimer)
+  if (provTimer) clearInterval(provTimer)
 })
 </script>
 
@@ -184,7 +209,35 @@ onUnmounted(() => {
         <!-- 导航：仪表开关（选中 = route 左缘竖条 + 提亮） -->
         <nav class="switches">
           <button
-            v-for="item in menuItems"
+            v-for="item in topItems"
+            :key="item.key"
+            class="switch"
+            :class="{ on: activeKey === item.key }"
+            @click="go(item.key)"
+          >
+            <span class="switch-bar"></span>
+            <span class="switch-label">{{ item.label }}</span>
+          </button>
+
+          <!-- 供应商分组：动态子项，各带就绪/健康 LED -->
+          <div class="nav-group">
+            <div class="nav-group-cap">供应商</div>
+            <button
+              v-for="p in providers"
+              :key="p.name"
+              class="switch sub"
+              :class="{ on: activeKey === `/providers/${p.name}` }"
+              @click="go(`/providers/${p.name}`)"
+            >
+              <span class="switch-bar"></span>
+              <span class="led" :class="providerLed(p)"></span>
+              <span class="switch-label">{{ p.display_name || p.name }}</span>
+            </button>
+            <div v-if="!providers.length" class="nav-group-empty">加载中…</div>
+          </div>
+
+          <button
+            v-for="item in bottomItems"
             :key="item.key"
             class="switch"
             :class="{ on: activeKey === item.key }"
@@ -287,6 +340,16 @@ onUnmounted(() => {
 .switch.on .switch-bar { background: var(--route); }
 .switch-label { line-height: 1; }
 
+/* 供应商分组：小标题 + 缩进子项，子项前置状态 LED */
+.nav-group { margin: 6px 0; }
+.nav-group-cap {
+  padding: 8px 12px 4px 16px; font-size: 11px; color: var(--fog);
+  letter-spacing: 0.04em;
+}
+.nav-group-empty { padding: 4px 16px 6px; font-size: 12px; color: var(--fog); }
+.switch.sub { padding-left: 16px; gap: 9px; }
+.switch.sub .switch-label { flex: 1; }
+
 .spine-foot { padding: 14px 16px; border-top: 1px solid var(--line); }
 .readout { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--fog); }
 .readout-text { color: var(--fog); }
@@ -312,6 +375,10 @@ onUnmounted(() => {
   .spine-head { border-bottom: none; border-right: 1px solid var(--line); padding: 12px 14px; flex-shrink: 0; }
   .switches { flex-direction: row; padding: 8px; gap: 2px; overflow-x: auto; overflow-y: hidden; }
   .switch { width: auto; height: 34px; padding: 0 12px; }
+  /* 供应商分组在窄屏摊平进横向开关行 */
+  .nav-group { display: contents; }
+  .nav-group-cap, .nav-group-empty { display: none; }
+  .switch.sub { padding: 0 12px; }
   .switch-bar { top: auto; bottom: 0; left: 8px; right: 8px; width: auto; height: 2px; }
   .spine-foot { border-top: none; border-left: 1px solid var(--line); padding: 10px 14px; flex-shrink: 0; display: flex; align-items: center; gap: 12px; }
   .spine-foot .token-link { margin-top: 0; }
