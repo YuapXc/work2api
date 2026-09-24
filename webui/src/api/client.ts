@@ -1,5 +1,5 @@
 import axios, { type AxiosInstance, type InternalAxiosRequestConfig } from 'axios'
-import { message } from 'ant-design-vue'
+import { toast } from '@/lib/toast'
 import type {
   AccountInfo,
   AppInfo,
@@ -38,18 +38,9 @@ http.interceptors.request.use((config) => {
 // 说明：仅对 GET（读数据、幂等）自动重试，POST/DELETE 等写操作不重试，避免重复副作用。
 const MAX_RETRIES = 2
 
-// 错误提示去重：概览页每 20s 自动轮询，后端短暂不可用时会连续触发多个请求失败，
-// 若每次都弹 toast 会造成刷屏。同一错误文案在 DEDUPE_WINDOW 内只提示一次。
-const DEDUPE_WINDOW = 5000
-let _lastToastKey = ''
-let _lastToastAt = 0
-
+// 错误提示：toast 自带去重（同文案窗口期内只弹一次），这里直接透传。
 function toastOnce(msg: string) {
-  const now = Date.now()
-  if (msg === _lastToastKey && now - _lastToastAt < DEDUPE_WINDOW) return
-  _lastToastKey = msg
-  _lastToastAt = now
-  message.error(`请求失败：${msg}`)
+  toast.error(`请求失败：${msg}`)
 }
 
 http.interceptors.response.use(
@@ -174,6 +165,13 @@ export const api = {
   providerOAuthPoll: (name: string, loginId: string) =>
     http.post<unknown, { status: 'pending' | 'ready' | 'error'; message?: string; account?: Record<string, unknown> }>(
       `/admin/providers/${encodeURIComponent(name)}/oauth/poll`, { login_id: loginId }),
+
+  // 供应商配置编辑（opencode 密钥层级）：读取 / 保存并热重载
+  providerGetConfig: (name: string) =>
+    http.get<unknown, Record<string, unknown>>(`/admin/providers/${encodeURIComponent(name)}/config`),
+  providerSaveConfig: (name: string, patch: Record<string, unknown>) =>
+    http.post<unknown, { ok: boolean; config?: Record<string, unknown> }>(
+      `/admin/providers/${encodeURIComponent(name)}/config`, patch),
 
   // 自动签到 / 额度刷新 设置
   getSettings: () => http.get<unknown, Settings>('/admin/settings'),

@@ -1,36 +1,50 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { SearchOutlined, ReloadOutlined } from '@ant-design/icons-vue'
 import { api } from '@/api/client'
-import type { ModelInfo } from '@/types'
-import ModelsPanel from '@/components/ModelsPanel.vue'
+import { toast } from '@/lib/toast'
+import { providerMeta } from '@/lib/providers'
+import WPage from '@/components/ui/WPage.vue'
+import WButton from '@/components/ui/WButton.vue'
+import WInput from '@/components/ui/WInput.vue'
+import WSelect from '@/components/ui/WSelect.vue'
+import WSpinner from '@/components/ui/WSpinner.vue'
+import WEmpty from '@/components/ui/WEmpty.vue'
+import WIcon from '@/components/ui/WIcon.vue'
+import WStat from '@/components/ui/WStat.vue'
+import ModelCard from '@/components/ModelCard.vue'
 
-// embedded：作为供应商钻取页的「模型」标签页嵌入时，隐藏自身的大标题/副标题，
-// 搜索、刷新、表格等保持不变。
-defineProps<{ embedded?: boolean }>()
-
-const models = ref<ModelInfo[]>([])
-const loading = ref(false)
-const source = ref<'dynamic' | 'static'>('dynamic')
-const search = ref('')
+interface Entry {
+  provider: string
+  model: Record<string, any>
+}
+const entries = ref<Entry[]>([])
+const source = ref<string>('')
+const loading = ref(true)
 const refreshing = ref(false)
 
-const filtered = computed(() => {
-  const q = search.value.trim().toLowerCase()
-  if (!q) return models.value
-  return models.value.filter(
-    (m) =>
-      m.id.toLowerCase().includes(q) ||
-      (m.name || '').toLowerCase().includes(q),
-  )
-})
+const search = ref('')
+const providerFilter = ref('')
+const modalityFilter = ref('')
 
 async function load() {
   loading.value = true
+  const acc: Entry[] = []
   try {
+    // 默认供应商（workbuddy）目录
     const res = await api.models()
-    models.value = res.models
-    source.value = res.source === 'static' ? 'static' : 'dynamic'
+    source.value = res.source || ''
+    for (const m of res.models || []) acc.push({ provider: 'workbuddy', model: m })
+    // 其它供应商目录：有 models 能力的才拉详情
+    const provs = (await api.getProviders()).providers || []
+    const others = provs.filter((p) => !p.default && p.capabilities?.includes('models'))
+    const details = await Promise.all(
+      others.map((p) => api.getProvider(p.name).catch(() => null)),
+    )
+    details.forEach((d, i) => {
+      if (!d) return
+      for (const m of (d.models as Record<string, any>[]) || []) acc.push({ provider: others[i].name, model: m })
+    })
+    entries.value = acc
   } finally {
     loading.value = false
   }
@@ -40,51 +54,75 @@ async function refresh() {
   refreshing.value = true
   try {
     await api.modelsRefresh()
+    toast.success('已刷新模型目录')
     await load()
-  } catch { /* 拦截器已提示 */ } finally {
+  } finally {
     refreshing.value = false
   }
 }
+
+const providerOptions = computed(() => {
+  const set = [...new Set(entries.value.map((e) => e.provider))]
+  return set.map((p) => ({ value: p, label: providerMeta(p).label }))
+})
+
+const filtered = computed(() =>
+  entries.value.filter((e) => {
+    if (providerFilter.value && e.provider !== providerFilter.value) return false
+    const isMulti = e.model.modality === 'multimodal' || e.model.vision || e.model.supports_image
+    if (modalityFilter.value === 'multimodal' && !isMulti) return false
+    if (modalityFilter.value === 'text' && isMulti) return false
+    const q = search.value.trim().toLowerCase()
+    if (q) {
+      const hay = `${e.model.id} ${e.model.name || ''}`.toLowerCase()
+      if (!hay.includes(q)) return false
+    }
+    return true
+  }),
+)
+
+const stats = computed(() => {
+  const total = entries.value.length
+  const multi = entries.value.filter((e) => e.model.modality === 'multimodal' || e.model.vision).length
+  const tool = entries.value.filter((e) => e.model.supportsToolCall).length
+  return { total, multi, tool }
+})
 
 onMounted(load)
 </script>
 
 <template>
-  <div style="padding-bottom: 36px">
-    <div class="view-header">
-      <div v-if="!embedded">
-        <div class="vh-title">模型</div>
-        <div class="vh-meta">
-          <span class="led route"></span>
-          <span class="mono">{{ filtered.length }}</span> 个模型 ·
-          {{ source === 'dynamic' ? '动态目录（来自上游）' : '静态兜底目录' }}
-        </div>
-      </div>
-      <div class="vh-actions">
-        <a-input
-          v-model:value="search"
-          placeholder="搜索模型 ID 或名称"
-          allow-clear
-          class="search"
-        >
-          <template #prefix><SearchOutlined style="color: var(--fog)" /></template>
-        </a-input>
-        <a-button :loading="refreshing" @click="refresh">
-          <ReloadOutlined />刷新模型
-        </a-button>
-      </div>
-    </div>
+  <WPage title="模型" :sub="`统一模型目录 · 来源 ${source === 'dynamic' ? '上游实时' : source === 'static' ? '内置' : '—'}`">
+    <template #actions>
+      <WButton variant="ghost" :loading="refreshing" @click="refresh"><WIcon name="refresh" :size="15" /> 刷新目录</WButton>
+    </template>
 
-    <ModelsPanel
-      :models="filtered"
-      :source="source"
-      :loading="loading"
-      :show-accounts="true"
-      @refresh="refresh"
-    />
-  </div>
+    <WSpinner v-if="loading" center label="加载中" />
+    <template v-else>
+      <div class="mb-4 grid grid-cols-3 gap-3">
+        <WStat label="模型总数" :value="stats.total" tone="brand" />
+        <WStat label="多模态" :value="stats.multi" tone="route" />
+        <WStat label="支持工具" :value="stats.tool" tone="live" />
+      </div>
+
+      <div class="mb-4 flex flex-wrap items-center gap-2">
+        <WInput v-model="search" placeholder="搜索模型 id 或名称" class="w-full sm:w-72">
+          <template #prefix><WIcon name="search" :size="16" class="text-faint" /></template>
+        </WInput>
+        <WSelect v-model="providerFilter" :options="providerOptions" placeholder="全部供应商" class="w-40" />
+        <WSelect
+          v-model="modalityFilter"
+          :options="[{ value: 'text', label: '纯文本' }, { value: 'multimodal', label: '多模态' }]"
+          placeholder="全部模态"
+          class="w-32"
+        />
+        <span class="ml-auto text-small text-faint">{{ filtered.length }} / {{ entries.length }}</span>
+      </div>
+
+      <div v-if="filtered.length" class="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+        <ModelCard v-for="e in filtered" :key="e.provider + '/' + e.model.id" :model="e.model" :provider="e.provider" />
+      </div>
+      <WEmpty v-else title="没有匹配的模型" hint="调整搜索或筛选条件，或刷新目录。" />
+    </template>
+  </WPage>
 </template>
-
-<style scoped>
-.search { width: 260px; }
-</style>

@@ -210,6 +210,10 @@ export interface Overview {
   /** 预警提示（后端按当前额度状态实时计算，仅用于展示） */
   alerts?: OverviewAlert[]
   models: string[]
+  /** 缓存的模型数量 */
+  model_count?: number
+  /** 模型目录来源：dynamic=上游实时 / static=内置 */
+  model_source?: string
   usage: UsageSummary
   recent: UsageRecord[]
   prediction?: {

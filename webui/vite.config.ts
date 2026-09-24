@@ -27,8 +27,7 @@ export default defineConfig({
       output: {
         manualChunks(id) {
           if (id.includes('node_modules')) {
-            if (id.includes('ant-design-vue')) return 'vendor-antd'
-            if (id.includes('@ant-design/icons-vue')) return 'vendor-icons'
+            if (id.includes('echarts') || id.includes('zrender')) return 'vendor-charts'
             if (id.includes('vue-router') || id.includes('node_modules/vue')) return 'vendor-vue'
             if (id.includes('axios') || id.includes('dayjs')) return 'vendor-util'
             return 'vendor'
