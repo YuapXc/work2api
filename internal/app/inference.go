@@ -2,8 +2,10 @@ package app
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"work2api/internal/store"
 	"work2api/internal/workbuddy/pool"
@@ -59,13 +61,26 @@ func (o *Orchestrator) logUsage(a logArgs) {
 		LatencyMs:        float64(time.Since(a.t0).Milliseconds()),
 		Status:           a.status,
 		Error:            a.errStr,
-		InputContent:     a.input,
-		OutputContent:    a.output,
-		ReasoningContent: a.reasoning,
+		InputContent:     clipContent(a.input, o.cfg.UsageContentMaxBytes),
+		OutputContent:    clipContent(a.output, o.cfg.UsageContentMaxBytes),
+		ReasoningContent: clipContent(a.reasoning, o.cfg.UsageContentMaxBytes),
 		Credits:          credits,
 		AppName:          a.appName,
 		ReasoningEffort:  effort,
 	})
+}
+
+// clipContent 把落库的 content 截到 max 字节（0=不截），主要挡 base64 图片这类
+// 大 payload。按 UTF-8 边界回退，避免把多字节字符切成乱码，并留可见截断标记。
+func clipContent(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…[已截断，原长 " + strconv.Itoa(len(s)) + " 字节]"
 }
 
 func usageTokens(u map[string]any) (int, int) {

@@ -34,6 +34,16 @@ type Config struct {
 	ModelRefreshHour   int
 	KeepaliveHour      int
 	UsageRetentionDays int
+	// UsageMaxRows caps total usage_logs rows (0 = unlimited). Guards against a
+	// burst of high-frequency calls bloating the DB within the retention window.
+	UsageMaxRows int
+	// UsageCheckIntervalMin is how often the row-count guard runs (cheap MIN/MAX
+	// id precheck; only trims when actually over the cap).
+	UsageCheckIntervalMin int
+	// UsageContentMaxBytes truncates each stored input/output/reasoning content
+	// field at write (0 = unlimited). The real DB-size driver is base64 image
+	// payloads in request/response bodies; this bounds per-row bytes.
+	UsageContentMaxBytes int
 }
 
 // PackageRoot is the directory containing the executable's working tree root.
@@ -86,6 +96,12 @@ func Load(args []string) *Config {
 		ModelRefreshHour:   envInt("MODEL_REFRESH_HOUR", 6),
 		KeepaliveHour:      envInt("KEEPALIVE_HOUR", 22),
 		UsageRetentionDays: envInt("USAGE_RETENTION_DAYS", 90),
+		// 行数上限默认 10 万条（0=不限）：多数个人用量到不了，却能兜住失控增长。
+		UsageMaxRows:          envInt("USAGE_MAX_ROWS", 100000),
+		UsageCheckIntervalMin: envInt("USAGE_CHECK_INTERVAL_MIN", 30),
+		// 单条 content 字段上限默认 32KB（0=不限）：纯文本远够（约 8k tokens），
+		// 主要截断 base64 图片这类撑爆库的大 payload。
+		UsageContentMaxBytes: envInt("USAGE_CONTENT_MAX_BYTES", 32768),
 	}
 }
 

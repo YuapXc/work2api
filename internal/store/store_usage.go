@@ -142,6 +142,42 @@ func (d *DB) CleanupUsage(retentionDays int) (int64, error) {
 	return n, nil
 }
 
+// UsageRowSpan returns (min id, max id) via primary-key index reads — an O(1)
+// precheck for whether the row count might exceed a cap, without a full COUNT(*).
+// Span (hi-lo+1) equals the row count only when nothing was deleted; deletes
+// inflate it (deleting old rows doesn't lower max id), so it's a "maybe over"
+// hint — the exact trim count comes from CleanupUsageRows. Empty table => (0,0).
+func (d *DB) UsageRowSpan() (int64, int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var lo, hi sql.NullInt64
+	err := d.db.QueryRow("SELECT MIN(id), MAX(id) FROM usage_logs").Scan(&lo, &hi)
+	return lo.Int64, hi.Int64, err
+}
+
+// CleanupUsageRows keeps only the newest maxRows usage_logs rows (by id, which
+// is monotonic with insert order) and returns how many were deleted. maxRows<=0
+// is a no-op. Uses a MAX(id) boundary subquery so SQLite walks the primary-key
+// index instead of scanning the whole table.
+func (d *DB) CleanupUsageRows(maxRows int) (int64, error) {
+	if maxRows <= 0 {
+		return 0, nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	res, err := d.db.Exec(
+		`DELETE FROM usage_logs WHERE id <= (
+			SELECT MAX(id) FROM (
+				SELECT id FROM usage_logs ORDER BY id DESC LIMIT -1 OFFSET ?
+			)
+		)`, maxRows)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // UsageSummary returns aggregate stats.
 func (d *DB) UsageSummary() (map[string]any, error) {
 	d.mu.Lock()

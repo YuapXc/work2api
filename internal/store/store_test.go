@@ -67,3 +67,44 @@ func TestStoreRoundTrip(t *testing.T) {
 		t.Fatalf("profile: %v", accs[0]["profile"])
 	}
 }
+
+func TestUsageRowCap(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "cap.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	// 空表：span 为 (0,0)，截断为 no-op
+	if lo, hi, _ := db.UsageRowSpan(); lo != 0 || hi != 0 {
+		t.Fatalf("empty span = (%d,%d), want (0,0)", lo, hi)
+	}
+	if n, _ := db.CleanupUsageRows(2); n != 0 {
+		t.Fatalf("cleanup on empty = %d, want 0", n)
+	}
+
+	for i := 0; i < 5; i++ {
+		if err := db.LogUsage(UsageParams{Model: "m", Protocol: "chat", AccountUID: "u", Status: "ok"}); err != nil {
+			t.Fatalf("log %d: %v", i, err)
+		}
+	}
+	// maxRows<=0 是 no-op
+	if n, _ := db.CleanupUsageRows(0); n != 0 {
+		t.Fatalf("cleanup(0) = %d, want 0", n)
+	}
+	// 保留最新 2 条，删除最旧 3 条
+	n, err := db.CleanupUsageRows(2)
+	if err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("deleted %d, want 3", n)
+	}
+	if c, _ := db.UsageRowCount(); c != 2 {
+		t.Fatalf("remaining %d, want 2", c)
+	}
+	// 已在上限内：再次截断不删
+	if n, _ := db.CleanupUsageRows(2); n != 0 {
+		t.Fatalf("second cleanup = %d, want 0", n)
+	}
+}

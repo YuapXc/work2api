@@ -36,7 +36,8 @@ type Scheduler struct {
 	stop chan struct{}
 	done chan struct{}
 
-	lastCredit float64
+	lastCredit   float64
+	lastRowCheck float64
 
 	// checkin state (see scheduler.py _run for the invariants these preserve)
 	lastCheckinDate       string
@@ -230,16 +231,16 @@ func (s *Scheduler) doKeepalive() {
 	}
 }
 
-// cleanupUsage removes usage_logs older than the configured retention.
+// cleanupUsage removes usage_logs older than the configured retention, then
+// enforces the row-count cap (if any). Runs daily at 04:00.
 func (s *Scheduler) cleanupUsage() {
 	n, err := s.o.db.CleanupUsage(s.o.cfg.UsageRetentionDays)
 	if err != nil {
 		log.Printf("使用记录清理异常: %v", err)
-		return
-	}
-	if n > 0 {
+	} else if n > 0 {
 		log.Printf("使用记录清理完成（保留 %d 天，删除 %d 条）", s.o.cfg.UsageRetentionDays, n)
 	}
+	s.checkUsageRows()
 }
 
 // run is the once-per-minute scheduling loop. Each branch is idempotent per day
@@ -343,5 +344,41 @@ func (s *Scheduler) tick() {
 	if float64(now.Unix())-s.lastCredit >= float64(interval)*60 {
 		s.refreshCredits()
 		s.lastCredit = float64(now.Unix())
+	}
+
+	// --- periodic usage row-count guard ---
+	// 天数保留一天判一次够用，但行数上限可能被一天内的高频调用冲破，所以按
+	// UsageCheckIntervalMin 定期检查。检查很便宜：先读 MIN/MAX(id) 预判，真超才删。
+	if s.o.cfg.UsageMaxRows > 0 {
+		checkEvery := s.o.cfg.UsageCheckIntervalMin
+		if checkEvery < 1 {
+			checkEvery = 30
+		}
+		if float64(now.Unix())-s.lastRowCheck >= float64(checkEvery)*60 {
+			s.checkUsageRows()
+			s.lastRowCheck = float64(now.Unix())
+		}
+	}
+}
+
+// checkUsageRows trims usage_logs to UsageMaxRows when exceeded. Uses the cheap
+// MIN/MAX(id) span as a "maybe over" precheck to avoid a COUNT(*)/DELETE on the
+// common (under-cap) path.
+func (s *Scheduler) checkUsageRows() {
+	max := s.o.cfg.UsageMaxRows
+	if max <= 0 {
+		return
+	}
+	lo, hi, err := s.o.db.UsageRowSpan()
+	if err != nil || hi <= 0 || (hi-lo+1) <= int64(max) {
+		return
+	}
+	n, err := s.o.db.CleanupUsageRows(max)
+	if err != nil {
+		log.Printf("使用记录行数检查异常: %v", err)
+		return
+	}
+	if n > 0 {
+		log.Printf("使用记录超出上限 %d 行，已截断最旧 %d 条", max, n)
 	}
 }
