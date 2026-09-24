@@ -19,7 +19,7 @@ func (rt *Runtime) AdminData(ctx context.Context) provider.AdminData {
 		Capabilities: []string{"models", "config"},
 	}
 	if !rt.Ready() {
-		d.Notes = "未配置：设置环境变量 OPENCODE_CONFIG 指向配置文件，或在工作目录放 opencode.json（含 zen_keys / go_keys / anonymous）"
+		d.Notes = "未配置：在账号页点「编辑配置」填 Zen/Go 密钥或启用匿名层；也可设 OPENCODE_CONFIG 或放 data/opencode/opencode.json（含 zen_keys / go_keys / anonymous）"
 		d.Status = map[string]any{"account_count": 0, "model_count": 0}
 		return d
 	}

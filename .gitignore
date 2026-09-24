@@ -24,6 +24,13 @@
 /auths/
 *.info
 
+# OpenCode 供应商配置（含 zen/go 上游 API Key）+ 自动生成的模型/定价缓存。
+# 默认落在 data/opencode/（已被 /data/ 覆盖）；下面兼容旧的项目根路径与自定义位置。
+/opencode.json
+/opencode/
+*.models.catalog.json
+*.models.dev.json
+
 # 前端
 /webui/node_modules/
 /webui/dist/

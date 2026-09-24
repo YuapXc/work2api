@@ -57,6 +57,7 @@ type Orchestrator struct {
 	mcMu           sync.Mutex
 	modelCooldowns map[string]cdEntry
 	projectAuths   string
+	sessions       *sessionRouter
 }
 
 type cdEntry struct {
@@ -84,6 +85,20 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 		limiters:       map[string]*ratelimit.Limiter{},
 		modelCooldowns: map[string]cdEntry{},
 		projectAuths:   projectAuths,
+		sessions:       newSessionRouter(),
+	}
+	// 重启后回填持久化的 (账号,模型) 冷却（6004 每日上限）：否则内存 map 为空，
+	// 已达上限的模型会被重新选中、白打一次上游、给客户端漏一个瞬时 6004 再轮转。
+	if rows, err := db.ActiveModelCooldowns(0); err == nil {
+		for _, row := range rows {
+			uid, _ := row["account_uid"].(string)
+			model, _ := row["model"].(string)
+			until, _ := row["cooldown_until"].(float64)
+			reason, _ := row["reason"].(string)
+			if uid != "" && model != "" && until > 0 {
+				o.modelCooldowns[uid+"|"+model] = cdEntry{until: until, reason: reason}
+			}
+		}
 	}
 	creds := map[string]pool.Credential{}
 	for _, f := range credentials.FindAuthFiles("", projectAuths) {
@@ -120,7 +135,7 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 		}
 	}
 	o.models = models.New(o.pool, db)
-	registerRuntimes()
+	registerRuntimes(cfg.DataDir)
 	return o, nil
 }
 
@@ -130,10 +145,10 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 // idempotent per process. workbuddy remains the default (un-namespaced) path.
 var runtimesOnce sync.Once
 
-func registerRuntimes() {
+func registerRuntimes(dataDir string) {
 	runtimesOnce.Do(func() {
 		provider.RegisterRuntime(qoder.New())
-		if oc, err := opencode.New(nil); err != nil {
+		if oc, err := opencode.New(nil, dataDir); err != nil {
 			log.Printf("opencode 运行时初始化失败（已跳过）: %v", err)
 		} else {
 			provider.RegisterRuntime(oc)
@@ -208,6 +223,37 @@ func (o *Orchestrator) markDailyModelLimit(acc *pool.Account, model string, raw 
 	return true
 }
 
+// penalizeAccount 对失败请求做统一处置：先看是否 6004 每日模型上限（有明确重置墙钟，
+// 走 (账号,模型) 冷却），否则按错误分类表决定 禁用 / (账号,模型)负缓存 / 账号冷却 /
+// 不罚（fail-fast 与 client）。返回的 errAction 由调用方据 Rotate/FailFast 决定是否换号。
+// 这是账号池处罚的**唯一权威点**：handler 侧的错误日志一律 updatePool:false。
+func (o *Orchestrator) penalizeAccount(acc *pool.Account, model string, ue *upstream.UpstreamError) errAction {
+	// 6004 每日模型上限：上游给了明确重置时间，按 (账号,模型) 冷却到该时刻。
+	if o.markDailyModelLimit(acc, model, ue.Raw) {
+		return errAction{Rotate: true, ModelScoped: true, Reason: "该模型今日已达上限"}
+	}
+	now := nowSec()
+	kind := classifyUpstream(ue.StatusCode, ue.Raw, ue.Header)
+	act := actionFor(kind, ue.Raw, ue.Header, now)
+	switch {
+	case act.Disable:
+		o.pool.SetEnabled(acc.UID, false, act.Reason)
+	case act.ModelScoped && act.Cooldown > 0:
+		until := now + act.Cooldown
+		o.mcMu.Lock()
+		o.modelCooldowns[acc.UID+"|"+model] = cdEntry{until: until, reason: act.Reason}
+		o.mcMu.Unlock()
+		_ = o.db.SetModelCooldown(acc.UID, model, until, act.Reason)
+	case act.FailFast:
+		// 请求自身的问题：不罚号、不换号，透传原文
+	case act.Cooldown > 0:
+		o.pool.OnFailure(acc.UID, act.Cooldown)
+	default:
+		// client / none：只换号不罚
+	}
+	return act
+}
+
 func (o *Orchestrator) modelAccountUIDs(model string) (map[string]bool, *apiError) {
 	entries := o.models.ListCached()
 	if len(entries) == 0 {
@@ -244,7 +290,7 @@ func (o *Orchestrator) modelAccountUIDs(model string) (map[string]bool, *apiErro
 	return out, nil
 }
 
-func (o *Orchestrator) pickAccount(model string) (*pool.Account, *apiError) {
+func (o *Orchestrator) pickAccount(model, sessionKey string) (*pool.Account, *apiError) {
 	allowed, aerr := o.modelAccountUIDs(model)
 	if aerr != nil {
 		return nil, aerr
@@ -262,12 +308,32 @@ func (o *Orchestrator) pickAccount(model string) (*pool.Account, *apiError) {
 	if len(allowed) > 0 && len(ready) == 0 {
 		return nil, errBody(429, "模型 "+model+" 的可用账号均已达到每日上限，请稍后重试", "rate_limit_error")
 	}
+	// 会话粘性：此前绑定的账号若仍可用（在候选集、未模型冷却、账号冷却≤30s、启用），
+	// 直接复用以保住上游 prompt cache 命中；否则解粘回池按权重重选并重绑。
+	if sessionKey != "" {
+		if uid := o.sessions.lookup(sessionKey); uid != "" {
+			if ready[uid] {
+				for _, a := range o.pool.Accounts() {
+					if a.UID == uid {
+						if a.Enabled && a.CooldownUntil-now <= 30 {
+							return a, nil
+						}
+						break
+					}
+				}
+			}
+			o.sessions.unbind(sessionKey)
+		}
+	}
 	acc := o.pool.Pick(ready)
 	if acc == nil {
 		return nil, errBody(503, "模型 "+model+" 无可用账号（全部冷却或额度耗尽），请检查账号状态", "auth_error")
 	}
 	if acc.CooldownUntil-now > 30 {
 		return nil, errBody(503, "上游限流中，所有账号均在冷却，请稍后重试", "rate_limit_error")
+	}
+	if sessionKey != "" {
+		o.sessions.bind(sessionKey, acc.UID)
 	}
 	return acc, nil
 }
@@ -305,14 +371,20 @@ func (o *Orchestrator) enhanceBody(body map[string]any) map[string]any {
 	}
 	modelID, _ := body["model"].(string)
 	maxOut := o.models.MaxOutputTokens(modelID)
-	if mt, ok := body["max_tokens"]; ok && mt != nil {
+	// 同时钳制 max_tokens 与 max_completion_tokens（新版 OpenAI SDK 用后者）：
+	// 超过模型上限的值会被上游直接 400。上游对两个键都做了裁剪。
+	for _, key := range []string{"max_tokens", "max_completion_tokens"} {
+		mt, ok := body[key]
+		if !ok || mt == nil {
+			continue
+		}
 		if n, err := strconv.Atoi(toStrLoose(mt)); err == nil {
 			if maxOut > 0 && n > maxOut {
 				n = maxOut
 			}
-			body["max_tokens"] = n
+			body[key] = n
 		} else {
-			delete(body, "max_tokens")
+			delete(body, key)
 		}
 	}
 	var dyn map[string][]string
@@ -359,12 +431,14 @@ func (o *Orchestrator) runOnce(ctx context.Context, acc *pool.Account, body map[
 	return started, err
 }
 
-func (o *Orchestrator) openUpstream(ctx context.Context, acc *pool.Account, body map[string]any, model string, sink func(string) error, onRetryFail func(*pool.Account, *upstream.UpstreamError)) (*pool.Account, error) {
+func (o *Orchestrator) openUpstream(ctx context.Context, acc *pool.Account, body map[string]any, model, sessionKey string, sink func(string) error, onRetryFail func(*pool.Account, *upstream.UpstreamError)) (*pool.Account, error) {
 	started, err := o.runOnce(ctx, acc, body, sink)
 	if err == nil {
 		return acc, nil
 	}
 	if started {
+		// 流已开始又中断：软冷却（可能是上游中途掉线），不重试已开始的流。
+		o.pool.OnFailure(acc.UID, cooldownSoft)
 		return acc, err
 	}
 	ue, ok := err.(*upstream.UpstreamError)
@@ -372,12 +446,10 @@ func (o *Orchestrator) openUpstream(ctx context.Context, acc *pool.Account, body
 		o.pool.OnFailure(acc.UID, cooldownSoft)
 		return acc, err
 	}
-	limited := o.markDailyModelLimit(acc, model, ue.Raw)
-	if !failoverStatus(ue.StatusCode) {
+	// 分类并对首个账号施加处罚（禁用/负缓存/冷却/不罚），返回是否应换号。
+	act := o.penalizeAccount(acc, model, ue)
+	if act.FailFast || !act.Rotate {
 		return acc, err
-	}
-	if !limited {
-		o.pool.OnFailure(acc.UID, cooldownFor(ue.StatusCode))
 	}
 	if o.pool.HealthyCount(o.modelReadyUIDs(model)) < 1 {
 		return acc, err
@@ -385,16 +457,14 @@ func (o *Orchestrator) openUpstream(ctx context.Context, acc *pool.Account, body
 	if onRetryFail != nil {
 		onRetryFail(acc, ue)
 	}
-	alt, aerr := o.pickAccount(model)
+	alt, aerr := o.pickAccount(model, sessionKey)
 	if aerr != nil {
 		return acc, err
 	}
 	started2, err2 := o.runOnce(ctx, alt, body, sink)
 	if err2 != nil {
 		if ue2, ok := err2.(*upstream.UpstreamError); ok {
-			if !o.markDailyModelLimit(alt, model, ue2.Raw) {
-				o.pool.OnFailure(alt.UID, cooldownFor(ue2.StatusCode))
-			}
+			o.penalizeAccount(alt, model, ue2)
 		} else if !started2 {
 			o.pool.OnFailure(alt.UID, cooldownSoft)
 		}

@@ -21,6 +21,58 @@ func (s *Server) mountProviderAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/providers/{name}/accounts/{id}/activate", s.adminProviderActivate)
 	mux.HandleFunc("POST /admin/providers/{name}/accounts/{id}/rename", s.adminProviderRename)
 	mux.HandleFunc("DELETE /admin/providers/{name}/accounts/{id}", s.adminProviderDeleteAccount)
+	mux.HandleFunc("GET /admin/providers/{name}/config", s.adminProviderGetConfig)
+	mux.HandleFunc("POST /admin/providers/{name}/config", s.adminProviderSaveConfig)
+}
+
+// configRuntime resolves a provider to its ConfigRuntime, or writes an error.
+func (s *Server) configRuntime(w http.ResponseWriter, name string) (provider.ConfigRuntime, bool) {
+	rt, ok := provider.RuntimeByName(name)
+	if !ok {
+		writeJSON(w, 404, errBody(404, "未知供应商："+name, "invalid_request_error").body)
+		return nil, false
+	}
+	cr, ok := rt.(provider.ConfigRuntime)
+	if !ok {
+		writeJSON(w, 400, errBody(400, name+" 不支持配置编辑", "invalid_request_error").body)
+		return nil, false
+	}
+	return cr, true
+}
+
+func (s *Server) adminProviderGetConfig(w http.ResponseWriter, r *http.Request) {
+	cr, ok := s.configRuntime(w, r.PathValue("name"))
+	if !ok {
+		return
+	}
+	doc, err := cr.ConfigDoc()
+	if err != nil {
+		writeJSON(w, 500, errBody(500, err.Error(), "internal_error").body)
+		return
+	}
+	writeJSON(w, 200, doc)
+}
+
+func (s *Server) adminProviderSaveConfig(w http.ResponseWriter, r *http.Request) {
+	cr, ok := s.configRuntime(w, r.PathValue("name"))
+	if !ok {
+		return
+	}
+	body, _ := readJSON(r)
+	if err := cr.SaveConfigDoc(body); err != nil {
+		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
+		return
+	}
+	// 返回刷新后的配置视图（由可能已被替换的新运行时提供）
+	if rt, ok := provider.RuntimeByName(r.PathValue("name")); ok {
+		if ncr, ok := rt.(provider.ConfigRuntime); ok {
+			if doc, err := ncr.ConfigDoc(); err == nil {
+				writeJSON(w, 200, map[string]any{"ok": true, "config": doc})
+				return
+			}
+		}
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 // accountManager resolves a provider to its AccountManager, or writes an error.

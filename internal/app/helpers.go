@@ -10,41 +10,13 @@ import (
 	"time"
 )
 
-// Cooldown durations (seconds) per error class.
+// Cooldown durations (seconds) used outside the error classifier (token-refresh
+// failure, mid-stream break, non-HTTP errors). Status-based cooldown selection
+// now lives in the error classifier (errclass.go).
 const (
-	cooldownNone = 0.0
 	cooldownSoft = 60.0
 	cooldownHard = 1800.0
 )
-
-// cooldownFor picks a cooldown by upstream HTTP status.
-func cooldownFor(status int) float64 {
-	switch {
-	case status == 429:
-		return 300.0
-	case status == 401 || status == 403:
-		return cooldownHard
-	case status >= 500:
-		return 120.0
-	default:
-		return cooldownSoft
-	}
-}
-
-// failoverStatus reports whether an upstream status warrants rotating to a
-// healthy account and retrying once. Beyond the upstream Python's 429/502/503,
-// we also fail over on 401/403 (dead credential): the offending account gets a
-// hard cooldown while a healthy account serves the request, so a single bad
-// credential no longer leaks a spurious auth error to the client when another
-// account could have served it. (High-value deviation from upstream, approved.)
-func failoverStatus(status int) bool {
-	switch status {
-	case 401, 403, 429, 502, 503:
-		return true
-	default:
-		return false
-	}
-}
 
 var limitResetRe = regexp.MustCompile(`(?i)(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*UTC\+8`)
 

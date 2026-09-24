@@ -34,6 +34,9 @@ var passthroughBodyKeys = map[string]struct{}{
 type UpstreamError struct {
 	StatusCode int
 	Raw        []byte
+	// Header carries the upstream response headers (Retry-After 等) for error
+	// classification. Nil for synthesized errors (invalid stream / bad JSON).
+	Header http.Header
 }
 
 func (e *UpstreamError) Error() string { return fmt.Sprintf("upstream HTTP %d", e.StatusCode) }
@@ -61,11 +64,15 @@ func Shared() *Client {
 		transport := &http.Transport{
 			// short connect timeout: fail fast when upstream is unreachable
 			// instead of holding a connection/goroutine.
-			DialContext: (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			DialContext:         (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 			MaxIdleConns:        50,
 			MaxIdleConnsPerHost: 20,
 			IdleConnTimeout:     90 * time.Second,
 			TLSHandshakeTimeout: 15 * time.Second,
+			// 首字节（响应头）等待上限：上游"接了连接却迟迟不回"时快速失败，
+			// 而不是把 goroutine 挂死等到客户端断开。只约束到首个响应头的等待，
+			// 不影响已开始的流式响应体（长思考流不会被腰斩）。
+			ResponseHeaderTimeout: 120 * time.Second,
 			// no ProxyFromEnvironment: mirrors trust_env=False, avoids picking
 			// up a broken HTTP_PROXY.
 			Proxy: nil,
@@ -144,7 +151,7 @@ func (c *Client) StreamUpstream(ctx context.Context, headers map[string]string, 
 
 	if resp.StatusCode != 200 {
 		raw := readAll(resp.Body)
-		return &UpstreamError{StatusCode: resp.StatusCode, Raw: raw}
+		return &UpstreamError{StatusCode: resp.StatusCode, Raw: raw, Header: resp.Header}
 	}
 
 	// Upstream sometimes answers a stream request with a single JSON object.
@@ -263,6 +270,11 @@ func streamSSE(resp *http.Response, yield LineFunc) error {
 			}
 			if delta, ok := choice["delta"].(map[string]any); ok {
 				if !empty(delta["content"]) {
+					sawContent = true
+				}
+				// reasoning-only 响应（仅思考链、无正文，finish_reason=stop）合法：上游 collect
+				// 把 reasoning 计入正文；不计会误判"没有正文"，把已推给客户端的流判为无效→502。
+				if !empty(delta["reasoning_content"]) {
 					sawContent = true
 				}
 				if !empty(delta["tool_calls"]) {

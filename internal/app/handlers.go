@@ -51,7 +51,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	clientStream := boolVal(payload["stream"])
 	body := s.o.enhanceBody(upstream.BuildUpstreamBody(payload))
 	model := strOr(body["model"], "auto")
-	acc, aerr := s.o.pickAccount(model)
+	// 会话键从原始 payload 提取（BuildUpstreamBody 已剥掉 prompt_cache_key/metadata）
+	sessionKey := extractSessionKey(payload)
+	acc, aerr := s.o.pickAccount(model, sessionKey)
 	if aerr != nil {
 		writeAPIErr(w, aerr)
 		return
@@ -80,16 +82,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			reason += rr
 			return nil
 		}
-		served, err := o.openUpstream(r.Context(), acc, body, model, sink, func(fa *pool.Account, e *upstream.UpstreamError) {
+		served, err := o.openUpstream(r.Context(), acc, body, model, sessionKey, sink, func(fa *pool.Account, e *upstream.UpstreamError) {
 			o.logUsage(logArgs{protocol: "chat", model: model, acc: fa, t0: t0, status: "error", errStr: upstreamErrorText(e.StatusCode, e.Raw), input: input, appName: principal.AppName, updatePool: false})
 		})
 		if err != nil {
 			if ue, ok := err.(*upstream.UpstreamError); ok {
-				limited := dailyLimited(ue.Raw)
-				o.logUsage(logArgs{protocol: "chat", model: model, acc: served, t0: t0, status: "error", errStr: upstreamErrorText(ue.StatusCode, ue.Raw), input: input, cooldown: cooldownFor(ue.StatusCode), appName: principal.AppName, effort: effort, updatePool: !limited})
+				o.logUsage(logArgs{protocol: "chat", model: model, acc: served, t0: t0, status: "error", errStr: upstreamErrorText(ue.StatusCode, ue.Raw), input: input, appName: principal.AppName, effort: effort, updatePool: false})
 				writeChunk("data: " + jsonError(ue.StatusCode, string(ue.Raw)) + "\n\n")
 			} else {
-				o.logUsage(logArgs{protocol: "chat", model: model, acc: served, t0: t0, status: "error", errStr: err.Error(), input: input, cooldown: cooldownSoft, appName: principal.AppName, effort: effort, updatePool: true})
+				o.logUsage(logArgs{protocol: "chat", model: model, acc: served, t0: t0, status: "error", errStr: err.Error(), input: input, appName: principal.AppName, effort: effort, updatePool: false})
 				writeChunk("data: " + jsonError(502, err.Error()) + "\n\n")
 			}
 			writeChunk("data: [DONE]\n\n")
@@ -101,13 +102,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	var lines []string
 	sink := func(line string) error { lines = append(lines, line); return nil }
-	served, err := o.openUpstream(r.Context(), acc, body, model, sink, nil)
+	served, err := o.openUpstream(r.Context(), acc, body, model, sessionKey, sink, nil)
 	if err != nil {
 		st, detail := errToHTTP(err)
 		if ue, ok := err.(*upstream.UpstreamError); ok {
-			o.logUsage(logArgs{protocol: "chat", model: model, acc: served, t0: t0, status: "error", errStr: upstreamErrorText(ue.StatusCode, ue.Raw), input: input, cooldown: cooldownFor(ue.StatusCode), appName: principal.AppName, effort: effort, updatePool: !dailyLimited(ue.Raw)})
+			o.logUsage(logArgs{protocol: "chat", model: model, acc: served, t0: t0, status: "error", errStr: upstreamErrorText(ue.StatusCode, ue.Raw), input: input, appName: principal.AppName, effort: effort, updatePool: false})
 		} else {
-			o.logUsage(logArgs{protocol: "chat", model: model, acc: served, t0: t0, status: "error", errStr: err.Error(), input: input, cooldown: cooldownSoft, appName: principal.AppName, effort: effort, updatePool: true})
+			o.logUsage(logArgs{protocol: "chat", model: model, acc: served, t0: t0, status: "error", errStr: err.Error(), input: input, appName: principal.AppName, effort: effort, updatePool: false})
 		}
 		writeJSON(w, st, detail)
 		return
@@ -183,7 +184,8 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 	}
 	chatBody = o.enhanceBody(chatBody)
 	model := strOr(chatBody["model"], "auto")
-	acc, aerr := o.pickAccount(model)
+	sessionKey := extractSessionKey(payload)
+	acc, aerr := o.pickAccount(model, sessionKey)
 	if aerr != nil {
 		writeAPIErr(w, aerr)
 		return
@@ -220,20 +222,17 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 		}
 		return nil
 	}
-	served, err := o.openUpstream(r.Context(), acc, chatBody, model, sink, func(fa *pool.Account, e *upstream.UpstreamError) {
+	served, err := o.openUpstream(r.Context(), acc, chatBody, model, sessionKey, sink, func(fa *pool.Account, e *upstream.UpstreamError) {
 		o.logUsage(logArgs{protocol: protocol, model: model, acc: fa, t0: t0, status: "error", errStr: upstreamErrorText(e.StatusCode, e.Raw), input: input, appName: principal.AppName, updatePool: false})
 	})
 	if err != nil {
 		st, detail := errToHTTP(err)
-		cd := cooldownSoft
 		errStr := err.Error()
-		updatePool := true
 		if ue, ok := err.(*upstream.UpstreamError); ok {
-			cd = cooldownFor(ue.StatusCode)
 			errStr = upstreamErrorText(ue.StatusCode, ue.Raw)
-			updatePool = !dailyLimited(ue.Raw)
 		}
-		o.logUsage(logArgs{protocol: protocol, model: model, acc: served, t0: t0, status: "error", errStr: errStr, input: input, cooldown: cd, appName: principal.AppName, effort: effort, updatePool: updatePool})
+		// 账号池处罚已在 openUpstream 统一处理，这里只记日志（updatePool:false）。
+		o.logUsage(logArgs{protocol: protocol, model: model, acc: served, t0: t0, status: "error", errStr: errStr, input: input, appName: principal.AppName, effort: effort, updatePool: false})
 		if streamMode {
 			if protocol == "anthropic" {
 				writeChunk(errAnthropic(st, errStr))
@@ -253,11 +252,6 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 		return
 	}
 	writeJSON(w, 200, conv.GetNonstreamResponse())
-}
-
-func dailyLimited(raw []byte) bool {
-	_, _, ok := dailyModelLimit(raw, 0)
-	return ok
 }
 
 func errToHTTP(err error) (int, map[string]any) {

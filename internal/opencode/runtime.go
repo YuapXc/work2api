@@ -23,6 +23,8 @@ const (
 type Runtime struct {
 	cfg        Config
 	logger     *slog.Logger
+	path       string // resolved config path (for display + hot-reload writes)
+	cancel     context.CancelFunc
 	transports *transportPool
 	zenNodes   *nodePool
 	goNodes    *nodePool
@@ -39,18 +41,28 @@ var _ provider.Runtime = (*Runtime)(nil)
 // $OPENCODE_CONFIG when set, else <cwd>/opencode.json when present; with
 // neither it returns an inert (not-ready) runtime and a nil error. A config
 // file that exists but is malformed is a hard error.
-func New(logger *slog.Logger) (*Runtime, error) {
+func New(logger *slog.Logger, dataDir string) (*Runtime, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	path, explicit := configPath()
+	path, explicit := configPath(dataDir)
+	// savePath is where the WebUI editor persists, even when currently inert.
+	savePath := path
+	if savePath == "" {
+		savePath = "opencode.json"
+	}
 	if path == "" {
-		return &Runtime{logger: logger}, nil
+		return &Runtime{logger: logger, path: savePath}, nil
 	}
 	if !explicit {
+		// 迁移：老版本把 opencode.json 放在工作目录根，现在默认落在 <dataDir>/opencode/。
+		// 新路径不存在但根目录有旧文件时，搬过去（连同缓存），保持根目录整洁且不丢配置。
 		if _, err := os.Stat(path); err != nil {
-			// No opencode.json in cwd: stay inert rather than fail startup.
-			return &Runtime{logger: logger}, nil
+			migrateLegacyConfig(path, logger)
+		}
+		if _, err := os.Stat(path); err != nil {
+			// 仍无配置：保持 inert，不因缺文件而启动失败。
+			return &Runtime{logger: logger, path: savePath}, nil
 		}
 	}
 	cfg, err := LoadConfig(path)
@@ -60,15 +72,51 @@ func New(logger *slog.Logger) (*Runtime, error) {
 	return newConfigured(cfg, path, logger)
 }
 
-func configPath() (string, bool) {
+// configPath 解析 opencode 配置路径：$OPENCODE_CONFIG 显式优先，否则默认落在
+// <dataDir>/opencode/opencode.json（三个文件——配置 + 两个缓存——同目录聚合，
+// 不再散在项目根）。dataDir 为空时退回工作目录下的 opencode/ 子目录。
+func configPath(dataDir string) (string, bool) {
 	if env := os.Getenv("OPENCODE_CONFIG"); env != "" {
 		return env, true
 	}
+	base := dataDir
+	if base == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			base = cwd
+		} else {
+			return "", false
+		}
+	}
+	return filepath.Join(base, "opencode", "opencode.json"), false
+}
+
+// migrateLegacyConfig 把旧的 <cwd>/opencode.json（及其两个缓存）搬到新路径。
+// 尽力而为：任一步失败就放弃迁移（调用方会退回 inert），不影响启动。
+func migrateLegacyConfig(newPath string, logger *slog.Logger) {
 	cwd, err := os.Getwd()
 	if err != nil {
-		return "", false
+		return
 	}
-	return filepath.Join(cwd, "opencode.json"), false
+	legacy := filepath.Join(cwd, "opencode.json")
+	if legacy == newPath {
+		return
+	}
+	if _, err := os.Stat(legacy); err != nil {
+		return // 无旧文件
+	}
+	if err := os.MkdirAll(filepath.Dir(newPath), 0o755); err != nil {
+		return
+	}
+	if err := os.Rename(legacy, newPath); err != nil {
+		return
+	}
+	// 缓存文件跟随迁移（失败无妨，会在新路径重建）。
+	for _, suffix := range []string{".models.catalog.json", ".models.dev.json"} {
+		_ = os.Rename(legacy+suffix, newPath+suffix)
+	}
+	if logger != nil {
+		logger.Info("opencode 配置已从项目根迁移到 data 目录", "from", legacy, "to", newPath)
+	}
 }
 
 func newConfigured(cfg Config, path string, logger *slog.Logger) (*Runtime, error) {
@@ -95,6 +143,7 @@ func newConfigured(cfg Config, path string, logger *slog.Logger) (*Runtime, erro
 	rt := &Runtime{
 		cfg:        cfg,
 		logger:     logger,
+		path:       path,
 		transports: transports,
 		zenNodes:   zenNodes,
 		goNodes:    goNodes,
@@ -106,9 +155,11 @@ func newConfigured(cfg Config, path string, logger *slog.Logger) (*Runtime, erro
 
 	pricing.SetClientProvider(rt.healthyClients)
 
-	// Background maintenance runs for the process lifetime. There is no explicit
-	// shutdown hook in the Runtime contract, so a process-scoped context is used.
-	ctx := context.Background()
+	// Background maintenance runs until the runtime is replaced (hot-reload) or
+	// the process exits. A cancelable context lets a reloaded runtime stop the
+	// old instance's loops instead of leaking a goroutine set per config save.
+	ctx, cancel := context.WithCancel(context.Background())
+	rt.cancel = cancel
 	pricing.Start(ctx)
 	rt.StartModelRefresh(ctx)
 	rt.StartProxyHealthChecks(ctx)

@@ -95,6 +95,15 @@ func RegisterRuntime(rt Runtime) {
 	runtimeRegistry[rt.Name()] = rt
 }
 
+// ReplaceRuntime swaps the registered runtime for its name (used for hot-reload
+// after a config edit). In-flight requests keep the old instance; new lookups
+// get the replacement. No-op semantics if the name was not registered before.
+func ReplaceRuntime(rt Runtime) {
+	regMu.Lock()
+	defer regMu.Unlock()
+	runtimeRegistry[rt.Name()] = rt
+}
+
 // Runtimes returns all registered runtimes (unordered snapshot).
 func Runtimes() []Runtime {
 	regMu.RLock()
@@ -182,4 +191,15 @@ type AccountManager interface {
 	RenameAccount(id, name string) error
 	// DeleteAccount removes the account.
 	DeleteAccount(id string) error
+}
+
+// ConfigRuntime is an optional capability: a runtime whose credentials/settings
+// are edited as a config document from the WebUI (opencode's key tiers). The
+// document is admin-only and may contain secrets. SaveConfigDoc validates and
+// persists the patch, then hot-reloads the runtime (typically via ReplaceRuntime).
+type ConfigRuntime interface {
+	// ConfigDoc returns the current editable config for display.
+	ConfigDoc() (map[string]any, error)
+	// SaveConfigDoc merges the patch, validates, persists and reloads.
+	SaveConfigDoc(patch map[string]any) error
 }

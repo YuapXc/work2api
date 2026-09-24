@@ -91,6 +91,37 @@ func (c *Catalog) SetCachePath(path string) {
 	c.mu.Unlock()
 }
 
+// CopyState transfers the in-memory catalog (model sets, per-tier native
+// protocols, unsupported set, metadata, freshness) from source into c. Used on
+// config hot-reload so the new runtime inherits the live catalog instead of
+// starting from the on-disk cache — which, if missing/stale, would make every
+// model look available on any tier and default to the Chat protocol until the
+// first async refresh lands (mirrors upstream RuntimeManager.Apply CopyState).
+func (c *Catalog) CopyState(source *Catalog) {
+	if source == nil {
+		return
+	}
+	source.mu.RLock()
+	zen := cloneBools(source.zen)
+	goModels := cloneBools(source.goModels)
+	native := map[Tier]map[string]protocol.Protocol{TierZen: {}, TierGo: {}}
+	unsupported := map[Tier]map[string]bool{TierZen: {}, TierGo: {}}
+	for _, tier := range []Tier{TierZen, TierGo} {
+		native[tier] = cloneProtocols(source.nativeProtocols[tier])
+		unsupported[tier] = cloneBools(source.unsupported[tier])
+	}
+	meta := cloneModelMeta(source.modelMeta)
+	updatedAt := source.updatedAt
+	cacheSource := source.cacheSource
+	stale := source.stale
+	source.mu.RUnlock()
+
+	c.mu.Lock()
+	c.zen, c.goModels, c.nativeProtocols, c.unsupported = zen, goModels, native, unsupported
+	c.modelMeta, c.updatedAt, c.cacheSource, c.stale = meta, updatedAt, cacheSource, stale
+	c.mu.Unlock()
+}
+
 func (c *Catalog) SetRefreshInterval(interval time.Duration) {
 	c.mu.Lock()
 	c.refreshAfter = interval
