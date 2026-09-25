@@ -28,6 +28,11 @@ if (-not $version) { $version = 'dev' }
 
 Write-Host "构建 work2api.exe ($version) ..." -ForegroundColor Cyan
 $env:CGO_ENABLED = '0'
+# 把 Go 链接器的临时目录指到仓库内（默认在 %Temp%\go-build*，火绒会拦截/锁定链接器
+# 刚产出的 a.out.exe，导致 "Access is denied" 构建失败）。放到项目盘可绕开。
+$tmp = Join-Path $root '.gobuildtmp'
+New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+$env:GOTMPDIR = $tmp
 go build -trimpath -ldflags "-X main.version=$version" -o work2api.exe ./cmd/server
 if ($LASTEXITCODE -ne 0) { throw "go build 失败" }
 Write-Host "构建完成: $root\work2api.exe" -ForegroundColor Green

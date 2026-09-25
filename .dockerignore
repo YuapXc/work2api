@@ -1,0 +1,11 @@
+# 白名单式：先排除一切，只放行构建所需。前端 dist 已 embed 进 internal/app/webui/，
+# 故无需 webui/ 源码或 node_modules。敏感数据（data/、auths/、*.db、.secret_key、
+# *.info）本就不在白名单内，不会进构建上下文。
+*
+
+!cmd/
+!cmd/**
+!internal/
+!internal/**
+!go.mod
+!go.sum

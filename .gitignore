@@ -9,6 +9,7 @@
 /work2api.exe
 /dist/
 /bin/
+/.gobuildtmp/
 *.exe
 *.test
 *.out
