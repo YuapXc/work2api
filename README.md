@@ -177,6 +177,28 @@ docker run -d --name work2api -p 8787:8787 \
 - 管理（回环免鉴权，或带 `ADMIN_TOKEN`）：`GET /admin/providers`、`GET/POST /admin/providers/{name}/...`（账号/模型/签到/额度/OAuth/账号管理）、`/admin/apps`、`/admin/usage/*`、`/admin/settings`
 - 健康检查：`GET /health`
 
+## 接入客户端（三协议 base URL + 供应商前缀路由）
+
+work2api 同时开三种协议，**任何兼容客户端都能接**，不只给 Claude 用。base URL 按客户端习惯填：
+
+| 协议 | base URL | 客户端自动拼的路径 | 谁用 |
+|---|---|---|---|
+| Anthropic Messages | `http://127.0.0.1:8787` | `/v1/messages` | Claude Code、Claude 系客户端 |
+| OpenAI Chat | `http://127.0.0.1:8787/v1` | `/v1/chat/completions` | 多数 OpenAI 兼容工具（Cherry Studio、LobeChat 等） |
+| OpenAI Responses | `http://127.0.0.1:8787/v1` | `/v1/responses` | Codex CLI 等用 Responses API 的客户端 |
+
+三个端点**共用同一套账号池、同一个 `sk-...`、同一套前缀路由**，协议之间由 work2api 自动互转。
+
+**多供应商靠模型名前缀分流**——切供应商只换模型名，不换地址/Key：
+
+| 供应商 | 模型名写法 |
+|---|---|
+| WorkBuddy（默认） | `<模型>`（无前缀） |
+| Qoder | `qoder/<模型>` |
+| OpenCode | `opencode/<模型>` |
+
+> 以 Claude Code + [cc-switch](https://github.com/farion1231/cc-switch) 这类切换器为例：建三个 profile，**base URL 和 Key 完全相同**，只有模型名前缀不同即可在三家间一键切换。注意 Claude Code 会同时用主模型（`ANTHROPIC_MODEL`）和小快模型（`ANTHROPIC_SMALL_FAST_MODEL`）——两个都要填成 work2api 能路由的模型（同一家、同前缀），否则后台调用会因模型不存在报错。
+
 ## 注意事项（重要）
 
 - **对外暴露安全**：默认只允许回环访问。要从局域网/公网访问，必须同时设置 `ADMIN_TOKEN`（否则管理台无鉴权）并设 `ALLOW_EXTERNAL_HOST=1`（放开 Host 校验）。切勿在无鉴权下暴露到公网。
