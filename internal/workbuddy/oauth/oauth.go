@@ -32,9 +32,9 @@ func (e *Error) Error() string { return e.Msg }
 
 // siteHosts maps a site key to its login-entry host (mirrors auth.domain).
 var siteHosts = map[string]string{
-	"cn":             "https://www.codebuddy.cn",  // 国内 CodeBuddy
-	"intl":           "https://www.workbuddy.ai",  // 国际 WorkBuddy
-	"intl-codebuddy": "https://www.codebuddy.ai",  // 国际 CodeBuddy
+	"cn":             "https://www.codebuddy.cn", // 国内 CodeBuddy
+	"intl":           "https://www.workbuddy.ai", // 国际 WorkBuddy
+	"intl-codebuddy": "https://www.codebuddy.ai", // 国际 CodeBuddy
 }
 
 // sitePlatforms is the platform query param per site (official CLI uses "CLI";
@@ -49,9 +49,9 @@ const defaultSite = "cn"
 
 // noAuthHeaders mimic the official plugin's unauthenticated markers.
 var noAuthHeaders = map[string]string{
-	"X-No-Authorization":  "true",
-	"X-No-User-Id":        "true",
-	"X-No-Enterprise-Id":  "true",
+	"X-No-Authorization":   "true",
+	"X-No-User-Id":         "true",
+	"X-No-Enterprise-Id":   "true",
 	"X-No-Department-Info": "true",
 }
 
@@ -193,9 +193,9 @@ func Poll(state, site string) (map[string]any, error) {
 	}
 	// 2) account (may be prepared asynchronously)
 	accHeaders := map[string]string{
-		"Authorization":      "Bearer " + str(token["accessToken"]),
-		"X-No-User-Id":       "true",
-		"X-No-Enterprise-Id": "true",
+		"Authorization":        "Bearer " + str(token["accessToken"]),
+		"X-No-User-Id":         "true",
+		"X-No-Enterprise-Id":   "true",
 		"X-No-Department-Info": "true",
 	}
 	for k, v := range enterpriseHeaders(token) {

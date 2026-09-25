@@ -44,19 +44,19 @@ var ErrInvalidHint = errors.New("站点提示无效")
 var ErrConflict = errors.New("凭据的站点提示相互冲突")
 
 var profileEndpoints = map[string]string{
-	"cn-cli":    DomesticEndpoint,          // 国内 CodeBuddy CLI
+	"cn-cli":    DomesticEndpoint,           // 国内 CodeBuddy CLI
 	"cn-work":   "https://www.workbuddy.cn", // 国内 WorkBuddy
-	"intl-cli":  InternationalEndpoint,     // 国际 CodeBuddy
+	"intl-cli":  InternationalEndpoint,      // 国际 CodeBuddy
 	"intl-work": "https://www.workbuddy.ai", // 国际 WorkBuddy
 }
 
 // domainProfiles maps a known lowercase host to its profile.
 var domainProfiles = map[string]string{
-	"www.codebuddy.cn":     "cn-cli",
-	"www.workbuddy.cn":     "cn-work",
-	"copilot.tencent.com":  "cn-cli",
-	"www.codebuddy.ai":     "intl-cli",
-	"www.workbuddy.ai":     "intl-work",
+	"www.codebuddy.cn":    "cn-cli",
+	"www.workbuddy.cn":    "cn-work",
+	"copilot.tencent.com": "cn-cli",
+	"www.codebuddy.ai":    "intl-cli",
+	"www.workbuddy.ai":    "intl-work",
 }
 
 // Auth is the credential's auth blob (subset used for routing).

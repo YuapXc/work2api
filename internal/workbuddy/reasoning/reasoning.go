@@ -18,17 +18,17 @@ var effortRank = map[string]int{
 // KnownEfforts is the cold-start fallback of per-model reasoning support.
 // At runtime the dynamic catalog table takes precedence.
 var KnownEfforts = map[string][]string{
-	"glm-5.2":            {"low", "medium", "high"},
-	"glm-5.1":            {"low", "medium", "high"},
-	"glm-5v-turbo":       {"low", "medium", "high"},
-	"kimi-k2.7":          {"low", "medium", "high"},
-	"kimi-k2.6":          {"low", "medium", "high"},
-	"kimi-k2.5":          {"low", "medium", "high"},
-	"deepseek-v4-pro":    {"off", "low", "medium", "high"},
-	"deepseek-v4-flash":  {"off", "low", "medium", "high"},
+	"glm-5.2":             {"low", "medium", "high"},
+	"glm-5.1":             {"low", "medium", "high"},
+	"glm-5v-turbo":        {"low", "medium", "high"},
+	"kimi-k2.7":           {"low", "medium", "high"},
+	"kimi-k2.6":           {"low", "medium", "high"},
+	"kimi-k2.5":           {"low", "medium", "high"},
+	"deepseek-v4-pro":     {"off", "low", "medium", "high"},
+	"deepseek-v4-flash":   {"off", "low", "medium", "high"},
 	"deepseek-v4.1-flash": {"low", "medium", "high"},
-	"minimax-m3-pay":     {"low", "medium", "high"},
-	"hy3-preview-agent":  {"low", "medium", "high"},
+	"minimax-m3-pay":      {"low", "medium", "high"},
+	"hy3-preview-agent":   {"low", "medium", "high"},
 }
 
 // Body is the mutable request body.

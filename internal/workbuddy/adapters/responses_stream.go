@@ -268,14 +268,14 @@ func (c *ResponsesStreamConverter) responseObj(status string) map[string]any {
 		}
 	}
 	response := map[string]any{
-		"id":                   c.respID,
-		"object":               "response",
-		"created_at":           c.createdAt,
-		"status":               status,
-		"model":                c.model,
-		"output":               output,
-		"parallel_tool_calls":  true,
-		"usage":                usage,
+		"id":                  c.respID,
+		"object":              "response",
+		"created_at":          c.createdAt,
+		"status":              status,
+		"model":               c.model,
+		"output":              output,
+		"parallel_tool_calls": true,
+		"usage":               usage,
 	}
 	if c.errObj != nil {
 		response["error"] = c.errObj

@@ -22,8 +22,8 @@ type AnthropicStreamConverter struct {
 	textBlockOpen bool
 	textBlockIdx  int
 
-	toolUses    map[int]*toolUseSlot
-	toolOrder   []int
+	toolUses     map[int]*toolUseSlot
+	toolOrder    []int
 	nextBlockIdx int
 
 	finishReason string

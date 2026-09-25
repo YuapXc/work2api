@@ -22,12 +22,12 @@ var ErrUnsupported = errors.New("operation not supported by provider")
 // Account is an upstream credential owned by a provider. Providers store their
 // own extra fields in Extra (persisted as JSON).
 type Account struct {
-	UID       string         // stable unique id, namespaced by provider
-	Provider  string         // provider name
-	Label     string         // human label
-	Enabled   bool           // operator toggle
-	Site      string         // provider-specific site/region hint (e.g. cn-cli, zen)
-	Extra     map[string]any // provider-specific fields
+	UID      string         // stable unique id, namespaced by provider
+	Provider string         // provider name
+	Label    string         // human label
+	Enabled  bool           // operator toggle
+	Site     string         // provider-specific site/region hint (e.g. cn-cli, zen)
+	Extra    map[string]any // provider-specific fields
 }
 
 // Model is a discovered upstream model, namespaced for non-default providers.
@@ -58,10 +58,10 @@ type ChatRequest struct {
 
 // UpstreamRequest is what a provider produces: the concrete HTTP call to make.
 type UpstreamRequest struct {
-	Method  string
-	URL     string
-	Header  map[string]string
-	Body    []byte
+	Method string
+	URL    string
+	Header map[string]string
+	Body   []byte
 }
 
 // Provider is the contract each upstream gateway implements.
