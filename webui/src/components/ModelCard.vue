@@ -19,8 +19,10 @@ const fmtScore = (v: number | null | undefined) => (v == null ? '—' : Number(v
 </script>
 
 <template>
-  <div class="glass flex flex-col gap-3 rounded-xl p-4 transition-colors hover:border-brand/40">
-    <div class="flex items-start justify-between gap-2">
+  <!-- h-full + flex-col：网格行内三张卡等高（grid 默认 stretch），各区段用 min-h
+       预留高度对齐，footer 用 mt-auto 压到底，跨卡横向成带、可读性更好。 -->
+  <div class="glass flex h-full flex-col gap-3 rounded-xl p-4 transition-colors hover:border-brand/40">
+    <div class="flex min-h-[2.5rem] items-start justify-between gap-2">
       <div class="min-w-0">
         <div class="truncate font-semibold text-ink" :title="m.name || m.id">{{ m.name || m.id }}</div>
         <div class="mono truncate text-micro text-faint" :title="m.id">{{ m.id }}</div>
@@ -28,7 +30,7 @@ const fmtScore = (v: number | null | undefined) => (v == null ? '—' : Number(v
       <WTag :tone="pm.tone">{{ pm.label }}</WTag>
     </div>
 
-    <div class="flex flex-wrap gap-1.5">
+    <div class="flex min-h-[1.625rem] flex-wrap gap-1.5">
       <WTag :tone="multimodal ? 'route' : 'muted'">{{ multimodal ? '多模态' : '文本' }}</WTag>
       <WTag v-if="reasoning.supportsReasoning" tone="brand">推理</WTag>
       <WTag v-if="m.supportsToolCall" tone="live">工具调用</WTag>
@@ -50,13 +52,14 @@ const fmtScore = (v: number | null | undefined) => (v == null ? '—' : Number(v
       </div>
     </div>
 
-    <p v-if="m.description" class="line-clamp-2 text-micro leading-relaxed text-muted">{{ m.description }}</p>
+    <!-- 描述固定预留两行高度，即使为空也占位，使下方评测框跨卡对齐 -->
+    <p class="line-clamp-2 min-h-[2.25rem] text-micro leading-relaxed text-muted">{{ m.description || '' }}</p>
 
     <!-- AA 第三方评测（配置了 key 且匹配到时展示） -->
     <div v-if="bench" class="rounded-lg border border-line bg-elevated/40 p-2.5">
       <div class="mb-1.5 flex items-center justify-between">
-        <span class="text-micro text-faint">AA 评测<span v-if="bench.name" class="ml-1 text-faint/70">· {{ bench.name }}</span></span>
-        <a :href="bench.aa_url || 'https://artificialanalysis.ai/models'" target="_blank" rel="noopener" class="text-micro text-brand hover:underline">榜单 ↗</a>
+        <span class="truncate text-micro text-faint">AA 评测<span v-if="bench.name" class="ml-1 text-faint/70">· {{ bench.name }}</span></span>
+        <a :href="bench.aa_url || 'https://artificialanalysis.ai/models'" target="_blank" rel="noopener" class="shrink-0 text-micro text-brand hover:underline">榜单 ↗</a>
       </div>
       <div class="grid grid-cols-3 gap-2 text-center">
         <div>
@@ -74,7 +77,8 @@ const fmtScore = (v: number | null | undefined) => (v == null ? '—' : Number(v
       </div>
     </div>
 
-    <div v-if="accounts.length" class="flex flex-wrap items-center gap-1.5 border-t border-line pt-3">
+    <!-- 可用账号：mt-auto 压到卡片底部，使各卡 footer 对齐 -->
+    <div v-if="accounts.length" class="mt-auto flex flex-wrap items-center gap-1.5 border-t border-line pt-3">
       <span class="text-micro text-faint">可用账号</span>
       <span
         v-for="a in accounts.slice(0, 6)"
