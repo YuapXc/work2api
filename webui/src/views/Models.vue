@@ -124,6 +124,13 @@ const stats = computed(() => {
 // 仅当本页存在带描述的模型时，才让无描述卡预留描述行高以对齐评测框；
 // 全都没描述时不预留，避免整片空白。
 const anyDesc = computed(() => entries.value.some((e) => String(e.model.description || '').trim()))
+// 思考强度档位同理：本页有带档位的模型时，无档位卡才补等高占位。
+const anyEfforts = computed(() =>
+  entries.value.some((e) => {
+    const r = e.model.reasoning || {}
+    return (Array.isArray(r.supportedEfforts) && r.supportedEfforts.length) || r.defaultEffort
+  }),
+)
 
 onMounted(load)
 </script>
@@ -164,7 +171,7 @@ onMounted(load)
       </div>
 
       <div v-if="filtered.length" class="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-        <ModelCard v-for="e in filtered" :key="e.provider + '/' + e.model.id" :model="e.model" :provider="e.provider" :reserve-desc="anyDesc" />
+        <ModelCard v-for="e in filtered" :key="e.provider + '/' + e.model.id" :model="e.model" :provider="e.provider" :reserve-desc="anyDesc" :reserve-efforts="anyEfforts" />
       </div>
       <WEmpty v-else title="没有匹配的模型" hint="调整搜索或筛选条件，或刷新目录。" />
     </template>

@@ -6,7 +6,7 @@ import WTag from '@/components/ui/WTag.vue'
 import { int } from '@/lib/format'
 import { providerMeta } from '@/lib/providers'
 
-const props = defineProps<{ model: Record<string, any>; provider: string; reserveDesc?: boolean }>()
+const props = defineProps<{ model: Record<string, any>; provider: string; reserveDesc?: boolean; reserveEfforts?: boolean }>()
 const m = computed(() => props.model)
 const pm = computed(() => providerMeta(props.provider))
 const multimodal = computed(() => m.value.modality === 'multimodal' || m.value.vision || m.value.supports_image)
@@ -16,6 +16,24 @@ const maxOut = computed(() => m.value.max_output_tokens ?? m.value.max_output)
 const accounts = computed(() => (m.value.accounts || []) as any[])
 const bench = computed(() => m.value.benchmark || null)
 const fmtScore = (v: number | null | undefined) => (v == null ? '—' : Number(v).toFixed(1))
+
+// 思考档位（对齐上游 Models.vue reasoningEfforts）：优先用 supportedEfforts，
+// 否则退回单个 defaultEffort；可关思考则补一个 off。
+const efforts = computed<string[]>(() => {
+  const r = reasoning.value
+  let list: string[] = Array.isArray(r.supportedEfforts) ? [...r.supportedEfforts] : []
+  if (!list.length && r.defaultEffort) list = [r.defaultEffort]
+  if (r.canDisableThinking && !list.includes('off')) list.push('off')
+  return list
+})
+// 单一思考标签：可关思考 > 仅思考 > 思考。
+const reasoningTag = computed<{ text: string; tone: 'brand' | 'live' | 'warn' } | null>(() => {
+  const r = reasoning.value
+  if (!r.supportsReasoning) return null
+  if (r.canDisableThinking) return { text: '可关思考', tone: 'live' }
+  if (r.onlyReasoning) return { text: '仅思考', tone: 'warn' }
+  return { text: '思考', tone: 'brand' }
+})
 </script>
 
 <template>
@@ -32,10 +50,23 @@ const fmtScore = (v: number | null | undefined) => (v == null ? '—' : Number(v
 
     <div class="flex min-h-[1.625rem] flex-wrap gap-1.5">
       <WTag :tone="multimodal ? 'route' : 'muted'">{{ multimodal ? '多模态' : '文本' }}</WTag>
-      <WTag v-if="reasoning.supportsReasoning" tone="brand">推理</WTag>
+      <WTag v-if="reasoningTag" :tone="reasoningTag.tone">{{ reasoningTag.text }}</WTag>
       <WTag v-if="m.supportsToolCall" tone="live">工具调用</WTag>
-      <WTag v-if="reasoning.onlyReasoning" tone="warn">仅推理</WTag>
     </div>
+
+    <!-- 思考强度档位：低/中/高/… + 可关思考时的 off。仅当本页有带档位的模型时，
+         无档位卡才补等高占位，保持跨卡对齐；全都没有则不占位。 -->
+    <div v-if="efforts.length" class="flex min-h-[1.625rem] flex-wrap items-center gap-1">
+      <span class="text-micro text-faint">思考强度</span>
+      <span
+        v-for="e in efforts"
+        :key="e"
+        class="mono rounded-md px-1.5 py-0.5 text-micro"
+        :class="e === reasoning.defaultEffort ? 'bg-brand/15 text-brand ring-1 ring-brand/30' : 'bg-elevated text-muted'"
+        :title="e === reasoning.defaultEffort ? '默认档位' : ''"
+      >{{ e }}</span>
+    </div>
+    <div v-else-if="reserveEfforts" class="min-h-[1.625rem]" aria-hidden="true"></div>
 
     <div class="grid grid-cols-3 gap-2 border-t border-line pt-3 text-center">
       <div>
