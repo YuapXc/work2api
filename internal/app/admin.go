@@ -520,7 +520,9 @@ func (s *Server) adminUsageDetail(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, errBody(404, "not found", "invalid_request_error").body)
 		return
 	}
-	writeJSON(w, 200, rec)
+	// 前端 usageDetail 读的是 {record: ...}；此前直接返回 rec 顶层字段，
+	// 前端取 .record 为 undefined → 详情弹窗空白。包一层修正。
+	writeJSON(w, 200, map[string]any{"record": rec})
 }
 
 func (s *Server) adminModels(w http.ResponseWriter, r *http.Request) {
