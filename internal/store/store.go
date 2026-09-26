@@ -37,6 +37,7 @@ var DefaultSettings = map[string]string{
 	"model_ttl_min":           "60",
 	"aa_refresh_hour":         "7",
 	"keepalive_hour":          "22",
+	"keepalive_enabled":       "1",
 	"aa_api_key":              "",
 	"model_aliases":           "",
 	"alert_enabled":           "0",

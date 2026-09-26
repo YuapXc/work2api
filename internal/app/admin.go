@@ -606,7 +606,7 @@ func (s *Server) adminRefreshModels(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) adminGetSettings(w http.ResponseWriter, r *http.Request) {
 	settings, _ := s.o.db.GetSettings()
-	writeJSON(w, 200, settings)
+	writeJSON(w, 200, settingsForClient(settings))
 }
 
 func (s *Server) adminSaveSettings(w http.ResponseWriter, r *http.Request) {
@@ -615,10 +615,42 @@ func (s *Server) adminSaveSettings(w http.ResponseWriter, r *http.Request) {
 	for k, v := range body {
 		kv[k] = toStrLoose(v)
 	}
+	// 勾选「清除已保存的密钥」时前端不再发 aa_api_key，这里显式清空。
+	if b, ok := body["clear_aa_api_key"].(bool); ok && b {
+		kv["aa_api_key"] = ""
+	}
+	delete(kv, "clear_aa_api_key")
 	if err := s.o.db.SaveSettings(kv); err != nil {
 		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
 		return
 	}
 	settings, _ := s.o.db.GetSettings()
-	writeJSON(w, 200, settings)
+	writeJSON(w, 200, settingsForClient(settings))
+}
+
+// settingsForClient never ships the raw aa_api_key to the browser; it derives a
+// masked preview + enabled flag the settings page renders instead.
+func settingsForClient(settings map[string]string) map[string]any {
+	out := map[string]any{}
+	for k, v := range settings {
+		if k == "aa_api_key" {
+			continue
+		}
+		out[k] = v
+	}
+	key := settings["aa_api_key"]
+	out["aa_enabled"] = key != ""
+	out["aa_api_key_masked"] = maskSecret(key)
+	return out
+}
+
+// maskSecret keeps the last 4 chars of a credential for display, hiding the rest.
+func maskSecret(key string) string {
+	if key == "" {
+		return ""
+	}
+	if len(key) <= 4 {
+		return strings.Repeat("•", len(key))
+	}
+	return strings.Repeat("•", 4) + key[len(key)-4:]
 }

@@ -112,6 +112,11 @@ function label(r: any): string {
   return a.label || a.alias || a.nickname || r.id.slice(0, 8)
 }
 
+// 本机 Qoder 桌面端自动探测出的账号：非持久、由桌面端登录态决定，不能在此改名/删除/设为激活。
+function isLocalQoder(r: any): boolean {
+  return r.provider === 'qoder' && r.raw.source === 'local'
+}
+
 const cols: Column[] = [
   { key: 'provider', label: '供应商' },
   { key: 'account', label: '账号' },
@@ -165,7 +170,7 @@ const renameTarget = ref<Row | null>(null)
 const renameValue = ref('')
 function openRename(r: any) {
   renameTarget.value = r
-  renameValue.value = r.raw.alias || ''
+  renameValue.value = r.provider === 'workbuddy' ? r.raw.alias || '' : r.raw.label || ''
   renameOpen.value = true
 }
 async function submitRename() {
@@ -420,14 +425,19 @@ async function saveConfig() {
               title="优先级：越大越优先被选中"
             />
             <WButton v-else-if="row.raw.active" size="sm" variant="subtle" disabled>已激活</WButton>
-            <WButton v-else-if="row.provider === 'qoder'" size="sm" variant="ghost" @click="activate(row)">设为激活</WButton>
+            <WButton v-else-if="row.provider === 'qoder' && row.raw.source !== 'local'" size="sm" variant="ghost" @click="activate(row)">设为激活</WButton>
             <span v-else class="text-faint">—</span>
           </template>
           <template #cell-actions="{ row }">
             <div class="flex items-center justify-end gap-1.5">
-              <WButton size="sm" variant="subtle" @click="openRename(row)">{{ row.provider === 'workbuddy' ? '别名' : '重命名' }}</WButton>
-              <WToggle v-if="row.provider === 'workbuddy'" :model-value="row.raw.enabled" @update:model-value="toggleEnabled(row)" />
-              <WButton size="sm" variant="danger" @click="removeAccount(row)">删除</WButton>
+              <template v-if="isLocalQoder(row)">
+                <WTag tone="muted" title="本机 Qoder 桌面端自动探测的账号，随桌面端登录状态变化，无法在此改名或删除">本机自动探测</WTag>
+              </template>
+              <template v-else>
+                <WButton size="sm" variant="subtle" @click="openRename(row)">{{ row.provider === 'workbuddy' ? '别名' : '重命名' }}</WButton>
+                <WToggle v-if="row.provider === 'workbuddy'" :model-value="row.raw.enabled" @update:model-value="toggleEnabled(row)" />
+                <WButton size="sm" variant="danger" @click="removeAccount(row)">删除</WButton>
+              </template>
             </div>
           </template>
           <template #empty>

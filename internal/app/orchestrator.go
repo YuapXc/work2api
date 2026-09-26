@@ -122,6 +122,9 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 				continue
 			}
 			o.pool.SetCredits(uid, fptr(row["credits_remaining"]), fptr(row["credits_total"]), fptr(row["credits_expire_at"]), nil)
+			if alias, _ := row["alias"].(string); alias != "" {
+				o.pool.SetAlias(uid, alias)
+			}
 			if p := intOf(row["priority"]); p != 0 {
 				o.pool.SetPriority(uid, p)
 			}
