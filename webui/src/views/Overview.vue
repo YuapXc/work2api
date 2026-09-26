@@ -5,6 +5,7 @@ import { api } from '@/api/client'
 import type { Overview, ProviderSummary } from '@/types'
 import { int, abbr, credits as fmtCredits, dt } from '@/lib/format'
 import { providerMeta } from '@/lib/providers'
+import { buildLabelMap } from '@/utils/accountLabel'
 import WPage from '@/components/ui/WPage.vue'
 import WCard from '@/components/ui/WCard.vue'
 import WStat from '@/components/ui/WStat.vue'
@@ -57,6 +58,11 @@ const recentCols: Column[] = [
   { key: 'status', label: '状态' },
 ]
 const recent = computed(() => (ov.value?.recent || []).slice(0, 8))
+
+// 最近调用的账号列同流量日志：uid → 显示名（含 workbuddy 别名）。
+// 概览返回的 accounts 已带 alias/nickname，直接建映射；未命中回退 uid 短码。
+const labelMap = computed(() => buildLabelMap(ov.value?.accounts || []))
+const acctLabel = (uid?: string | null) => (uid ? labelMap.value[uid] || uid.slice(0, 8) : '—')
 
 onMounted(() => {
   load()
@@ -139,7 +145,7 @@ onUnmounted(() => timer && clearInterval(timer))
         <WCard title="最近调用" flush>
           <WTable :columns="recentCols" :rows="recent" row-key="id" min-width="420px">
             <template #cell-ts="{ value }">{{ dt(value, 'HH:mm:ss') }}</template>
-            <template #cell-account_uid="{ value }">{{ value ? value.slice(0, 8) : '—' }}</template>
+            <template #cell-account_uid="{ value }">{{ acctLabel(value) }}</template>
             <template #cell-total_tokens="{ value }">{{ int(value) }}</template>
             <template #cell-status="{ row }">
               <WLed :tone="row.status === 'ok' ? 'live' : row.status === 'error' ? 'fault' : 'muted'" />
