@@ -43,6 +43,8 @@ export interface Settings {
   keepalive_hour: string
   /** token 保活开关：'1' 开启（默认），'0' 关闭 */
   keepalive_enabled?: string
+  /** 成本优先选号开关：'1' 开启（默认），'0' 关闭 */
+  cost_aware_routing?: string
   aa_api_key?: string
   aa_api_key_masked?: string
   aa_enabled?: boolean
@@ -101,6 +103,8 @@ export interface ModelInfo {
   supportsImages?: boolean
   /** 成本系数（倍率） */
   credits?: number
+  /** 每站点成本系数，如 {domestic:0.03, international:0}；仅两站点不同价时前端分列。 */
+  credits_by_region?: Record<string, number>
   temperature?: number
   top_p?: number
   vendor?: string

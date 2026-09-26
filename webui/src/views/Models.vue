@@ -131,6 +131,13 @@ const anyEfforts = computed(() =>
     return (Array.isArray(r.supportedEfforts) && r.supportedEfforts.length) || r.defaultEffort
   }),
 )
+// 多站点成本分列同理：本页有"两站点不同价"的模型时才预留占位。
+const anyCost = computed(() =>
+  entries.value.some((e) => {
+    const cbr = e.model.credits_by_region as Record<string, number> | undefined
+    return cbr && Object.keys(cbr).length >= 2 && new Set(Object.values(cbr)).size >= 2
+  }),
+)
 
 onMounted(load)
 </script>
@@ -171,7 +178,7 @@ onMounted(load)
       </div>
 
       <div v-if="filtered.length" class="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-        <ModelCard v-for="e in filtered" :key="e.provider + '/' + e.model.id" :model="e.model" :provider="e.provider" :reserve-desc="anyDesc" :reserve-efforts="anyEfforts" />
+        <ModelCard v-for="e in filtered" :key="e.provider + '/' + e.model.id" :model="e.model" :provider="e.provider" :reserve-desc="anyDesc" :reserve-efforts="anyEfforts" :reserve-cost="anyCost" />
       </div>
       <WEmpty v-else title="没有匹配的模型" hint="调整搜索或筛选条件，或刷新目录。" />
     </template>

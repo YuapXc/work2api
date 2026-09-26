@@ -6,7 +6,7 @@ import WTag from '@/components/ui/WTag.vue'
 import { int } from '@/lib/format'
 import { providerMeta } from '@/lib/providers'
 
-const props = defineProps<{ model: Record<string, any>; provider: string; reserveDesc?: boolean; reserveEfforts?: boolean }>()
+const props = defineProps<{ model: Record<string, any>; provider: string; reserveDesc?: boolean; reserveEfforts?: boolean; reserveCost?: boolean }>()
 const m = computed(() => props.model)
 const pm = computed(() => providerMeta(props.provider))
 const multimodal = computed(() => m.value.modality === 'multimodal' || m.value.vision || m.value.supports_image)
@@ -16,6 +16,26 @@ const maxOut = computed(() => m.value.max_output_tokens ?? m.value.max_output)
 const accounts = computed(() => (m.value.accounts || []) as any[])
 const bench = computed(() => m.value.benchmark || null)
 const fmtScore = (v: number | null | undefined) => (v == null ? '—' : Number(v).toFixed(1))
+
+// 每站点成本系数（credits_by_region）。同模型两站点不同价时分列展示并标出更便宜的
+// 那个（成本优先选号会用它）。全相同或只有一个站点则回退单值 m.credits。
+const siteName = (s: string) => (s === 'domestic' ? '国内' : s === 'international' ? '国际' : s)
+const costEntries = computed<{ label: string; v: number; cheapest: boolean }[] | null>(() => {
+  const cbr = m.value.credits_by_region as Record<string, number> | undefined
+  if (!cbr) return null
+  const es = Object.entries(cbr)
+  if (es.length < 2 || new Set(es.map(([, v]) => v)).size < 2) return null
+  const min = Math.min(...es.map(([, v]) => v))
+  return es
+    .sort((a, b) => a[1] - b[1])
+    .map(([s, v]) => ({ label: siteName(s), v, cheapest: v === min }))
+})
+// 指标格里显示的成本：多站点时取最低（即成本优先实际会用到的价），否则用合并值。
+const displayCredits = computed(() => {
+  const cbr = m.value.credits_by_region as Record<string, number> | undefined
+  if (cbr && Object.keys(cbr).length) return Math.min(...Object.values(cbr))
+  return m.value.credits
+})
 
 // 思考档位（对齐上游 Models.vue reasoningEfforts）：优先用 supportedEfforts，
 // 否则退回单个 defaultEffort；可关思考则补一个 off。
@@ -78,10 +98,20 @@ const reasoningTag = computed<{ text: string; tone: 'brand' | 'live' | 'warn' } 
         <div class="text-micro text-faint">最大输出</div>
       </div>
       <div>
-        <div class="mono text-small font-semibold" :class="m.credits ? 'text-warn' : 'text-ink'">{{ m.credits ?? '—' }}</div>
+        <div class="mono text-small font-semibold" :class="displayCredits ? 'text-warn' : 'text-ink'">{{ displayCredits ?? '—' }}</div>
         <div class="text-micro text-faint">成本系数</div>
       </div>
     </div>
+
+    <!-- 多站点成本分列：标出更便宜的站点（成本优先会用它）。同价/单站点则不显示。 -->
+    <div v-if="costEntries" class="flex min-h-[1.25rem] flex-wrap items-center gap-x-3 gap-y-0.5 text-micro">
+      <span class="text-faint">分站点</span>
+      <span v-for="c in costEntries" :key="c.label" class="inline-flex items-center gap-1">
+        <span class="text-faint">{{ c.label }}</span>
+        <span class="mono" :class="c.cheapest ? 'text-live' : 'text-muted'">x{{ c.v }}</span>
+      </span>
+    </div>
+    <div v-else-if="reserveCost" class="min-h-[1.25rem]" aria-hidden="true"></div>
 
     <!-- 描述：有描述才占两行；仅当本页存在带描述的模型时，无描述卡才补等高占位，
          使评测框跨卡对齐——全都没描述时不留任何空白。 -->

@@ -331,7 +331,7 @@ func (o *Orchestrator) pickAccount(model, sessionKey string) (*pool.Account, *ap
 			o.sessions.unbind(sessionKey)
 		}
 	}
-	acc := o.pool.Pick(ready)
+	acc := o.pool.Pick(ready, o.modelCostByUID(model, ready))
 	if acc == nil {
 		return nil, errBody(503, "模型 "+model+" 无可用账号（全部冷却或额度耗尽），请检查账号状态", "auth_error")
 	}
@@ -342,6 +342,35 @@ func (o *Orchestrator) pickAccount(model, sessionKey string) (*pool.Account, *ap
 		o.sessions.bind(sessionKey, acc.UID)
 	}
 	return acc, nil
+}
+
+// modelCostByUID maps each ready account UID to its per-model cost coefficient
+// (the model's per-site catalog credits), for cost-aware selection. Returns nil
+// when cost_aware_routing is off or no cost data exists, so Pick stays cost-blind.
+// Accounts on a site the catalog gave no value for are omitted → unknown, which
+// Pick ranks last.
+func (o *Orchestrator) modelCostByUID(model string, ready map[string]bool) map[string]float64 {
+	settings, _ := o.db.GetSettings()
+	if v, ok := settings["cost_aware_routing"]; ok && v != "1" {
+		return nil
+	}
+	cbr := o.models.CreditsByRegion(model)
+	if len(cbr) == 0 {
+		return nil
+	}
+	out := map[string]float64{}
+	for _, a := range o.pool.Accounts() {
+		if !ready[a.UID] {
+			continue
+		}
+		if c, ok := cbr[siterouting.ProfileSite(a.Profile)]; ok {
+			out[a.UID] = c
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func (o *Orchestrator) modelReadyUIDs(model string) map[string]bool {

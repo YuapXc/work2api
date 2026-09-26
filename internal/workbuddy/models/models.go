@@ -123,6 +123,27 @@ func (r *Registry) Source() string {
 	return r.source
 }
 
+// CreditsByRegion returns a model's per-site cost coefficients (e.g.
+// {"domestic":0.03,"international":0}) from the cache; nil if unknown. A site
+// absent from the map means the catalog gave no value there (not free).
+func (r *Registry) CreditsByRegion(model string) map[string]float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, m := range r.models {
+		if str(m["id"]) == model {
+			if cbr, ok := m["credits_by_region"].(map[string]float64); ok && len(cbr) > 0 {
+				out := make(map[string]float64, len(cbr))
+				for k, v := range cbr {
+					out[k] = v
+				}
+				return out
+			}
+			return nil
+		}
+	}
+	return nil
+}
+
 // Refresh force-refreshes the model cache.
 func (r *Registry) Refresh() []map[string]any {
 	fetched := r.fetchFromUpstream()
@@ -252,7 +273,7 @@ func (r *Registry) fetchFromUpstream() []fetchedModel {
 		}
 	}
 	if len(accounts) == 0 {
-		if a := r.pool.Pick(nil); a != nil {
+		if a := r.pool.Pick(nil, nil); a != nil {
 			accounts = []*pool.Account{a}
 		}
 	}
@@ -263,6 +284,10 @@ func (r *Registry) fetchFromUpstream() []fetchedModel {
 	var order []string
 	modelProfiles := map[string][]string{}
 	modelAccounts := map[string][]string{}
+	// 每模型每站点的成本系数（domestic/international）。合并是先到先得、会丢掉落败
+	// 站点的 credits，这里单独按站点各记一份，让界面能如实显示"同模型两站点不同价"，
+	// 也供成本优先选号用。nil（该站点没给值）不记，绝不当 0。
+	creditsByRegion := map[string]map[string]float64{}
 	anyOK := false
 	for _, account := range accounts {
 		got := r.fetchOne(account)
@@ -270,10 +295,19 @@ func (r *Registry) fetchFromUpstream() []fetchedModel {
 			continue
 		}
 		anyOK = true
+		region := siterouting.ProfileSite(account.Profile)
 		for _, fm := range got {
 			if _, exists := merged[fm.id]; !exists {
 				merged[fm.id] = fm
 				order = append(order, fm.id)
+			}
+			if c, ok := fm.entry["credits"].(float64); ok {
+				if creditsByRegion[fm.id] == nil {
+					creditsByRegion[fm.id] = map[string]float64{}
+				}
+				if _, seen := creditsByRegion[fm.id][region]; !seen {
+					creditsByRegion[fm.id][region] = c
+				}
 			}
 			if !contains(modelProfiles[fm.id], account.Profile) {
 				modelProfiles[fm.id] = append(modelProfiles[fm.id], account.Profile)
@@ -291,6 +325,9 @@ func (r *Registry) fetchFromUpstream() []fetchedModel {
 		fm := merged[id]
 		fm.entry["profiles"] = modelProfiles[id]
 		fm.entry["account_uids"] = modelAccounts[id]
+		if cbr := creditsByRegion[id]; len(cbr) > 0 {
+			fm.entry["credits_by_region"] = cbr
+		}
 		out = append(out, fm)
 	}
 	// ensure "auto"

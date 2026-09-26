@@ -27,6 +27,7 @@ const s = reactive<Record<string, string>>({
   qoder_machine_salt: '',
 })
 const keepalive = ref(true)
+const costAware = ref(true)
 const alertOn = ref(false)
 const aaKeyInput = ref('')
 const aaMasked = ref('')
@@ -39,6 +40,7 @@ async function load() {
     const data = (await api.getSettings()) as Settings & Record<string, string>
     for (const k of Object.keys(s)) if (data[k] != null) s[k] = String(data[k])
     keepalive.value = String(data.keepalive_enabled ?? '1') === '1'
+    costAware.value = String(data.cost_aware_routing ?? '1') === '1'
     alertOn.value = String(data.alert_enabled ?? '0') === '1'
     aaEnabled.value = !!data.aa_enabled
     aaMasked.value = data.aa_api_key_masked || ''
@@ -53,6 +55,7 @@ async function save() {
     const payload: Record<string, unknown> = {
       ...s,
       keepalive_enabled: keepalive.value ? '1' : '0',
+      cost_aware_routing: costAware.value ? '1' : '0',
       alert_enabled: alertOn.value ? '1' : '0',
     }
     if (clearAA.value) payload.clear_aa_api_key = true
@@ -120,7 +123,19 @@ onMounted(load)
         </div>
       </WCard>
 
-      <!-- 模型别名 -->
+      <!-- 成本优先选号 -->
+      <WCard title="成本优先选号" sub="多账号命中同一模型时，优先用该模型成本更低的站点账号；限流/出错再轮询其它账号。">
+        <div class="space-y-3.5">
+          <div class="flex items-center justify-between">
+            <label class="text-small text-muted">启用成本优先</label>
+            <WToggle v-model="costAware" />
+          </div>
+          <p class="text-micro text-faint">
+            关闭则回到纯加权轮换。注意：额度临近到期的账号仍会被优先消耗（用完即废优先于省成本），不受此开关影响。
+          </p>
+        </div>
+      </WCard>
+
       <WCard title="模型别名" sub="每行一条 别名=真实模型，让客户端用自定义名称调用。">
         <WTextarea v-model="s.model_aliases" :rows="6" placeholder="claude-latest=claude-sonnet-4-5&#10;gpt=gpt-5" />
       </WCard>

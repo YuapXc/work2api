@@ -128,10 +128,12 @@ func (p *Pool) HealthyCount(allowed map[string]bool) int {
 
 const expiryPriorityDays = 7.0
 
-// Pick selects the next healthy account by weighted random. Two-phase: urgent
-// (soon-to-expire) accounts first, else all healthy; falls back to the account
-// whose cooldown expires soonest.
-func (p *Pool) Pick(allowed map[string]bool) *Account {
+// Pick selects the next healthy account by weighted random. Phases (in order):
+// soon-to-expire accounts win outright (use-it-or-lose-it credits); otherwise,
+// when costByUID is provided, restrict to the cheapest cost group (unknown cost
+// ranks last); then weighted random. costByUID nil = cost-blind (legacy).
+// Falls back to the account whose cooldown expires soonest when none healthy.
+func (p *Pool) Pick(allowed map[string]bool, costByUID map[string]float64) *Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := nowSec()
@@ -164,8 +166,12 @@ func (p *Pool) Pick(allowed map[string]bool) *Account {
 	poolToPick := candidates
 	applyIdle := true
 	if len(urgent) > 0 {
+		// 到期紧迫硬优先：先烧快过期的额度，此阶段不看成本（用完即废更急）。
 		poolToPick = urgent
 		applyIdle = false
+	} else if costByUID != nil {
+		// 无快到期账号时才做成本优先：精确分组取最低成本组，未知成本垫底。
+		poolToPick = cheapestGroup(candidates, costByUID)
 	}
 	var totalW float64
 	weights := make([]float64, len(poolToPick))
@@ -185,6 +191,33 @@ func (p *Pool) Pick(allowed map[string]bool) *Account {
 	}
 	acc.LastUsed = now
 	return acc
+}
+
+// cheapestGroup returns the candidates sharing the lowest known per-model cost.
+// Accounts with unknown cost (not in costByUID) rank last: they are excluded
+// whenever at least one candidate has a known cost. If no candidate has a known
+// cost, the full set is returned unfiltered (soft fallback, never empties).
+func cheapestGroup(cands []*Account, cost map[string]float64) []*Account {
+	const eps = 1e-9
+	minCost := math.Inf(1)
+	for _, a := range cands {
+		if c, ok := cost[a.UID]; ok && c < minCost {
+			minCost = c
+		}
+	}
+	if math.IsInf(minCost, 1) {
+		return cands // 全部未知成本 → 不过滤
+	}
+	var group []*Account
+	for _, a := range cands {
+		if c, ok := cost[a.UID]; ok && c <= minCost+eps {
+			group = append(group, a)
+		}
+	}
+	if len(group) == 0 {
+		return cands
+	}
+	return group
 }
 
 func daysToExpiry(a *Account, now float64) float64 {

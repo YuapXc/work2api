@@ -38,6 +38,7 @@ var DefaultSettings = map[string]string{
 	"aa_refresh_hour":         "7",
 	"keepalive_hour":          "22",
 	"keepalive_enabled":       "1",
+	"cost_aware_routing":      "1",
 	"aa_api_key":              "",
 	"model_aliases":           "",
 	"alert_enabled":           "0",
