@@ -34,7 +34,13 @@ function render() {
   const muted = cssVar('--c-muted')
   chart.setOption({
     grid: { left: 8, right: 12, top: 16, bottom: 8, containLabel: true },
-    tooltip: { trigger: 'axis', backgroundColor: cssVar('--c-elevated'), borderColor: line, textStyle: { color: cssVar('--c-ink'), fontSize: 12 } },
+    tooltip: {
+      trigger: 'axis',
+      backgroundColor: cssVar('--c-elevated'),
+      borderColor: line,
+      textStyle: { color: cssVar('--c-ink'), fontSize: 12 },
+      axisPointer: { type: 'line', lineStyle: { color: line } },
+    },
     xAxis: {
       type: 'category',
       data: props.data.map((d) => d.bucket),
@@ -52,6 +58,9 @@ function render() {
         type: 'line',
         smooth: true,
         symbol: 'none',
+        // 悬停时不改变系列外观：echarts 5 默认 hover 会对系列做 emphasis/blur，
+        // 单系列 + areaStyle 下会把线/面积淡出，表现为"鼠标放上去曲线消失"。
+        emphasis: { disabled: true },
         data: props.data.map((d) => (props.metric === 'tokens' ? d.tokens : d.count)),
         lineStyle: { color: brand, width: 2 },
         areaStyle: {
