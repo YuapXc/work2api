@@ -1,6 +1,7 @@
 import axios, { type AxiosInstance, type InternalAxiosRequestConfig } from 'axios'
 import { toast } from '@/lib/toast'
 import type {
+  AABenchmark,
   AccountInfo,
   AppInfo,
   CheckinResponse,
@@ -126,6 +127,11 @@ export const api = {
   models: () => http.get<unknown, { models: ModelInfo[]; source?: 'dynamic' | 'static' }>('/admin/models'),
   modelsRefresh: () =>
     http.post<unknown, { ok: boolean; models: ModelInfo[]; source?: 'dynamic' | 'static' }>('/admin/models/refresh'),
+  // AA（Artificial Analysis）评测：按带命名空间的模型 id 返回智能/编码/数学指数
+  benchmarks: () =>
+    http.get<unknown, { configured: boolean; models: Record<string, AABenchmark> }>('/admin/models/benchmarks'),
+  benchmarksRefresh: () =>
+    http.post<unknown, { ok: boolean; configured: boolean }>('/admin/models/benchmarks/refresh'),
 
   // ---------- 多供应商（workbuddy / qoder / opencode）统一管理 ----------
   // 摘要列表：驱动左侧导航的供应商子项与概览页的供应商卡片

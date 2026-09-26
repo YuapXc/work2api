@@ -25,6 +25,8 @@ const refreshing = ref(false)
 const search = ref('')
 const providerFilter = ref('')
 const modalityFilter = ref('')
+const aaConfigured = ref(false)
+const refreshingAA = ref(false)
 
 async function load() {
   loading.value = true
@@ -45,8 +47,38 @@ async function load() {
       for (const m of (d.models as Record<string, any>[]) || []) acc.push({ provider: others[i].name, model: m })
     })
     entries.value = acc
+    await loadBenchmarks()
   } finally {
     loading.value = false
+  }
+}
+
+// AA 评测按带命名空间的模型 id 合并进各卡片（后端 key 即 e.model.id）。
+async function loadBenchmarks() {
+  try {
+    const res = await api.benchmarks()
+    aaConfigured.value = !!res.configured
+    if (!res.configured) return
+    const map = res.models || {}
+    for (const e of entries.value) {
+      const b = map[e.model.id]
+      if (b) e.model.benchmark = b
+    }
+  } catch {
+    aaConfigured.value = false
+  }
+}
+
+async function refreshAA() {
+  refreshingAA.value = true
+  try {
+    await api.benchmarksRefresh()
+    await loadBenchmarks()
+    toast.success('已刷新 AA 评测')
+  } catch {
+    toast.error('刷新失败：请确认已在设置页填入 AA API Key')
+  } finally {
+    refreshingAA.value = false
   }
 }
 
@@ -85,7 +117,8 @@ const stats = computed(() => {
   const total = entries.value.length
   const multi = entries.value.filter((e) => e.model.modality === 'multimodal' || e.model.vision).length
   const tool = entries.value.filter((e) => e.model.supportsToolCall).length
-  return { total, multi, tool }
+  const aa = entries.value.filter((e) => e.model.benchmark).length
+  return { total, multi, tool, aa }
 })
 
 onMounted(load)
@@ -94,15 +127,22 @@ onMounted(load)
 <template>
   <WPage title="模型" :sub="`统一模型目录 · 来源 ${source === 'dynamic' ? '上游实时' : source === 'static' ? '内置' : '—'}`">
     <template #actions>
+      <WButton v-if="aaConfigured" variant="ghost" :loading="refreshingAA" @click="refreshAA"><WIcon name="refresh" :size="15" /> 刷新评测</WButton>
       <WButton variant="ghost" :loading="refreshing" @click="refresh"><WIcon name="refresh" :size="15" /> 刷新目录</WButton>
     </template>
 
     <WSpinner v-if="loading" center label="加载中" />
     <template v-else>
-      <div class="mb-4 grid grid-cols-3 gap-3">
+      <div class="mb-4 grid gap-3" :class="aaConfigured ? 'grid-cols-4' : 'grid-cols-3'">
         <WStat label="模型总数" :value="stats.total" tone="brand" />
         <WStat label="多模态" :value="stats.multi" tone="route" />
         <WStat label="支持工具" :value="stats.tool" tone="live" />
+        <WStat v-if="aaConfigured" label="已评测" :value="stats.aa" tone="warn" />
+      </div>
+
+      <div v-if="!aaConfigured" class="mb-4 flex items-center gap-2 rounded-lg border border-line bg-elevated/40 px-3 py-2 text-small text-muted">
+        <WIcon name="chart" :size="15" class="text-faint" />
+        在「设置」填入 Artificial Analysis API Key 后，这里会展示各模型的第三方权威评测（智能 / 编码 / 数学指数）。
       </div>
 
       <div class="mb-4 flex flex-wrap items-center gap-2">

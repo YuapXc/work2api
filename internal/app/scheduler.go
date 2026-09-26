@@ -3,11 +3,12 @@ package app
 // Scheduler is the background daemon ported from workbuddy_one/scheduler.py.
 // Single-user scope: daily checkin (with catch-up + retry), periodic credit
 // refresh, daily token keepalive (fail-threshold disable), daily model refresh
-// and cache-TTL warming, and daily usage-log cleanup. All timing is read from
-// the DB settings on every tick, so changes take effect without a restart.
+// and cache-TTL warming, daily usage-log cleanup, and daily AA benchmark
+// refresh. All timing is read from the DB settings on every tick, so changes
+// take effect without a restart.
 //
-// Deferred (per project decisions): AA benchmarks, weekly full backup, credit
-// webhook alerts, attachment archiving, and the usage row-count cap.
+// Deferred (per project decisions): weekly full backup, credit webhook alerts,
+// and attachment archiving.
 
 import (
 	"context"
@@ -48,6 +49,7 @@ type Scheduler struct {
 
 	lastKeepaliveDate    string
 	lastModelRefreshDate string
+	lastBenchDate        string
 	lastCleanupDate      string
 	keepaliveFails       map[string]int
 }
@@ -257,6 +259,11 @@ func (s *Scheduler) run() {
 	}
 	s.refreshCredits()
 	s.o.models.Refresh()
+	// AA benchmarks: warm once at startup so the Models page has data without
+	// waiting for the daily window (skipped cheaply when no key is configured).
+	if s.o.bench.Configured() {
+		s.o.bench.Refresh()
+	}
 
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
@@ -332,6 +339,12 @@ func (s *Scheduler) tick() {
 	if now.Hour() == parseHour(s.setting("model_refresh_hour", "6"), 6) && s.lastModelRefreshDate != t {
 		s.o.models.Refresh()
 		s.lastModelRefreshDate = t
+	}
+
+	// --- daily AA benchmark refresh (only when configured) ---
+	if s.o.bench.Configured() && now.Hour() == parseHour(s.setting("aa_refresh_hour", "7"), 7) && s.lastBenchDate != t {
+		s.o.bench.Refresh()
+		s.lastBenchDate = t
 	}
 	// TTL-expiry refresh happens off the request path: List() refreshes if stale.
 	s.o.models.List()

@@ -101,3 +101,29 @@ func (o *Orchestrator) runtimeModels(ctx context.Context) []map[string]any {
 	}
 	return out
 }
+
+// benchTarget is one (provider, namespaced id, display name) the benchmarks
+// resolver matches against AA.
+type benchTarget struct{ provider, id, name string }
+
+// benchTargets is the merged catalog used for AA lookups: workbuddy from the
+// read-only model cache (no network on the request path) plus every ready
+// runtime's namespaced models.
+func (o *Orchestrator) benchTargets(ctx context.Context) []benchTarget {
+	var out []benchTarget
+	for _, m := range o.models.ListCached() {
+		id := toStrLoose(m["id"])
+		if id == "" {
+			continue
+		}
+		out = append(out, benchTarget{"workbuddy", id, toStrLoose(m["name"])})
+	}
+	for _, m := range o.runtimeModels(ctx) {
+		id := toStrLoose(m["id"])
+		if id == "" {
+			continue
+		}
+		out = append(out, benchTarget{toStrLoose(m["provider"]), id, toStrLoose(m["name"])})
+	}
+	return out
+}

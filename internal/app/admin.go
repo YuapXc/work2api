@@ -377,15 +377,34 @@ func (s *Server) adminUpload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, res)
 }
 
-// adminBenchmarks / adminBenchmarksRefresh are graceful stubs: AA benchmarks are
-// deferred, so the Models page always sees "not configured" (empty table) rather
-// than a 404.
+// adminBenchmarks returns AA evaluations keyed by namespaced model id, for the
+// Models page. Read-only against the cache; it triggers a live fetch only when
+// the cache is empty (first use after the key is set), so the 20s AA call never
+// rides the normal request path — the scheduler warms/refreshes it otherwise.
 func (s *Server) adminBenchmarks(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"configured": false, "models": map[string]any{}})
+	if !s.o.bench.Configured() {
+		writeJSON(w, 200, map[string]any{"configured": false, "models": map[string]any{}})
+		return
+	}
+	if !s.o.bench.HasCache() {
+		s.o.bench.Refresh()
+	}
+	out := map[string]any{}
+	for _, m := range s.o.benchTargets(r.Context()) {
+		if res := s.o.bench.Map(m.provider, m.id, m.name); res != nil {
+			out[m.id] = res
+		}
+	}
+	writeJSON(w, 200, map[string]any{"configured": true, "models": out})
 }
 
 func (s *Server) adminBenchmarksRefresh(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"ok": true, "configured": false})
+	if !s.o.bench.Configured() {
+		writeJSON(w, 400, errBody(400, "未配置 Artificial Analysis API Key", "invalid_request_error").body)
+		return
+	}
+	s.o.bench.Refresh()
+	writeJSON(w, 200, map[string]any{"ok": true, "configured": true})
 }
 
 func (s *Server) adminApps(w http.ResponseWriter, r *http.Request) {

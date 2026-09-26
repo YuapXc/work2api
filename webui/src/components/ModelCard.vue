@@ -14,6 +14,8 @@ const reasoning = computed(() => m.value.reasoning || {})
 const ctx = computed(() => m.value.context_length ?? m.value.context)
 const maxOut = computed(() => m.value.max_output_tokens ?? m.value.max_output)
 const accounts = computed(() => (m.value.accounts || []) as any[])
+const bench = computed(() => m.value.benchmark || null)
+const fmtScore = (v: number | null | undefined) => (v == null ? '—' : Number(v).toFixed(1))
 </script>
 
 <template>
@@ -49,6 +51,28 @@ const accounts = computed(() => (m.value.accounts || []) as any[])
     </div>
 
     <p v-if="m.description" class="line-clamp-2 text-micro leading-relaxed text-muted">{{ m.description }}</p>
+
+    <!-- AA 第三方评测（配置了 key 且匹配到时展示） -->
+    <div v-if="bench" class="rounded-lg border border-line bg-elevated/40 p-2.5">
+      <div class="mb-1.5 flex items-center justify-between">
+        <span class="text-micro text-faint">AA 评测<span v-if="bench.name" class="ml-1 text-faint/70">· {{ bench.name }}</span></span>
+        <a :href="bench.aa_url || 'https://artificialanalysis.ai/models'" target="_blank" rel="noopener" class="text-micro text-brand hover:underline">榜单 ↗</a>
+      </div>
+      <div class="grid grid-cols-3 gap-2 text-center">
+        <div>
+          <div class="mono text-small font-semibold text-ink">{{ fmtScore(bench.intelligence_index) }}</div>
+          <div class="text-micro text-faint">智能</div>
+        </div>
+        <div>
+          <div class="mono text-small font-semibold text-ink">{{ fmtScore(bench.coding_index) }}</div>
+          <div class="text-micro text-faint">编码</div>
+        </div>
+        <div>
+          <div class="mono text-small font-semibold text-ink">{{ fmtScore(bench.math_index) }}</div>
+          <div class="text-micro text-faint">数学</div>
+        </div>
+      </div>
+    </div>
 
     <div v-if="accounts.length" class="flex flex-wrap items-center gap-1.5 border-t border-line pt-3">
       <span class="text-micro text-faint">可用账号</span>

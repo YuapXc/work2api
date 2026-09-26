@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"work2api/internal/benchmarks"
 	"work2api/internal/config"
 	"work2api/internal/core/provider"
 	"work2api/internal/crypto"
@@ -49,6 +50,7 @@ type Orchestrator struct {
 	crypto   *crypto.Manager
 	pool     *pool.Pool
 	models   *models.Registry
+	bench    *benchmarks.Store
 	managers map[string]*credentials.Manager
 
 	limMu    sync.Mutex
@@ -81,6 +83,7 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 		cfg:            cfg,
 		db:             db,
 		crypto:         crypto.NewManager(cfg.DataDir),
+		bench:          benchmarks.New(db),
 		managers:       map[string]*credentials.Manager{},
 		limiters:       map[string]*ratelimit.Limiter{},
 		modelCooldowns: map[string]cdEntry{},
