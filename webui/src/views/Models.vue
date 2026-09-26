@@ -121,6 +121,10 @@ const stats = computed(() => {
   return { total, multi, tool, aa }
 })
 
+// 仅当本页存在带描述的模型时，才让无描述卡预留描述行高以对齐评测框；
+// 全都没描述时不预留，避免整片空白。
+const anyDesc = computed(() => entries.value.some((e) => String(e.model.description || '').trim()))
+
 onMounted(load)
 </script>
 
@@ -160,7 +164,7 @@ onMounted(load)
       </div>
 
       <div v-if="filtered.length" class="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-        <ModelCard v-for="e in filtered" :key="e.provider + '/' + e.model.id" :model="e.model" :provider="e.provider" />
+        <ModelCard v-for="e in filtered" :key="e.provider + '/' + e.model.id" :model="e.model" :provider="e.provider" :reserve-desc="anyDesc" />
       </div>
       <WEmpty v-else title="没有匹配的模型" hint="调整搜索或筛选条件，或刷新目录。" />
     </template>

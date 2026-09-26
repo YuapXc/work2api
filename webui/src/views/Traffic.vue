@@ -20,6 +20,7 @@ import WSpinner from '@/components/ui/WSpinner.vue'
 import WIcon from '@/components/ui/WIcon.vue'
 import TrendChart from '@/components/TrendChart.vue'
 import BarList from '@/components/BarList.vue'
+import { buildLabelMap } from '@/utils/accountLabel'
 
 const route = useRoute()
 const router = useRouter()
@@ -76,6 +77,22 @@ const filterOpts = ref<{ protocols: string[]; models: string[]; apps: string[]; 
   protocols: [], models: [], apps: [], apps_history: [], statuses: [],
 })
 const searchInput = ref('')
+
+// account_uid → 显示名（含 workbuddy 别名）。日志表原本只显示 uid 短码，别名看不到。
+// 仅覆盖 workbuddy 池账号；其它供应商/已删除账号回退 uid 短码（不误标「已移除」）。
+const labelMap = ref<Record<string, string>>({})
+async function loadAccountLabels() {
+  try {
+    const res = await api.accounts()
+    labelMap.value = buildLabelMap(res.accounts || [])
+  } catch {
+    labelMap.value = {}
+  }
+}
+function acctLabel(uid?: string | null): string {
+  if (!uid) return '—'
+  return labelMap.value[uid] || uid.slice(0, 8)
+}
 
 async function loadFilters() {
   const f = await api.usageFilters()
@@ -168,6 +185,7 @@ async function exportCSV() {
 onMounted(() => {
   loadAnalytics()
   loadFilters()
+  loadAccountLabels()
   loadLogs()
 })
 </script>
@@ -226,7 +244,7 @@ onMounted(() => {
         <WSpinner v-if="logLoading && !records.length" center label="加载中" />
         <WTable v-else :columns="logCols" :rows="records" row-key="id" min-width="960px">
           <template #cell-ts="{ value }">{{ dt(value, 'MM-DD HH:mm:ss') }}</template>
-          <template #cell-account_uid="{ value }">{{ value ? value.slice(0, 8) : '—' }}</template>
+          <template #cell-account_uid="{ value }">{{ acctLabel(value) }}</template>
           <template #cell-tokens="{ row }">
             <span class="text-ink">{{ int(row.input_tokens) }}</span><span class="text-faint"> / {{ int(row.output_tokens) }}</span>
           </template>

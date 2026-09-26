@@ -6,7 +6,7 @@ import WTag from '@/components/ui/WTag.vue'
 import { int } from '@/lib/format'
 import { providerMeta } from '@/lib/providers'
 
-const props = defineProps<{ model: Record<string, any>; provider: string }>()
+const props = defineProps<{ model: Record<string, any>; provider: string; reserveDesc?: boolean }>()
 const m = computed(() => props.model)
 const pm = computed(() => providerMeta(props.provider))
 const multimodal = computed(() => m.value.modality === 'multimodal' || m.value.vision || m.value.supports_image)
@@ -52,8 +52,10 @@ const fmtScore = (v: number | null | undefined) => (v == null ? '—' : Number(v
       </div>
     </div>
 
-    <!-- 描述固定预留两行高度，即使为空也占位，使下方评测框跨卡对齐 -->
-    <p class="line-clamp-2 min-h-[2.25rem] text-micro leading-relaxed text-muted">{{ m.description || '' }}</p>
+    <!-- 描述：有描述才占两行；仅当本页存在带描述的模型时，无描述卡才补等高占位，
+         使评测框跨卡对齐——全都没描述时不留任何空白。 -->
+    <p v-if="m.description" class="line-clamp-2 min-h-[2.25rem] text-micro leading-relaxed text-muted">{{ m.description }}</p>
+    <div v-else-if="reserveDesc" class="min-h-[2.25rem]" aria-hidden="true"></div>
 
     <!-- AA 第三方评测（配置了 key 且匹配到时展示） -->
     <div v-if="bench" class="rounded-lg border border-line bg-elevated/40 p-2.5">
