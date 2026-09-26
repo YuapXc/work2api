@@ -129,10 +129,12 @@ func (p *Pool) HealthyCount(allowed map[string]bool) int {
 const expiryPriorityDays = 7.0
 
 // Pick selects the next healthy account by weighted random. Phases (in order):
-// soon-to-expire accounts win outright (use-it-or-lose-it credits); otherwise,
-// when costByUID is provided, restrict to the cheapest cost group (unknown cost
-// ranks last); then weighted random. costByUID nil = cost-blind (legacy).
-// Falls back to the account whose cooldown expires soonest when none healthy.
+// when costByUID is provided, first restrict to the cheapest cost group (cost
+// is the top priority — a cheaper account is chosen even over a soon-to-expire
+// costlier one, so the latter's expiring credits may go unused; unknown cost
+// ranks last). Within that group, soon-to-expire accounts win (burn expiring
+// credits among same-cost peers); then weighted random. costByUID nil =
+// cost-blind (legacy). Falls back to the soonest-cooldown account when none healthy.
 func (p *Pool) Pick(allowed map[string]bool, costByUID map[string]float64) *Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -157,6 +159,10 @@ func (p *Pool) Pick(allowed map[string]bool, costByUID map[string]float64) *Acco
 		}
 		return best
 	}
+	// 成本绝对优先：先把候选收敛到最低成本组（未知成本垫底），到期紧迫只在组内起作用。
+	if costByUID != nil {
+		candidates = cheapestGroup(candidates, costByUID)
+	}
 	var urgent []*Account
 	for _, a := range candidates {
 		if daysToExpiry(a, now) <= expiryPriorityDays {
@@ -166,12 +172,9 @@ func (p *Pool) Pick(allowed map[string]bool, costByUID map[string]float64) *Acco
 	poolToPick := candidates
 	applyIdle := true
 	if len(urgent) > 0 {
-		// 到期紧迫硬优先：先烧快过期的额度，此阶段不看成本（用完即废更急）。
+		// 同成本组内先烧快过期的额度（此阶段不叠加闲置补偿，避免抵消优先意图）。
 		poolToPick = urgent
 		applyIdle = false
-	} else if costByUID != nil {
-		// 无快到期账号时才做成本优先：精确分组取最低成本组，未知成本垫底。
-		poolToPick = cheapestGroup(candidates, costByUID)
 	}
 	var totalW float64
 	weights := make([]float64, len(poolToPick))

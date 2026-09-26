@@ -49,8 +49,9 @@ func TestPickPrefersCheapest(t *testing.T) {
 	}
 }
 
-func TestPickExpiryBeatsCost(t *testing.T) {
-	soon := nowSec() + 1*86400 // within expiryPriorityDays → urgent
+func TestPickCostBeatsExpiry(t *testing.T) {
+	// 成本绝对优先：更便宜的账号即使对方额度快到期也胜出（对方到期额度可能作废）。
+	soon := nowSec() + 1*86400 // paid 账号 1 天后到期
 	p := &Pool{accounts: []*Account{
 		{UID: "free", Enabled: true},
 		{UID: "paid", Enabled: true, CreditsExpireAt: &soon},
@@ -58,8 +59,24 @@ func TestPickExpiryBeatsCost(t *testing.T) {
 	cost := map[string]float64{"free": 0, "paid": 0.03}
 	for i := 0; i < 50; i++ {
 		got := p.Pick(map[string]bool{"free": true, "paid": true}, cost)
-		if got == nil || got.UID != "paid" {
-			t.Fatalf("soon-to-expire account must win over cheaper one, got %v", got)
+		if got == nil || got.UID != "free" {
+			t.Fatalf("cost must outrank expiry: expected free, got %v", got)
+		}
+	}
+}
+
+func TestPickExpiryBreaksTieWithinCostGroup(t *testing.T) {
+	// 同成本组内，快到期的先烧。
+	soon := nowSec() + 1*86400
+	p := &Pool{accounts: []*Account{
+		{UID: "fresh", Enabled: true},
+		{UID: "expiring", Enabled: true, CreditsExpireAt: &soon},
+	}}
+	cost := map[string]float64{"fresh": 0, "expiring": 0} // 同价
+	for i := 0; i < 50; i++ {
+		got := p.Pick(map[string]bool{"fresh": true, "expiring": true}, cost)
+		if got == nil || got.UID != "expiring" {
+			t.Fatalf("within same-cost group, expiring should burn first, got %v", got)
 		}
 	}
 }
