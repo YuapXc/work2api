@@ -68,6 +68,35 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSettingsCacheInvalidation: GetSettings is memoized, but SaveSettings must
+// invalidate the cache so a later read reflects the write (and returned maps are
+// independent copies the caller can mutate without corrupting the cache).
+func TestSettingsCacheInvalidation(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "settings.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	first, _ := db.GetSettings() // populates cache with defaults
+	if first["cost_aware_routing"] != "1" {
+		t.Fatalf("default cost_aware_routing = %q, want 1", first["cost_aware_routing"])
+	}
+	// mutating the returned copy must not leak into the cache
+	first["cost_aware_routing"] = "tampered"
+
+	if again, _ := db.GetSettings(); again["cost_aware_routing"] != "1" {
+		t.Fatalf("cache corrupted by caller mutation: %q", again["cost_aware_routing"])
+	}
+
+	if err := db.SaveSettings(map[string]string{"cost_aware_routing": "0"}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if after, _ := db.GetSettings(); after["cost_aware_routing"] != "0" {
+		t.Fatalf("stale after save: %q, want 0", after["cost_aware_routing"])
+	}
+}
+
 func TestUsageRowCap(t *testing.T) {
 	db, err := New(filepath.Join(t.TempDir(), "cap.db"))
 	if err != nil {

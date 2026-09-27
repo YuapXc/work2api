@@ -42,7 +42,7 @@ func TestPickPrefersCheapest(t *testing.T) {
 	p := &Pool{accounts: []*Account{{UID: "free", Enabled: true}, {UID: "paid", Enabled: true}}}
 	cost := map[string]float64{"free": 0, "paid": 0.03}
 	for i := 0; i < 50; i++ {
-		got := p.Pick(map[string]bool{"free": true, "paid": true}, cost)
+		got := p.Pick(map[string]bool{"free": true, "paid": true}, cost, 7)
 		if got == nil || got.UID != "free" {
 			t.Fatalf("cost-aware pick must always choose free, got %v", got)
 		}
@@ -58,7 +58,7 @@ func TestPickCostBeatsExpiry(t *testing.T) {
 	}}
 	cost := map[string]float64{"free": 0, "paid": 0.03}
 	for i := 0; i < 50; i++ {
-		got := p.Pick(map[string]bool{"free": true, "paid": true}, cost)
+		got := p.Pick(map[string]bool{"free": true, "paid": true}, cost, 7)
 		if got == nil || got.UID != "free" {
 			t.Fatalf("cost must outrank expiry: expected free, got %v", got)
 		}
@@ -74,7 +74,7 @@ func TestPickExpiryBreaksTieWithinCostGroup(t *testing.T) {
 	}}
 	cost := map[string]float64{"fresh": 0, "expiring": 0} // 同价
 	for i := 0; i < 50; i++ {
-		got := p.Pick(map[string]bool{"fresh": true, "expiring": true}, cost)
+		got := p.Pick(map[string]bool{"fresh": true, "expiring": true}, cost, 7)
 		if got == nil || got.UID != "expiring" {
 			t.Fatalf("within same-cost group, expiring should burn first, got %v", got)
 		}
@@ -83,7 +83,60 @@ func TestPickExpiryBreaksTieWithinCostGroup(t *testing.T) {
 
 func TestPickCostBlindWhenNil(t *testing.T) {
 	p := &Pool{accounts: []*Account{{UID: "a", Enabled: true}, {UID: "b", Enabled: true}}}
-	if got := p.Pick(map[string]bool{"a": true, "b": true}, nil); got == nil {
+	if got := p.Pick(map[string]bool{"a": true, "b": true}, nil, 7); got == nil {
 		t.Fatal("cost-blind pick should still return an account")
+	}
+}
+
+// pkgWith builds a one-package credit list for tests.
+func pkgWith(remain, expireAt float64) []map[string]any {
+	return []map[string]any{{"remain": remain, "expire_at": expireAt}}
+}
+
+// TestPickPrefersLargerExpiringPile: same cost, both expiring within the window
+// at similar times, but one has far more balance about to vanish — it should be
+// picked overwhelmingly so the bigger expiring pile is burned first (Option A).
+func TestPickPrefersLargerExpiringPile(t *testing.T) {
+	soonBig := nowSec() + 2*86400
+	soonSmall := nowSec() + 2*86400
+	p := &Pool{accounts: []*Account{
+		{UID: "big", Enabled: true, CreditPackages: pkgWith(8000, soonBig)},
+		{UID: "small", Enabled: true, CreditPackages: pkgWith(200, soonSmall)},
+	}}
+	cost := map[string]float64{"big": 0, "small": 0}
+	bigHits := 0
+	for i := 0; i < 400; i++ {
+		if got := p.Pick(map[string]bool{"big": true, "small": true}, cost, 7); got != nil && got.UID == "big" {
+			bigHits++
+		}
+	}
+	// With a ~40x larger expiring pile the bias should land the big account well
+	// above an even split; assert a clear majority (soft bias still lets small win
+	// occasionally, so we don't demand 100%).
+	if bigHits < 280 {
+		t.Fatalf("larger expiring pile should dominate, big won %d/400", bigHits)
+	}
+}
+
+// TestPickExpiringPileIgnoredOutsideWindow: a huge balance expiring far beyond
+// the window must NOT pull traffic — only in-window expiring amounts bias burn.
+func TestPickExpiringPileIgnoredOutsideWindow(t *testing.T) {
+	farBig := nowSec() + 60*86400 // 60 天后，远超 7 天窗口
+	soonSmall := nowSec() + 2*86400
+	p := &Pool{accounts: []*Account{
+		{UID: "farbig", Enabled: true, CreditPackages: pkgWith(9000, farBig)},
+		{UID: "soonsmall", Enabled: true, CreditPackages: pkgWith(300, soonSmall)},
+	}}
+	cost := map[string]float64{"farbig": 0, "soonsmall": 0}
+	soonHits := 0
+	for i := 0; i < 400; i++ {
+		if got := p.Pick(map[string]bool{"farbig": true, "soonsmall": true}, cost, 7); got != nil && got.UID == "soonsmall" {
+			soonHits++
+		}
+	}
+	// farbig is not urgent (outside window) so soonsmall alone forms the urgent
+	// group and is always chosen.
+	if soonHits != 400 {
+		t.Fatalf("only the in-window expiring account should be urgent, soonsmall won %d/400", soonHits)
 	}
 }

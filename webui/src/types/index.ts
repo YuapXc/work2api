@@ -45,6 +45,8 @@ export interface Settings {
   keepalive_enabled?: string
   /** 成本优先选号开关：'1' 开启（默认），'0' 关闭 */
   cost_aware_routing?: string
+  /** 临期优先窗口（天）：余额在该天数内到期的账号优先命中并按临期余额加权 */
+  expiry_priority_days?: string
   aa_api_key?: string
   aa_api_key_masked?: string
   aa_enabled?: boolean

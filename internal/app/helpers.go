@@ -16,6 +16,12 @@ import (
 const (
 	cooldownSoft = 60.0
 	cooldownHard = 1800.0
+
+	// sessionStickyMaxCooldown bounds how much residual account cooldown still
+	// counts as "usable now" for both session-sticky reuse and the final pick
+	// guard: an account cooling down for <= this many seconds is treated as
+	// immediately serviceable, anything more means the pool is rate-limited.
+	sessionStickyMaxCooldown = 30.0
 )
 
 var limitResetRe = regexp.MustCompile(`(?i)(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*UTC\+8`)

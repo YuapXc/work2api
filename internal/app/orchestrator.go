@@ -297,6 +297,13 @@ func (o *Orchestrator) modelAccountUIDs(model string) (map[string]bool, *apiErro
 }
 
 func (o *Orchestrator) pickAccount(model, sessionKey string) (*pool.Account, *apiError) {
+	return o.pickAccountExcluding(model, sessionKey, nil)
+}
+
+// pickAccountExcluding is pickAccount with a set of already-tried UIDs removed
+// from the ready candidates, so failover can rotate through fresh accounts until
+// the candidate set is exhausted. tried nil = first pick (no exclusions).
+func (o *Orchestrator) pickAccountExcluding(model, sessionKey string, tried map[string]bool) (*pool.Account, *apiError) {
 	allowed, aerr := o.modelAccountUIDs(model)
 	if aerr != nil {
 		return nil, aerr
@@ -307,35 +314,37 @@ func (o *Orchestrator) pickAccount(model, sessionKey string) (*pool.Account, *ap
 	ready := map[string]bool{}
 	now := nowSec()
 	for uid := range allowed {
+		if tried[uid] {
+			continue
+		}
 		if o.modelCooldownUntil(uid, model) <= now {
 			ready[uid] = true
 		}
 	}
 	if len(allowed) > 0 && len(ready) == 0 {
+		if len(tried) > 0 {
+			// 换号重试时候选已耗尽（都试过或都在冷却），交由调用方返回上一次的错误。
+			return nil, errBody(503, "模型 "+model+" 的可用账号均已尝试或冷却", "auth_error")
+		}
 		return nil, errBody(429, "模型 "+model+" 的可用账号均已达到每日上限，请稍后重试", "rate_limit_error")
 	}
-	// 会话粘性：此前绑定的账号若仍可用（在候选集、未模型冷却、账号冷却≤30s、启用），
-	// 直接复用以保住上游 prompt cache 命中；否则解粘回池按权重重选并重绑。
+	// 会话粘性：此前绑定的账号若仍可用（在候选集、未模型冷却、账号冷却≤30s、启用、
+	// 且本轮未试过），直接复用以保住上游 prompt cache 命中；否则解粘回池按权重重选并重绑。
 	if sessionKey != "" {
-		if uid := o.sessions.lookup(sessionKey); uid != "" {
+		if uid := o.sessions.lookup(sessionKey); uid != "" && !tried[uid] {
 			if ready[uid] {
-				for _, a := range o.pool.Accounts() {
-					if a.UID == uid {
-						if a.Enabled && a.CooldownUntil-now <= 30 {
-							return a, nil
-						}
-						break
-					}
+				if a := o.pool.Get(uid); a != nil && a.Enabled && a.CooldownUntil-now <= sessionStickyMaxCooldown {
+					return a, nil
 				}
 			}
 			o.sessions.unbind(sessionKey)
 		}
 	}
-	acc := o.pool.Pick(ready, o.modelCostByUID(model, ready))
+	acc := o.pool.Pick(ready, o.modelCostByUID(model, ready), o.expiryWindowDays())
 	if acc == nil {
 		return nil, errBody(503, "模型 "+model+" 无可用账号（全部冷却或额度耗尽），请检查账号状态", "auth_error")
 	}
-	if acc.CooldownUntil-now > 30 {
+	if acc.CooldownUntil-now > sessionStickyMaxCooldown {
 		return nil, errBody(503, "上游限流中，所有账号均在冷却，请稍后重试", "rate_limit_error")
 	}
 	if sessionKey != "" {
@@ -373,22 +382,17 @@ func (o *Orchestrator) modelCostByUID(model string, ready map[string]bool) map[s
 	return out
 }
 
-func (o *Orchestrator) modelReadyUIDs(model string) map[string]bool {
-	allowed, _ := o.modelAccountUIDs(model)
-	if allowed == nil {
-		allowed = map[string]bool{}
-		for _, a := range o.pool.Accounts() {
-			allowed[a.UID] = true
+// expiryWindowDays is the configured look-ahead (setting expiry_priority_days)
+// for soon-to-expire credit prioritization in Pick; falls back to the pool
+// default on a missing/invalid value. Cheap now that GetSettings is memoized.
+func (o *Orchestrator) expiryWindowDays() float64 {
+	settings, _ := o.db.GetSettings()
+	if v, ok := settings["expiry_priority_days"]; ok {
+		if d, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil && d > 0 {
+			return d
 		}
 	}
-	ready := map[string]bool{}
-	now := nowSec()
-	for uid := range allowed {
-		if o.modelCooldownUntil(uid, model) <= now {
-			ready[uid] = true
-		}
-	}
-	return ready
+	return pool.DefaultExpiryWindowDays
 }
 
 func (o *Orchestrator) resolveModel(model string) string {
@@ -466,45 +470,48 @@ func (o *Orchestrator) runOnce(ctx context.Context, acc *pool.Account, body map[
 	return started, err
 }
 
+// openUpstream runs the request against acc, and on a retryable pre-stream
+// failure rotates to fresh accounts (never re-trying one already attempted this
+// request) until it succeeds or the candidate set is exhausted — capped at
+// maxFailoverAttempts total tries so a full upstream outage can't turn one
+// client request into an unbounded sequential sweep of a large pool. A failure
+// after bytes have been streamed is never retried (can't un-send).
 func (o *Orchestrator) openUpstream(ctx context.Context, acc *pool.Account, body map[string]any, model, sessionKey string, sink func(string) error, onRetryFail func(*pool.Account, *upstream.UpstreamError)) (*pool.Account, error) {
-	started, err := o.runOnce(ctx, acc, body, sink)
-	if err == nil {
-		return acc, nil
-	}
-	if started {
-		// 流已开始又中断：软冷却（可能是上游中途掉线），不重试已开始的流。
-		o.pool.OnFailure(acc.UID, cooldownSoft)
-		return acc, err
-	}
-	ue, ok := err.(*upstream.UpstreamError)
-	if !ok {
-		o.pool.OnFailure(acc.UID, cooldownSoft)
-		return acc, err
-	}
-	// 分类并对首个账号施加处罚（禁用/负缓存/冷却/不罚），返回是否应换号。
-	act := o.penalizeAccount(acc, model, ue)
-	if act.FailFast || !act.Rotate {
-		return acc, err
-	}
-	if o.pool.HealthyCount(o.modelReadyUIDs(model)) < 1 {
-		return acc, err
-	}
-	if onRetryFail != nil {
-		onRetryFail(acc, ue)
-	}
-	alt, aerr := o.pickAccount(model, sessionKey)
-	if aerr != nil {
-		return acc, err
-	}
-	started2, err2 := o.runOnce(ctx, alt, body, sink)
-	if err2 != nil {
-		if ue2, ok := err2.(*upstream.UpstreamError); ok {
-			o.penalizeAccount(alt, model, ue2)
-		} else if !started2 {
-			o.pool.OnFailure(alt.UID, cooldownSoft)
+	const maxFailoverAttempts = 5
+	tried := map[string]bool{}
+	for attempt := 0; ; attempt++ {
+		tried[acc.UID] = true
+		started, err := o.runOnce(ctx, acc, body, sink)
+		if err == nil {
+			return acc, nil
 		}
+		if started {
+			// 流已开始又中断：软冷却（可能是上游中途掉线），不重试已开始的流。
+			o.pool.OnFailure(acc.UID, cooldownSoft)
+			return acc, err
+		}
+		ue, ok := err.(*upstream.UpstreamError)
+		if !ok {
+			o.pool.OnFailure(acc.UID, cooldownSoft)
+			return acc, err
+		}
+		// 分类并对该账号施加处罚（禁用/负缓存/冷却/不罚），返回是否应换号。
+		act := o.penalizeAccount(acc, model, ue)
+		if act.FailFast || !act.Rotate {
+			return acc, err
+		}
+		if attempt+1 >= maxFailoverAttempts {
+			return acc, err
+		}
+		alt, aerr := o.pickAccountExcluding(model, sessionKey, tried)
+		if aerr != nil {
+			return acc, err // 候选耗尽：返回最后一次的上游错误
+		}
+		if onRetryFail != nil {
+			onRetryFail(acc, ue)
+		}
+		acc = alt
 	}
-	return alt, err2
 }
 
 func (o *Orchestrator) refreshCreditsFor(ctx context.Context, acc *pool.Account) {

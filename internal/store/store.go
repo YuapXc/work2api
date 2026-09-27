@@ -27,6 +27,12 @@ const SchemaVersion = 12
 type DB struct {
 	db *sql.DB
 	mu sync.Mutex
+
+	// settingsCache memoizes the merged settings map. GetSettings is on the
+	// per-request hot path (model alias resolve + cost-aware routing both read
+	// it), so serving from memory avoids a SQLite round-trip per request. It is
+	// invalidated on SaveSettings; nil means "not populated yet".
+	settingsCache map[string]string
 }
 
 // DefaultSettings mirror db.py DEFAULT_SETTINGS.
@@ -39,6 +45,7 @@ var DefaultSettings = map[string]string{
 	"keepalive_hour":          "22",
 	"keepalive_enabled":       "1",
 	"cost_aware_routing":      "1",
+	"expiry_priority_days":    "7",
 	"aa_api_key":              "",
 	"model_aliases":           "",
 	"alert_enabled":           "0",

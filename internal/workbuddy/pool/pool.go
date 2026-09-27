@@ -126,18 +126,32 @@ func (p *Pool) HealthyCount(allowed map[string]bool) int {
 	return n
 }
 
-const expiryPriorityDays = 7.0
+// DefaultExpiryWindowDays is the look-ahead window for "soon-to-expire" credit
+// prioritization when a caller passes 0 (cost-blind / non-routing picks).
+const DefaultExpiryWindowDays = 7.0
+
+// expiryAmountBias controls how strongly the soon-to-expire group prefers the
+// account with the larger absolute in-window expiring balance: the biggest pile
+// gets weight ×(1+bias), scaling linearly to ×1 for an empty pile. Kept moderate
+// so it steers burn order without fully overriding priority/failure weighting.
+const expiryAmountBias = 2.0
 
 // Pick selects the next healthy account by weighted random. Phases (in order):
 // when costByUID is provided, first restrict to the cheapest cost group (cost
 // is the top priority — a cheaper account is chosen even over a soon-to-expire
 // costlier one, so the latter's expiring credits may go unused; unknown cost
-// ranks last). Within that group, soon-to-expire accounts win (burn expiring
-// credits among same-cost peers); then weighted random. costByUID nil =
-// cost-blind (legacy). Falls back to the soonest-cooldown account when none healthy.
-func (p *Pool) Pick(allowed map[string]bool, costByUID map[string]float64) *Account {
+// ranks last). Within that group, accounts with credits expiring inside
+// expiryWindowDays win (burn expiring credits among same-cost peers), and among
+// those the larger absolute in-window expiring balance is preferred (Option A
+// soft bias); then weighted random. costByUID nil = cost-blind (legacy).
+// expiryWindowDays <= 0 falls back to DefaultExpiryWindowDays. Falls back to the
+// soonest-cooldown account when none healthy.
+func (p *Pool) Pick(allowed map[string]bool, costByUID map[string]float64, expiryWindowDays float64) *Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if expiryWindowDays <= 0 {
+		expiryWindowDays = DefaultExpiryWindowDays
+	}
 	now := nowSec()
 	var candidates []*Account
 	for _, a := range p.accounts {
@@ -165,7 +179,7 @@ func (p *Pool) Pick(allowed map[string]bool, costByUID map[string]float64) *Acco
 	}
 	var urgent []*Account
 	for _, a := range candidates {
-		if daysToExpiry(a, now) <= expiryPriorityDays {
+		if daysToExpiry(a, now) <= expiryWindowDays {
 			urgent = append(urgent, a)
 		}
 	}
@@ -176,10 +190,23 @@ func (p *Pool) Pick(allowed map[string]bool, costByUID map[string]float64) *Acco
 		poolToPick = urgent
 		applyIdle = false
 	}
+	// Option A：紧迫组内按「窗口内绝对到期余额」偏置，优先烧最大的一堆；用组内最大值
+	// 归一化，避免绝对量级压垮其它权重因子。非紧迫组不参与（maxExpiring 保持 0）。
+	var maxExpiring float64
+	if !applyIdle {
+		for _, a := range poolToPick {
+			if e := a.expiringWithin(now, expiryWindowDays); e > maxExpiring {
+				maxExpiring = e
+			}
+		}
+	}
 	var totalW float64
 	weights := make([]float64, len(poolToPick))
 	for i, a := range poolToPick {
 		w := weight(a, now, applyIdle)
+		if maxExpiring > 0 {
+			w *= 1 + expiryAmountBias*(a.expiringWithin(now, expiryWindowDays)/maxExpiring)
+		}
 		weights[i] = w
 		totalW += w
 	}
@@ -223,7 +250,74 @@ func cheapestGroup(cands []*Account, cost map[string]float64) []*Account {
 	return group
 }
 
+// pkgFloat reads a numeric field from a credit-package map, tolerating the
+// float64/*float64/int shapes the billing layer and JSON round-trips produce.
+func pkgFloat(p map[string]any, key string) (float64, bool) {
+	switch v := p[key].(type) {
+	case float64:
+		return v, true
+	case *float64:
+		if v != nil {
+			return *v, true
+		}
+	case int:
+		return float64(v), true
+	}
+	return 0, false
+}
+
+// nearestExpiry returns the soonest real per-package expiry among packages that
+// still hold a positive balance, or nil when package data is absent/none apply.
+// This is the truthful "credits will actually vanish" time. The account-level
+// CreditsExpireAt is now derived from the same per-package data (see billing
+// earliestPackageExpiry), so daysToExpiry's fallback to it stays consistent;
+// nearestExpiry is still preferred because it needs no stored round-trip and
+// pairs with expiringWithin for the in-window amount.
+func (a *Account) nearestExpiry() *float64 {
+	var best *float64
+	for _, p := range a.CreditPackages {
+		if rem, ok := pkgFloat(p, "remain"); !ok || rem <= 0 {
+			continue
+		}
+		exp, ok := pkgFloat(p, "expire_at")
+		if !ok || exp <= 0 {
+			continue
+		}
+		if best == nil || exp < *best {
+			e := exp
+			best = &e
+		}
+	}
+	return best
+}
+
+// expiringWithin sums the balance of packages expiring within windowDays from
+// now — the absolute amount at risk of going unused, driving burn priority.
+func (a *Account) expiringWithin(now, windowDays float64) float64 {
+	if len(a.CreditPackages) == 0 || windowDays <= 0 {
+		return 0
+	}
+	limit := now + windowDays*86400
+	var sum float64
+	for _, p := range a.CreditPackages {
+		exp, ok := pkgFloat(p, "expire_at")
+		if !ok || exp <= 0 || exp > limit {
+			continue
+		}
+		if rem, ok := pkgFloat(p, "remain"); ok && rem > 0 {
+			sum += rem
+		}
+	}
+	return sum
+}
+
+// daysToExpiry prefers the truthful per-package nearest expiry; only when no
+// package data is available yet (e.g. before the first credit refresh) does it
+// fall back to the account-level cycle boundary.
 func daysToExpiry(a *Account, now float64) float64 {
+	if e := a.nearestExpiry(); e != nil {
+		return (*e - now) / 86400.0
+	}
 	if a.CreditsExpireAt == nil || *a.CreditsExpireAt == 0 {
 		return math.Inf(1)
 	}
@@ -464,6 +558,19 @@ func (p *Pool) Accounts() []*Account {
 	out := make([]*Account, len(p.accounts))
 	copy(out, p.accounts)
 	return out
+}
+
+// Get returns the account with the given UID, or nil. Avoids copying the whole
+// slice when the caller only needs one account (e.g. session-sticky lookup).
+func (p *Pool) Get(uid string) *Account {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, a := range p.accounts {
+		if a.UID == uid {
+			return a
+		}
+	}
+	return nil
 }
 
 func nowSec() float64 { return float64(time.Now().UnixNano()) / 1e9 }

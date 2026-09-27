@@ -273,7 +273,7 @@ func (r *Registry) fetchFromUpstream() []fetchedModel {
 		}
 	}
 	if len(accounts) == 0 {
-		if a := r.pool.Pick(nil, nil); a != nil {
+		if a := r.pool.Pick(nil, nil, 0); a != nil {
 			accounts = []*pool.Account{a}
 		}
 	}

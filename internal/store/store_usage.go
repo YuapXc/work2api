@@ -31,27 +31,36 @@ func (d *DB) UsageCreditStats() (models []map[string]any, totalCredits, totalTok
 	return models, totalCredits, totalTokens
 }
 
-// GetSettings returns settings merged over defaults.
+// GetSettings returns settings merged over defaults. Results are memoized in
+// memory (invalidated by SaveSettings) since this is read on the per-request
+// hot path. The returned map is a fresh copy the caller may mutate freely.
 func (d *DB) GetSettings() (map[string]string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	rows, err := d.db.Query("SELECT key, value FROM settings")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	merged := map[string]string{}
-	for k, v := range DefaultSettings {
-		merged[k] = v
-	}
-	for rows.Next() {
-		var k, v string
-		if err := rows.Scan(&k, &v); err != nil {
+	if d.settingsCache == nil {
+		rows, err := d.db.Query("SELECT key, value FROM settings")
+		if err != nil {
 			return nil, err
 		}
-		merged[k] = v
+		defer rows.Close()
+		merged := map[string]string{}
+		for k, v := range DefaultSettings {
+			merged[k] = v
+		}
+		for rows.Next() {
+			var k, v string
+			if err := rows.Scan(&k, &v); err != nil {
+				return nil, err
+			}
+			merged[k] = v
+		}
+		d.settingsCache = merged
 	}
-	return merged, nil
+	out := make(map[string]string, len(d.settingsCache))
+	for k, v := range d.settingsCache {
+		out[k] = v
+	}
+	return out, nil
 }
 
 // SaveSettings persists whitelisted settings keys.
@@ -68,6 +77,7 @@ func (d *DB) SaveSettings(kv map[string]string) error {
 			return err
 		}
 	}
+	d.settingsCache = nil // invalidate memoized GetSettings
 	return nil
 }
 

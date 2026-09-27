@@ -21,6 +21,7 @@ const s = reactive<Record<string, string>>({
   aa_refresh_hour: '',
   keepalive_hour: '',
   model_aliases: '',
+  expiry_priority_days: '',
   alert_webhook: '',
   alert_threshold_percent: '',
   alert_expiry_days: '',
@@ -132,6 +133,13 @@ onMounted(load)
           </div>
           <p class="text-micro text-faint">
             关闭则回到纯加权轮换。成本为最高优先级：只要有更便宜的账号可用就用它（更贵账号里临近到期的额度可能因此用不完）；限流/冷却时才轮到较贵的账号。
+          </p>
+          <div class="flex items-center justify-between border-t border-line pt-3">
+            <label class="text-small text-muted">临期优先窗口（天）</label>
+            <WInput v-model="s.expiry_priority_days" placeholder="7" class="w-24" />
+          </div>
+          <p class="text-micro text-faint">
+            同成本账号里，余额在该天数内到期的会被优先命中；到期临近的账号中，按各资源包「窗口内即将过期的余额」大小加权——过期越多的越先烧，尽量不浪费。按上游逐个资源包的真实到期时间计算，非账号级周期时间。
           </p>
         </div>
       </WCard>
