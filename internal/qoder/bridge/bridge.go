@@ -107,7 +107,7 @@ func tokenPrefix(s string, n int) string {
 //  1. OAuth device token (dt-xxx): 直接使用，调用 /api/v1/userinfo 获取用户信息
 //  2. Personal Access Token (PAT): 调用 ExchangeJobToken 转换为 session token
 func NewBridge(pat string, region account.Region, templateBase map[string]interface{}) (*Bridge, error) {
-	logger.Info("Bridge using token: %s (prefix: %s)", tokenPrefix(pat, 10), tokenPrefix(pat, 4))
+	logger.Debug("Bridge using token: %s (prefix: %s)", tokenPrefix(pat, 10), tokenPrefix(pat, 4))
 
 	var identity cosy.AuthIdentity
 	var name, id string
@@ -150,13 +150,13 @@ func NewBridge(pat string, region account.Region, templateBase map[string]interf
 		}
 	}
 
-	logger.Info("Bridge session for %s (%s)", name, id)
+	logger.Debug("Bridge session for %s (%s)", name, id)
 	// 稳定设备指纹：优先 uid 派生（双区统一、重启不变），uid 缺失退回凭证种子
 	seed := cosy.FingerprintSeed(id, pat)
 	mid := cosy.DeriveMachineID(seed)
 	mtoken := cosy.DeriveMachineToken(seed)
 	mtype := cosy.DeriveMachineType(seed)
-	logger.Info("Bridge fingerprint machineid=%s (stable derive)", mid)
+	logger.Debug("Bridge fingerprint machineid=%s (stable derive)", mid)
 	sess, err := cosy.NewSession(identity, mid, mtoken, mtype)
 	if err != nil {
 		return nil, err
@@ -184,7 +184,7 @@ func (b *Bridge) ListAvailableModels() ([]QoderModel, error) {
 	for k := range resp {
 		keys = append(keys, k)
 	}
-	logger.Info("model list response keys: %v (region=%s)", keys, b.region)
+	logger.Debug("model list response keys: %v (region=%s)", keys, b.region)
 	models := parseQoderModels(resp)
 	if len(models) == 0 {
 		return nil, fmt.Errorf("%s -> empty model list, keys=%v", modelListURL, keys)
@@ -410,7 +410,7 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 	if len(preview) > 80 {
 		preview = preview[:80] + "..."
 	}
-	logger.Info("callQoder model=%s prompt=%s", model, preview)
+	logger.Debug("callQoder model=%s prompt=%s", model, preview)
 	logger.Debug("callQoder request body: %s", func() string { d, _ := json.Marshal(body); return string(d) }())
 
 	// ---- SSE 信封重试闸门（第 3 步，参照 hub should_retry_envelope /

@@ -281,8 +281,7 @@ func FetchQuota(token string, region Region) (*QuotaInfo, error) {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 
-	fmt.Printf("[QUOTA DEBUG] API URL: %s\n", ep.QuotaEndpoint)
-	fmt.Printf("[QUOTA DEBUG] Raw response: %s\n", string(raw))
+	logger.Debug("FetchQuota %s raw: %s", ep.QuotaEndpoint, string(raw))
 
 	var result map[string]interface{}
 	if err := json.Unmarshal(raw, &result); err != nil {
@@ -297,16 +296,16 @@ func FetchQuota(token string, region Region) (*QuotaInfo, error) {
 
 	if uq := extractBucket(result, "userQuota"); uq != nil {
 		info.UserQuota = uq
-		fmt.Printf("[QUOTA DEBUG] userQuota found: %+v\n", uq)
+		logger.Debug("FetchQuota userQuota: %+v", uq)
 	} else {
-		fmt.Printf("[QUOTA DEBUG] userQuota NOT found in response\n")
+		logger.Debug("FetchQuota userQuota missing")
 	}
 
 	if aq := extractBucket(result, "addOnQuota"); aq != nil {
 		info.AddonQuota = aq
-		fmt.Printf("[QUOTA DEBUG] addonQuota found: %+v\n", aq)
+		logger.Debug("FetchQuota addonQuota: %+v", aq)
 	} else {
-		fmt.Printf("[QUOTA DEBUG] addonQuota NOT found in response\n")
+		logger.Debug("FetchQuota addonQuota missing")
 	}
 
 	return info, nil

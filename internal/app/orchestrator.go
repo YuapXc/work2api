@@ -141,7 +141,7 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 		}
 	}
 	o.models = models.New(o.pool, db)
-	registerRuntimes(cfg.DataDir)
+	registerRuntimes(cfg.DataDir, cfg.LogLevel)
 	return o, nil
 }
 
@@ -151,9 +151,9 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 // idempotent per process. workbuddy remains the default (un-namespaced) path.
 var runtimesOnce sync.Once
 
-func registerRuntimes(dataDir string) {
+func registerRuntimes(dataDir, logLevel string) {
 	runtimesOnce.Do(func() {
-		provider.RegisterRuntime(qoder.New())
+		provider.RegisterRuntime(qoder.New(logLevel))
 		if oc, err := opencode.New(nil, dataDir); err != nil {
 			log.Printf("opencode 运行时初始化失败（已跳过）: %v", err)
 		} else {

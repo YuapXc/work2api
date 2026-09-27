@@ -107,7 +107,7 @@ func (c *BearerClient) callGet(fullURL string) (map[string]interface{}, error) {
 	if len(preview) > 2000 {
 		preview = preview[:2000]
 	}
-	logger.Info("callGet %s response (%d bytes): %s", fullURL, len(data), preview)
+	logger.Debug("callGet %s response (%d bytes): %s", fullURL, len(data), preview)
 	var result map[string]interface{}
 	err = json.Unmarshal(data, &result)
 	return result, err

@@ -77,11 +77,15 @@ type quotaEntry struct {
 }
 
 // New constructs the qoder runtime. It applies the qoder2api install salt so
-// device fingerprints match the account's existing qoder2api deployment, and
-// aligns the log level with qoder2api settings. When the qoder2api data dir does
-// not exist (user does not use qoder) it stays dormant and creates nothing on
-// disk — the salt/settings are only touched once a real account is present.
-func New() *Runtime {
+// device fingerprints match the account's existing qoder2api deployment. When
+// the qoder2api data dir does not exist (user does not use qoder) it stays
+// dormant and creates nothing on disk — the salt/settings are only touched once
+// a real account is present.
+//
+// logLevel is the gateway-wide LOG_LEVEL ("debug"/"info"/"error"); when non-empty
+// it drives the qoder logger and takes precedence over the qoder store's own
+// setting, so a single LOG_LEVEL in .env controls console verbosity everywhere.
+func New(logLevel string) *Runtime {
 	if dataDirExists() {
 		if salt, err := account.EnsureMachineSalt(); err == nil {
 			cosy.SetInstallSalt(salt)
@@ -92,6 +96,8 @@ func New() *Runtime {
 			logger.SetLevel(st.LogLevel)
 		}
 	}
+	// Gateway LOG_LEVEL wins over the qoder store fallback set above.
+	logger.SetLevel(strings.ToLower(strings.TrimSpace(logLevel)))
 	return &Runtime{
 		bridges:       map[string]*bridge.Bridge{},
 		oauthStates:   map[string]*oauthState{},
