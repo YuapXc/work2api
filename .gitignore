@@ -14,6 +14,10 @@
 *.test
 *.out
 
+# 本地环境变量（可能含 ADMIN_TOKEN 等，敏感）；.env.example 模板照常提交
+/.env
+!/.env.example
+
 # 运行时数据（含凭证/密钥/使用记录，敏感）
 /data/
 *.db

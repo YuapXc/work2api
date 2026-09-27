@@ -107,6 +107,7 @@ jobs:
           go build -trimpath -ldflags="-s -w -X main.version=$RELEASE_TAG" \
             -o "dist/$PACKAGE_NAME/work2api$EXTENSION" ./cmd/server
           cp README.md "dist/$PACKAGE_NAME/"
+          cp .env.example "dist/$PACKAGE_NAME/"
           if [[ "$ARCHIVE_FORMAT" == "zip" ]]; then
             (cd dist && zip -q -r "$PACKAGE_NAME.zip" "$PACKAGE_NAME")
             archive="$PACKAGE_NAME.zip"

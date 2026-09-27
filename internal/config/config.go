@@ -8,6 +8,7 @@ package config
 import (
 	"bufio"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -70,6 +71,11 @@ func Load(args []string) *Config {
 	logLevel := fs.String("log-level", env("LOG_LEVEL", "INFO"), "log level")
 	_ = fs.Parse(args)
 
+	if *port < 1 || *port > 65535 {
+		warnf("PORT=%d 超出 1–65535 范围，已回退默认 8787", *port)
+		*port = 8787
+	}
+
 	dd := resolvePath(*dataDir)
 	dbp := *dbPath
 	if dbp == "" {
@@ -118,6 +124,7 @@ func floatEnv(k string, def float64) float64 {
 		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
 			return f
 		}
+		warnf("%s=%q 不是合法数字，已回退默认值 %g", k, v, def)
 	}
 	return def
 }
@@ -129,11 +136,18 @@ func intListEnv(k string, def []int) []int {
 	}
 	var out []int
 	for _, p := range strings.Split(v, ",") {
-		if n, err := strconv.Atoi(strings.TrimSpace(p)); err == nil {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if n, err := strconv.Atoi(p); err == nil {
 			out = append(out, n)
+		} else {
+			warnf("%s 中的 %q 不是合法整数，已忽略该项", k, p)
 		}
 	}
 	if len(out) == 0 {
+		warnf("%s=%q 无任何合法整数，已回退默认值 %v", k, v, def)
 		return def
 	}
 	return out
@@ -158,8 +172,16 @@ func envInt(k string, def int) int {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
 			return n
 		}
+		warnf("%s=%q 不是合法整数，已回退默认值 %d", k, v, def)
 	}
 	return def
+}
+
+// warnf prints a configuration warning to stderr. Bad values are non-fatal:
+// the caller falls back to the documented default, but the operator is told
+// which key was ignored and why (satisfies “遇到错误的变量配置在命令中提示”).
+func warnf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "⚠ 配置警告："+format+"\n", args...)
 }
 
 // loadDotEnv is a minimal .env reader (no external dependency). Existing env
