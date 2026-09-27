@@ -1,6 +1,7 @@
 package app
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -26,7 +27,53 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/responses", s.handleResponses)
 	s.mountAdmin(mux)
 	s.mountWebUI(mux)
-	return s.hostGuard(mux)
+	return s.hostGuard(s.adminGuard(mux))
+}
+
+// adminGuard authenticates the /admin/* surface. Historically ADMIN_TOKEN was
+// read into config but never enforced, so the whole management API was open to
+// anyone who could reach the host — a real exposure once ALLOW_EXTERNAL_HOST=1
+// puts the server on a LAN/public interface. Now: when ADMIN_TOKEN is set every
+// /admin/* request must carry it (X-Admin-Token, or Authorization: Bearer);
+// when it is empty the management API is loopback-only, regardless of
+// ALLOW_EXTERNAL_HOST (inference endpoints can still be LAN-exposed behind their
+// API keys). The static WebUI at "/" is served without a token so the operator
+// can load the page and enter one.
+func (s *Server) adminGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/admin/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		token := s.o.cfg.AdminToken
+		if token == "" {
+			host := r.Host
+			if h, _, err := net.SplitHostPort(host); err == nil {
+				host = h
+			}
+			if !isLoopbackHost(host) {
+				writeJSON(w, http.StatusForbidden, map[string]any{"error": map[string]any{
+					"message": "管理端未设置 ADMIN_TOKEN，仅本机（回环）可访问。需要远程管理请设置 ADMIN_TOKEN 环境变量。",
+					"type":    "forbidden"}})
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+		provided := r.Header.Get("X-Admin-Token")
+		if provided == "" {
+			if a := r.Header.Get("Authorization"); strings.HasPrefix(a, "Bearer ") {
+				provided = strings.TrimSpace(a[7:])
+			}
+		}
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]any{
+				"message": "管理端令牌无效或缺失（请在请求头 X-Admin-Token 携带 ADMIN_TOKEN）。",
+				"type":    "unauthorized"}})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // hostGuard blocks DNS-rebinding: only loopback/allowed hosts unless
