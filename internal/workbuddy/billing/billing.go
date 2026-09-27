@@ -167,7 +167,7 @@ func minTS(a, b *float64) *float64 {
 	return a
 }
 
-func summarize(accounts []any) (remain, total float64, earliest *float64) {
+func summarize(accounts []any) (remain, total float64) {
 	for _, a := range accounts {
 		acct, ok := a.(map[string]any)
 		if !ok {
@@ -188,19 +188,8 @@ func summarize(accounts []any) (remain, total float64, earliest *float64) {
 			remain += math.Max(capRemain, 0)
 			total += capSize
 		}
-		if cycleRemain <= 0 && capRemain <= 0 {
-			continue
-		}
-		for _, kv := range []struct {
-			key  string
-			isMs bool
-		}{{"CycleEndTime", false}, {"ExpiredTime", false}, {"DeductionEndTime", true}} {
-			if ts := parseTS(acct[kv.key], kv.isMs); ts != nil {
-				earliest = minTS(earliest, ts)
-			}
-		}
 	}
-	return remain, total, earliest
+	return remain, total
 }
 
 func summarizePackages(accounts []any) []map[string]any {
@@ -284,6 +273,31 @@ func summarizePackages(accounts []any) []map[string]any {
 	return out
 }
 
+// earliestPackageExpiry returns the soonest real per-package expiry among
+// packages that still hold a positive balance — the truthful "credits will
+// actually vanish" time. This is used for the account-level ExpireAt instead of
+// summarize()'s min over CycleEndTime/ExpiredTime/DeductionEndTime, which
+// upstream fills with a rolling daily-cycle boundary that reads as the same
+// near-date for every account and is not a real expiry. Returns nil when no
+// package with a balance carries a known expiry.
+func earliestPackageExpiry(pkgs []map[string]any) *float64 {
+	var best *float64
+	for _, g := range pkgs {
+		if rem, _ := g["remain"].(float64); rem <= 0 {
+			continue
+		}
+		ea, ok := g["expire_at"].(float64)
+		if !ok {
+			continue
+		}
+		if best == nil || ea < *best {
+			e := ea
+			best = &e
+		}
+	}
+	return best
+}
+
 func fetchNewCredits(ctx context.Context, mgr Credential) *Credit {
 	now := time.Now()
 	dayStart := now.Format("2006-01-02") + " 00:00:00"
@@ -315,8 +329,9 @@ func fetchNewCredits(ctx context.Context, mgr Credential) *Credit {
 	if len(accounts) == 0 {
 		return nil
 	}
-	remain, total, expireAt := summarize(accounts)
-	return &Credit{Remain: math.Round(remain), Total: math.Round(total), ExpireAt: expireAt, Packages: summarizePackages(accounts)}
+	remain, total := summarize(accounts)
+	pkgs := summarizePackages(accounts)
+	return &Credit{Remain: math.Round(remain), Total: math.Round(total), ExpireAt: earliestPackageExpiry(pkgs), Packages: pkgs}
 }
 
 func fetchOldCredits(ctx context.Context, mgr Credential) *Credit {
@@ -335,8 +350,9 @@ func fetchOldCredits(ctx context.Context, mgr Credential) *Credit {
 	if len(accounts) == 0 {
 		return nil
 	}
-	remain, total, expireAt := summarize(accounts)
-	return &Credit{Remain: math.Round(remain), Total: math.Round(total), ExpireAt: expireAt, Packages: summarizePackages(accounts)}
+	remain, total := summarize(accounts)
+	pkgs := summarizePackages(accounts)
+	return &Credit{Remain: math.Round(remain), Total: math.Round(total), ExpireAt: earliestPackageExpiry(pkgs), Packages: pkgs}
 }
 
 // FetchCredits queries the account's spendable credit balance.
