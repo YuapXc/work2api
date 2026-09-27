@@ -54,6 +54,12 @@ const reasoningTag = computed<{ text: string; tone: 'brand' | 'live' | 'warn' } 
   if (r.onlyReasoning) return { text: '仅思考', tone: 'warn' }
   return { text: '思考', tone: 'brand' }
 })
+
+// SystemOne 决策模型（opencode）：native_protocol=systemone。这类模型的请求体是
+// 结构化决策 payload，和聊天消息完全不同，用 /v1/chat|messages|responses 调用会被
+// 上游 400。保留展示但明确标注，避免误用（后续如接决策端点可直接用）。
+const systemOne = computed(() => String(m.value.native_protocol || '').toLowerCase() === 'systemone')
+
 </script>
 
 <template>
@@ -72,6 +78,13 @@ const reasoningTag = computed<{ text: string; tone: 'brand' | 'live' | 'warn' } 
       <WTag :tone="multimodal ? 'route' : 'muted'">{{ multimodal ? '多模态' : '文本' }}</WTag>
       <WTag v-if="reasoningTag" :tone="reasoningTag.tone">{{ reasoningTag.text }}</WTag>
       <WTag v-if="m.supportsToolCall" tone="live">工具调用</WTag>
+      <WTag v-if="systemOne" tone="warn" title="仅 SystemOne 决策协议，不能用普通聊天/消息/Responses 接口调用">SystemOne</WTag>
+    </div>
+
+    <!-- SystemOne 模型用法提示：这类模型只接受结构化决策 payload，普通聊天/消息/
+         Responses 调用会被上游 400，明确标注避免误用。 -->
+    <div v-if="systemOne" class="rounded-lg border border-warn/30 bg-warn/5 px-2.5 py-1.5 text-micro leading-relaxed text-warn">
+      仅 <span class="mono">SystemOne</span> 决策协议模型：无法用聊天 / 消息 / Responses 接口调用（会返回 400），需按 SystemOne 结构化 payload 请求。
     </div>
 
     <!-- 思考强度档位：低/中/高/… + 可关思考时的 off。仅当本页有带档位的模型时，

@@ -105,6 +105,9 @@ export interface ModelInfo {
   credits?: number
   /** 每站点成本系数，如 {domestic:0.03, international:0}；仅两站点不同价时前端分列。 */
   credits_by_region?: Record<string, number>
+  /** 上游原生协议（opencode）：chat/anthropic/responses/systemone。
+   *  systemone 模型无法用普通聊天/消息接口调用，卡片会标注提示。 */
+  native_protocol?: string
   temperature?: number
   top_p?: number
   vendor?: string
