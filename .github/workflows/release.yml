@@ -198,6 +198,8 @@ jobs:
           fi
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" release-files/* --clobber --repo "$GITHUB_REPOSITORY"
+            # tag 被删重建时旧 release 会失去 tag 引用变成 draft，这里显式转正
+            gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$RELEASE_TAG" release-files/* "${release_type[@]}" --generate-notes --title "$RELEASE_TAG" --target "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
           fi
