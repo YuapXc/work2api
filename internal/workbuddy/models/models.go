@@ -538,6 +538,12 @@ func extractCaps(m map[string]any) map[string]any {
 	if desc == "" {
 		desc = str(m["descriptionEn"])
 	}
+	// 上游 catalog 的 tags 里偶带营销标记（如 "badge:夜间折扣:#3B82F6"），
+	// 原样透传给 WebUI 做价格时段提醒展示。
+	var tags []any
+	if t, ok := m["tags"].([]any); ok {
+		tags = t
+	}
 	return map[string]any{
 		"modality":         modality,
 		"supportsToolCall": boolOf(m["supportsToolCall"]),
@@ -547,6 +553,7 @@ func extractCaps(m map[string]any) map[string]any {
 		"top_p":            m["top_p"],
 		"vendor":           m["vendor"],
 		"description":      desc,
+		"tags":             tags,
 	}
 }
 

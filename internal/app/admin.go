@@ -45,6 +45,7 @@ func (s *Server) mountAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /admin/apps/{id}", s.adminDeleteApp)
 	mux.HandleFunc("POST /admin/credits/refresh", s.adminRefreshCredits)
 	mux.HandleFunc("POST /admin/checkin", s.adminCheckin)
+	mux.HandleFunc("GET /admin/checkin/history", s.adminCheckinHistory)
 	mux.HandleFunc("GET /admin/usage/summary", s.adminUsageSummary)
 	mux.HandleFunc("GET /admin/usage/timeseries", s.adminUsageTimeseries)
 	mux.HandleFunc("GET /admin/usage/recent", s.adminUsageRecent)
@@ -55,6 +56,7 @@ func (s *Server) mountAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/models/refresh", s.adminRefreshModels)
 	mux.HandleFunc("GET /admin/models/benchmarks", s.adminBenchmarks)
 	mux.HandleFunc("POST /admin/models/benchmarks/refresh", s.adminBenchmarksRefresh)
+	mux.HandleFunc("POST /admin/models/test", s.adminModelTest)
 	mux.HandleFunc("GET /admin/settings", s.adminGetSettings)
 	mux.HandleFunc("POST /admin/settings", s.adminSaveSettings)
 	s.mountProviderAdmin(mux)
@@ -193,8 +195,21 @@ func accountFloat(a map[string]any, key string) float64 {
 		return v
 	case int64:
 		return float64(v)
+	case *float64:
+		// billing.summarizePackages 的内存态 expire_at 先是 *float64，JSON 归一化
+		// 才解引用；creditAlerts 走内存路径（pool.AllAccounts）必须接住指针形态。
+		if v != nil {
+			return *v
+		}
 	}
 	return 0
+}
+
+func accountString(a map[string]any, key string) string {
+	if s, ok := a[key].(string); ok {
+		return s
+	}
+	return ""
 }
 
 // creditPrediction estimates how many tokens the remaining credits can buy,
@@ -280,17 +295,36 @@ func (s *Server) creditAlerts(accounts []map[string]any) []map[string]any {
 		if enabled, _ := a["enabled"].(bool); !enabled {
 			continue
 		}
-		exp := accountFloat(a, "credits_expire_at")
-		rem := accountFloat(a, "credits_remaining")
-		if exp == 0 || rem == 0 {
-			continue
+		// 按资源包粒度提醒（与 WebUI 积分构成浮窗同源）：账号级 credits_expire_at
+		// 是最早一个包的到期时间，把整个账号余额说成"将过期"是错的——到期的只是
+		// 那一个包。remain<=0 的已耗尽包不计。credit_packages 在内存路径是
+		// []map[string]any（pool 直通），JSON round-trip 后是 []any，两种都要接住。
+		var pkgs []map[string]any
+		switch v := a["credit_packages"].(type) {
+		case []map[string]any:
+			pkgs = v
+		case []any:
+			for _, raw := range v {
+				if m, ok := raw.(map[string]any); ok {
+					pkgs = append(pkgs, m)
+				}
+			}
 		}
-		daysLeft := (exp - now) / 86400
-		if daysLeft >= 0 && daysLeft <= expiryDays {
-			alerts = append(alerts, map[string]any{
-				"level": "info", "kind": "expiry", "uid": a["uid"],
-				"message": fmt.Sprintf("账号 %s 有 %.0f 积分将在 %.1f 天后过期", accountLabel(a), rem, daysLeft),
-			})
+		for _, p := range pkgs {
+			rem := accountFloat(p, "remain")
+			exp := accountFloat(p, "expire_at")
+			if exp == 0 || rem <= 0 {
+				continue
+			}
+			daysLeft := (exp - now) / 86400
+			if daysLeft >= 0 && daysLeft <= expiryDays {
+				alerts = append(alerts, map[string]any{
+					"level": "info", "kind": "expiry", "uid": a["uid"],
+					"message": fmt.Sprintf("账号 %s 的资源包「%s」剩 %.0f 积分将于 %s 过期（%.1f 天后）",
+						accountLabel(a), accountString(p, "name"), rem,
+						time.Unix(int64(exp), 0).Format("01-02 15:04"), daysLeft),
+				})
+			}
 		}
 	}
 	return alerts
@@ -469,6 +503,25 @@ func (s *Server) adminRefreshCredits(w http.ResponseWriter, r *http.Request) {
 // existing WebUI. It delegates to the shared workbuddy checkin helper.
 func (s *Server) adminCheckin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.runWorkbuddyCheckin(context.Background()))
+}
+
+// adminCheckinHistory serves the per-account check-in calendar data:
+// {uid: ["YYYY-MM-DD", ...]} for the last N days (default 35, ?days=).
+func (s *Server) adminCheckinHistory(w http.ResponseWriter, r *http.Request) {
+	days, _ := strconv.Atoi(r.URL.Query().Get("days"))
+	if days <= 0 || days > 366 {
+		days = 35
+	}
+	since := time.Now().AddDate(0, 0, -(days - 1)).Format("2006-01-02")
+	history, err := s.o.db.CheckinHistory(since)
+	if err != nil {
+		writeJSON(w, 500, errBody(500, "读取签到历史失败: "+err.Error(), "internal_error").body)
+		return
+	}
+	if history == nil {
+		history = map[string][]string{}
+	}
+	writeJSON(w, 200, map[string]any{"days": days, "since": since, "history": history})
 }
 
 func (s *Server) adminUsageSummary(w http.ResponseWriter, r *http.Request) {

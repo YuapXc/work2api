@@ -15,6 +15,12 @@ import (
 // the model is not namespaced to any runtime, leaving the default (workbuddy)
 // path to handle it.
 func (s *Server) dispatchRuntime(w http.ResponseWriter, r *http.Request, proto provider.Protocol, payload map[string]any, principal *Principal) bool {
+	return s.dispatchRuntimeTo(w, r, proto, payload, principal)
+}
+
+// dispatchRuntimeTo is dispatchRuntime with an explicit writer (the model test
+// endpoint injects an httptest.Recorder to capture the response).
+func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto provider.Protocol, payload map[string]any, principal *Principal) bool {
 	rawModel := strOr(payload["model"], "")
 	if rawModel == "" {
 		return false
