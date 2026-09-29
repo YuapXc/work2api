@@ -22,6 +22,13 @@ type AnthropicStreamConverter struct {
 	textBlockOpen bool
 	textBlockIdx  int
 
+	// thinking 追踪：上游 reasoning_content 增量 → Anthropic thinking block。
+	// 不产出 signature：本网关的请求转换器本就会剥掉 thinking 签名回传，客户端
+	// 多轮带上无签名 thinking block 是安全形态。
+	thinkingContent   strings.Builder
+	thinkingBlockOpen bool
+	thinkingBlockIdx  int
+
 	toolUses     map[int]*toolUseSlot
 	toolOrder    []int
 	nextBlockIdx int
@@ -71,6 +78,10 @@ func (c *AnthropicStreamConverter) FeedLine(line string) string {
 // Finish emits the closing events.
 func (c *AnthropicStreamConverter) Finish() string {
 	var events strings.Builder
+	if c.thinkingBlockOpen {
+		events.WriteString(c.evt("content_block_stop", map[string]any{"index": c.thinkingBlockIdx}))
+		c.thinkingBlockOpen = false
+	}
 	if c.textBlockOpen {
 		events.WriteString(c.evt("content_block_stop", map[string]any{"index": c.textBlockIdx}))
 		c.textBlockOpen = false
@@ -150,9 +161,36 @@ func (c *AnthropicStreamConverter) processChunk(chunk map[string]any) string {
 		finish, _ := choice["finish_reason"].(string)
 
 		if delta != nil {
+			// thinking 增量：上游 reasoning_content → thinking block（先于正文）。
+			// thinking 与 text 交替时按 Anthropic 语义切换 block：开 thinking 前先
+			// 关掉打开中的 text block，正文出现时先关 thinking 再开新 text。
+			if reasoning, ok := delta["reasoning_content"].(string); ok && reasoning != "" {
+				c.thinkingContent.WriteString(reasoning)
+				if !c.thinkingBlockOpen {
+					if c.textBlockOpen {
+						events.WriteString(c.evt("content_block_stop", map[string]any{"index": c.textBlockIdx}))
+						c.textBlockOpen = false
+					}
+					c.thinkingBlockIdx = c.nextBlockIdx
+					c.nextBlockIdx++
+					events.WriteString(c.evt("content_block_start", map[string]any{
+						"index":         c.thinkingBlockIdx,
+						"content_block": map[string]any{"type": "thinking", "thinking": ""},
+					}))
+					c.thinkingBlockOpen = true
+				}
+				events.WriteString(c.evt("content_block_delta", map[string]any{
+					"index": c.thinkingBlockIdx,
+					"delta": map[string]any{"type": "thinking_delta", "thinking": reasoning},
+				}))
+			}
 			if content, ok := delta["content"].(string); ok && content != "" {
 				c.textContent.WriteString(content)
 				if !c.textBlockOpen {
+					if c.thinkingBlockOpen {
+						events.WriteString(c.evt("content_block_stop", map[string]any{"index": c.thinkingBlockIdx}))
+						c.thinkingBlockOpen = false
+					}
 					c.textBlockIdx = c.nextBlockIdx
 					c.nextBlockIdx++
 					events.WriteString(c.evt("content_block_start", map[string]any{
@@ -213,6 +251,10 @@ func (c *AnthropicStreamConverter) processChunk(chunk map[string]any) string {
 
 		if finish != "" {
 			c.finishReason = finish
+			if c.thinkingBlockOpen {
+				events.WriteString(c.evt("content_block_stop", map[string]any{"index": c.thinkingBlockIdx}))
+				c.thinkingBlockOpen = false
+			}
 			if c.textBlockOpen {
 				events.WriteString(c.evt("content_block_stop", map[string]any{"index": c.textBlockIdx}))
 				c.textBlockOpen = false
@@ -240,6 +282,9 @@ func (c *AnthropicStreamConverter) evt(eventType string, data map[string]any) st
 
 func (c *AnthropicStreamConverter) buildContentBlocks() []any {
 	var blocks []any
+	if c.thinkingContent.Len() > 0 || c.thinkingBlockOpen {
+		blocks = append(blocks, map[string]any{"type": "thinking", "thinking": c.thinkingContent.String()})
+	}
 	if c.textContent.Len() > 0 || c.textBlockOpen {
 		blocks = append(blocks, map[string]any{"type": "text", "text": c.textContent.String()})
 	}
@@ -279,6 +324,9 @@ func (c *AnthropicStreamConverter) ToolsSummary() string {
 
 // TextContent returns the accumulated assistant text (for usage logging).
 func (c *AnthropicStreamConverter) TextContent() string { return c.textContent.String() }
+
+// Reasoning returns the accumulated thinking text (for usage logging).
+func (c *AnthropicStreamConverter) Reasoning() string { return c.thinkingContent.String() }
 
 // Usage returns the merged usage map (may be nil).
 func (c *AnthropicStreamConverter) Usage() map[string]any { return c.usage }

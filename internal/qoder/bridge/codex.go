@@ -102,8 +102,19 @@ func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[
 
 		var toolCallBuf []interface{}
 		var streamFull strings.Builder
+		var streamReasoning strings.Builder
 
 		err := b.CallQoder(ctx, "codex", messages, model, tools, func(d Delta) {
+			if d.Reasoning != "" {
+				streamReasoning.WriteString(d.Reasoning)
+				writeEvent("response.reasoning_text.delta", map[string]interface{}{
+					"type":          "response.reasoning_text.delta",
+					"item_id":       outputItemId,
+					"output_index":  0,
+					"content_index": 0,
+					"delta":         d.Reasoning,
+				})
+			}
 			if d.Content != "" {
 				streamFull.WriteString(d.Content)
 				writeEvent("response.output_text.delta", map[string]interface{}{
@@ -119,6 +130,7 @@ func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[
 			}
 		})
 		result.Output = streamFull.String()
+		result.Reasoning = streamReasoning.String()
 		if err != nil {
 			logger.Error("[Codex][%s] stream 请求失败: %v (耗时 %dms)", reqID, err, time.Since(startTime).Milliseconds())
 			errMsg, _ := FriendlyError(err)
@@ -188,8 +200,12 @@ func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[
 		return result, nil
 	} else {
 		var full strings.Builder
+		var reasoning strings.Builder
 		var toolCallBuf []interface{}
 		err := b.CallQoder(ctx, "codex", messages, model, tools, func(d Delta) {
+			if d.Reasoning != "" {
+				reasoning.WriteString(d.Reasoning)
+			}
 			if d.Content != "" {
 				full.WriteString(d.Content)
 			}
@@ -198,6 +214,7 @@ func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[
 			}
 		})
 		result.Output = full.String()
+		result.Reasoning = reasoning.String()
 		if err != nil {
 			logger.Error("[Codex][%s] 请求失败: %v (耗时 %dms)", reqID, err, time.Since(startTime).Milliseconds())
 			WriteCodexErr(w, err)
@@ -205,6 +222,14 @@ func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[
 		}
 
 		output := []interface{}{}
+		if reasoning.Len() > 0 {
+			output = append(output, map[string]interface{}{
+				"type": "reasoning", "id": "rs_" + cosy.NewRequestID(),
+				"summary": []interface{}{
+					map[string]interface{}{"type": "summary_text", "text": reasoning.String()},
+				},
+			})
+		}
 		if full.Len() > 0 {
 			output = append(output, map[string]interface{}{
 				"type": "message", "role": "assistant",

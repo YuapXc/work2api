@@ -25,6 +25,10 @@ type ResponsesStreamConverter struct {
 	toolCalls map[int]*respToolCall
 	toolOrder []int
 
+	// thinking 追踪：上游 reasoning_content 增量 → Responses reasoning 项，
+	// 排在 message 项之前（summary text 形态，无服务端 id，不参与上游回放校验）。
+	reasoning strings.Builder
+
 	finishReason string
 	usage        map[string]any
 	errObj       map[string]any
@@ -139,6 +143,12 @@ func (c *ResponsesStreamConverter) processChunk(chunk map[string]any) string {
 		finish, _ := choice["finish_reason"].(string)
 
 		if delta != nil {
+			if reasoning, ok := delta["reasoning_content"].(string); ok && reasoning != "" {
+				c.reasoning.WriteString(reasoning)
+				events.WriteString(c.evt("response.reasoning_text.delta", map[string]any{
+					"output_index": 0, "content_index": 0, "delta": reasoning,
+				}))
+			}
 			if content, ok := delta["content"].(string); ok && content != "" {
 				if !c.emittedMsgItem {
 					events.WriteString(c.evt("response.output_item.added", map[string]any{
@@ -248,6 +258,13 @@ func (c *ResponsesStreamConverter) fcItem(tc *respToolCall, status string) map[s
 
 func (c *ResponsesStreamConverter) responseObj(status string) map[string]any {
 	var output []any
+	if c.reasoning.Len() > 0 {
+		output = append(output, map[string]any{
+			"type":    "reasoning",
+			"id":      randID("rs_"),
+			"summary": []any{map[string]any{"type": "summary_text", "text": c.reasoning.String()}},
+		})
+	}
 	if c.emittedMsgItem || c.content.Len() > 0 {
 		output = append(output, c.msgItem(status, false))
 	}
@@ -299,6 +316,9 @@ func (c *ResponsesStreamConverter) ToolsSummary() string {
 
 // TextContent returns the accumulated assistant text (for usage logging).
 func (c *ResponsesStreamConverter) TextContent() string { return c.content.String() }
+
+// Reasoning returns the accumulated thinking text (for usage logging).
+func (c *ResponsesStreamConverter) Reasoning() string { return c.reasoning.String() }
 
 // Usage returns the merged usage map (may be nil).
 func (c *ResponsesStreamConverter) Usage() map[string]any { return c.usage }

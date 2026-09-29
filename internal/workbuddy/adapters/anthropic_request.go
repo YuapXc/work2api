@@ -65,6 +65,19 @@ func AnthropicRequestToChat(body map[string]any) (map[string]any, error) {
 			}
 		}
 	}
+	// thinking.budget_tokens → reasoning_effort 档位。显式 output_config.effort
+	// 恒优先（上方已写入）；budget 只在客户端未声明 effort 时生效。ladder 与
+	// core/protocol 的 effortForThinkingBudget 对齐：8192→high、16384→xhigh、
+	// 32768→max，往返不重排档位。
+	if _, stated := chat["reasoning_effort"]; !stated {
+		if th, ok := body["thinking"].(map[string]any); ok {
+			if typ, _ := th["type"].(string); strings.EqualFold(typ, "disabled") {
+				// 显式关闭：不注入档位。
+			} else if effort := budgetToEffort(jsonNum(th["budget_tokens"])); effort != "" {
+				chat["reasoning_effort"] = effort
+			}
+		}
+	}
 	if tools, ok := body["tools"].([]any); ok && len(tools) > 0 {
 		chat["tools"] = convertAnthropicTools(tools)
 	}
@@ -94,6 +107,40 @@ func AnthropicRequestToChat(body map[string]any) (map[string]any, error) {
 		chat["stop"] = v
 	}
 	return chat, nil
+}
+
+// budgetToEffort maps an Anthropic thinking budget onto an effort rung, same
+// ladder as core/protocol.effortForThinkingBudget: 32768+→max, 16384+→xhigh,
+// 8192+→high, 2048+→medium, else low. Missing budget defaults to "high"
+// (thinking enabled without a budget asks for deep thinking). Empty means the
+// caller should not inject an effort.
+func budgetToEffort(budget int) string {
+	switch {
+	case budget <= 0:
+		// thinking:{enabled} without a budget asks for deep thinking.
+		return "high"
+	case budget >= 32768:
+		return "max"
+	case budget >= 16384:
+		return "xhigh"
+	case budget >= 8192:
+		return "high"
+	case budget > 2048:
+		return "medium"
+	default:
+		return "low"
+	}
+}
+
+// jsonNum reads a JSON number out of a decoded body (float64/int shapes).
+func jsonNum(v any) int {
+	switch x := v.(type) {
+	case float64:
+		return int(x)
+	case int:
+		return x
+	}
+	return 0
 }
 
 func extractSystemText(system any) string {

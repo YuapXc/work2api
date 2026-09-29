@@ -74,6 +74,7 @@ func (b *Bridge) ServeChat(ctx context.Context, w http.ResponseWriter, req map[s
 		var toolCallBuf []interface{}
 		var totalInputTokens, totalOutputTokens int
 		var streamFull strings.Builder
+		var streamReasoning strings.Builder
 
 		err := b.CallQoder(ctx, InferAgent(model), messages, model, tools, func(d Delta) {
 			if d.Err != nil {
@@ -87,6 +88,10 @@ func (b *Bridge) ServeChat(ctx context.Context, w http.ResponseWriter, req map[s
 			chunk := MakeChatChunk(reqId, created, model)
 			choices := chunk["choices"].([]interface{})
 			delta := choices[0].(map[string]interface{})["delta"].(map[string]interface{})
+			if d.Reasoning != "" {
+				delta["reasoning_content"] = d.Reasoning
+				streamReasoning.WriteString(d.Reasoning)
+			}
 			if d.Content != "" {
 				delta["role"] = "assistant"
 				delta["content"] = d.Content
@@ -109,6 +114,7 @@ func (b *Bridge) ServeChat(ctx context.Context, w http.ResponseWriter, req map[s
 		result.InputTokens = totalInputTokens
 		result.OutputTokens = totalOutputTokens
 		result.Output = streamFull.String()
+		result.Reasoning = streamReasoning.String()
 		if err != nil {
 			logger.Error("[Chat][%s] stream 请求失败: %v (耗时 %dms)", reqID, err, time.Since(startTime).Milliseconds())
 			errMsg, errType := FriendlyError(err)
@@ -146,12 +152,16 @@ func (b *Bridge) ServeChat(ctx context.Context, w http.ResponseWriter, req map[s
 		return result, nil
 	} else {
 		var full strings.Builder
+		var reasoning strings.Builder
 		var toolCallBuf []interface{}
 		var totalInputTokens, totalOutputTokens int
 		err := b.CallQoder(ctx, InferAgent(model), messages, model, tools, func(d Delta) {
 			if d.InputTokens > 0 || d.OutputTokens > 0 {
 				totalInputTokens = d.InputTokens
 				totalOutputTokens = d.OutputTokens
+			}
+			if d.Reasoning != "" {
+				reasoning.WriteString(d.Reasoning)
 			}
 			if d.Content != "" {
 				full.WriteString(d.Content)
@@ -163,6 +173,7 @@ func (b *Bridge) ServeChat(ctx context.Context, w http.ResponseWriter, req map[s
 		result.InputTokens = totalInputTokens
 		result.OutputTokens = totalOutputTokens
 		result.Output = full.String()
+		result.Reasoning = reasoning.String()
 		if err != nil {
 			logger.Error("[Chat][%s] 请求失败: %v (耗时 %dms)", reqID, err, time.Since(startTime).Milliseconds())
 			WriteErr(w, err)
@@ -170,6 +181,9 @@ func (b *Bridge) ServeChat(ctx context.Context, w http.ResponseWriter, req map[s
 		}
 		finishReason := "stop"
 		msg := map[string]interface{}{"role": "assistant", "content": full.String()}
+		if reasoning.Len() > 0 {
+			msg["reasoning_content"] = reasoning.String()
+		}
 		if len(toolCallBuf) > 0 {
 			finishReason = "tool_calls"
 			// Merge streamed tool-call fragments (all index 0, id+name on the

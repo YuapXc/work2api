@@ -145,6 +145,7 @@ type converter interface {
 	GetNonstreamResponse() map[string]any
 	ToolsSummary() string
 	TextContent() string
+	Reasoning() string
 	Usage() map[string]any
 }
 
@@ -212,11 +213,8 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 	if streamMode {
 		writeChunk, _ = sseWriter(w)
 	}
-	var reason string
 	sink := func(line string) error {
 		evt := conv.FeedLine(line)
-		_, rr := deltaParts(line)
-		reason += rr
 		if evt != "" && streamMode {
 			writeChunk(evt)
 		}
@@ -246,7 +244,7 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 	}
 	finish := conv.Finish()
 	out := conv.TextContent() + conv.ToolsSummary()
-	o.logUsage(logArgs{protocol: protocol, model: model, acc: served, t0: t0, status: "ok", usage: conv.Usage(), input: input, output: out, reasoning: reason, appName: principal.AppName, effort: effort, updatePool: true})
+	o.logUsage(logArgs{protocol: protocol, model: model, acc: served, t0: t0, status: "ok", usage: conv.Usage(), input: input, output: out, reasoning: conv.Reasoning(), appName: principal.AppName, effort: effort, updatePool: true})
 	if streamMode {
 		writeChunk(finish)
 		return
