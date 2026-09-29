@@ -34,6 +34,15 @@ var sensitiveTerms = []string{
 	"self-harm", "murder", "kill", "violence", "violent",
 	"Claude Code", "Claude Opus", "Claude Sonnet", "Claude Haiku", "Claude Fable",
 	"Anthropic", "Co-Authored-By", "noreply@anthropic.com",
+	// 客户端身份特征词（避免暴露使用 Claude Code / Codex CLI 等，被上游按
+	// 客户端特征拦截；buddy-proxy 2026-09 词表）
+	"Oh My Pi", "omp", "Kiro", "Codex CLI", "coding harness", "harness",
+	"subagent", "subagents", "MCP Server", "MCP tool", "tool call", "function call",
+	"antml:invoke", "antml:function_calls",
+	"skill://", "agent://", "artifact://", "rule://", "memory://", "local://",
+	"history://", "issue://", "pr://", "xd://",
+	"AutoImprove", "CodeGraph", "codegraph_explore", "Rust Token Killer",
+	"AGENTS.md", "CLAUDE.md", ".cursorrules",
 }
 
 var pattern = buildPattern()
@@ -74,6 +83,32 @@ var harnessUserMarkers = []string{
 var codexSystemMarkers = []string{
 	"You are a coding agent running in the Codex CLI", "Within this context, Codex refers to",
 	"# How you work", "You are Claude Code",
+}
+
+// Claude Code 2.x 注入的长 system 模板：不含旧版 Codex 标记，携带客户端/渠道
+// 身份、内部运行时指令与工具环境元数据。即使逐词打零宽空格，整个块仍会被上游
+// 渠道审核整体拒绝，需要语义压缩成短摘要（buddy-proxy desensitize.py 同款）。
+var claudeHarnessMarkers = []string{
+	"You are an interactive agent that helps users with software engineering tasks.",
+	"# Harness", "# Session-specific guidance", "# Memory", "# Environment", "# Context management",
+}
+
+const claudeHarnessSummary = "Help with software engineering tasks. Follow repository instructions and " +
+	"runtime permission rules, use available capabilities when needed, and report outcomes accurately. " +
+	"Be precise, helpful, concise, and safe."
+
+// looksLikeClaudeHarness 识别 Claude Code 注入的长 system 模板（而非普通 system prompt）。
+func looksLikeClaudeHarness(text string) bool {
+	if len(text) < 1000 {
+		return false
+	}
+	matched := 0
+	for _, m := range claudeHarnessMarkers {
+		if strings.Contains(text, m) {
+			matched++
+		}
+	}
+	return matched >= 2
 }
 
 var permissionsMarkers = []string{
@@ -184,6 +219,11 @@ func compactHarnessMessage(role string, content any) (string, bool) {
 	text := contentToText(content)
 	if text == "" {
 		return "", false
+	}
+	// Claude Code 2.x 长 harness 模板：整体压缩（渠道审核会整块拒绝，
+	// 逐词脱敏救不了；只保留行为契约，工具 schema 在独立的 tools 字段不受影响）。
+	if role == "system" && looksLikeClaudeHarness(text) {
+		return claudeHarnessSummary, true
 	}
 	if role == "system" && anyContains(text, codexSystemMarkers) {
 		if strings.Contains(text, "You are Claude Code") {

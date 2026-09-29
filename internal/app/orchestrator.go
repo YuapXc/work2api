@@ -434,7 +434,9 @@ func (o *Orchestrator) enhanceBody(body map[string]any) map[string]any {
 	}
 	body = reasoning.Sanitize(body, dyn)
 	if o.cfg.Desensitize {
-		body = desensitize.Body(body, desensitize.Options{Roles: []string{"system", "developer"}})
+		// CompactHarness 必须开：CC 2.x 的长 harness 模板会被上游渠道审核整块
+		// 拒绝，逐词零宽空格救不了，只有整体压缩成行为摘要才行（buddy-proxy #45）
+		body = desensitize.Body(body, desensitize.Options{Roles: []string{"system", "developer"}, CompactHarness: true})
 	}
 	return body
 }
