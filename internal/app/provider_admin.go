@@ -337,7 +337,7 @@ func (s *Server) runWorkbuddyCheckin(ctx context.Context) map[string]any {
 		}
 		res, err := billingCheckin(ctx, mgr)
 		if err == nil && (res.OK || res.Already) {
-			_ = s.o.db.SetCheckinDate(a.UID, today)
+			_ = s.o.db.RecordCheckin(a.UID, today, "manual")
 		}
 		msg := res.Message
 		if err != nil && msg == "" {

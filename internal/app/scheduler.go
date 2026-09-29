@@ -191,7 +191,9 @@ func (s *Scheduler) doCheckin() []string {
 		}
 		log.Printf("签到 %s: ok=%v already=%v %s", acc.UID, res.OK, res.Already, res.Message)
 		if res.OK || res.Already {
-			_ = s.o.db.SetCheckinDate(acc.UID, t) // record only on success/already, so failures retry
+			// record only on success/already, so failures retry；
+			// 同时追加历史（签到日历数据源），already 也记（幂等）。
+			_ = s.o.db.RecordCheckin(acc.UID, t, "auto")
 		} else {
 			failed = append(failed, acc.UID)
 		}

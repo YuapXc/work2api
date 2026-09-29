@@ -115,6 +115,10 @@ CREATE TABLE IF NOT EXISTS model_cooldowns (
     account_uid TEXT, model TEXT, cooldown_until REAL, reason TEXT,
     created_at REAL, PRIMARY KEY (account_uid, model)
 );
+CREATE TABLE IF NOT EXISTS checkin_history (
+    account_uid TEXT, date TEXT, source TEXT DEFAULT 'auto',
+    created_at REAL, PRIMARY KEY (account_uid, date)
+);
 CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_logs(ts);
 CREATE INDEX IF NOT EXISTS idx_usage_account ON usage_logs(account_uid);
 CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_logs(model);
@@ -234,6 +238,49 @@ func (d *DB) SetCheckinDate(uid, date string) error {
 	_, err := d.db.Exec("UPDATE accounts SET last_checkin_date=?, updated_at=? WHERE uid=?",
 		date, float64(time.Now().UnixNano())/1e9, uid)
 	return err
+}
+
+// RecordCheckin appends one day to the check-in history (idempotent per uid+date)
+// and updates the account's last_checkin_date. source: auto (scheduler) / manual.
+func (d *DB) RecordCheckin(uid, date, source string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, err := d.db.Exec(
+		"INSERT OR IGNORE INTO checkin_history (account_uid, date, source, created_at) VALUES (?,?,?,?)",
+		uid, date, source, float64(time.Now().UnixNano())/1e9); err != nil {
+		return err
+	}
+	_, err := d.db.Exec("UPDATE accounts SET last_checkin_date=?, updated_at=? WHERE uid=?",
+		date, float64(time.Now().UnixNano())/1e9, uid)
+	return err
+}
+
+// CheckinHistory returns the check-in history (YYYY-MM-DD list) for every
+// account since the given date (inclusive), grouped by uid. Empty date = all.
+func (d *DB) CheckinHistory(since string) (map[string][]string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	q := "SELECT account_uid, date FROM checkin_history"
+	args := []any{}
+	if since != "" {
+		q += " WHERE date >= ?"
+		args = append(args, since)
+	}
+	q += " ORDER BY date"
+	rows, err := d.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]string{}
+	for rows.Next() {
+		var uid, date string
+		if err := rows.Scan(&uid, &date); err != nil {
+			return nil, err
+		}
+		out[uid] = append(out[uid], date)
+	}
+	return out, rows.Err()
 }
 
 // CheckinDates returns {uid: last_checkin_date}.
