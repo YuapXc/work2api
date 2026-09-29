@@ -1,8 +1,11 @@
 <script setup lang="ts">
 // 模型卡片：名称/命名空间 id + 供应商标签 + 能力标签 + 关键指标 + 描述 +
-// （若后端提供）可调用账号。用于统一模型目录。
-import { computed } from 'vue'
+// （若后端提供）可调用账号 + 一键测试（单模型单次，可编辑 prompt）。
+import { computed, ref } from 'vue'
 import WTag from '@/components/ui/WTag.vue'
+import WButton from '@/components/ui/WButton.vue'
+import { api } from '@/api/client'
+import { toast } from '@/lib/toast'
 import { int } from '@/lib/format'
 import { providerMeta } from '@/lib/providers'
 
@@ -60,6 +63,53 @@ const reasoningTag = computed<{ text: string; tone: 'brand' | 'live' | 'warn' } 
 // 上游 400。保留展示但明确标注，避免误用（后续如接决策端点可直接用）。
 const systemOne = computed(() => String(m.value.native_protocol || '').toLowerCase() === 'systemone')
 
+// ---- 一键测试（单模型单次）----
+// 不做批量：一次只测一个模型，prompt 可编辑（默认 hi），max_tokens 上限 64。
+// 后端有 5s 最小间隔 + 单飞频控。SystemOne 决策模型不支持聊天调用，不给按钮。
+interface TestResult {
+  ok: boolean
+  latency_ms: number
+  content?: string
+  error?: string
+  finish_reason?: string
+}
+const testResult = ref<TestResult | null>(null)
+const testing = ref(false)
+const testPrompt = ref('')
+
+async function runTest() {
+  if (testing.value || systemOne.value) return
+  testing.value = true
+  testResult.value = null
+  try {
+    const res: TestResult = await api.modelTest(m.value.id, testPrompt.value || 'hi')
+    testResult.value = res
+    if (!res.ok) toast.error(`测试失败：${res.error || '未知错误'}`)
+  } catch (e: any) {
+    testResult.value = { ok: false, latency_ms: 0, error: e?.message || String(e) }
+    toast.error('测试请求失败')
+  } finally {
+    testing.value = false
+  }
+}
+
+// ---- 价格时段提醒 ----
+// 上游 catalog 的 tags 偶带定价说明（"badge:夜间折扣:#3B82F6"、"限时免费" 等）。
+// 这里解析成卡片上的提醒标签：badge:文本:#色号 或纯文本都接受，纯文本用默认色。
+// 这类模型按时段高低价计费，选号/成本预估以成本系数列为准，时段内实扣可能更低。
+const pricingNotes = computed(() => {
+  const tags = (m.value.tags || []) as string[]
+  const notes: { text: string; color: string }[] = []
+  for (const t of tags) {
+    if (typeof t !== 'string') continue
+    if (t.trim() === 'craft') continue // 上游内部标记（手工艺/质量档），与定价无关
+    const bd = t.match(/^badge:([^:]+)(?::#([0-9a-fA-F]{3,8}))?$/)
+    if (bd) notes.push({ text: bd[1].trim(), color: bd[2] ? `#${bd[2]}` : '' })
+    else notes.push({ text: t.trim(), color: '' })
+  }
+  return notes
+})
+
 </script>
 
 <template>
@@ -79,6 +129,17 @@ const systemOne = computed(() => String(m.value.native_protocol || '').toLowerCa
       <WTag v-if="reasoningTag" :tone="reasoningTag.tone">{{ reasoningTag.text }}</WTag>
       <WTag v-if="m.supportsToolCall" tone="live">工具调用</WTag>
       <WTag v-if="systemOne" tone="warn" title="仅 SystemOne 决策协议，不能用普通聊天/消息/Responses 接口调用">SystemOne</WTag>
+    </div>
+
+    <!-- 价格时段提醒：上游 catalog 标记的定价说明（夜间折扣/限时免费等）。
+         只做提醒不限制调用：这类模型按时段计费，时段内实扣可能低于成本系数。 -->
+    <div v-if="pricingNotes.length" class="rounded-lg border border-warn/30 bg-warn/5 px-2.5 py-1.5 text-micro leading-relaxed text-warn">
+      <span v-for="(n, i) in pricingNotes" :key="i"
+        class="mr-1.5 inline-flex items-center gap-1 rounded-md px-1.5 py-0.5"
+        :style="n.color ? { color: n.color, borderColor: n.color + '55', border: '1px solid' } : {}">
+        {{ n.text }}
+      </span>
+      <span class="text-faint">· 按时段计费，实际成本可能低于成本系数</span>
     </div>
 
     <!-- SystemOne 模型用法提示：这类模型只接受结构化决策 payload，普通聊天/消息/
@@ -150,6 +211,28 @@ const systemOne = computed(() => String(m.value.native_protocol || '').toLowerCa
           <div class="mono text-small font-semibold text-ink">{{ fmtScore(bench.math_index) }}</div>
           <div class="text-micro text-faint">数学</div>
         </div>
+      </div>
+    </div>
+
+    <!-- 一键测试：SystemOne 模型不支持聊天调用，不提供按钮。结果显示在下方。 -->
+    <div v-if="!systemOne" class="border-t border-line pt-3">
+      <div class="flex items-center gap-2">
+        <WButton size="sm" variant="ghost" :loading="testing" @click="runTest">
+          <WIcon v-if="!testing" name="bolt" :size="14" /> 测试
+        </WButton>
+        <input
+          v-model="testPrompt"
+          type="text"
+          placeholder="hi（可编辑测试语）"
+          class="mono h-8 min-w-0 flex-1 rounded-lg border border-line bg-bg/40 px-2 text-micro text-ink placeholder:text-faint focus:border-brand focus:outline-none"
+          @keydown.enter="runTest"
+        />
+      </div>
+      <div v-if="testResult" class="mt-2 rounded-lg border px-2.5 py-1.5 text-micro leading-relaxed"
+        :class="testResult.ok ? 'border-live/30 bg-live/5 text-muted' : 'border-fault/30 bg-fault/5 text-fault'">
+        <span class="mono">{{ testResult.latency_ms }}ms</span>
+        <template v-if="testResult.ok"> · <span class="text-live">通过</span><template v-if="testResult.finish_reason"> · {{ testResult.finish_reason }}</template> · <span>{{ testResult.content }}</span></template>
+        <template v-else> · <span>{{ testResult.error || '失败' }}</span></template>
       </div>
     </div>
 

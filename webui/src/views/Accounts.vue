@@ -209,6 +209,82 @@ function closePkgs() {
   }, 150)
 }
 
+// ---------- 签到日历 ----------
+// 悬停/点击「今日签到」列弹出 35 天打卡点阵。数据源 /admin/checkin/history，
+// 一次拉全量按 uid 索引；uid 短码是 8 位十六进制（uid 形如 ea3293e0-...）。
+const calOpenFor = ref<string | null>(null)
+const calStyle = ref<Record<string, string>>({})
+const calData = ref<Record<string, string[]>>({})
+const calDays = ref(35)
+const calAnchor = ref<HTMLElement | null>(null)
+
+function shortUid(r: any): string {
+  const uid = (r.raw?.uid as string) || ''
+  return uid.split('-')[0] || uid
+}
+
+// 该账号是否属于有签到活动的 provider（workbuddy 国内 / qoder 有；国际站无）
+function hasCheckin(r: any): boolean {
+  if (r.provider === 'workbuddy') return r.raw?.site !== 'international'
+  return r.provider === 'qoder'
+}
+
+function calDatesOf(r: any): string[] {
+  return calData.value[shortUid(r)] || []
+}
+
+async function loadCalendar() {
+  try {
+    const res = await api.checkinHistory(calDays.value)
+    calData.value = res.history || {}
+    calDays.value = res.days || 35
+  } catch {
+    /* 静默：日历是增强信息，失败不打断账号列表 */
+  }
+}
+
+function openCalendar(r: any, e: MouseEvent | FocusEvent) {
+  cancelClose()
+  calAnchor.value = e.currentTarget as HTMLElement
+  calOpenFor.value = pkgKey(r)
+  if (!calData.value[shortUid(r)]) loadCalendar()
+  nextTick(positionCal)
+}
+
+function positionCal() {
+  const a = calAnchor.value
+  if (!a) return
+  const rect = a.getBoundingClientRect()
+  const el = Array.isArray(panelEl.value) ? panelEl.value[0] : panelEl.value
+  const panelW = Math.min(Math.max(el?.offsetWidth || 300, 300), 460)
+  const left = Math.min(Math.max(8, rect.right - panelW), window.innerWidth - panelW - 8)
+  const top = Math.min(rect.bottom + 6, window.innerHeight - 300)
+  calStyle.value = { left: left + 'px', top: top + 'px' }
+}
+
+function closeCalendar() {
+  cancelClose()
+  closeTimer = setTimeout(() => {
+    calOpenFor.value = null
+    calAnchor.value = null
+  }, 150)
+}
+
+// 35 天点阵的格子状态：''（无记录）/ ok（已签）/ future
+const todayStr = new Date().toISOString().slice(0, 10)
+function calGrid(dates: string[]) {
+  const set = new Set(dates)
+  const cells: { date: string; state: '' | 'ok' | 'future' }[] = []
+  const now = new Date()
+  for (let i = calDays.value - 1; i >= 0; i--) {
+    const d = new Date(now)
+    d.setDate(now.getDate() - i)
+    const ds = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+    cells.push({ date: ds, state: ds > todayStr ? 'future' : set.has(ds) ? 'ok' : '' })
+  }
+  return cells
+}
+
 // ---------- 行内动作 ----------
 async function toggleEnabled(r: any) {
   if (r.provider !== 'workbuddy') return
@@ -504,9 +580,21 @@ async function saveConfig() {
             <span v-else class="text-faint">—</span>
           </template>
           <template #cell-checkin="{ row }">
-            <WTag v-if="row.raw.checkin_today" tone="live" dot>今日已签</WTag>
-            <span v-else class="text-faint">—</span>
-            <div v-if="row.raw.streak_days" class="text-micro text-faint">连签 {{ row.raw.streak_days }} 天</div>
+            <button
+              type="button"
+              class="inline-flex items-center gap-1.5 rounded focus:outline-none"
+              @mouseenter="openCalendar(row, $event)"
+              @focus="openCalendar(row, $event)"
+              @click="openCalendar(row, $event)"
+              @mouseleave="closeCalendar"
+              @blur="closeCalendar"
+              title="悬停查看 35 天签到记录"
+            >
+              <WTag v-if="row.raw.checkin_today" tone="live" dot>今日已签</WTag>
+              <WTag v-else-if="hasCheckin(row)" tone="warn" dot>未签</WTag>
+              <span v-else class="text-faint">—</span>
+              <div v-if="row.raw.streak_days" class="text-micro text-faint">连签 {{ row.raw.streak_days }} 天</div>
+            </button>
           </template>
           <template #cell-ctrl="{ row }">
             <input
@@ -693,13 +781,51 @@ async function saveConfig() {
             <div class="mt-1.5 flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-micro text-faint">
               <span class="mono whitespace-nowrap">剩 {{ fmtCredits(p.remain) }} / {{ fmtCredits(p.total) }}</span>
               <span class="mono whitespace-nowrap">已用 {{ fmtCredits(p.used) }}</span>
-              <span v-if="p.expire_at" class="ml-auto whitespace-nowrap" :class="pkgExpiring(p) ? 'text-warn' : ''">
-                {{ dt(p.expire_at, 'YYYY-MM-DD') }}<template v-if="pkgExpiring(p)"> · 临期</template>
+              <!-- 临期包：过期时间精确到分钟并标黄，一眼看出紧迫度 -->
+              <span v-if="p.expire_at" class="ml-auto mono whitespace-nowrap" :class="pkgExpiring(p) ? 'text-warn' : ''">
+                {{ dt(p.expire_at, pkgExpiring(p) ? 'YYYY-MM-DD HH:mm' : 'YYYY-MM-DD') }}
               </span>
             </div>
           </div>
         </div>
         <div class="mt-3 border-t border-line pt-2 text-micro text-faint">已用完的批次不计入最早到期时间</div>
+      </div>
+
+      <!-- 签到日历：35 天打卡点阵 -->
+      <div
+        v-for="r in rows.filter((x) => pkgKey(x) === calOpenFor)"
+        :key="'cal-' + pkgKey(r)"
+        ref="panelEl"
+        class="fixed z-50 w-fit min-w-[300px] max-w-[460px] rounded-xl border border-line bg-elevated/95 p-4 shadow-glass backdrop-blur-sm"
+        :style="calStyle"
+        @mouseenter="cancelClose"
+        @mouseleave="closeCalendar"
+      >
+        <div class="mb-3 flex items-start justify-between gap-3">
+          <span class="shrink-0 font-medium text-ink">签到记录 · 近 {{ calDays }} 天</span>
+          <span class="min-w-0 break-words text-right text-micro leading-snug text-faint">{{ label(r) }}</span>
+        </div>
+        <div class="grid grid-cols-7 gap-1">
+          <div
+            v-for="c in calGrid(calDatesOf(r))"
+            :key="c.date"
+            class="h-4 w-4 rounded-sm"
+            :class="{
+              'bg-live/70': c.state === 'ok',
+              'bg-line/50': c.state === '',
+              'bg-transparent ring-1 ring-line/30': c.state === 'future',
+            }"
+            :title="c.date + (c.state === 'ok' ? ' · 已签到' : c.state === '' ? ' · 未签到' : '')"
+          />
+        </div>
+        <div class="mt-3 flex items-center justify-between gap-3 text-micro text-faint">
+          <span class="flex items-center gap-2">
+            <span class="inline-block h-2.5 w-2.5 rounded-sm bg-live/70" /> 已签
+            <span class="ml-1 inline-block h-2.5 w-2.5 rounded-sm bg-line/50" /> 未签
+          </span>
+          <span class="mono whitespace-nowrap">{{ calDatesOf(r).length }} / {{ calDays }} 天</span>
+        </div>
+        <div class="mt-2 border-t border-line pt-2 text-micro text-faint">签到历史从本版本开始记录，此前无数据</div>
       </div>
     </Teleport>
   </WPage>

@@ -96,6 +96,15 @@ export const api = {
   deleteAccount: (uid: string) => http.delete<unknown, { ok: boolean }>(`/admin/accounts/${uid}`),
   refreshCredits: () => http.post<unknown, { ok: boolean; accounts: AccountInfo[] }>('/admin/credits/refresh'),
   checkin: () => http.post<unknown, CheckinResponse>('/admin/checkin'),
+  checkinHistory: (days = 35) =>
+    http.get<unknown, { days: number; since: string; history: Record<string, string[]> }>(
+      `/admin/checkin/history?days=${days}`,
+    ),
+  modelTest: (model: string, prompt: string) =>
+    http.post<unknown, { ok: boolean; model: string; latency_ms: number; content?: string; error?: string; finish_reason?: string }>(
+      '/admin/models/test',
+      { model, prompt },
+    ),
   usageSummary: () => http.get<unknown, UsageSummary>('/admin/usage/summary'),
   usageTimeseries: (granularity = 'hour', points = 24, model?: string) =>
     http.get<unknown, { granularity: string; points: number; data: UsagePoint[] }>(
