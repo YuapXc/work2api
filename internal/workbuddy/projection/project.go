@@ -176,9 +176,9 @@ func shrinkJSONValue(value any, depth int, key string) any {
 // ---- 工具 schema 投影 ----
 
 type toolsStats struct {
-	OriginalTools     int
-	ProjectedTools    int
-	OriginalToolChars int
+	OriginalTools      int
+	ProjectedTools     int
+	OriginalToolChars  int
 	ProjectedToolChars int
 }
 

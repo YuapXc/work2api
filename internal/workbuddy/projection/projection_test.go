@@ -32,7 +32,7 @@ func agenticBody() map[string]any {
 			map[string]any{"type": "function", "function": map[string]any{
 				"name": "exec_command",
 				"parameters": map[string]any{
-					"type": "object",
+					"type":        "object",
 					"description": "Run a shell command. " + strings.Repeat("long docs. ", 100),
 					"properties": map[string]any{
 						"cmd": map[string]any{"type": "string", "description": strings.Repeat("d", 500)},

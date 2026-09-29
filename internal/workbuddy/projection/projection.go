@@ -17,28 +17,28 @@
 package projection
 
 const (
-	historyPrefix            = "Earlier conversation summary (condensed):"
-	baseSystemPrompt         = "You are a coding assistant serving an OpenAI-compatible CLI. Be precise, concise, safe, and action-oriented. Use available tools when needed, follow repository instructions and durable user context, and continue from the preserved recent context. If earlier history was condensed, rely on the preserved recent messages and rerun tools when exact old details are required."
-	maxSystemGuidanceChars   = 1200
-	maxUserChars             = 3200
-	maxAssistantChars        = 1800
-	maxToolOutputChars       = 1600
-	maxToolArgsChars         = 900
-	maxHistorySummaryChars   = 2200
-	maxHistoryItems          = 10
-	maxTailMessages          = 8
-	maxTailChars             = 7000
-	schemaMaxDepth           = 6
-	jsonShrinkMaxDepth       = 4
-	jsonShrinkMaxKeys        = 12
-	jsonShrinkMaxList        = 6
-	oneOfMaxItems            = 6
-	historyLineUserChars     = 220
+	historyPrefix             = "Earlier conversation summary (condensed):"
+	baseSystemPrompt          = "You are a coding assistant serving an OpenAI-compatible CLI. Be precise, concise, safe, and action-oriented. Use available tools when needed, follow repository instructions and durable user context, and continue from the preserved recent context. If earlier history was condensed, rely on the preserved recent messages and rerun tools when exact old details are required."
+	maxSystemGuidanceChars    = 1200
+	maxUserChars              = 3200
+	maxAssistantChars         = 1800
+	maxToolOutputChars        = 1600
+	maxToolArgsChars          = 900
+	maxHistorySummaryChars    = 2200
+	maxHistoryItems           = 10
+	maxTailMessages           = 8
+	maxTailChars              = 7000
+	schemaMaxDepth            = 6
+	jsonShrinkMaxDepth        = 4
+	jsonShrinkMaxKeys         = 12
+	jsonShrinkMaxList         = 6
+	oneOfMaxItems             = 6
+	historyLineUserChars      = 220
 	historyLineAssistantChars = 180
-	historyLineReplyChars    = 160
-	historyLineToolChars     = 220
-	historyLineSystemChars   = 180
-	inlineSummaryChars       = 220
+	historyLineReplyChars     = 160
+	historyLineToolChars      = 220
+	historyLineSystemChars    = 180
+	inlineSummaryChars        = 220
 )
 
 // agenticToolNames Codex CLI 等 agentic 客户端的特征工具名：命中即走激进模式。
@@ -107,10 +107,10 @@ func Body(body map[string]any) (map[string]any, Stats) {
 		projected["messages"] = toAny(conservative)
 		return projected, Stats{
 			Mode: "conservative", OriginalMessages: len(messages),
-			ProjectedMessages: len(conservative),
-			OriginalMessageChars: messagesSize(messages),
+			ProjectedMessages:     len(conservative),
+			OriginalMessageChars:  messagesSize(messages),
 			ProjectedMessageChars: messagesSize(conservative),
-			OriginalTools: toolStats.OriginalTools, ProjectedTools: toolStats.ProjectedTools,
+			OriginalTools:         toolStats.OriginalTools, ProjectedTools: toolStats.ProjectedTools,
 			OriginalToolChars: toolStats.OriginalToolChars, ProjectedToolChars: toolStats.ProjectedToolChars,
 		}
 	}
