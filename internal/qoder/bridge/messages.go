@@ -67,7 +67,37 @@ func BuildQoderMessages(templateMsgs []interface{}, incoming []interface{}, prom
 	if len(rebuilt) == 0 && prompt != "" {
 		rebuilt = append(rebuilt, BuildUserMessage(prompt))
 	}
-	return rebuilt
+	return normalizeOutboundMessages(rebuilt)
+}
+
+// normalizeOutboundMessages 对即将出站的消息逐条做上游适配。三条上游硬性要求
+// （buddy-proxy #45，2026-09 实测）：
+//
+//  1. 带 tool_calls 的消息 content 不能是 null——Anthropic 纯 tool_use 回合转
+//     出来正是 content:null，上游拒单且报错文案误导（说 role 'tool' 必须回应
+//     带 tool_calls 的消息）。content="" 实测 200。不绑 role（绑 assistant 的
+//     话 developer 先被改写就命中不了），且必须排在摘 tool_calls 之前。
+//  2. developer role 整请求被拒（反序列化阶段就挂），转 system。
+//  3. tool_calls 只能挂 assistant 上：system 带 tool_calls 一样被拒（其后的
+//     tool 没有 assistant 可配对），所以 developer→system 时连 tool_calls 一起
+//     摘掉（系统消息本就不该发起工具调用，摘掉不丢信息）。
+func normalizeOutboundMessages(msgs []interface{}) []interface{} {
+	for i, m := range msgs {
+		mm, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		// content 修正必须在摘 tool_calls 之前：摘掉后判据永远不成立
+		if mm["tool_calls"] != nil && mm["content"] == nil {
+			mm["content"] = ""
+		}
+		if role, _ := mm["role"].(string); role == "developer" {
+			delete(mm, "tool_calls")
+			mm["role"] = "system"
+		}
+		msgs[i] = mm
+	}
+	return msgs
 }
 
 func ConvertIncomingMessage(msg map[string]interface{}, toolsEnabled bool) map[string]interface{} {

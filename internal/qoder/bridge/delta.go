@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"work2api/internal/qoder/cosy"
 
@@ -84,8 +85,7 @@ func ExtractDelta(dataLine string) Delta {
 	// 内容审核单独映射为 content_policy_rejected。
 	// 注意：业务错误检查仍先于 usage-only 返回，错误帧不因带 usage 被误判为正常帧。
 	if code, ok := innerJSON["code"].(string); ok && code != "" && code != "0" {
-		msg, _ := innerJSON["message"].(string)
-		err := NewStreamBusinessError(fmt.Sprintf("upstream error code=%s: %s", code, msg))
+		err := NewStreamBusinessError(fmt.Sprintf("upstream error code=%s: %s", code, describeUpstreamError(innerJSON)))
 		logger.Error("[delta] %v", err)
 		return Delta{Err: err}
 	}
@@ -102,6 +102,44 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max] + "..."
+}
+
+// describeUpstreamError 把带内错误帧转成可读原因。
+//
+// 上游把真正的失败原因放在 details 里（JSON 字符串），顶层 message 只有一句
+// 没用的 "Error in upstream response"。只取 message 会让「模型不存在」「参数
+// 非法」「渠道校验拦截」全都退化成同一句话，线上只能靠猜——所以把
+// details.error.message 一并挖出（buddy-proxy #45 同款）。
+func describeUpstreamError(frame map[string]interface{}) string {
+	parts := []string{}
+	if m, _ := frame["message"].(string); m != "" {
+		parts = append(parts, m)
+	}
+	detailMsg := ""
+	switch d := frame["details"].(type) {
+	case string:
+		if s := strings.TrimSpace(d); s != "" {
+			var parsed map[string]interface{}
+			if err := json.Unmarshal([]byte(s), &parsed); err != nil {
+				detailMsg = s
+			} else if errObj, ok := parsed["error"].(map[string]interface{}); ok {
+				detailMsg, _ = errObj["message"].(string)
+			} else if m, ok := parsed["message"].(string); ok {
+				detailMsg = m
+			}
+		}
+	case map[string]interface{}:
+		if errObj, ok := d["error"].(map[string]interface{}); ok {
+			detailMsg, _ = errObj["message"].(string)
+		}
+	}
+	if detailMsg != "" {
+		parts = append(parts, detailMsg)
+	}
+	if len(parts) == 0 {
+		return "上游返回未知错误"
+	}
+	return truncate(strings.Join(parts, " | "), 500)
 }
 
 func mapKeys(m map[string]interface{}) []string {
