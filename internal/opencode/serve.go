@@ -14,6 +14,7 @@ import (
 	"work2api/internal/core/protocol"
 	"work2api/internal/core/provider"
 	"work2api/internal/jsonutil"
+	"work2api/internal/streamwatch"
 )
 
 func externalProtocol(p provider.Protocol) protocol.Protocol {
@@ -101,11 +102,14 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provid
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("X-Accel-Buffering", "no")
 		w.WriteHeader(resp.StatusCode)
+		// 看门狗：空闲 180s / 总时长 30min，防上游建流后挂住（三通道同款）。
+		watch := streamwatch.NewWatch(resp.Body, ctx, 0, 0)
+		defer watch.Close()
 		var usage protocol.Usage
 		if external == upstreamRoute.Protocol {
-			usage, _, err = protocol.ForwardStream(ctx, w, resp.Body, upstreamRoute.Protocol, model)
+			usage, _, err = protocol.ForwardStream(ctx, w, watch.Reader(resp.Body), upstreamRoute.Protocol, model)
 		} else {
-			usage, _, err = protocol.TranscodeStream(ctx, w, resp.Body, upstreamRoute.Protocol, external, model)
+			usage, _, err = protocol.TranscodeStream(ctx, w, watch.Reader(resp.Body), upstreamRoute.Protocol, external, model)
 		}
 		report := usageReport(usage)
 		if err != nil && !protocol.ClientCanceled(ctx, err) {

@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"work2api/internal/streamwatch"
 )
 
 // passthroughBodyKeys is the whitelist of body fields forwarded upstream.
@@ -212,7 +214,11 @@ func (c *Client) handleJSONResponse(resp *http.Response, yield LineFunc) error {
 
 // streamSSE consumes and validates a real SSE stream.
 func streamSSE(resp *http.Response, yield LineFunc) error {
-	scanner := bufio.NewScanner(resp.Body)
+	// 看门狗：空闲 180s / 总时长 30min（与 qoder 通道同款双超时）。ResponseHeaderTimeout
+	// 只管首字节；这里管流中挂起。
+	watch := streamwatch.NewWatch(resp.Body, resp.Request.Context(), 0, 0)
+	defer watch.Close()
+	scanner := bufio.NewScanner(watch.Reader(resp.Body))
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 
 	finished := false
@@ -287,6 +293,9 @@ func streamSSE(resp *http.Response, yield LineFunc) error {
 		}
 	}
 	if err := scanner.Err(); err != nil {
+		if watch.Err != nil {
+			return watch.Err
+		}
 		return err
 	}
 	if !finished {

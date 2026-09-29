@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 	"work2api/internal/qoder/cosy"
+	"work2api/internal/streamwatch"
 
 	"work2api/internal/qoder/logger"
 )
@@ -239,7 +240,11 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 			return NewUpstreamError(resp.StatusCode, detail)
 		}
 
-		// 建流成功：进入流式读取，不再在本层重试
+		// 建流成功：进入流式读取，不再在本层重试。
+		// 看门狗：空闲 180s 无任何字节 / 总时长 30min 上限——上游建流后挂住
+		// 不再让 goroutine 和连接无限挂到客户端断开（buddy-proxy 同款双超时）。
+		watch := streamwatch.NewWatch(resp.Body, ctx, 0, 0)
+		defer watch.Close()
 		defer resp.Body.Close()
 		lineCh := make(chan string)
 		errCh := make(chan error, 1)
@@ -248,7 +253,7 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 		done := make(chan struct{})
 		defer close(done)
 		go func() {
-			scanner := bufio.NewScanner(resp.Body)
+			scanner := bufio.NewScanner(watch.Reader(resp.Body))
 			scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
 			for scanner.Scan() {
 				select {
@@ -271,6 +276,10 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 			case <-ctx.Done():
 				return ctx.Err()
 			case err := <-errCh:
+				if watch.Err != nil {
+					logger.Error("[streamwatch] %v", watch.Err)
+					return watch.Err
+				}
 				logger.Debug("stream read complete")
 				return err
 			case line := <-lineCh:
