@@ -159,6 +159,44 @@ func (c *Catalog) ReplaceWithCapabilities(zen, goModels []string, native map[Tie
 	c.stale = false
 }
 
+// Fingerprint returns a compact signature of the live catalog content (tier
+// model sets + per-tier protocol/unsupported maps). Callers compare successive
+// fingerprints to decide whether a periodic refresh actually changed anything —
+// keeping unchanged refreshes out of the info-level log.
+func (c *Catalog) Fingerprint() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var b strings.Builder
+	for _, tier := range []Tier{TierZen, TierGo} {
+		b.WriteString(string(tier))
+		b.WriteByte(':')
+		for _, id := range sortedSetKeys(c.tierSetLocked(tier)) {
+			b.WriteString(id)
+			b.WriteByte(',')
+		}
+		b.WriteString("|p:")
+		for _, id := range sortedMapKeys(c.nativeProtocols[tier]) {
+			fmt.Fprintf(&b, "%s=%s,", id, c.nativeProtocols[tier][id])
+		}
+		b.WriteString("|u:")
+		for _, id := range sortedSetKeys(c.unsupported[tier]) {
+			if c.unsupported[tier][id] {
+				b.WriteString(id)
+				b.WriteByte(',')
+			}
+		}
+		b.WriteByte(';')
+	}
+	return b.String()
+}
+
+func (c *Catalog) tierSetLocked(tier Tier) map[string]bool {
+	if tier == TierZen {
+		return c.zen
+	}
+	return c.goModels
+}
+
 func (c *Catalog) Route(model string, hasZenKeys, hasGoKeys, hasAnonymous bool) (Route, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -384,6 +422,16 @@ func sortedSetKeys(source map[string]bool) []string {
 		if available {
 			result = append(result, model)
 		}
+	}
+	sort.Strings(result)
+	return result
+}
+
+// sortedMapKeys returns the sorted keys of a string-keyed map.
+func sortedMapKeys[V any](source map[string]V) []string {
+	result := make([]string, 0, len(source))
+	for id := range source {
+		result = append(result, id)
 	}
 	sort.Strings(result)
 	return result

@@ -123,6 +123,10 @@ func (rt *Runtime) applyProxyHealthResult(result proxyHealthResult, source strin
 }
 
 func (rt *Runtime) StartModelRefresh(ctx context.Context) {
+	// unchanged refreshes stay at debug so a steady catalog doesn't spam the
+	// info log every refresh interval; the fingerprint covers tier model sets,
+	// native protocols and the unsupported map, so any real change is caught.
+	prevFingerprint := rt.catalog.Fingerprint()
 	refresh := func() {
 		var zen, goModels []string
 		var capabilities Capabilities
@@ -151,7 +155,12 @@ func (rt *Runtime) StartModelRefresh(ctx context.Context) {
 					rt.logger.Warn("model catalog cache write failed", "component", "opencode.models", "error", err)
 				}
 			}
-			rt.logger.Info("model catalog refreshed", "component", "opencode.models", "models", len(rt.catalog.List()))
+			if fp := rt.catalog.Fingerprint(); fp != prevFingerprint {
+				prevFingerprint = fp
+				rt.logger.Info("model catalog refreshed", "component", "opencode.models", "models", len(rt.catalog.List()))
+			} else {
+				rt.logger.Debug("model catalog refresh: no change", "component", "opencode.models", "models", len(rt.catalog.List()))
+			}
 		}
 	}
 	go func() {
