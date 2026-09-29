@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue'
 import { api } from '@/api/client'
 import type { ProviderSummary, OAuthOption } from '@/types'
 import { toast } from '@/lib/toast'
 import { confirm } from '@/lib/confirm'
-import { credits as fmtCredits, dt, rel, cooldown } from '@/lib/format'
+import { credits as fmtCredits, dt, rel, cooldown, int as fmtInt } from '@/lib/format'
 import { providerMeta, siteLabel } from '@/lib/providers'
 import WPage from '@/components/ui/WPage.vue'
 import WCard from '@/components/ui/WCard.vue'
@@ -132,6 +132,81 @@ const cols: Column[] = [
 // 状态文字颜色（避免动态拼接 class 被 Tailwind purge）
 function statusTextClass(r: any): string {
   return { live: 'text-live', warn: 'text-warn', fault: 'text-fault', muted: 'text-faint' }[statusOf(r).tone]
+}
+
+// ---------- 积分构成悬浮层（对标官方控制台"积分明细"口径） ----------
+// workbuddy 账号的 credit_packages 逐资源包展示：名称/剩余/已用/总量/到期。
+// 弹层 Teleport 到 body——表格容器 overflow-x-auto 会裁剪行内绝对定位。
+interface Pkg {
+  name: string
+  remain: number
+  used: number
+  total: number
+  expire_at?: number | null
+}
+
+const pkgOpenFor = ref<string | null>(null) // `${provider}:${id}`
+const pkgStyle = ref<Record<string, string>>({})
+const pkgAnchor = ref<HTMLElement | null>(null)
+// v-for 内的模板 ref：Vue 3 会收集为数组，这里恒只有 0/1 个面板
+const panelEl = ref<any>(null)
+// 延迟关闭：锚点 → 面板之间移动会先触发锚点 mouseleave，留出间隙让面板
+// mouseenter 接住（holdPkgs），避免弹层闪烁消失。
+let closeTimer: ReturnType<typeof setTimeout> | null = null
+
+function pkgKey(r: any): string {
+  return `${r.provider}:${r.id}`
+}
+
+function pkgsOf(r: any): Pkg[] {
+  return (r.raw?.credit_packages as Pkg[] | undefined) || []
+}
+
+function cancelClose() {
+  if (closeTimer) {
+    clearTimeout(closeTimer)
+    closeTimer = null
+  }
+}
+
+// 包剩余百分比（总量未知时不给条）
+function pkgPct(p: Pkg): number | null {
+  if (!p.total || p.total <= 0) return null
+  return Math.max(0, Math.min(100, (p.remain / p.total) * 100))
+}
+
+// 有余额且 7 天内到期的包：临期（与选号"临期优先烧"同窗口语义）
+function pkgExpiring(p: Pkg): boolean {
+  if (!p.expire_at || p.remain <= 0) return false
+  return p.expire_at * 1000 - Date.now() < 7 * 86400_000
+}
+
+function openPkgs(r: any, e: MouseEvent | FocusEvent) {
+  if (!pkgsOf(r).length) return
+  cancelClose()
+  pkgAnchor.value = e.currentTarget as HTMLElement
+  pkgOpenFor.value = pkgKey(r)
+  nextTick(positionPkgs)
+}
+
+function positionPkgs() {
+  const a = pkgAnchor.value
+  if (!a) return
+  const rect = a.getBoundingClientRect()
+  // 宽度自适应：实测渲染宽度（w-fit），上限 440px、下限 300px
+  const el = Array.isArray(panelEl.value) ? panelEl.value[0] : panelEl.value
+  const panelW = Math.min(Math.max(el?.offsetWidth || 300, 300), 440)
+  const left = Math.min(Math.max(8, rect.right - panelW), window.innerWidth - panelW - 8)
+  const top = Math.min(rect.bottom + 6, window.innerHeight - 260)
+  pkgStyle.value = { left: left + 'px', top: top + 'px' }
+}
+
+function closePkgs() {
+  cancelClose()
+  closeTimer = setTimeout(() => {
+    pkgOpenFor.value = null
+    pkgAnchor.value = null
+  }, 150)
 }
 
 // ---------- 行内动作 ----------
@@ -295,8 +370,11 @@ async function onUpload(e: Event) {
 }
 
 onMounted(load)
-// 组件卸载时停掉可能残留的扫码轮询定时器，避免离开页面后仍在轮询
-onUnmounted(stopPoll)
+// 组件卸载时停掉可能残留的扫码轮询/悬浮层关闭定时器，避免离开页面后仍在轮询
+onUnmounted(() => {
+  stopPoll()
+  cancelClose()
+})
 
 // ---------- 配置型供应商（opencode 密钥层级） ----------
 const configProviders = computed(() => providers.value.filter((p) => p.capabilities?.includes('config')))
@@ -407,7 +485,22 @@ async function saveConfig() {
             <span v-else class="text-faint">—</span>
           </template>
           <template #cell-expire="{ row }">
-            <span v-if="row.raw.credits_expire_at" :title="dt(row.raw.credits_expire_at, 'YYYY-MM-DD HH:mm')" class="text-muted">{{ rel(row.raw.credits_expire_at) }}</span>
+            <template v-if="row.raw.credits_expire_at || pkgsOf(row).length">
+              <button
+                type="button"
+                class="inline-flex items-center gap-1 rounded text-muted hover:text-ink"
+                :class="{ 'cursor-help': pkgsOf(row).length, 'cursor-default': !pkgsOf(row).length }"
+                :title="pkgsOf(row).length ? '查看积分构成明细' : dt(row.raw.credits_expire_at, 'YYYY-MM-DD HH:mm')"
+                @mouseenter="openPkgs(row, $event)"
+                @focus="openPkgs(row, $event)"
+                @click="openPkgs(row, $event)"
+                @mouseleave="closePkgs"
+                @blur="closePkgs"
+              >
+                <span class="text-muted">{{ row.raw.credits_expire_at ? rel(row.raw.credits_expire_at) : fmtInt(row.raw.credits_remaining) + ' 积分' }}</span>
+                <WIcon v-if="pkgsOf(row).length" name="clock" :size="13" class="text-faint" />
+              </button>
+            </template>
             <span v-else class="text-faint">—</span>
           </template>
           <template #cell-checkin="{ row }">
@@ -564,5 +657,50 @@ async function saveConfig() {
         <WButton variant="primary" :loading="cfgSaving" @click="saveConfig">保存并重载</WButton>
       </template>
     </WModal>
+
+    <!-- 积分构成悬浮层：逐资源包明细（对齐官方控制台"积分明细"口径） -->
+    <Teleport to="body">
+      <div
+        v-for="r in rows.filter((x) => pkgKey(x) === pkgOpenFor)"
+        :key="pkgKey(r)"
+        ref="panelEl"
+        class="fixed z-50 w-fit min-w-[300px] max-w-[440px] rounded-xl border border-line bg-elevated/95 p-4 shadow-glass backdrop-blur-sm"
+        :style="pkgStyle"
+        @mouseenter="cancelClose"
+        @mouseleave="closePkgs"
+      >
+        <div class="mb-3 flex items-start justify-between gap-3">
+          <span class="shrink-0 font-medium text-ink">积分构成</span>
+          <span class="min-w-0 break-words text-right text-micro leading-snug text-faint">{{ label(r) }}</span>
+        </div>
+        <div class="space-y-3">
+          <div v-for="(p, i) in pkgsOf(r)" :key="i">
+            <div class="flex items-start justify-between gap-3">
+              <span class="min-w-0 break-words text-small leading-snug text-muted">{{ p.name }}</span>
+              <span v-if="pkgPct(p) != null" class="mono shrink-0 text-small leading-snug" :class="pkgExpiring(p) ? 'text-warn' : 'text-ink'">
+                {{ Math.round(pkgPct(p)!) }}%
+              </span>
+            </div>
+            <div class="mt-1.5 h-1.5 overflow-hidden rounded-full bg-line/60">
+              <div
+                v-if="pkgPct(p) != null"
+                class="h-full rounded-full"
+                :class="pkgExpiring(p) ? 'bg-warn' : 'bg-brand'"
+                :style="{ width: pkgPct(p)! + '%' }"
+              />
+            </div>
+            <!-- flex-wrap：一行放不下时整段折到下一行，数字串自身不折断 -->
+            <div class="mt-1.5 flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-micro text-faint">
+              <span class="mono whitespace-nowrap">剩 {{ fmtCredits(p.remain) }} / {{ fmtCredits(p.total) }}</span>
+              <span class="mono whitespace-nowrap">已用 {{ fmtCredits(p.used) }}</span>
+              <span v-if="p.expire_at" class="ml-auto whitespace-nowrap" :class="pkgExpiring(p) ? 'text-warn' : ''">
+                {{ dt(p.expire_at, 'YYYY-MM-DD') }}<template v-if="pkgExpiring(p)"> · 临期</template>
+              </span>
+            </div>
+          </div>
+        </div>
+        <div class="mt-3 border-t border-line pt-2 text-micro text-faint">已用完的批次不计入最早到期时间</div>
+      </div>
+    </Teleport>
   </WPage>
 </template>
