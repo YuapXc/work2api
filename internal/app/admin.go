@@ -59,6 +59,7 @@ func (s *Server) mountAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/models/test", s.adminModelTest)
 	mux.HandleFunc("GET /admin/settings", s.adminGetSettings)
 	mux.HandleFunc("POST /admin/settings", s.adminSaveSettings)
+	mux.HandleFunc("GET /admin/credentials/export", s.adminExportCredentials)
 	s.mountProviderAdmin(mux)
 }
 

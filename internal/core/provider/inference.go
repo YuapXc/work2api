@@ -203,3 +203,13 @@ type ConfigRuntime interface {
 	// SaveConfigDoc merges the patch, validates, persists and reloads.
 	SaveConfigDoc(patch map[string]any) error
 }
+
+// CredentialExporter is an optional capability: a runtime that can hand its
+// current credentials to the admin credential-export endpoint so the operator
+// can migrate them to another deployment/project. The returned document may
+// contain long-lived secrets — it is served only through the admin surface.
+type CredentialExporter interface {
+	// ExportCredentials returns {accounts: [...], note?: string} describing each
+	// credential in a form the target project can import, or an error.
+	ExportCredentials() (map[string]any, error)
+}

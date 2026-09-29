@@ -73,6 +73,30 @@ async function save() {
 
 const aaStatus = computed(() => (clearAA.value ? '将在保存后清除' : aaEnabled.value ? `已配置 ${aaMasked.value}` : '未配置'))
 
+// 凭证导出：拉取 JSON 并触发浏览器下载（axios 拦截器返回 data 本身）
+const exporting = ref(false)
+async function exportCreds() {
+  exporting.value = true
+  try {
+    const resp = await fetch('/admin/credentials/export', {
+      headers: { 'X-Admin-Token': localStorage.getItem('workbuddy_admin_token') || '' },
+    })
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    const blob = await resp.blob()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = resp.headers.get('Content-Disposition')?.match(/filename="([^"]+)"/)?.[1] || 'work2api-credentials.json'
+    a.click()
+    URL.revokeObjectURL(url)
+    toast.success('凭证已导出')
+  } catch (e) {
+    toast.error(`导出失败：${e instanceof Error ? e.message : e}`)
+  } finally {
+    exporting.value = false
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -178,6 +202,14 @@ onMounted(load)
               <WInput v-model="s.alert_expiry_days" placeholder="7" :disabled="!alertOn" />
             </div>
           </div>
+        </div>
+      </WCard>
+
+      <!-- 凭证导出 -->
+      <WCard title="凭证导出" sub="把当前全部渠道凭证（workbuddy 会话 / qoder 账号 / opencode 密钥）打包下载，用于迁移到其他项目或部署。">
+        <div class="flex items-center gap-3">
+          <WButton variant="subtle" :loading="exporting" @click="exportCreds"><span>导出凭证</span></WButton>
+          <span class="text-small text-muted">文件包含明文密钥，请妥善保管，不要提交到仓库。</span>
         </div>
       </WCard>
 

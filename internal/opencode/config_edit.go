@@ -82,6 +82,20 @@ func (rt *Runtime) SaveConfigDoc(patch map[string]any) error {
 	return nil
 }
 
+// ExportCredentials implements provider.CredentialExporter: the zen/go key
+// tiers plus the prefer setting, enough to reconstruct the credential half of
+// opencode.json on another deployment (protocol overrides omitted — they are
+// tuning, not credentials).
+func (rt *Runtime) ExportCredentials() (map[string]any, error) {
+	cfg := rt.baseConfig()
+	return map[string]any{
+		"zen_keys":  cfg.ZenKeys,
+		"go_keys":   cfg.GoKeys,
+		"prefer":    string(cfg.Prefer),
+		"anonymous": cfg.Anonymous,
+	}, nil
+}
+
 // baseConfig picks the best starting point: the live config when ready, else
 // the on-disk file if it parses, else opencode2api defaults.
 func (rt *Runtime) baseConfig() Config {

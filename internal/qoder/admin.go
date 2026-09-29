@@ -198,6 +198,37 @@ func (r *Runtime) DeleteAccount(id string) error {
 	return account.Delete(id)
 }
 
+// ExportCredentials implements provider.CredentialExporter: native ~/.qoder2api
+// accounts carry their full account JSON + secret (importable by copying back
+// into ~/.qoder2api); locally-detected desktop credentials export their device
+// token with source "local" (importable as a native account).
+func (r *Runtime) ExportCredentials() (map[string]any, error) {
+	accounts := []map[string]any{}
+	if dataDirExists() {
+		if list, err := account.List(); err == nil {
+			for i := range list {
+				a := &list[i]
+				entry := map[string]any{"source": "native", "account": a}
+				if sec, err := account.GetSecret(a.ID); err == nil {
+					entry["secret"] = sec
+				}
+				accounts = append(accounts, entry)
+			}
+		}
+	}
+	for _, c := range r.detectLocal() {
+		accounts = append(accounts, map[string]any{
+			"source": "local", "id": "qoder-local-" + c.Region,
+			"name": "本地 Qoder（" + c.Region + "）", "region": c.Region,
+			"secret": c.DeviceToken,
+		})
+	}
+	return map[string]any{
+		"accounts": accounts,
+		"note":     "native 账号可将 account+secret 保存为 ~/.qoder2api/accounts/<id>.json 与 secrets/<id>.token；local 为本机桌面登录探测，迁移需在目标机器重新登录或导入 device token",
+	}, nil
+}
+
 // AdminCheckin runs the campaigns checkin for every usable qoder credential.
 func (r *Runtime) AdminCheckin(ctx context.Context) (map[string]any, error) {
 	results := []map[string]any{}
