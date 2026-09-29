@@ -28,6 +28,7 @@ type Config struct {
 	// workbuddy provider knobs (ported from workbuddy_one/config.py)
 	AllowExternalHost  bool
 	Desensitize        bool
+	OptimizeContext    bool
 	Ratelimit          bool
 	RatelimitInterval  float64
 	CheckinHours       []int
@@ -95,6 +96,7 @@ func Load(args []string) *Config {
 
 		AllowExternalHost:  boolEnv("ALLOW_EXTERNAL_HOST", false),
 		Desensitize:        boolEnv("DESENSITIZE", true),
+		OptimizeContext:    boolEnv("OPTIMIZE_CONTEXT", false),
 		Ratelimit:          boolEnv("RATELIMIT", true),
 		RatelimitInterval:  floatEnv("RATELIMIT_INTERVAL", 1.5),
 		CheckinHours:       intListEnv("CHECKIN_HOURS", []int{9, 21}),

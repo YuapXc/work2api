@@ -1,12 +1,14 @@
 package app
 
 import (
+	"log"
 	"net/http"
 	"time"
 
 	"work2api/internal/core/provider"
 	"work2api/internal/workbuddy/adapters"
 	"work2api/internal/workbuddy/pool"
+	"work2api/internal/workbuddy/projection"
 	"work2api/internal/workbuddy/upstream"
 )
 
@@ -42,12 +44,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, errBody(400, "messages is required", "invalid_request_error").body)
 		return
 	}
-	// Namespaced models (qoder/*, opencode/*) are served by their own provider
-	// runtime, which owns conversion + upstream; the workbuddy path below only
-	// handles the default (un-namespaced) provider.
 	if s.dispatchRuntime(w, r, provider.ProtocolChat, payload, principal) {
 		return
 	}
+	s.runChatPath(w, r, payload, principal)
+}
+
+// runChatPath is the default (workbuddy) chat path with an injectable writer,
+// so the model test endpoint can capture the response with a recorder.
+func (s *Server) runChatPath(w http.ResponseWriter, r *http.Request, payload map[string]any, principal *Principal) {
 	clientStream := boolVal(payload["stream"])
 	body := s.o.enhanceBody(upstream.BuildUpstreamBody(payload))
 	model := strOr(body["model"], "auto")
@@ -182,6 +187,18 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 	if cvErr != nil {
 		writeJSON(w, 400, errBody(400, "请求内容无效："+cvErr.Error(), "invalid_request_error").body)
 		return
+	}
+	// 消息压缩（--optimize-context 语义，OPTIMIZE_CONTEXT 开关，默认关）：只对
+	// /v1/responses 生效（与 buddy-proxy 相同的适用面）——Codex CLI 的 agentic
+	// 请求常带海量运行时提示/schema/长历史，投影后显著省 token 且降低触发上游
+	// 内容审核的概率。挂在 enhanceBody 之前，投影结果再走统一的脱敏/参数增强。
+	if protocol == "responses" && o.cfg.OptimizeContext {
+		var stats projection.Stats
+		chatBody, stats = projection.Body(chatBody)
+		log.Printf("[projection] mode=%s msgs %d->%d chars %d->%d tools chars %d->%d",
+			stats.Mode, stats.OriginalMessages, stats.ProjectedMessages,
+			stats.OriginalMessageChars, stats.ProjectedMessageChars,
+			stats.OriginalToolChars, stats.ProjectedToolChars)
 	}
 	chatBody = o.enhanceBody(chatBody)
 	model := strOr(chatBody["model"], "auto")
