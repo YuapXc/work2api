@@ -1,7 +1,6 @@
 package app
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -11,10 +10,16 @@ import (
 // Server is the HTTP surface over an Orchestrator.
 type Server struct {
 	o *Orchestrator
+	// adminSessions + loginLimiter back the WebUI login (HttpOnly cookie
+	// sessions). In-memory only: restart signs everyone out.
+	sessions     *adminSessionManager
+	loginLimiter *loginRateLimiter
 }
 
 // NewServer builds the HTTP server.
-func NewServer(o *Orchestrator) *Server { return &Server{o: o} }
+func NewServer(o *Orchestrator) *Server {
+	return &Server{o: o, sessions: newAdminSessionManager(), loginLimiter: newLoginRateLimiter()}
+}
 
 // Handler returns the root handler with all routes mounted and Host guarded.
 func (s *Server) Handler() http.Handler {
@@ -33,15 +38,23 @@ func (s *Server) Handler() http.Handler {
 // adminGuard authenticates the /admin/* surface. Historically ADMIN_TOKEN was
 // read into config but never enforced, so the whole management API was open to
 // anyone who could reach the host — a real exposure once ALLOW_EXTERNAL_HOST=1
-// puts the server on a LAN/public interface. Now: when ADMIN_TOKEN is set every
-// /admin/* request must carry it (X-Admin-Token, or Authorization: Bearer);
-// when it is empty the management API is loopback-only, regardless of
-// ALLOW_EXTERNAL_HOST (inference endpoints can still be LAN-exposed behind their
-// API keys). The static WebUI at "/" is served without a token so the operator
-// can load the page and enter one.
+// puts the server on a LAN/public interface. Now:
+//   - POST /admin/login|logout are always reachable (login must be reachable to
+//     authenticate; logout is harmless).
+//   - With ADMIN_TOKEN set, requests authenticate via session cookie (WebUI
+//     login) OR X-Admin-Token/Bearer header (scripts, kept for compatibility).
+//   - Without ADMIN_TOKEN the management API is loopback-only regardless of
+//     ALLOW_EXTERNAL_HOST; the WebUI skips login in that mode.
+//
+// The static WebUI at "/" is served without a token so the operator can load
+// the login page.
 func (s *Server) adminGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/admin/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.URL.Path == "/admin/login" || r.URL.Path == "/admin/logout" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -60,15 +73,10 @@ func (s *Server) adminGuard(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		provided := r.Header.Get("X-Admin-Token")
-		if provided == "" {
-			if a := r.Header.Get("Authorization"); strings.HasPrefix(a, "Bearer ") {
-				provided = strings.TrimSpace(a[7:])
-			}
-		}
-		if subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+		sessionOK, headerOK := s.adminAuth(r)
+		if !sessionOK && !headerOK {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]any{
-				"message": "管理端令牌无效或缺失（请在请求头 X-Admin-Token 携带 ADMIN_TOKEN）。",
+				"message": "管理端会话无效或已过期，请重新登录（或携带 X-Admin-Token 请求头）。",
 				"type":    "unauthorized"}})
 			return
 		}

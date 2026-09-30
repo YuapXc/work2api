@@ -20,9 +20,12 @@ import type {
 const http: AxiosInstance = axios.create({
   baseURL: '/',
   timeout: 30000,
+  // 管理端认证走 HttpOnly 会话 cookie（/admin/login 签发），浏览器自动携带。
+  withCredentials: true,
 })
 
-// 请求拦截：附加管理 Token（从 localStorage 读取，支持局域网访问时设置 ADMIN_TOKEN）
+// 请求拦截：兼容模式——localStorage 里存有 X-Admin-Token 时附加（脚本/旧部署），
+// 会话 cookie 始终随请求发送，服务端两者任一通过即可。
 http.interceptors.request.use((config) => {
   const token = localStorage.getItem('workbuddy_admin_token') || ''
   if (token) {
@@ -211,10 +214,20 @@ export const api = {
 
   // 应用 API Key
   apps: () => http.get<unknown, { apps: AppInfo[] }>('/admin/apps'),
-  createApp: (name: string, note = '', user_id?: number) =>
-    http.post<unknown, { ok: boolean; id: number; app_id: number; name: string; key: string }>('/admin/apps', { name, note, user_id }),
+  createApp: (name: string, note = '', allowed_models?: string[]) =>
+    http.post<unknown, { ok: boolean; id: number; app_id: number; name: string; key: string }>(
+      '/admin/apps', { name, note, allowed_models }),
   appKey: (id: number) =>
     http.get<unknown, { ok: boolean; key: string | null; unavailable?: boolean; message?: string }>(`/admin/apps/${id}/key`),
   toggleApp: (id: number) => http.post<unknown, { ok: boolean; enabled: boolean }>(`/admin/apps/${id}/toggle`),
+  setAppModels: (id: number, allowedModels: string[] | null) =>
+    http.post<unknown, { ok: boolean; allowed_models: string[]; warnings: string[] }>(
+      `/admin/apps/${id}/models`, { allowed_models: allowedModels }),
   deleteApp: (id: number) => http.delete<unknown, { ok: boolean }>(`/admin/apps/${id}`),
+
+  // ---------- 管理员登录（HttpOnly 会话 cookie） ----------
+  // 空 body 的 POST /admin/login 即会话探测，后端不消耗限速配额
+  loginProbe: () => http.post<unknown, { ok: boolean; probe?: boolean }>('/admin/login', {}),
+  login: (token: string) => http.post<unknown, { ok: boolean; message?: string }>('/admin/login', { token }),
+  logout: () => http.post<unknown, { ok: boolean }>('/admin/logout'),
 }

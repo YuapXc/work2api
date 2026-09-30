@@ -2,7 +2,10 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
+	"fmt"
 	"math"
+	"strings"
 	"time"
 )
 
@@ -17,6 +20,9 @@ type App struct {
 	Requests  int64   `json:"requests"`
 	Tokens    int64   `json:"tokens"`
 	Credits   float64 `json:"credits"`
+	// AllowedModels is the per-key model allowlist (JSON array of model ids);
+	// empty/nil means unrestricted. Parsed for display convenience.
+	AllowedModels []string `json:"allowed_models"`
 }
 
 // ListApps returns applications with cumulative usage. No ciphertext is
@@ -24,7 +30,7 @@ type App struct {
 func (d *DB) ListApps() ([]App, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	rows, err := d.db.Query("SELECT id, name, key_prefix, note, enabled, created_at FROM apps ORDER BY id ASC")
+	rows, err := d.db.Query("SELECT id, name, key_prefix, note, enabled, created_at, allowed_models FROM apps ORDER BY id ASC")
 	if err != nil {
 		return nil, err
 	}
@@ -32,13 +38,14 @@ func (d *DB) ListApps() ([]App, error) {
 	apps := []App{}
 	for rows.Next() {
 		var a App
-		var note sql.NullString
+		var note, allowed sql.NullString
 		var enabled int
-		if err := rows.Scan(&a.ID, &a.Name, &a.KeyPrefix, &note, &enabled, &a.CreatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.Name, &a.KeyPrefix, &note, &enabled, &a.CreatedAt, &allowed); err != nil {
 			return nil, err
 		}
 		a.Note = note.String
 		a.Enabled = enabled != 0
+		a.AllowedModels = parseAllowedModels(allowed.String)
 		apps = append(apps, a)
 	}
 	// per-app usage stats
@@ -53,13 +60,14 @@ func (d *DB) ListApps() ([]App, error) {
 	return apps, nil
 }
 
-// CreateApp inserts a new application key and returns its id.
-func (d *DB) CreateApp(name, keyHash, keyPrefix, note, keyEnc string) (int64, error) {
+// CreateApp inserts a new application key and returns its id. allowedJSON is
+// the raw JSON array string of allowed model ids ("" = unrestricted).
+func (d *DB) CreateApp(name, keyHash, keyPrefix, note, keyEnc, allowedJSON string) (int64, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	res, err := d.db.Exec(
-		"INSERT INTO apps (name, key_hash, key_prefix, note, enabled, created_at, key_enc, user_id) VALUES (?,?,?,?,1,?,?,?)",
-		name, keyHash, keyPrefix, note, float64(time.Now().UnixNano())/1e9, keyEnc, nil)
+		"INSERT INTO apps (name, key_hash, key_prefix, note, enabled, created_at, key_enc, user_id, allowed_models) VALUES (?,?,?,?,1,?,?,?,?)",
+		name, keyHash, keyPrefix, note, float64(time.Now().UnixNano())/1e9, keyEnc, nil, allowedJSON)
 	if err != nil {
 		return 0, err
 	}
@@ -80,6 +88,62 @@ func (d *DB) FindAppByKey(keyHash string) (map[string]any, error) {
 		return nil, err
 	}
 	return list[0], nil
+}
+
+// AllowedModelsOf returns the parsed allowlist for the app id, or nil for
+// unrestricted / unknown app. Used on the per-request auth path.
+func (d *DB) AllowedModelsOf(appID int64) ([]string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var allowed sql.NullString
+	err := d.db.QueryRow("SELECT allowed_models FROM apps WHERE id = ?", appID).Scan(&allowed)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return parseAllowedModels(allowed.String), nil
+}
+
+// SetAppModels replaces an app's model allowlist. An empty list clears the
+// restriction (all models allowed).
+func (d *DB) SetAppModels(appID int64, allowedJSON string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	res, err := d.db.Exec("UPDATE apps SET allowed_models = ? WHERE id = ?", allowedJSON, appID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("应用不存在：%d", appID)
+	}
+	return nil
+}
+
+// parseAllowedModels decodes the stored JSON array, treating garbage or an
+// empty string as unrestricted (nil). Never errors: a malformed value must not
+// break auth.
+func parseAllowedModels(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "null" {
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	clean := make([]string, 0, len(out))
+	for _, m := range out {
+		if m = strings.TrimSpace(m); m != "" {
+			clean = append(clean, m)
+		}
+	}
+	if len(clean) == 0 {
+		return nil
+	}
+	return clean
 }
 
 // GetAppKeyEnc returns the encrypted key token (may be empty for legacy apps).

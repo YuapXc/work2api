@@ -23,7 +23,7 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 
 	// app create + find
-	id, err := db.CreateApp("app1", "hash123", "sk-abc", "note", "enc")
+	id, err := db.CreateApp("app1", "hash123", "sk-abc", "note", "enc", "")
 	if err != nil {
 		t.Fatalf("create app: %v", err)
 	}

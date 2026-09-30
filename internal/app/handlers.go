@@ -44,6 +44,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, errBody(400, "messages is required", "invalid_request_error").body)
 		return
 	}
+	if aerr := s.authorizeModel(principal, strOr(payload["model"], "")); aerr != nil {
+		writeAPIErr(w, aerr)
+		return
+	}
 	if s.dispatchRuntime(w, r, provider.ProtocolChat, payload, principal) {
 		return
 	}
@@ -165,6 +169,10 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 	payload, err := readJSON(r)
 	if err != nil {
 		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").body)
+		return
+	}
+	if aerr := s.authorizeModel(principal, strOr(payload["model"], "")); aerr != nil {
+		writeAPIErr(w, aerr)
 		return
 	}
 	o := s.o

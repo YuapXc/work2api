@@ -303,4 +303,6 @@ export interface AppInfo {
   tokens: number
   credits: number
   user_id?: number | null
+  /** 可用模型白名单（空数组 = 不限制） */
+  allowed_models: string[]
 }

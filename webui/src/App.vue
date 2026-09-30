@@ -1,12 +1,10 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { setAdminToken } from '@/api/client'
 import { toast } from '@/lib/toast'
 import WIcon from '@/components/ui/WIcon.vue'
 import WButton from '@/components/ui/WButton.vue'
 import WInput from '@/components/ui/WInput.vue'
-import WModal from '@/components/ui/WModal.vue'
 import WLed from '@/components/ui/WLed.vue'
 import WToaster from '@/components/ui/WToaster.vue'
 import WConfirm from '@/components/ui/WConfirm.vue'
@@ -14,7 +12,6 @@ import WConfirm from '@/components/ui/WConfirm.vue'
 const route = useRoute()
 const router = useRouter()
 
-const TOKEN_KEY = 'workbuddy_admin_token'
 const nav = [
   { key: '/overview', label: '概览', icon: 'overview' },
   { key: '/accounts', label: '账号', icon: 'accounts' },
@@ -39,53 +36,63 @@ function toggleTheme() {
 }
 
 // ---------- 登录门 ----------
+// ADMIN_TOKEN 已设置：POST /admin/login 校验并签发 HttpOnly 会话 cookie（24h，
+// 服务端滑动续期），token 不再落 localStorage。未设置 ADMIN_TOKEN：后端 /admin
+// 仅回环可达，本机直接放行（后端 403 会把远程访问者挡在登录页外）。
 const authChecking = ref(true)
 const authOk = ref(false)
 const authLoading = ref(false)
 const tokenInput = ref('')
-const tokenModal = ref(false)
-const validateToken = (t: string) => /^[a-zA-Z0-9_-]{8,}$/.test(t)
-
-async function probe(token: string): Promise<number> {
-  try {
-    const res = await fetch('/admin/accounts', { headers: { 'X-Admin-Token': token } })
-    return res.status
-  } catch {
-    return 0
-  }
-}
+const authError = ref('')
 
 async function checkAuth() {
   authChecking.value = true
-  const status = await probe(localStorage.getItem(TOKEN_KEY) || '')
-  // 403 才锁；网络错误等放行，交由页面自身重试，避免误锁
-  authOk.value = status !== 403
+  authError.value = ''
+  try {
+    // 空 body 的 POST /admin/login 即会话探测：后端校验 cookie/头部，不消耗限速。
+    const res = await fetch('/admin/login', { method: 'POST', body: '{}' })
+    authOk.value = res.ok
+  } catch {
+    authOk.value = false
+    authError.value = '网络异常，请稍后重试'
+  }
   authChecking.value = false
 }
 
 async function onLogin() {
   const t = tokenInput.value.trim()
-  if (!validateToken(t)) return toast.error('Token 格式不正确（至少 8 位字母/数字/_-）')
+  if (!t) return toast.error('请输入管理 Token')
   authLoading.value = true
-  setAdminToken(t)
-  const status = await probe(t)
-  authLoading.value = false
-  if (status && status !== 403) {
-    authOk.value = true
-    toast.success('登录成功')
-  } else {
-    setAdminToken('')
-    toast.error(status === 403 ? 'Token 无效，请检查后重试' : '网络异常，请稍后重试')
+  authError.value = ''
+  try {
+    const res = await fetch('/admin/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: t }),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (res.ok) {
+      authOk.value = true
+      tokenInput.value = ''
+      toast.success('登录成功')
+    } else {
+      authError.value = data.message || (res.status === 429 ? '尝试次数过多，请稍后再试' : 'Token 无效，请检查后重试')
+      toast.error(authError.value)
+    }
+  } catch {
+    authError.value = '网络异常，请稍后重试'
+    toast.error(authError.value)
+  } finally {
+    authLoading.value = false
   }
 }
 
-function saveToken() {
-  const t = tokenInput.value.trim()
-  if (t && !validateToken(t)) return toast.error('Token 格式不正确（至少 8 位字母/数字/_-）')
-  setAdminToken(t)
-  tokenModal.value = false
-  toast.success(t ? '已保存管理 Token' : '已清除管理 Token')
-  router.go(0)
+async function logout() {
+  try {
+    await fetch('/admin/logout', { method: 'POST' })
+  } catch { /* 忽略 */ }
+  authOk.value = false
+  toast.success('已退出登录')
 }
 
 // ---------- 网关健康（30s 轮询） ----------
@@ -94,7 +101,13 @@ const total = ref<number | null>(null)
 let timer: ReturnType<typeof setInterval> | null = null
 async function refreshHealth() {
   try {
-    const res = await fetch('/admin/accounts', { headers: { 'X-Admin-Token': localStorage.getItem(TOKEN_KEY) || '' } })
+    const res = await fetch('/admin/accounts', { credentials: 'same-origin' })
+    if (res.status === 401 || res.status === 403) {
+      // 会话过期：踢回登录页
+      authOk.value = false
+      healthy.value = total.value = null
+      return
+    }
     if (!res.ok) { healthy.value = total.value = null; return }
     const data = await res.json()
     const list = (data.accounts || []) as { healthy?: boolean }[]
@@ -129,9 +142,12 @@ onUnmounted(() => timer && clearInterval(timer))
         <span class="mono text-lg font-semibold tracking-tight text-ink">work2api</span>
       </div>
       <h1 class="mb-1 text-base font-semibold text-ink">管理员登录</h1>
-      <p class="mb-5 text-micro text-faint">本机回环访问且未设置 ADMIN_TOKEN 时无需登录，可直接进入。</p>
+      <p class="mb-5 text-micro text-faint">
+        使用服务端 ADMIN_TOKEN 登录；会话有效期 24 小时，本机（回环）访问且未设置 ADMIN_TOKEN 时无需登录。
+      </p>
       <label class="mb-1.5 block text-small text-muted">管理 Token</label>
-      <WInput v-model="tokenInput" type="password" placeholder="输入 ADMIN_TOKEN" class="mb-4" @enter="onLogin" />
+      <WInput v-model="tokenInput" type="password" placeholder="输入 ADMIN_TOKEN" class="mb-1" @enter="onLogin" />
+      <p v-if="authError" class="mb-2 text-micro text-fault">{{ authError }}</p>
       <WButton variant="primary" block :loading="authLoading" @click="onLogin">
         <WIcon name="keys" :size="16" /> 登录
       </WButton>
@@ -185,10 +201,10 @@ onUnmounted(() => timer && clearInterval(timer))
             <WIcon :name="isLight ? 'moon' : 'sun'" :size="15" /> {{ isLight ? '暗色' : '浅色' }}
           </button>
           <button
-            class="flex h-8 flex-1 items-center justify-center gap-1.5 rounded-lg border border-line text-micro text-muted transition-colors hover:border-brand hover:text-brand"
-            @click="tokenInput = ''; tokenModal = true"
+            class="flex h-8 flex-1 items-center justify-center gap-1.5 rounded-lg border border-line text-micro text-muted transition-colors hover:border-fault hover:text-fault"
+            @click="logout"
           >
-            <WIcon name="keys" :size="15" /> Token
+            <WIcon name="keys" :size="15" /> 退出登录
           </button>
         </div>
       </div>
@@ -204,18 +220,6 @@ onUnmounted(() => timer && clearInterval(timer))
       <main class="flex-1 overflow-auto"><router-view /></main>
     </div>
   </div>
-
-  <!-- Token 管理 -->
-  <WModal v-model:open="tokenModal" size="sm" title="管理 Token">
-    <p class="mb-3 text-small text-muted">
-      仅当后端设置了 <code class="mono text-brand">ADMIN_TOKEN</code>（如从局域网访问）时才需要填写。留空保存即清除。
-    </p>
-    <WInput v-model="tokenInput" type="password" placeholder="输入 ADMIN_TOKEN" @enter="saveToken" />
-    <template #footer>
-      <WButton variant="subtle" @click="tokenModal = false">取消</WButton>
-      <WButton variant="primary" @click="saveToken">保存并重载</WButton>
-    </template>
-  </WModal>
 
   <WToaster />
   <WConfirm />

@@ -20,8 +20,10 @@ import (
 	"work2api/internal/workbuddy/siterouting"
 )
 
-// SchemaVersion matches the Python app's final schema (v12).
-const SchemaVersion = 12
+// SchemaVersion is the Go store's schema version. v12 matches the Python
+// app's final schema; v13 adds the Go-side apps.allowed_models column
+// (per-key model allowlist, JSON array, empty = unrestricted).
+const SchemaVersion = 13
 
 // DB wraps the SQLite connection.
 type DB struct {
@@ -109,7 +111,7 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS apps (
     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, key_hash TEXT UNIQUE,
     key_prefix TEXT, note TEXT, enabled INTEGER DEFAULT 1, created_at REAL,
-    key_enc TEXT, user_id INTEGER
+    key_enc TEXT, user_id INTEGER, allowed_models TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS model_cooldowns (
     account_uid TEXT, model TEXT, cooldown_until REAL, reason TEXT,
@@ -126,6 +128,14 @@ CREATE INDEX IF NOT EXISTS idx_usage_protocol ON usage_logs(protocol);
 `
 	if _, err := d.db.Exec(schema); err != nil {
 		return err
+	}
+	// Incremental migration: databases created before v13 lack the
+	// apps.allowed_models column (CREATE TABLE IF NOT EXISTS won't add it).
+	// A failed ALTER on a column that already exists is the benign case.
+	if _, err := d.db.Exec("ALTER TABLE apps ADD COLUMN allowed_models TEXT DEFAULT ''"); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("migrate apps.allowed_models: %w", err)
+		}
 	}
 	if _, err := d.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion)); err != nil {
 		return err

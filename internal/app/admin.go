@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -9,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"work2api/internal/core/provider"
 )
 
 func roundN(v float64, places int) float64 {
@@ -27,6 +30,8 @@ func parseFloatDefault(s string, def float64) float64 {
 }
 
 func (s *Server) mountAdmin(mux *http.ServeMux) {
+	mux.HandleFunc("POST /admin/login", s.handleAdminLogin)
+	mux.HandleFunc("POST /admin/logout", s.handleAdminLogout)
 	mux.HandleFunc("GET /admin/overview", s.adminOverview)
 	mux.HandleFunc("GET /admin/accounts", s.adminAccounts)
 	mux.HandleFunc("POST /admin/accounts/upload", s.adminUpload)
@@ -42,6 +47,7 @@ func (s *Server) mountAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/apps", s.adminCreateApp)
 	mux.HandleFunc("GET /admin/apps/{id}/key", s.adminAppKey)
 	mux.HandleFunc("POST /admin/apps/{id}/toggle", s.adminToggleApp)
+	mux.HandleFunc("POST /admin/apps/{id}/models", s.adminSetAppModels)
 	mux.HandleFunc("DELETE /admin/apps/{id}", s.adminDeleteApp)
 	mux.HandleFunc("POST /admin/credits/refresh", s.adminRefreshCredits)
 	mux.HandleFunc("POST /admin/checkin", s.adminCheckin)
@@ -459,14 +465,48 @@ func (s *Server) adminCreateApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	note, _ := body["note"].(string)
+	allowed, err := normalizeAllowedModels(body["allowed_models"])
+	if err != nil {
+		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
+		return
+	}
 	key := s.o.genAPIKey()
 	enc, _ := s.o.crypto.Encrypt(key)
-	id, err := s.o.db.CreateApp(name, s.o.hashKey(key), key[:min(10, len(key))]+"…", note, enc)
+	id, err := s.o.db.CreateApp(name, s.o.hashKey(key), key[:min(10, len(key))]+"…", note, enc, allowed)
 	if err != nil {
 		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"id": id, "app_id": id, "name": name, "key": key, "ok": true})
+}
+
+// normalizeAllowedModels validates a client-supplied model allowlist: nil/absent
+// means unrestricted (""), a list must be non-empty strings; the result is the
+// JSON array string persisted in apps.allowed_models.
+func normalizeAllowedModels(v any) (string, error) {
+	if v == nil {
+		return "", nil
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		return "", fmt.Errorf("allowed_models 必须是字符串数组")
+	}
+	out := make([]string, 0, len(arr))
+	for _, item := range arr {
+		s, ok := item.(string)
+		if !ok || strings.TrimSpace(s) == "" {
+			return "", fmt.Errorf("allowed_models 含空项，必须是非空字符串数组")
+		}
+		out = append(out, strings.TrimSpace(s))
+	}
+	if len(out) == 0 {
+		return "", nil
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
 
 func (s *Server) adminAppKey(w http.ResponseWriter, r *http.Request) {
@@ -493,6 +533,68 @@ func (s *Server) adminDeleteApp(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	ok, _ := s.o.db.DeleteApp(id)
 	writeJSON(w, 200, map[string]any{"ok": ok})
+}
+
+// adminSetAppModels replaces an app's model allowlist. Body: {allowed_models:
+// ["id", ...]} — absent/null clears the restriction (all models allowed); an
+// empty array is rejected so "no restriction" and "no models" can't be
+// confused.
+func (s *Server) adminSetAppModels(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	body, _ := readJSON(r)
+	allowed, err := normalizeAllowedModels(body["allowed_models"])
+	if err != nil {
+		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
+		return
+	}
+	// 预校验：目录里是否真有这个模型，给配置人即时反馈。仅警告不阻断：目录是
+	// 动态的，冷门模型可能只是缓存里暂时没有；别名与 runtime 前缀模型放行。
+	warnings := []string{}
+	aliases := map[string]string{}
+	if settings, _ := s.o.db.GetSettings(); settings != nil {
+		aliases = parseModelAliases(settings["model_aliases"])
+	}
+	known := map[string]bool{}
+	for _, id := range s.o.models.IDs() {
+		known[id] = true
+	}
+	for _, m := range decodeAllowedModels(allowed) {
+		if _, isAlias := aliases[m]; isAlias {
+			continue
+		}
+		if !known[m] && !isNamespacedModel(m) {
+			warnings = append(warnings, "模型 "+m+" 不在当前模型目录中，请确认拼写")
+		}
+	}
+	if err := s.o.db.SetAppModels(id, allowed); err != nil {
+		writeJSON(w, 404, errBody(404, err.Error(), "invalid_request_error").body)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "allowed_models": decodeAllowedModels(allowed), "warnings": warnings})
+}
+
+// isNamespacedModel reports whether the id carries a runtime namespace prefix
+// (e.g. "qoder/claude-…", "opencode/gpt-…"); those live in runtime catalogs,
+// not the workbuddy model cache.
+func isNamespacedModel(id string) bool {
+	for _, rt := range provider.Runtimes() {
+		if strings.HasPrefix(id, rt.Name()+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// decodeAllowedModels parses the stored JSON back to a list for responses.
+func decodeAllowedModels(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return []string{}
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return []string{}
+	}
+	return out
 }
 
 func (s *Server) adminRefreshCredits(w http.ResponseWriter, r *http.Request) {

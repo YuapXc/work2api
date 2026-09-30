@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { api } from '@/api/client'
-import type { AppInfo } from '@/types'
+import type { AppInfo, ModelInfo } from '@/types'
 import { toast } from '@/lib/toast'
 import { confirm } from '@/lib/confirm'
 import { int, credits, dt } from '@/lib/format'
@@ -23,6 +23,7 @@ const loading = ref(true)
 const cols: Column[] = [
   { key: 'name', label: '名称' },
   { key: 'key_prefix', label: '密钥', mono: true },
+  { key: 'allowed_models', label: '可用模型' },
   { key: 'requests', label: '请求数', align: 'right', mono: true },
   { key: 'tokens', label: 'Tokens', align: 'right', mono: true },
   { key: 'credits', label: '消耗额度', align: 'right', mono: true, hint: '该密钥累计消耗的额度' },
@@ -90,6 +91,66 @@ async function remove(app: any) {
   await load()
 }
 
+// ---------- 可用模型白名单 ----------
+// 空 = 不限制（所有模型可用）；勾选后仅白名单内模型可被该密钥调用，
+// 越权请求在网关入口直接 403。别名条目按其原样保存（网关按别名/实名双重匹配）。
+const modelsOpen = ref(false)
+const modelsTarget = ref<AppInfo | null>(null)
+const selected = ref<Set<string>>(new Set())
+const modelSearch = ref('')
+const savingModels = ref(false)
+const allModels = ref<ModelInfo[]>([])
+
+const filteredModels = computed(() => {
+  const q = modelSearch.value.trim().toLowerCase()
+  if (!q) return allModels.value
+  return allModels.value.filter((m) => m.id.toLowerCase().includes(q) || (m.name || '').toLowerCase().includes(q))
+})
+
+async function openModels(app: any) {
+  modelsTarget.value = app
+  selected.value = new Set(app.allowed_models || [])
+  modelSearch.value = ''
+  modelsOpen.value = true
+  if (!allModels.value.length) {
+    try {
+      const res = await api.models()
+      allModels.value = res.models ?? []
+    } catch { /* 目录加载失败时仍可手动编辑已选项 */ }
+  }
+}
+
+function toggleModel(id: string) {
+  const next = new Set(selected.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  selected.value = next
+}
+
+async function saveModels() {
+  const target = modelsTarget.value
+  if (!target) return
+  savingModels.value = true
+  try {
+    // 全不选视为「不限制」——与「清空白名单」语义一致，避免把密钥锁死成 0 个模型
+    const list = selected.value.size ? [...selected.value].sort() : []
+    const res = await api.setAppModels(target.id, list.length ? list : null)
+    if (res.warnings?.length) toast.info(res.warnings[0])
+    toast.success(list.length ? `已限定 ${list.length} 个模型` : '已恢复不限制')
+    modelsOpen.value = false
+    await load()
+  } finally {
+    savingModels.value = false
+  }
+}
+
+function modelCell(app: any) {
+  const list = app.allowed_models || []
+  if (!list.length) return '全部模型'
+  if (list.length <= 3) return list.join('、')
+  return `${list[0]}、${list[1]} 等 ${list.length} 个`
+}
+
 onMounted(load)
 </script>
 
@@ -110,6 +171,17 @@ onMounted(load)
         <template #cell-key_prefix="{ value }">
           <span class="text-muted">{{ value }}…</span>
         </template>
+        <template #cell-allowed_models="{ row }">
+          <button
+            type="button"
+            class="text-left text-small transition-colors"
+            :class="row.allowed_models?.length ? 'text-ink' : 'text-muted hover:text-brand'"
+            @click="openModels(row)"
+            title="点击编辑可用模型"
+          >
+            {{ modelCell(row) }}
+          </button>
+        </template>
         <template #cell-requests="{ value }">{{ int(value) }}</template>
         <template #cell-tokens="{ value }">{{ int(value) }}</template>
         <template #cell-credits="{ value }">{{ credits(value) }}</template>
@@ -119,6 +191,7 @@ onMounted(load)
         </template>
         <template #cell-actions="{ row }">
           <div class="flex items-center justify-end gap-1.5">
+            <WButton size="sm" variant="subtle" @click="openModels(row)">模型</WButton>
             <WButton size="sm" variant="subtle" @click="viewKey(row)">查看</WButton>
             <WToggle :model-value="row.enabled" @update:model-value="toggle(row)" />
             <WButton size="sm" variant="danger" @click="remove(row)">删除</WButton>
@@ -166,6 +239,43 @@ onMounted(load)
       </div>
       <p v-else class="text-small text-warn">{{ keyMsg }}</p>
       <template #footer><WButton variant="primary" @click="keyOpen = false">关闭</WButton></template>
+    </WModal>
+
+    <!-- 可用模型白名单编辑 -->
+    <WModal v-model:open="modelsOpen" title="可用模型">
+      <p class="mb-3 text-small text-muted">
+        为「{{ modelsTarget?.name }}」限定可调用的模型；白名单外的请求会被网关拒绝（403）。
+        <span class="text-faint">全部不选 = 不限制。</span>
+      </p>
+      <WInput v-model="modelSearch" placeholder="搜索模型…" class="mb-2.5" />
+      <div class="max-h-72 space-y-1 overflow-y-auto rounded-lg border border-line p-2">
+        <WSpinner v-if="!allModels.length" center label="加载模型目录" />
+        <label
+          v-for="m in filteredModels"
+          :key="m.id"
+          class="flex cursor-pointer items-center gap-2.5 rounded-md px-2 py-1.5 text-small transition-colors hover:bg-elevated"
+        >
+          <input
+            type="checkbox"
+            class="accent-brand"
+            :checked="selected.has(m.id)"
+            @change="toggleModel(m.id)"
+          />
+          <span class="mono min-w-0 flex-1 truncate text-ink">{{ m.id }}</span>
+          <span class="shrink-0 text-micro text-faint">{{ m.name }}</span>
+        </label>
+        <p v-if="allModels.length && !filteredModels.length" class="px-2 py-3 text-center text-micro text-faint">
+          没有匹配「{{ modelSearch }}」的模型
+        </p>
+      </div>
+      <div class="mt-2 flex items-center justify-between text-micro text-faint">
+        <span>已选 {{ selected.size }} 个</span>
+        <button class="transition-colors hover:text-brand" @click="selected = new Set()">清空</button>
+      </div>
+      <template #footer>
+        <WButton variant="subtle" @click="modelsOpen = false">取消</WButton>
+        <WButton variant="primary" :loading="savingModels" @click="saveModels">保存</WButton>
+      </template>
     </WModal>
   </WPage>
 </template>

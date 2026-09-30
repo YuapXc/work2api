@@ -40,8 +40,14 @@ func errBody(status int, message, typ string) *apiError {
 	return &apiError{status: status, body: map[string]any{"error": map[string]any{"message": message, "type": typ}}}
 }
 
-// Principal is the authenticated application.
-type Principal struct{ AppName string }
+// Principal is the authenticated application. AllowedModels is the per-key
+// model allowlist (nil = unrestricted); enforced in authorizeModel before any
+// upstream dispatch.
+type Principal struct {
+	AppName       string
+	AppID         int64
+	AllowedModels []string
+}
 
 // Orchestrator holds shared runtime state and the request pipeline.
 type Orchestrator struct {
@@ -189,7 +195,29 @@ func (o *Orchestrator) checkAPIKey(authorization, xAPIKey string) (*Principal, *
 		return nil, errBody(401, "invalid api key", "auth_error")
 	}
 	name, _ := app["name"].(string)
-	return &Principal{AppName: name}, nil
+	id, _ := app["id"].(int64)
+	allowed, _ := o.db.AllowedModelsOf(id)
+	return &Principal{AppName: name, AppID: id, AllowedModels: allowed}, nil
+}
+
+// authorizeModel enforces the principal's per-key model allowlist. The model
+// is checked as-requested AND alias-resolved, so a key allowing "gpt" permits
+// calls made via that alias, and a key listing only real ids rejects alias
+// calls unless the alias itself is allowed. Empty allowlist = unrestricted.
+func (s *Server) authorizeModel(principal *Principal, requestedModel string) *apiError {
+	if principal == nil || len(principal.AllowedModels) == 0 {
+		return nil
+	}
+	model := strings.TrimSpace(requestedModel)
+	if model == "" {
+		return nil
+	}
+	for _, allowed := range principal.AllowedModels {
+		if allowed == model || allowed == s.o.resolveModel(model) {
+			return nil
+		}
+	}
+	return errBody(403, "该 API 密钥未被授权使用模型 "+model+"（可在 WebUI「API 密钥」中调整可用模型）", "model_not_allowed")
 }
 
 func (o *Orchestrator) limiter(uid string) *ratelimit.Limiter {
