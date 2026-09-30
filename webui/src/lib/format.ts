@@ -64,3 +64,9 @@ export function latency(ms: number | undefined | null): string {
   if (ms == null) return '—'
   return ms >= 1000 ? (ms / 1000).toFixed(2) + 's' : ms + 'ms'
 }
+
+// 缓存命中率 0~1 → "87%"；null/undefined → null（调用方渲染占位）
+export function pct(n: number | undefined | null): string | null {
+  if (n == null || isNaN(n)) return null
+  return Math.round(n * 100) + '%'
+}

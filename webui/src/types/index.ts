@@ -183,6 +183,14 @@ export interface UsageSummary {
   by_app?: { app: string; count: number; tokens: number }[]
   /** 按账号聚合（多账号轮询下的核心视角） */
   by_account?: AccountStat[]
+  /** 缓存命中聚合（仅统计上游上报过 cached_tokens 的成功请求） */
+  cache?: {
+    known_rows: number
+    cached_tokens: number
+    uncached_tokens: number
+    /** 0~1；无已知样本时为 null */
+    hit_rate: number | null
+  }
 }
 
 export interface UsagePoint {
@@ -212,6 +220,8 @@ export interface UsageRecord {
   /** 只有上游明确提供积分时才为 true；旧服务未提供此字段。 */
   credit_known?: boolean
   app_name?: string | null
+  /** 上游 prompt-cache 命中 tokens；null/undefined = 上游未上报（区别于 0 命中） */
+  cached_tokens?: number | null
 }
 
 export interface Overview {

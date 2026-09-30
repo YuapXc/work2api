@@ -90,11 +90,11 @@ type Bridge struct {
 
 // QoderModel 是返回给前端的精简模型条目（仅保留下拉选择必要字段）
 type QoderModel struct {
-	Key             string  `json:"key"`
-	DisplayName     string  `json:"display_name"`
-	Enable          bool    `json:"enable"`
-	IsDefault       bool    `json:"is_default"`
-	IsReasoning     bool    `json:"is_reasoning,omitempty"`
+	Key         string `json:"key"`
+	DisplayName string `json:"display_name"`
+	Enable      bool   `json:"enable"`
+	IsDefault   bool   `json:"is_default"`
+	IsReasoning bool   `json:"is_reasoning,omitempty"`
 	// IsVL 上游 vision-language 标记（model/list 条目的 is_vl 字段）：
 	// true 表示该模型接受图片输入（多模态）。Go 版此前漏读该字段导致
 	// 整个 qoder 目录被标成纯文本。

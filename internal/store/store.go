@@ -23,8 +23,9 @@ import (
 
 // SchemaVersion is the Go store's schema version. v12 matches the Python
 // app's final schema; v13 adds the Go-side apps.allowed_models column
-// (per-key model allowlist, JSON array, empty = unrestricted).
-const SchemaVersion = 13
+// (per-key model allowlist, JSON array, empty = unrestricted); v14 adds
+// usage_logs.cached_tokens (upstream prompt-cache hit tokens, NULL = unknown).
+const SchemaVersion = 14
 
 // DB wraps the SQLite connection.
 type DB struct {
@@ -158,6 +159,10 @@ CREATE INDEX IF NOT EXISTS idx_usage_protocol ON usage_logs(protocol);
 	}
 	if _, err := d.db.Exec("ALTER TABLE usage_logs ADD COLUMN tokens_known INTEGER"); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 		return fmt.Errorf("migrate usage_logs.tokens_known: %w", err)
+	}
+	// v14: 上游 prompt-cache 命中 tokens（上游未报/未知为 NULL，便于区分 0 命中与不可知）。
+	if _, err := d.db.Exec("ALTER TABLE usage_logs ADD COLUMN cached_tokens INTEGER"); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("migrate usage_logs.cached_tokens: %w", err)
 	}
 	if _, err := d.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion)); err != nil {
 		return err

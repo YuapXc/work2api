@@ -97,10 +97,17 @@ func (c *AnthropicStreamConverter) Finish() string {
 	delta := map[string]any{"stop_reason": stopReason, "stop_sequence": nil}
 	var usage any
 	if c.usage != nil {
-		usage = map[string]any{
+		// 把上游缓存命中映射为 Anthropic cache_read_input_tokens：Claude Code
+		// 等客户端据此展示缓存命中；上游未报缓存字段时省略该键（0 会显示为
+		// "全 miss"，误导）。
+		anthropicUsage := map[string]any{
 			"input_tokens":  intOr(c.usage, "prompt_tokens"),
 			"output_tokens": intOr(c.usage, "completion_tokens"),
 		}
+		if cached := upstreamCachedTokens(c.usage); cached != nil {
+			anthropicUsage["cache_read_input_tokens"] = *cached
+		}
+		usage = anthropicUsage
 	}
 	events.WriteString(c.evt("message_delta", map[string]any{"delta": delta, "usage": usage}))
 	events.WriteString(c.evt("message_stop", map[string]any{}))
@@ -120,10 +127,14 @@ func (c *AnthropicStreamConverter) GetNonstreamResponse() map[string]any {
 		"stop_sequence": nil,
 	}
 	if c.usage != nil {
-		resp["usage"] = map[string]any{
+		nonstreamUsage := map[string]any{
 			"input_tokens":  intOr(c.usage, "prompt_tokens"),
 			"output_tokens": intOr(c.usage, "completion_tokens"),
 		}
+		if cached := upstreamCachedTokens(c.usage); cached != nil {
+			nonstreamUsage["cache_read_input_tokens"] = *cached
+		}
+		resp["usage"] = nonstreamUsage
 	}
 	return resp
 }

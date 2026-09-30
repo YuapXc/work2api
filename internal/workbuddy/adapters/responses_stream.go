@@ -276,13 +276,24 @@ func (c *ResponsesStreamConverter) responseObj(status string) map[string]any {
 	}
 	var usage any
 	if c.usage != nil {
-		usage = map[string]any{
+		// cached_tokens 用上游真实值（未上报则省略该字段）——硬编码 0 会让
+		// 客户端把每次请求都当成全量 miss。
+		details := map[string]any{"reasoning_tokens": 0}
+		cached := upstreamCachedTokens(c.usage)
+		if cached != nil {
+			details["cached_tokens"] = *cached
+		}
+		usageMap := map[string]any{
 			"input_tokens":          intOrAny(c.usage, "prompt_tokens", "input_tokens"),
-			"input_tokens_details":  map[string]any{"cached_tokens": 0},
+			"input_tokens_details":  details,
 			"output_tokens":         intOrAny(c.usage, "completion_tokens", "output_tokens"),
 			"output_tokens_details": map[string]any{"reasoning_tokens": 0},
 			"total_tokens":          intOr(c.usage, "total_tokens"),
 		}
+		if cached != nil {
+			usageMap["cache_read_input_tokens"] = *cached
+		}
+		usage = usageMap
 	}
 	response := map[string]any{
 		"id":                  c.respID,
@@ -337,6 +348,40 @@ func intOrAny(m map[string]any, keys ...string) int {
 		}
 	}
 	return 0
+}
+
+// upstreamCachedTokens 提取上游 usage 里的 prompt-cache 命中 tokens；未上报返回
+// nil。兼容 OpenAI（prompt_tokens_details.cached_tokens）、DeepSeek
+// （prompt_cache_hit_tokens）、Anthropic（cache_read_input_tokens）三种风格。
+// 实测 deepseek-v4.1-flash / glm-5.3-flash 均上报。
+func upstreamCachedTokens(u map[string]any) *int {
+	if u == nil {
+		return nil
+	}
+	if v := intOrAny(u, "prompt_cache_hit_tokens", "cache_read_input_tokens"); v > 0 {
+		return &v
+	}
+	sawField := false
+	for _, key := range []string{"prompt_tokens_details", "input_tokens_details"} {
+		det, ok := u[key].(map[string]any)
+		if !ok {
+			continue
+		}
+		if v := intOrAny(det, "cached_tokens"); v > 0 {
+			return &v
+		}
+		if _, has := det["cached_tokens"]; has {
+			sawField = true
+		}
+	}
+	if _, has := u["prompt_cache_hit_tokens"]; has {
+		sawField = true
+	}
+	if sawField {
+		zero := 0 // 上游报了结构但为 0：真实的"无命中"
+		return &zero
+	}
+	return nil
 }
 
 func itoa(n int) string {

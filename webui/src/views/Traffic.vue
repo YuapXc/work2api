@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { api } from '@/api/client'
 import type { UsageSummary, UsagePoint, UsageRecord, RecordsResponse } from '@/types'
 import { toast } from '@/lib/toast'
-import { int, abbr, credits as fmtCredits, dt, latency } from '@/lib/format'
+import { int, abbr, credits as fmtCredits, dt, latency, pct } from '@/lib/format'
 import WPage from '@/components/ui/WPage.vue'
 import WCard from '@/components/ui/WCard.vue'
 import WTabs from '@/components/ui/WTabs.vue'
@@ -65,6 +65,14 @@ const accountBars = computed(() =>
     sub: fmtCredits(a.credits) + ' 额度',
   })),
 )
+
+// 缓存命中：仅上游上报过 cached_tokens 的请求参与统计。
+// cached / (cached + 未命中输入)；输入里包含缓存的增量部分才是"可命中"的总量。
+const cacheStats = computed(() => {
+  const c = summary.value?.cache
+  if (!c || !c.known_rows || c.hit_rate == null) return null
+  return { rows: c.known_rows, hitRate: pct(c.hit_rate), cached: c.cached_tokens, uncached: c.uncached_tokens }
+})
 
 // ================= 日志 =================
 const records = ref<UsageRecord[]>([])
@@ -207,6 +215,30 @@ onMounted(() => {
           <WStat label="今日 Tokens" :value="abbr(summary?.today_tokens)" />
         </div>
 
+        <!-- 缓存命中：有可统计样本才展示（qoder 等不上报的上游自动隐藏） -->
+        <WCard v-if="cacheStats" title="提示词缓存" class="mb-4">
+          <template #actions>
+            <span class="text-micro text-faint">基于 {{ int(cacheStats.rows) }} 条已知样本（仅统计上报缓存数据的成功请求）</span>
+          </template>
+          <div class="flex flex-wrap items-center gap-6">
+            <div class="min-w-24">
+              <div class="text-micro text-faint">命中率</div>
+              <div class="mono text-2xl font-semibold text-live">{{ cacheStats.hitRate }}</div>
+            </div>
+            <div class="min-w-24">
+              <div class="text-micro text-faint">命中 Tokens</div>
+              <div class="mono text-small text-ink">{{ int(cacheStats.cached) }}</div>
+            </div>
+            <div class="min-w-24">
+              <div class="text-micro text-faint">未命中 Tokens</div>
+              <div class="mono text-small text-muted">{{ int(cacheStats.uncached) }}</div>
+            </div>
+            <div class="h-2 min-w-40 flex-1 overflow-hidden rounded-full bg-bg">
+              <div class="h-full rounded-full bg-live/70" :style="{ width: cacheStats.hitRate || '0%' }" />
+            </div>
+          </div>
+        </WCard>
+
         <WCard title="调用趋势" class="mb-4">
           <template #actions>
             <WTabs v-model="metric" :tabs="[{ key: 'count', label: '请求数' }, { key: 'tokens', label: 'Tokens' }]" />
@@ -246,7 +278,19 @@ onMounted(() => {
           <template #cell-ts="{ value }">{{ dt(value, 'MM-DD HH:mm:ss') }}</template>
           <template #cell-account_uid="{ value }">{{ acctLabel(value) }}</template>
           <template #cell-tokens="{ row }">
-            <span class="text-ink">{{ int(row.input_tokens) }}</span><span class="text-faint"> / {{ int(row.output_tokens) }}</span>
+            <div class="text-right leading-tight">
+              <div><span class="text-ink">{{ int(row.input_tokens) }}</span><span class="text-faint"> / {{ int(row.output_tokens) }}</span></div>
+              <!-- 缓存明细：未命中在前（异常醒目，琥珀色），命中灰色小字；
+                   全量未命中整行升级警示；上游未上报则不显示 -->
+              <div v-if="row.cached_tokens === 0" class="text-micro text-warn" title="上游上报了缓存数据，但本次完全未命中（换号/前缀被打散？）">
+                全量未命中 {{ int(row.input_tokens) }}
+              </div>
+              <div v-else-if="row.cached_tokens != null && row.input_tokens > row.cached_tokens" class="text-micro">
+                <span class="text-warn" title="未命中输入 Tokens">未命中 {{ int(row.input_tokens - row.cached_tokens) }}</span>
+                <span class="text-faint" title="缓存命中 Tokens"> · ⚡命中 {{ int(row.cached_tokens) }}</span>
+              </div>
+              <div v-else-if="row.cached_tokens != null" class="text-micro text-faint" title="全部输入命中缓存">⚡全命中 {{ int(row.cached_tokens) }}</div>
+            </div>
           </template>
           <template #cell-credits="{ row }">
             <span v-if="row.credit_known" class="text-ink">{{ fmtCredits(row.credits) }}</span>
@@ -288,6 +332,16 @@ onMounted(() => {
           <div><div class="text-micro text-faint">状态</div><div class="text-small text-ink">{{ detail.status }}</div></div>
           <div><div class="text-micro text-faint">输入 Tokens</div><div class="mono text-small text-ink">{{ int(detail.input_tokens) }}</div></div>
           <div><div class="text-micro text-faint">输出 Tokens</div><div class="mono text-small text-ink">{{ int(detail.output_tokens) }}</div></div>
+          <div v-if="detail.cached_tokens != null">
+            <div class="text-micro text-faint">缓存命中</div>
+            <div class="mono text-small">
+              <span v-if="detail.cached_tokens === 0" class="text-warn">全量未命中 {{ int(detail.input_tokens) }}</span>
+              <span v-else>
+                <span class="text-ink">⚡命中 {{ int(detail.cached_tokens) }}</span>
+                <span v-if="detail.input_tokens > detail.cached_tokens" class="text-warn"> · 未命中 {{ int(detail.input_tokens - detail.cached_tokens) }}</span>
+              </span>
+            </div>
+          </div>
           <div v-if="detail.reasoning_effort"><div class="text-micro text-faint">推理强度</div><div class="text-small text-ink">{{ detail.reasoning_effort }}</div></div>
           <div><div class="text-micro text-faint">时间</div><div class="mono text-small text-ink">{{ dt(detail.ts, 'MM-DD HH:mm:ss') }}</div></div>
         </div>

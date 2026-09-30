@@ -83,12 +83,15 @@ func (d *DB) SaveSettings(kv map[string]string) error {
 
 // UsageParams are the fields for a usage log entry.
 type UsageParams struct {
-	TokensKnown      *bool
-	Model            string
-	Protocol         string
-	AccountUID       string
-	InputTokens      int
-	OutputTokens     int
+	TokensKnown  *bool
+	Model        string
+	Protocol     string
+	AccountUID   string
+	InputTokens  int
+	OutputTokens int
+	// CachedTokens is the upstream prompt-cache hit tokens; nil = unknown
+	// (upstream didn't report), 0 = reported but no hit.
+	CachedTokens     *int
 	LatencyMs        float64
 	Status           string
 	Error            string
@@ -114,16 +117,20 @@ func (d *DB) LogUsage(p UsageParams) error {
 	if p.ReasoningEffort != "" {
 		effort = p.ReasoningEffort
 	}
+	var cached any
+	if p.CachedTokens != nil {
+		cached = *p.CachedTokens
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	_, err := d.db.Exec(
 		`INSERT INTO usage_logs (ts, model, protocol, account_uid, input_tokens, output_tokens,
 		   total_tokens, latency_ms, status, error, input_content, output_content,
-		   reasoning_content, credits, app_name, user_id, reasoning_effort, tokens_known)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		   reasoning_content, credits, app_name, user_id, reasoning_effort, tokens_known, cached_tokens)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		float64(time.Now().UnixNano())/1e9, p.Model, p.Protocol, p.AccountUID,
 		p.InputTokens, p.OutputTokens, total, p.LatencyMs, p.Status, p.Error,
-		p.InputContent, p.OutputContent, p.ReasoningContent, credits, p.AppName, nil, effort, p.TokensKnown)
+		p.InputContent, p.OutputContent, p.ReasoningContent, credits, p.AppName, nil, effort, p.TokensKnown, cached)
 	return err
 }
 
@@ -229,6 +236,27 @@ func (d *DB) UsageSummary() (map[string]any, error) {
 		}
 		out["by_account"] = byAccount
 	}
+
+	// 缓存命中聚合：只统计上游确实上报过的行（cached_tokens IS NOT NULL），
+	// cached 输入 + 未命中输入 = 可命中输入总量，命中率 = cached / (cached + miss)。
+	var knownRows, cachedSum, missSum int64
+	_ = d.db.QueryRow(`SELECT COUNT(*),
+		COALESCE(SUM(cached_tokens),0),
+		COALESCE(SUM(CASE WHEN cached_tokens IS NOT NULL THEN input_tokens - cached_tokens ELSE 0 END),0)
+		FROM usage_logs WHERE cached_tokens IS NOT NULL AND status='ok'`).Scan(&knownRows, &cachedSum, &missSum)
+	out["cache"] = map[string]any{
+		"known_rows": knownRows, "cached_tokens": cachedSum, "uncached_tokens": missSum,
+		"hit_rate": func() any {
+			if knownRows == 0 {
+				return nil
+			}
+			total := cachedSum + missSum
+			if total <= 0 {
+				return nil
+			}
+			return float64(cachedSum) / float64(total)
+		}(),
+	}
 	return out, nil
 }
 
@@ -282,7 +310,7 @@ func usageWhere(protocol, model string, appName *string, status, search string) 
 	return "WHERE " + strings.Join(clauses, " AND "), params
 }
 
-const usageLightCols = "id, ts, model, protocol, account_uid, input_tokens, output_tokens, total_tokens, latency_ms, status, error, credits, app_name, user_id, reasoning_effort, tokens_known"
+const usageLightCols = "id, ts, model, protocol, account_uid, input_tokens, output_tokens, total_tokens, latency_ms, status, error, credits, app_name, user_id, reasoning_effort, tokens_known, cached_tokens"
 
 // UsageRecent returns recent usage records with optional filters.
 func (d *DB) UsageRecent(limit int, protocol, model string, appName *string, status string, light bool, offset int, search string) ([]map[string]any, error) {
