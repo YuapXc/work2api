@@ -163,13 +163,21 @@ func (s *Server) adminAuth(r *http.Request) (sessionOK, headerOK bool) {
 // header) it returns 200 without checking the token, so the WebUI can probe
 // session liveness with a plain GET-style POST of nothing.
 func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
+	body, _ := readJSON(r)
+	// No ADMIN_TOKEN configured: the whole admin surface is loopback-only and
+	// the WebUI must skip login. The probe (empty body) reports that state as
+	// ok:true/no_login rather than an error, so the frontend never shows the
+	// login page in this mode.
 	if s.o.cfg.AdminToken == "" {
+		if len(body) == 0 {
+			writeJSON(w, 200, map[string]any{"ok": true, "probe": true, "no_login": true})
+			return
+		}
 		writeJSON(w, 400, map[string]any{"ok": false, "message": "未设置 ADMIN_TOKEN（本机回环模式无需登录）"})
 		return
 	}
 	// Session probe / liveness check (no token in body): authenticated callers
 	// get ok + csrf-free status without consuming a rate-limit slot.
-	body, _ := readJSON(r)
 	if len(body) == 0 {
 		if sessionOK, headerOK := s.adminAuth(r); sessionOK || headerOK {
 			writeJSON(w, 200, map[string]any{"ok": true, "probe": true})
