@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // Server is the HTTP surface over an Orchestrator.
@@ -60,9 +61,14 @@ func (s *Server) adminGuard(next http.Handler) http.Handler {
 		}
 		token := s.o.cfg.AdminToken
 		if token == "" {
-			host := r.Host
-			if h, _, err := net.SplitHostPort(host); err == nil {
-				host = h
+			// Loopback check MUST use the peer address (r.RemoteAddr), not the
+			// Host header: the header is client-controlled, so a remote
+			// attacker could send "Host: 127.0.0.1" and walk straight in when
+			// the listener is bound beyond loopback (HOST=0.0.0.0). The
+			// hostGuard's Host check exists separately for DNS-rebinding.
+			host, _, err := net.SplitHostPort(r.RemoteAddr)
+			if err != nil {
+				host = r.RemoteAddr
 			}
 			if !isLoopbackHost(host) {
 				writeJSON(w, http.StatusForbidden, map[string]any{"error": map[string]any{
@@ -80,8 +86,31 @@ func (s *Server) adminGuard(next http.Handler) http.Handler {
 				"type":    "unauthorized"}})
 			return
 		}
+		// Cookie-authenticated GETs are readable cross-site unless the browser
+		// tells us the request origin. SameSite=Lax already blocks cross-site
+		// POST/DELETE; this closes the cross-site READ hole (e.g. <img>/top-level
+		// navigation carrying the session cookie to /admin/credentials/export).
+		// Header-authenticated requests (scripts) don't carry cookies and are
+		// exempt. Missing Sec-Fetch-Site (old browsers / curl) still passes —
+		// defense-in-depth, not the only line.
+		if sessionOK && !headerOK && isCrossSiteFetch(r) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": map[string]any{
+				"message": "拒绝跨站请求（CSRF 防护）。", "type": "forbidden"}})
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isCrossSiteFetch reports whether the browser-declared Sec-Fetch-Site header
+// marks a cross-site request.
+func isCrossSiteFetch(r *http.Request) bool {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "same-origin", "same-site", "none", "":
+		return false
+	default:
+		return true
+	}
 }
 
 // hostGuard blocks DNS-rebinding: only loopback/allowed hosts unless
@@ -114,13 +143,22 @@ func isLoopbackHost(host string) bool {
 	return false
 }
 
+// handleHealth is a liveness probe, unauthenticated by design (load balancers).
+// Public exposure note: it reports counts and health summary only — account
+// identifiers were previously enumerated here, which is information leakage on
+// a public listener (they key cooldowns and display in logs, not secrets, but
+// there is no reason to publish them).
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	accounts := make([]string, 0)
-	for _, a := range s.o.pool.Accounts() {
-		accounts = append(accounts, a.UID)
+	accounts := s.o.pool.Accounts()
+	healthy := 0
+	for _, a := range accounts {
+		if a.Enabled && a.CooldownUntil <= float64(time.Now().UnixNano())/1e9 {
+			healthy++
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status": "ok", "accounts": accounts, "model_source": s.o.models.Source(),
+		"status": "ok", "account_count": len(accounts), "healthy_accounts": healthy,
+		"model_source": s.o.models.Source(),
 	})
 }
 
