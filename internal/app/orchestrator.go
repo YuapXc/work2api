@@ -204,7 +204,7 @@ func (o *Orchestrator) checkAPIKey(authorization, xAPIKey string) (*Principal, *
 // authorizeModel enforces the principal's per-key model allowlist. The model
 // is checked as-requested AND alias-resolved, so a key allowing "gpt" permits
 // calls made via that alias, and a key listing real ids permits aliases resolving
-// to those ids. Missing/empty model means auto; empty allowlist = unrestricted.
+// to those ids. Empty allowlist = unrestricted.
 func (s *Server) authorizeModel(principal *Principal, requestedModel string) *apiError {
 	if principal == nil || len(principal.AllowedModels) == 0 {
 		return nil
@@ -213,19 +213,31 @@ func (s *Server) authorizeModel(principal *Principal, requestedModel string) *ap
 	if model == "" {
 		model = "auto"
 	}
-	for _, allowed := range principal.AllowedModels {
-		if allowed == model || allowed == s.o.resolveModel(model) {
-			return nil
-		}
+	if modelAllowed(principal, model, s.o.resolveModel(model)) {
+		return nil
 	}
 	return errBody(403, "该 API 密钥未被授权使用模型 "+model+"（可在 WebUI「API 密钥」中调整可用模型）", "model_not_allowed")
+}
+
+// modelAllowed shares the same requested-id/alias-target policy between
+// request authorization and the public model catalog.
+func modelAllowed(principal *Principal, model, resolved string) bool {
+	if principal == nil || len(principal.AllowedModels) == 0 {
+		return true
+	}
+	for _, allowed := range principal.AllowedModels {
+		if allowed == model || allowed == resolved {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) prepareModel(principal *Principal, payload map[string]any) *apiError {
 	if payload == nil {
 		return errBody(400, "请求体必须是 JSON 对象", "invalid_request_error")
 	}
-	model := "auto"
+	model := ""
 	if value := payload["model"]; value != nil {
 		name, ok := value.(string)
 		if !ok {
@@ -233,6 +245,19 @@ func (s *Server) prepareModel(principal *Principal, payload map[string]any) *api
 		}
 		if name = strings.TrimSpace(name); name != "" {
 			model = name
+		}
+	}
+	if model == "" {
+		model = "auto"
+		if principal != nil {
+			switch len(principal.AllowedModels) {
+			case 1:
+				model = principal.AllowedModels[0]
+			case 0:
+				// Unrestricted keys retain the upstream default.
+			default:
+				return errBody(400, "该 API 密钥允许多个模型，请明确指定 model（可通过 /v1/models 查询可用模型）", "invalid_request_error")
+			}
 		}
 	}
 	payload["model"] = model

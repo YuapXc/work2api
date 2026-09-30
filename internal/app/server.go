@@ -244,11 +244,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
-	if _, aerr := s.auth(r); aerr != nil {
+	principal, aerr := s.auth(r)
+	if aerr != nil {
 		writeAPIErr(w, aerr)
 		return
 	}
 	data := s.o.models.ListCached()
+	// Merge all providers before adding aliases and applying the key's policy.
+	data = append(data, s.o.runtimeModels(r.Context())...)
 	settings, _ := s.o.db.GetSettings()
 	aliases := parseModelAliases(settings["model_aliases"])
 	if len(aliases) > 0 {
@@ -273,6 +276,14 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]map[string]any, 0, len(data))
 	for _, item := range data {
+		id := str2(item["id"])
+		resolved := id
+		if real, ok := aliases[id]; ok {
+			resolved = real
+		}
+		if !modelAllowed(principal, id, resolved) {
+			continue
+		}
 		clean := map[string]any{}
 		for k, v := range item {
 			if k == "account_uids" {
@@ -282,8 +293,6 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, clean)
 	}
-	// Append models served by non-default provider runtimes (qoder/*, opencode/*).
-	out = append(out, s.o.runtimeModels(r.Context())...)
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": out})
 }
 
