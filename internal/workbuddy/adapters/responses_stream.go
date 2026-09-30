@@ -350,6 +350,19 @@ func intOrAny(m map[string]any, keys ...string) int {
 	return 0
 }
 
+// upstreamCacheCreationTokens 提取上游 usage 里的缓存写入 tokens（本轮新建立
+// 缓存的部分）；上游未报则为 0。兼容 Anthropic（cache_creation_input_tokens）与
+// DeepSeek（prompt_cache_write_tokens）两种风格。
+func upstreamCacheCreationTokens(u map[string]any) int {
+	if u == nil {
+		return 0
+	}
+	if v := intOrAny(u, "cache_creation_input_tokens", "prompt_cache_write_tokens"); v > 0 {
+		return v
+	}
+	return 0
+}
+
 // upstreamCachedTokens 提取上游 usage 里的 prompt-cache 命中 tokens；未上报返回
 // nil。兼容 OpenAI（prompt_tokens_details.cached_tokens）、DeepSeek
 // （prompt_cache_hit_tokens）、Anthropic（cache_read_input_tokens）三种风格。

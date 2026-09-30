@@ -97,21 +97,46 @@ func (c *AnthropicStreamConverter) Finish() string {
 	delta := map[string]any{"stop_reason": stopReason, "stop_sequence": nil}
 	var usage any
 	if c.usage != nil {
-		// 把上游缓存命中映射为 Anthropic cache_read_input_tokens：Claude Code
-		// 等客户端据此展示缓存命中；上游未报缓存字段时省略该键（0 会显示为
-		// "全 miss"，误导）。
-		anthropicUsage := map[string]any{
-			"input_tokens":  intOr(c.usage, "prompt_tokens"),
-			"output_tokens": intOr(c.usage, "completion_tokens"),
-		}
-		if cached := upstreamCachedTokens(c.usage); cached != nil {
-			anthropicUsage["cache_read_input_tokens"] = *cached
-		}
-		usage = anthropicUsage
+		usage = anthropicUsage(c.usage)
 	}
 	events.WriteString(c.evt("message_delta", map[string]any{"delta": delta, "usage": usage}))
 	events.WriteString(c.evt("message_stop", map[string]any{}))
 	return events.String()
+}
+
+// anthropicUsage 把上游 OpenAI 风格 usage 转成 Anthropic 官方语义：
+//
+//	Anthropic: input_tokens = 非缓存的新鲜输入；总输入 = input + cache_read + cache_creation
+//	OpenAI/上游: prompt_tokens = cached + 非cached（总输入）
+//
+// 直接把 prompt_tokens 填给 input_tokens 会让 Claude Code 把"总输入"记成 input，
+// 下游统计工具（cc-switch 扫描本地日志）的 Input 列随之虚高、与 Cache 列重复相加。
+// 因此 input_tokens = prompt_tokens - cached - creation；cache_creation 用上游的
+// write/creation 字段（如无则为 0）。上游未报缓存字段时保持 input=prompt 原语义。
+func anthropicUsage(u map[string]any) map[string]any {
+	out := map[string]any{
+		"input_tokens":  intOr(u, "prompt_tokens"),
+		"output_tokens": intOr(u, "completion_tokens"),
+	}
+	cached := upstreamCachedTokens(u)
+	if cached == nil {
+		return out
+	}
+	creation := upstreamCacheCreationTokens(u)
+	fresh := intOr(u, "prompt_tokens") - *cached - creation
+	if fresh < 0 {
+		fresh = 0
+	}
+	out["input_tokens"] = fresh
+	if *cached > 0 {
+		out["cache_read_input_tokens"] = *cached
+	} else {
+		// 上游明确报了缓存字段但本轮 0 命中：仍下发 cache_read=0，保持字段
+		// 存在性一致（Claude Code 日志口径稳定，便于下游工具归一化）。
+		out["cache_read_input_tokens"] = 0
+	}
+	out["cache_creation_input_tokens"] = creation
+	return out
 }
 
 // GetNonstreamResponse returns the full non-streaming Message response object.
@@ -127,14 +152,7 @@ func (c *AnthropicStreamConverter) GetNonstreamResponse() map[string]any {
 		"stop_sequence": nil,
 	}
 	if c.usage != nil {
-		nonstreamUsage := map[string]any{
-			"input_tokens":  intOr(c.usage, "prompt_tokens"),
-			"output_tokens": intOr(c.usage, "completion_tokens"),
-		}
-		if cached := upstreamCachedTokens(c.usage); cached != nil {
-			nonstreamUsage["cache_read_input_tokens"] = *cached
-		}
-		resp["usage"] = nonstreamUsage
+		resp["usage"] = anthropicUsage(c.usage)
 	}
 	return resp
 }
