@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"time"
@@ -44,7 +45,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, errBody(400, "messages is required", "invalid_request_error").body)
 		return
 	}
-	if aerr := s.authorizeModel(principal, strOr(payload["model"], "")); aerr != nil {
+	if aerr := s.prepareModel(principal, payload); aerr != nil {
 		writeAPIErr(w, aerr)
 		return
 	}
@@ -100,7 +101,12 @@ func (s *Server) runChatPath(w http.ResponseWriter, r *http.Request, payload map
 				writeChunk("data: " + jsonError(ue.StatusCode, string(ue.Raw)) + "\n\n")
 			} else {
 				o.logUsage(logArgs{protocol: "chat", model: model, acc: served, t0: t0, status: "error", errStr: err.Error(), input: input, appName: principal.AppName, effort: effort, updatePool: false})
-				writeChunk("data: " + jsonError(502, err.Error()) + "\n\n")
+				status, detail := errToHTTP(err)
+				if body, ok := detail["error"].(map[string]any); ok {
+					body["code"] = status
+				}
+				encoded, _ := json.Marshal(detail)
+				writeChunk("data: " + string(encoded) + "\n\n")
 			}
 			writeChunk("data: [DONE]\n\n")
 			return
@@ -171,7 +177,7 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").body)
 		return
 	}
-	if aerr := s.authorizeModel(principal, strOr(payload["model"], "")); aerr != nil {
+	if aerr := s.prepareModel(principal, payload); aerr != nil {
 		writeAPIErr(w, aerr)
 		return
 	}
@@ -278,6 +284,9 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 }
 
 func errToHTTP(err error) (int, map[string]any) {
+	if ae, ok := err.(*apiError); ok {
+		return ae.status, ae.body
+	}
 	if ue, ok := err.(*upstream.UpstreamError); ok {
 		return ue.StatusCode, safeErr(ue.Raw, ue.StatusCode)
 	}

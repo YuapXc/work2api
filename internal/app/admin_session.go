@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -163,7 +164,11 @@ func (s *Server) adminAuth(r *http.Request) (sessionOK, headerOK bool) {
 // header) it returns 200 without checking the token, so the WebUI can probe
 // session liveness with a plain GET-style POST of nothing.
 func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
-	body, _ := readJSON(r)
+	body, err := readJSON(r)
+	if err != nil && err != io.EOF {
+		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").body)
+		return
+	}
 	// No ADMIN_TOKEN configured: the whole admin surface is loopback-only and
 	// the WebUI must skip login. The probe (empty body) reports that state as
 	// ok:true/no_login rather than an error, so the frontend never shows the
@@ -187,11 +192,6 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Real login: rate-limit, constant-time compare, issue cookie.
-	ip := clientIP(r)
-	if !s.loginLimiter.allow(ip) {
-		writeJSON(w, 429, map[string]any{"ok": false, "message": "尝试次数过多，请 10 分钟后再试"})
-		return
-	}
 	token, _ := body["token"].(string)
 	if subtle.ConstantTimeCompare([]byte(token), []byte(s.o.cfg.AdminToken)) != 1 {
 		time.Sleep(200 * time.Millisecond) // blunt brute-force cost
@@ -205,7 +205,7 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		MaxAge:   int(sessionTTL.Seconds()),
 		HttpOnly: true,
-		Secure:   r.TLS != nil,
+		Secure:   r.TLS != nil || s.o.cfg.AdminCookieSecure,
 		SameSite: http.SameSiteLaxMode,
 	})
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -219,7 +219,7 @@ func (s *Server) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: cookieName, Value: "", Path: "/", MaxAge: -1,
-		HttpOnly: true, SameSite: http.SameSiteLaxMode,
+		HttpOnly: true, Secure: r.TLS != nil || s.o.cfg.AdminCookieSecure, SameSite: http.SameSiteLaxMode,
 	})
 	writeJSON(w, 200, map[string]any{"ok": true})
 }

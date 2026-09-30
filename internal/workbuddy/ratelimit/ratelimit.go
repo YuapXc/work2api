@@ -4,8 +4,9 @@
 package ratelimit
 
 import (
+	"context"
+	"errors"
 	"math/rand"
-	"sync"
 	"time"
 )
 
@@ -13,7 +14,8 @@ import (
 type Limiter struct {
 	minInterval time.Duration
 	jitter      time.Duration
-	mu          sync.Mutex
+	turn        chan struct{}
+	pending     chan struct{}
 	last        time.Time
 }
 
@@ -26,12 +28,29 @@ func New(minInterval, jitter time.Duration) *Limiter {
 	if jitter < 0 {
 		jitter = 300 * time.Millisecond
 	}
-	return &Limiter{minInterval: minInterval, jitter: jitter}
+	return &Limiter{minInterval: minInterval, jitter: jitter, turn: make(chan struct{}, 1), pending: make(chan struct{}, 32)}
 }
 
-// Wait blocks until the account is allowed to make its next request.
-func (l *Limiter) Wait() {
-	l.mu.Lock()
+var ErrQueueFull = errors.New("account rate-limit queue is full")
+
+// Wait bounds queued callers and only records actual grants. Cancelled callers
+// release admission without leaving reservations in the account's future.
+func (l *Limiter) Wait(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case l.pending <- struct{}{}:
+		defer func() { <-l.pending }()
+	default:
+		return ErrQueueFull
+	}
+	select {
+	case l.turn <- struct{}{}:
+		defer func() { <-l.turn }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	now := time.Now()
 	wait := l.minInterval - now.Sub(l.last)
 	if wait > 0 {
@@ -43,13 +62,19 @@ func (l *Limiter) Wait() {
 		if wait < 100*time.Millisecond {
 			wait = 100 * time.Millisecond
 		}
-		l.last = time.Now().Add(wait)
-	} else {
-		wait = 0
-		l.last = now
 	}
-	l.mu.Unlock()
 	if wait > 0 {
-		time.Sleep(wait)
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	l.last = time.Now()
+	return nil
 }

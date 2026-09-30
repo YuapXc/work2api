@@ -1,6 +1,23 @@
 package bridge
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
+
+func textBlocks(blocks []interface{}, separator string) string {
+	var text strings.Builder
+	for _, block := range blocks {
+		b, _ := block.(map[string]interface{})
+		if t, ok := b["text"].(string); ok {
+			if text.Len() > 0 {
+				text.WriteString(separator)
+			}
+			text.WriteString(t)
+		}
+	}
+	return text.String()
+}
 
 func BuildQoderMessages(templateMsgs []interface{}, incoming []interface{}, prompt string, toolsEnabled bool) []interface{} {
 	var rebuilt []interface{}
@@ -40,13 +57,7 @@ func BuildQoderMessages(templateMsgs []interface{}, incoming []interface{}, prom
 						case string:
 							resultContent = c
 						case []interface{}:
-							for _, part := range c {
-								if pm, ok := part.(map[string]interface{}); ok {
-									if t, ok := pm["text"].(string); ok {
-										resultContent += t
-									}
-								}
-							}
+							resultContent = textBlocks(c, "")
 						}
 						rebuilt = append(rebuilt, map[string]interface{}{
 							"role":         "tool",
@@ -113,7 +124,7 @@ func ConvertIncomingMessage(msg map[string]interface{}, toolsEnabled bool) map[s
 		if role == "assistant" && HasBlockType(contentArr, "tool_use") {
 			out := map[string]interface{}{"role": "assistant", "content": ""}
 			var toolCalls []interface{}
-			var textParts string
+			var textParts strings.Builder
 			for _, block := range contentArr {
 				b, _ := block.(map[string]interface{})
 				if b == nil {
@@ -132,12 +143,12 @@ func ConvertIncomingMessage(msg map[string]interface{}, toolsEnabled bool) map[s
 					})
 				case "text":
 					if t, ok := b["text"].(string); ok {
-						textParts += t
+						textParts.WriteString(t)
 					}
 				}
 			}
-			if textParts != "" {
-				out["content"] = textParts
+			if textParts.Len() > 0 {
+				out["content"] = textParts.String()
 			}
 			if len(toolCalls) > 0 {
 				out["tool_calls"] = toolCalls
@@ -159,13 +170,7 @@ func ConvertIncomingMessage(msg map[string]interface{}, toolsEnabled bool) map[s
 				case string:
 					resultContent = c
 				case []interface{}:
-					for _, part := range c {
-						if pm, ok := part.(map[string]interface{}); ok {
-							if t, ok := pm["text"].(string); ok {
-								resultContent += t
-							}
-						}
-					}
+					resultContent = textBlocks(c, "")
 				}
 				results = append(results, map[string]interface{}{
 					"role":         "tool",
@@ -187,19 +192,19 @@ func ConvertIncomingMessage(msg map[string]interface{}, toolsEnabled bool) map[s
 		// Handle thinking blocks - skip them
 		if blockType == "thinking" || blockType == "redacted_thinking" {
 			// Extract only text blocks
-			var textParts string
+			var textParts strings.Builder
 			for _, block := range contentArr {
 				b, _ := block.(map[string]interface{})
 				if b != nil && b["type"] == "text" {
 					if t, ok := b["text"].(string); ok {
-						textParts += t
+						textParts.WriteString(t)
 					}
 				}
 			}
-			if textParts == "" {
+			if textParts.Len() == 0 {
 				return nil
 			}
-			return BuildStructuredMessage(role, textParts)
+			return BuildStructuredMessage(role, textParts.String())
 		}
 	}
 
@@ -290,15 +295,5 @@ func NormalizeMessageContent(msg map[string]interface{}) string {
 		data, _ := json.Marshal(c)
 		return string(data)
 	}
-	var sb string
-	for _, block := range arr {
-		b, _ := block.(map[string]interface{})
-		if t, ok := b["text"].(string); ok {
-			if sb != "" {
-				sb += "\n\n"
-			}
-			sb += t
-		}
-	}
-	return sb
+	return textBlocks(arr, "\n\n")
 }

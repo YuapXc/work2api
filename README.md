@@ -118,6 +118,8 @@ docker run -d --name work2api -p 8787:8787 \
 
 > 从**非回环**地址（局域网 IP / 域名）访问时，必须同时设 `-e ADMIN_TOKEN=<你的令牌> -e ALLOW_EXTERNAL_HOST=1`，否则会被 Host 校验拦截（防 DNS rebinding）。
 
+公网管理台应通过 HTTPS 访问。`ALLOW_EXTERNAL_HOST=1` 时默认启用 Secure Cookie，支持代理以 HTTP 回源；反向代理须保留外部 `Host`（含非默认端口），以便校验管理请求的 `Origin`。服务不会凭 `X-Forwarded-Proto` 放宽 Cookie 或来源校验。仅可信局域网直接使用 HTTP 时，可显式设置 `ADMIN_COOKIE_SECURE=false`；公网应保持开启。脚本管理请求继续使用 `X-Admin-Token`，分发给调用者的应是独立 API Key。
+
 ### 关于火绒 `Trojan/Intercept.a`（误报）
 
 自编译或未签名的 exe 可能被火绒等按**行为启发式**误报为 `Trojan/Intercept.a`——本质是「未知未签名 + 监听端口 + 处理凭据」触发的通用规则，依赖仅 `modernc.org/sqlite` 等可信包。处理方式：
@@ -139,6 +141,9 @@ docker run -d --name work2api -p 8787:8787 \
 | `-admin-token` | `ADMIN_TOKEN` | 空 | 管理台/`/admin/*` 令牌；**空 = 仅回环可用** |
 | `-log-level` | `LOG_LEVEL` | `INFO` | 日志级别 |
 | — | `ALLOW_EXTERNAL_HOST` | `false` | 允许非回环 Host 访问（防 DNS rebinding，见注意事项） |
+| — | `ADMIN_COOKIE_SECURE` | 随公网模式开启 | 强制管理 Cookie 的 Secure 属性；HTTPS 代理 HTTP 回源时应保持开启 |
+| — | `MAX_REQUEST_BYTES` | `16777216` | 请求体上限（字节，必须大于 0）；登录固定 8 KiB，读取期限 30 秒 |
+| — | `MAX_CONCURRENT_REQUESTS` | `32` | 同时处理的请求数，包含 SSE；超出返回 429 |
 | — | `DESENSITIZE` | `true` | 对 system/developer 消息脱敏 |
 | — | `RATELIMIT` / `RATELIMIT_INTERVAL` | `true` / `1.5` | 每账号限速 |
 | — | `CHECKIN_HOURS` | `9,21` | 每日自动签到小时 |

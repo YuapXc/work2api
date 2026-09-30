@@ -17,13 +17,16 @@ import (
 
 // Config is the fully-resolved runtime configuration.
 type Config struct {
-	Host       string // listen host
-	Port       int    // listen port
-	DBPath     string // SQLite file path
-	AdminToken string // admin/WebUI auth; empty => loopback-only
-	DataDir    string // base dir for data (db, attachments, secrets)
-	LogLevel   string
-	LogToFile  bool
+	Host                  string // listen host
+	Port                  int    // listen port
+	DBPath                string // SQLite file path
+	AdminToken            string // admin/WebUI auth; empty => loopback-only
+	AdminCookieSecure     bool   // force Secure cookies behind a TLS-terminating proxy
+	MaxRequestBytes       int64
+	MaxConcurrentRequests int
+	DataDir               string // base dir for data (db, attachments, secrets)
+	LogLevel              string
+	LogToFile             bool
 
 	// workbuddy provider knobs (ported from workbuddy_one/config.py)
 	AllowExternalHost  bool
@@ -86,13 +89,16 @@ func Load(args []string) *Config {
 	}
 
 	return &Config{
-		Host:       *host,
-		Port:       *port,
-		DataDir:    dd,
-		DBPath:     dbp,
-		AdminToken: *adminToken,
-		LogLevel:   strings.ToUpper(*logLevel),
-		LogToFile:  env("LOG_TO_FILE", "1") != "0",
+		Host:                  *host,
+		Port:                  *port,
+		DataDir:               dd,
+		DBPath:                dbp,
+		AdminToken:            *adminToken,
+		AdminCookieSecure:     boolEnv("ADMIN_COOKIE_SECURE", boolEnv("ALLOW_EXTERNAL_HOST", false)),
+		MaxRequestBytes:       int64(positiveEnvInt("MAX_REQUEST_BYTES", 16*1024*1024)),
+		MaxConcurrentRequests: positiveEnvInt("MAX_CONCURRENT_REQUESTS", 32),
+		LogLevel:              strings.ToUpper(*logLevel),
+		LogToFile:             env("LOG_TO_FILE", "1") != "0",
 
 		AllowExternalHost:  boolEnv("ALLOW_EXTERNAL_HOST", false),
 		Desensitize:        boolEnv("DESENSITIZE", true),
@@ -111,6 +117,15 @@ func Load(args []string) *Config {
 		// 主要截断 base64 图片这类撑爆库的大 payload。
 		UsageContentMaxBytes: envInt("USAGE_CONTENT_MAX_BYTES", 32768),
 	}
+}
+
+func positiveEnvInt(k string, def int) int {
+	v := envInt(k, def)
+	if v <= 0 {
+		warnf("%s=%d 必须大于 0，已回退默认值 %d", k, v, def)
+		return def
+	}
+	return v
 }
 
 func boolEnv(k string, def bool) bool {

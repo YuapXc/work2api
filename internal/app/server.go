@@ -1,9 +1,14 @@
 package app
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -16,6 +21,8 @@ type Server struct {
 	sessions     *adminSessionManager
 	loginLimiter *loginRateLimiter
 }
+
+type principalContextKey struct{}
 
 // NewServer builds the HTTP server.
 func NewServer(o *Orchestrator) *Server {
@@ -33,7 +40,73 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/responses", s.handleResponses)
 	s.mountAdmin(mux)
 	s.mountWebUI(mux)
-	return s.hostGuard(s.adminGuard(mux))
+	return s.hostGuard(s.adminGuard(s.requestGuard(mux)))
+}
+
+// Bound admission and finish reading bodies before opening a long-lived SSE
+// response. A body deadline must not become a deadline for the response stream.
+func (s *Server) requestGuard(next http.Handler) http.Handler {
+	capacity := s.o.cfg.MaxConcurrentRequests
+	if capacity <= 0 {
+		capacity = 32
+	}
+	slots := make(chan struct{}, capacity)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v1/") {
+			principal, aerr := s.auth(r)
+			if aerr != nil {
+				writeAPIErr(w, aerr)
+				return
+			}
+			r = r.WithContext(context.WithValue(r.Context(), principalContextKey{}, principal))
+		}
+		select {
+		case slots <- struct{}{}:
+			defer func() { <-slots }()
+		default:
+			writeJSON(w, 429, errBody(429, "并发请求过多，请稍后重试", "rate_limit_error").body)
+			return
+		}
+		if r.URL.Path == "/admin/login" && s.o.cfg.AdminToken != "" {
+			sessionOK, headerOK := s.adminAuth(r)
+			if !sessionOK && !headerOK && !s.loginLimiter.allow(clientIP(r)) {
+				writeJSON(w, 429, errBody(429, "尝试次数过多，请 10 分钟后再试", "rate_limit_error").body)
+				return
+			}
+		}
+		if r.Body != nil && r.Body != http.NoBody {
+			limit := s.o.cfg.MaxRequestBytes
+			if limit <= 0 {
+				limit = 16 * 1024 * 1024
+			}
+			if r.URL.Path == "/admin/login" {
+				limit = 8 * 1024
+			}
+			if r.ContentLength > limit {
+				writeJSON(w, 413, errBody(413, "请求体过大", "invalid_request_error").body)
+				return
+			}
+			controller := http.NewResponseController(w)
+			_ = controller.SetReadDeadline(time.Now().Add(30 * time.Second))
+			body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+			_ = r.Body.Close()
+			_ = controller.SetReadDeadline(time.Time{})
+			if err != nil {
+				status := http.StatusBadRequest
+				var tooLarge *http.MaxBytesError
+				var timeout net.Error
+				if errors.As(err, &tooLarge) {
+					status = http.StatusRequestEntityTooLarge
+				} else if errors.As(err, &timeout) && timeout.Timeout() {
+					status = http.StatusRequestTimeout
+				}
+				writeJSON(w, status, errBody(status, "请求体读取失败或超过限制", "invalid_request_error").body)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // adminGuard authenticates the /admin/* surface. Historically ADMIN_TOKEN was
@@ -56,6 +129,10 @@ func (s *Server) adminGuard(next http.Handler) http.Handler {
 			return
 		}
 		if r.URL.Path == "/admin/login" || r.URL.Path == "/admin/logout" {
+			if !s.adminOriginAllowed(r, false) {
+				writeJSON(w, 403, errBody(403, "拒绝跨源管理请求", "forbidden").body)
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -86,14 +163,9 @@ func (s *Server) adminGuard(next http.Handler) http.Handler {
 				"type":    "unauthorized"}})
 			return
 		}
-		// Cookie-authenticated GETs are readable cross-site unless the browser
-		// tells us the request origin. SameSite=Lax already blocks cross-site
-		// POST/DELETE; this closes the cross-site READ hole (e.g. <img>/top-level
-		// navigation carrying the session cookie to /admin/credentials/export).
-		// Header-authenticated requests (scripts) don't carry cookies and are
-		// exempt. Missing Sec-Fetch-Site (old browsers / curl) still passes —
-		// defense-in-depth, not the only line.
-		if sessionOK && !headerOK && isCrossSiteFetch(r) {
+		// Header-authenticated scripts are exempt; ambient browser cookies must
+		// not authorize a sibling origin, even when it is considered same-site.
+		if sessionOK && !headerOK && !s.adminOriginAllowed(r, true) {
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": map[string]any{
 				"message": "拒绝跨站请求（CSRF 防护）。", "type": "forbidden"}})
 			return
@@ -102,15 +174,24 @@ func (s *Server) adminGuard(next http.Handler) http.Handler {
 	})
 }
 
-// isCrossSiteFetch reports whether the browser-declared Sec-Fetch-Site header
-// marks a cross-site request.
-func isCrossSiteFetch(r *http.Request) bool {
-	switch r.Header.Get("Sec-Fetch-Site") {
-	case "same-origin", "same-site", "none", "":
+// Explicit token headers authenticate scripts independently of browser cookies.
+// Cookie writes require a same-origin browser signal; reads also reject sibling
+// origins so credentials/export cannot be navigated from an untrusted subdomain.
+func (s *Server) adminOriginAllowed(r *http.Request, requireBrowserSignal bool) bool {
+	site := r.Header.Get("Sec-Fetch-Site")
+	if site != "" && site != "same-origin" && site != "none" {
 		return false
-	default:
-		return true
 	}
+	if origin := r.Header.Get("Origin"); origin != "" {
+		u, err := url.Parse(origin)
+		scheme := "http"
+		if r.TLS != nil || s.o.cfg.AdminCookieSecure {
+			scheme = "https"
+		}
+		return err == nil && u.Scheme == scheme && strings.EqualFold(u.Host, r.Host) && u.User == nil && u.Path == "" && u.RawQuery == "" && u.Fragment == ""
+	}
+	safe := r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions
+	return !requireBrowserSignal || safe || site == "same-origin"
 }
 
 // hostGuard blocks DNS-rebinding: only loopback/allowed hosts unless
@@ -241,6 +322,9 @@ func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) auth(r *http.Request) (*Principal, *apiError) {
+	if principal, ok := r.Context().Value(principalContextKey{}).(*Principal); ok {
+		return principal, nil
+	}
 	return s.o.checkAPIKey(r.Header.Get("Authorization"), r.Header.Get("X-Api-Key"))
 }
 

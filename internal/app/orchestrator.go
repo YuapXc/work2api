@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"log"
 	"strconv"
 	"strings"
@@ -202,15 +203,15 @@ func (o *Orchestrator) checkAPIKey(authorization, xAPIKey string) (*Principal, *
 
 // authorizeModel enforces the principal's per-key model allowlist. The model
 // is checked as-requested AND alias-resolved, so a key allowing "gpt" permits
-// calls made via that alias, and a key listing only real ids rejects alias
-// calls unless the alias itself is allowed. Empty allowlist = unrestricted.
+// calls made via that alias, and a key listing real ids permits aliases resolving
+// to those ids. Missing/empty model means auto; empty allowlist = unrestricted.
 func (s *Server) authorizeModel(principal *Principal, requestedModel string) *apiError {
 	if principal == nil || len(principal.AllowedModels) == 0 {
 		return nil
 	}
 	model := strings.TrimSpace(requestedModel)
 	if model == "" {
-		return nil
+		model = "auto"
 	}
 	for _, allowed := range principal.AllowedModels {
 		if allowed == model || allowed == s.o.resolveModel(model) {
@@ -218,6 +219,24 @@ func (s *Server) authorizeModel(principal *Principal, requestedModel string) *ap
 		}
 	}
 	return errBody(403, "该 API 密钥未被授权使用模型 "+model+"（可在 WebUI「API 密钥」中调整可用模型）", "model_not_allowed")
+}
+
+func (s *Server) prepareModel(principal *Principal, payload map[string]any) *apiError {
+	if payload == nil {
+		return errBody(400, "请求体必须是 JSON 对象", "invalid_request_error")
+	}
+	model := "auto"
+	if value := payload["model"]; value != nil {
+		name, ok := value.(string)
+		if !ok {
+			return errBody(400, "model 必须是字符串", "invalid_request_error")
+		}
+		if name = strings.TrimSpace(name); name != "" {
+			model = name
+		}
+	}
+	payload["model"] = model
+	return s.authorizeModel(principal, model)
 }
 
 func (o *Orchestrator) limiter(uid string) *ratelimit.Limiter {
@@ -484,7 +503,15 @@ func (o *Orchestrator) getHeaders(acc *pool.Account) (map[string]string, *apiErr
 
 func (o *Orchestrator) runOnce(ctx context.Context, acc *pool.Account, body map[string]any, sink func(string) error) (bool, error) {
 	if o.cfg.Ratelimit {
-		o.limiter(acc.UID).Wait()
+		if err := o.limiter(acc.UID).Wait(ctx); err != nil {
+			if errors.Is(err, ratelimit.ErrQueueFull) {
+				return false, errBody(429, "账号等待队列已满，请稍后重试", "rate_limit_error")
+			}
+			return false, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
 	headers, aerr := o.getHeaders(acc)
 	if aerr != nil {
@@ -514,6 +541,12 @@ func (o *Orchestrator) openUpstream(ctx context.Context, acc *pool.Account, body
 		started, err := o.runOnce(ctx, acc, body, sink)
 		if err == nil {
 			return acc, nil
+		}
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return acc, err
+		}
+		if aerr, ok := err.(*apiError); ok && aerr.status == 429 {
+			return acc, err
 		}
 		if started {
 			// 流已开始又中断：软冷却（可能是上游中途掉线），不重试已开始的流。

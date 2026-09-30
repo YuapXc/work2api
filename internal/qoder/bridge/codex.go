@@ -294,17 +294,7 @@ func CodexInputToMessages(input interface{}, instructions string) []interface{} 
 				if contentStr, ok := content.(string); ok {
 					msgs = append(msgs, map[string]interface{}{"role": role, "content": contentStr})
 				} else if contentArr, ok := content.([]interface{}); ok {
-					var text string
-					for _, block := range contentArr {
-						if bm, ok := block.(map[string]interface{}); ok {
-							if t, ok := bm["text"].(string); ok {
-								if text != "" {
-									text += "\n"
-								}
-								text += t
-							}
-						}
-					}
+					text := textBlocks(contentArr, "\n")
 					msgs = append(msgs, map[string]interface{}{"role": role, "content": text})
 				}
 			case "function_call":

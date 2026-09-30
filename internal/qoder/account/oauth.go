@@ -150,7 +150,7 @@ func pollToken(nonce, verifier string, ep Endpoints) (string, string, error) {
 	defer resp.Body.Close()
 
 	raw, _ := io.ReadAll(resp.Body)
-	logger.Debug("OAuth: Response [%d]: %s", resp.StatusCode, string(raw))
+	logger.Debug("OAuth: Response status=%d", resp.StatusCode)
 
 	// 404 表示还没授权，继续等待
 	if resp.StatusCode == 404 {

@@ -186,11 +186,37 @@ func RepairToolSequence(body Body) Body {
 	}
 	var out []any
 	var pendingIDs []string
+	var consumed []bool
+	byID := map[string][]int{}
+	firstPending, pendingCount := 0, 0
+	resetPending := func() {
+		pendingIDs, consumed = nil, nil
+		byID = map[string][]int{}
+		firstPending, pendingCount = 0, 0
+	}
+	consume := func(idx int) {
+		consumed[idx] = true
+		pendingCount--
+		id := pendingIDs[idx]
+		positions := byID[id]
+		// The matched node or fallback is always this ID's earliest live node.
+		if len(positions) <= 1 {
+			delete(byID, id)
+		} else {
+			byID[id] = positions[1:]
+		}
+		for firstPending < len(consumed) && consumed[firstPending] {
+			firstPending++
+		}
+	}
 	var userBuffer []any
 
 	missingResults := func() []any {
 		res := make([]any, 0, len(pendingIDs))
-		for _, id := range pendingIDs {
+		for i, id := range pendingIDs {
+			if consumed[i] {
+				continue
+			}
 			res = append(res, map[string]any{
 				"role":         "tool",
 				"tool_call_id": id,
@@ -212,10 +238,10 @@ func RepairToolSequence(body Body) Body {
 		role, _ := msg["role"].(string)
 		switch role {
 		case "assistant":
-			if len(pendingIDs) > 0 {
+			if pendingCount > 0 {
 				out = append(out, missingResults()...)
-				pendingIDs = nil
 			}
+			resetPending()
 			if len(userBuffer) > 0 {
 				flushUser()
 			}
@@ -227,24 +253,27 @@ func RepairToolSequence(body Body) Body {
 						if id == "" {
 							id = "missing-" + strconv.Itoa(len(pendingIDs))
 						}
+						byID[id] = append(byID[id], len(pendingIDs))
 						pendingIDs = append(pendingIDs, id)
+						consumed = append(consumed, false)
+						pendingCount++
 					}
 				}
 			}
 		case "tool":
 			callID := toStr(msg["tool_call_id"])
-			if idx := indexOf(pendingIDs, callID); idx >= 0 {
+			if positions := byID[callID]; len(positions) > 0 {
 				out = append(out, msg)
-				pendingIDs = append(pendingIDs[:idx], pendingIDs[idx+1:]...)
-			} else if len(pendingIDs) > 0 {
-				msg["tool_call_id"] = pendingIDs[0]
-				pendingIDs = pendingIDs[1:]
+				consume(positions[0])
+			} else if pendingCount > 0 {
+				msg["tool_call_id"] = pendingIDs[firstPending]
+				consume(firstPending)
 				out = append(out, msg)
 			} else {
 				log.Printf("丢弃孤立的 tool 结果: tool_call_id=%s", callID)
 			}
 		default:
-			if len(pendingIDs) > 0 {
+			if pendingCount > 0 {
 				userBuffer = append(userBuffer, msg)
 				continue
 			}
@@ -254,7 +283,7 @@ func RepairToolSequence(body Body) Body {
 			out = append(out, msg)
 		}
 	}
-	if len(pendingIDs) > 0 {
+	if pendingCount > 0 {
 		out = append(out, missingResults()...)
 	}
 	if len(userBuffer) > 0 {
@@ -375,13 +404,4 @@ func toInt(v any) (int, bool) {
 	default:
 		return 0, false
 	}
-}
-
-func indexOf(s []string, v string) int {
-	for i, x := range s {
-		if x == v {
-			return i
-		}
-	}
-	return -1
 }

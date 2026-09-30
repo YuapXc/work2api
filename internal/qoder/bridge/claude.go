@@ -56,16 +56,7 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 		case string:
 			sysText = v
 		case []interface{}:
-			for _, block := range v {
-				if bk, ok := block.(map[string]interface{}); ok {
-					if t, ok := bk["text"].(string); ok {
-						if sysText != "" {
-							sysText += "\n"
-						}
-						sysText += t
-					}
-				}
-			}
+			sysText = textBlocks(v, "\n")
 		}
 		if sysText != "" {
 			sysMsg := map[string]interface{}{"role": "system", "content": sysText}
