@@ -28,6 +28,9 @@
 - **应用 Key 鉴权**：为不同用途创建独立 `sk-...` Key，使用记录按应用统计。
 - **密钥模型白名单**：`/v1/models` 只展示该密钥获准调用的模型及别名。省略 `model`（含 `null`、空字符串）时，不限模型的密钥默认使用 `auto`，仅允许一个模型的密钥默认使用该模型，允许多个模型的密钥需明确指定，否则返回 400。显式指定 `auto` 仍需获得授权；它会交给上游选择，并不表示在密钥白名单内自动选择。
 - **账号池**：加权轮换 / 冷却 / 失败换号 / 额度感知（WorkBuddy），或单激活账号（Qoder），或 zen/go 双 tier + 匿名 + 会话亲和（OpenCode）。
+- **会话粘性路由**：同一会话粘住同一账号，保上游 prompt cache 命中；账号冷却/停用时自动解粘回池。
+- **缓存命中观测**：上游上报的 prompt-cache 命中 tokens 落库并在 WebUI 展示（命中率卡片 + 逐条明细）；WorkBuddy 路径同时把命中映射为 Anthropic `cache_read_input_tokens` 下发，客户端（如 Claude Code）可正确显示缓存命中。上游不报缓存（如 Qoder）时自动隐藏，不以 0 命中误导。
+- **Qoder 多模态**：Qoder 模型目录读取上游 `is_vl` 标记并在 WebUI/`/v1/models` 标注多模态；三种入站图片格式（OpenAI `image_url` / Anthropic base64 / Responses `input_image`）归一化透传上游，base64 自动转 data URL。
 - **WebUI 管理台**：功能优先的信息架构——概览（三供应商状态 + 额度续航预测）、账号、模型、API 密钥、流量（用量分析 + 调用记录）、设置；供应商作为跨页筛选维度，而非独立分页。
 - **调度器**：定时签到（含追赶重试）、周期额度刷新、每日模型刷新与预热、token 保活、使用记录清理。
 
@@ -188,8 +191,8 @@ docker run -d --name work2api -p 8787:8787 \
 ## API 端点
 
 - 推理（需 `Authorization: Bearer sk-...`）：`POST /v1/chat/completions`、`POST /v1/messages`、`POST /v1/responses`、`GET /v1/models`
-- 管理（回环免鉴权，或带 `ADMIN_TOKEN`）：`GET /admin/providers`、`GET/POST /admin/providers/{name}/...`（账号/模型/签到/额度/OAuth/账号管理）、`/admin/apps`、`/admin/usage/*`、`/admin/settings`
-- 健康检查：`GET /health`
+- 管理（回环免鉴权，或带 `ADMIN_TOKEN`）：`GET /admin/providers`、`GET/POST /admin/providers/{name}/...`（账号/模型/签到/额度/OAuth/账号管理）、`/admin/apps`、`/admin/apps/{id}/models`（密钥模型白名单）、`/admin/models/catalog`（跨供应商聚合模型目录）、`/admin/checkin/history`（跨供应商签到日历）、`/admin/usage/*`、`/admin/settings`、`/admin/login` + `/admin/logout`（WebUI 会话）
+- 健康检查：`GET /health`（只报计数，不含账号 UID）；`GET /admin/health`（管理台健康详情）
 
 ## 接入客户端（三协议 base URL + 供应商前缀路由）
 
