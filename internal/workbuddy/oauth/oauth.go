@@ -171,7 +171,7 @@ func Begin(site string) (map[string]any, error) {
 	if authURL == "" || state == "" {
 		return nil, &Error{Msg: "登录状态响应缺少 authUrl/state"}
 	}
-	return map[string]any{"state": state, "authUrl": authURL, "site": siteKey(site)}, nil
+	return map[string]any{"state": state, "authUrl": authURL, "site": siteKey(site), "expires_at": time.Now().Add(10 * time.Minute).Unix()}, nil
 }
 
 // Poll checks a login once. Returns {status:"pending"} until both token and

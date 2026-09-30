@@ -58,6 +58,8 @@ func (s *Server) mountAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/usage/filters", s.adminUsageFilters)
 	mux.HandleFunc("GET /admin/usage/{id}", s.adminUsageDetail)
 	mux.HandleFunc("GET /admin/models", s.adminModels)
+	mux.HandleFunc("GET /admin/models/catalog", s.adminModelCatalog)
+	mux.HandleFunc("GET /admin/health", s.adminHealth)
 	mux.HandleFunc("POST /admin/models", s.adminRefreshModels)
 	mux.HandleFunc("POST /admin/models/refresh", s.adminRefreshModels)
 	mux.HandleFunc("GET /admin/models/benchmarks", s.adminBenchmarks)
@@ -380,8 +382,10 @@ func (s *Server) adminAlias(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) adminDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	s.o.pool.RemoveAccount(uid)
-	_, _ = s.o.db.DeleteAccount(uid)
+	if err := s.o.deleteAccount(uid); err != nil {
+		writeJSON(w, 500, errBody(500, err.Error(), "server_error").body)
+		return
+	}
 	writeJSON(w, 200, map[string]any{"ok": true, "uid": uid})
 }
 
@@ -500,7 +504,7 @@ func normalizeAllowedModels(v any) (string, error) {
 		out = append(out, strings.TrimSpace(s))
 	}
 	if len(out) == 0 {
-		return "", nil
+		return "", fmt.Errorf("allowed_models 不能为空数组；解除限制请明确传 null")
 	}
 	b, err := json.Marshal(out)
 	if err != nil {
@@ -516,7 +520,13 @@ func (s *Server) adminAppKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": false, "key": nil, "unavailable": true, "message": "该应用未加密存储 Key（旧版创建），无法查看"})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "key": s.o.crypto.Decrypt(enc)})
+	hash, _ := s.o.db.GetAppKeyHash(id)
+	key := s.o.crypto.DecryptVerified(enc, hash)
+	if key == "" {
+		writeJSON(w, 200, map[string]any{"ok": false, "key": nil, "unavailable": true, "message": "Key 解密或哈希验证失败，请检查原主密钥备份；无法恢复时需重建 API Key"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "key": key})
 }
 
 func (s *Server) adminToggleApp(w http.ResponseWriter, r *http.Request) {
@@ -555,8 +565,8 @@ func (s *Server) adminSetAppModels(w http.ResponseWriter, r *http.Request) {
 		aliases = parseModelAliases(settings["model_aliases"])
 	}
 	known := map[string]bool{}
-	for _, id := range s.o.models.IDs() {
-		known[id] = true
+	for _, entry := range s.modelCatalog(r.Context()) {
+		known[str2(entry["id"])] = true
 	}
 	for _, m := range decodeAllowedModels(allowed) {
 		if _, isAlias := aliases[m]; isAlias {
@@ -624,7 +634,20 @@ func (s *Server) adminCheckinHistory(w http.ResponseWriter, r *http.Request) {
 	if history == nil {
 		history = map[string][]string{}
 	}
-	writeJSON(w, 200, map[string]any{"days": days, "since": since, "history": history})
+	today := time.Now().Format("2006-01-02")
+	calendars := map[string]provider.CheckinCalendar{"workbuddy": {History: history, Today: today, WindowDate: today, Timezone: time.Now().Location().String()}}
+	var warnings []string
+	for _, rt := range provider.Runtimes() {
+		if historian, ok := rt.(provider.CheckinHistorian); ok {
+			cal, err := historian.CheckinHistory(r.Context(), days)
+			if err != nil {
+				warnings = append(warnings, rt.Name()+": "+err.Error())
+				continue
+			}
+			calendars[rt.Name()] = cal
+		}
+	}
+	writeJSON(w, 200, map[string]any{"days": days, "since": since, "history": history, "calendars": calendars, "warnings": warnings})
 }
 
 func (s *Server) adminUsageSummary(w http.ResponseWriter, r *http.Request) {
@@ -685,6 +708,26 @@ func (s *Server) adminModels(w http.ResponseWriter, r *http.Request) {
 	entries := s.o.models.ListCached()
 	s.attachModelAccounts(entries)
 	writeJSON(w, 200, map[string]any{"models": entries, "source": s.o.models.Source()})
+}
+
+func (s *Server) adminModelCatalog(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]any{"models": s.modelCatalog(r.Context())})
+}
+
+func (s *Server) adminHealth(w http.ResponseWriter, r *http.Request) {
+	healthy := s.o.pool.HealthyCount(nil)
+	available := 0
+	if healthy > 0 {
+		available++
+	}
+	total := 1
+	for _, rt := range provider.Runtimes() {
+		total++
+		if rt.Ready() {
+			available++
+		}
+	}
+	writeJSON(w, 200, map[string]any{"status": "ok", "available_providers": available, "total_providers": total})
 }
 
 // attachModelAccounts enriches each model entry with an "accounts" array: the
@@ -778,7 +821,8 @@ func (s *Server) attachModelAccounts(entries []map[string]any) {
 
 func (s *Server) adminRefreshModels(w http.ResponseWriter, r *http.Request) {
 	models := s.o.models.Refresh()
-	writeJSON(w, 200, map[string]any{"ok": true, "models": models, "source": s.o.models.Source(), "count": len(models)})
+	warnings := s.o.refreshRuntimeModels(r.Context())
+	writeJSON(w, 200, map[string]any{"ok": true, "models": models, "source": s.o.models.Source(), "count": len(models), "warnings": warnings})
 }
 
 func (s *Server) adminGetSettings(w http.ResponseWriter, r *http.Request) {

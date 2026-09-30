@@ -24,7 +24,7 @@ func (s *Server) adminExportCredentials(w http.ResponseWriter, r *http.Request) 
 	// workbuddy: from the live managers so refreshed tokens are included.
 	wbAccounts := []map[string]any{}
 	for _, acc := range s.o.pool.Accounts() {
-		mgr := s.o.managers[acc.UID]
+		mgr := s.o.manager(acc.UID)
 		if mgr == nil {
 			continue
 		}

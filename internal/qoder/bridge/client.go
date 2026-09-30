@@ -20,6 +20,12 @@ type BearerClient struct {
 	sess *cosy.SessionContext
 }
 
+var streamHTTPClient = func() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 120 * time.Second
+	return &http.Client{Transport: transport}
+}()
+
 func NewBearerClient(sess *cosy.SessionContext) *BearerClient {
 	return &BearerClient{sess: sess}
 }
@@ -79,6 +85,10 @@ func (c *BearerClient) CallGetForTest(fullURL string) (map[string]interface{}, e
 // callGet 用 cosy 签名发送 GET 请求，body 部分参与签名时为空字符串。
 // 用于 /algo/api/v2/model/list 之类的纯查询接口。
 func (c *BearerClient) callGet(fullURL string) (map[string]interface{}, error) {
+	return c.callGetContext(context.Background(), fullURL)
+}
+
+func (c *BearerClient) callGetContext(ctx context.Context, fullURL string) (map[string]interface{}, error) {
 	pathSig, err := PathSigFrom(fullURL)
 	if err != nil {
 		return nil, err
@@ -87,7 +97,7 @@ func (c *BearerClient) callGet(fullURL string) (map[string]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest("GET", fullURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -197,12 +207,14 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 		return err
 	}
 	// 不设整体 Timeout，改由 context 控制生命周期，避免长流式响应被截断
-	client := &http.Client{}
+	client := streamHTTPClient
 
 	var lastErr error
 	for attempt := 0; attempt <= TransientMaxRetries; attempt++ {
 		if attempt > 0 {
-			time.Sleep(RetryBackoff(attempt))
+			if err := sleepCtx(ctx, RetryBackoff(attempt)); err != nil {
+				return err
+			}
 		}
 		headers, err := c.buildHeaders(pathSig, bodyStr, "text/event-stream", extra)
 		if err != nil {

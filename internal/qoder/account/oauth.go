@@ -63,6 +63,7 @@ func StartLogin(region Region) (*OAuthSession, error) {
 		pending.cancel()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	deadline := time.Now().Add(10 * time.Minute)
 	pending = &pendingOAuth{
 		loginID:  loginID,
 		nonce:    nonce,
@@ -70,11 +71,11 @@ func StartLogin(region Region) (*OAuthSession, error) {
 		region:   region,
 		ctx:      ctx,
 		cancel:   cancel,
-		deadline: time.Now().Add(10 * time.Minute),
+		deadline: deadline,
 	}
 	pendingMu.Unlock()
 
-	return &OAuthSession{LoginID: loginID, LoginURL: loginURL}, nil
+	return &OAuthSession{LoginID: loginID, LoginURL: loginURL, ExpiresAt: deadline.Unix()}, nil
 }
 
 // WaitLogin 等待用户完成 OAuth 授权

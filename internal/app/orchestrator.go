@@ -52,13 +52,15 @@ type Principal struct {
 
 // Orchestrator holds shared runtime state and the request pipeline.
 type Orchestrator struct {
-	cfg      *config.Config
-	db       *store.DB
-	crypto   *crypto.Manager
-	pool     *pool.Pool
-	models   *models.Registry
-	bench    *benchmarks.Store
-	managers map[string]*credentials.Manager
+	cfg       *config.Config
+	db        *store.DB
+	crypto    *crypto.Manager
+	pool      *pool.Pool
+	models    *models.Registry
+	bench     *benchmarks.Store
+	managers  map[string]*credentials.Manager
+	managerMu sync.RWMutex
+	accountMu sync.Mutex
 
 	limMu    sync.Mutex
 	limiters map[string]*ratelimit.Limiter
@@ -79,6 +81,22 @@ func (o *Orchestrator) Pool() *pool.Pool         { return o.pool }
 func (o *Orchestrator) Models() *models.Registry { return o.models }
 func (o *Orchestrator) Crypto() *crypto.Manager  { return o.crypto }
 
+func (o *Orchestrator) manager(uid string) *credentials.Manager {
+	o.managerMu.RLock()
+	defer o.managerMu.RUnlock()
+	return o.managers[uid]
+}
+
+func (o *Orchestrator) setManager(uid string, mgr *credentials.Manager) {
+	o.managerMu.Lock()
+	defer o.managerMu.Unlock()
+	if mgr == nil {
+		delete(o.managers, uid)
+	} else {
+		o.managers[uid] = mgr
+	}
+}
+
 // New builds the orchestrator, loading local auth files into the pool.
 func New(cfg *config.Config) (*Orchestrator, error) {
 	db, err := store.New(cfg.DBPath)
@@ -97,6 +115,12 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 		projectAuths:   projectAuths,
 		sessions:       newSessionRouter(),
 	}
+	if existing, err := db.HasEncryptedAppKeys(); err != nil {
+		_ = db.Close()
+		return nil, err
+	} else if existing {
+		o.crypto.RequireExistingKey()
+	}
 	// 重启后回填持久化的 (账号,模型) 冷却（6004 每日上限）：否则内存 map 为空，
 	// 已达上限的模型会被重新选中、白打一次上游、给客户端漏一个瞬时 6004 再轮转。
 	if rows, err := db.ActiveModelCooldowns(0); err == nil {
@@ -111,6 +135,10 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 		}
 	}
 	creds := map[string]pool.Credential{}
+	settings, err := db.GetSettings()
+	if err != nil {
+		return nil, err
+	}
 	for _, f := range credentials.FindAuthFiles("", projectAuths) {
 		mgr := credentials.NewManager(f)
 		s := mgr.Summary()
@@ -118,10 +146,13 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 		if uid == "" {
 			continue
 		}
+		if settings[hiddenAccountKey(uid)] == "1" {
+			continue
+		}
 		if raw, err := mgr.RawSession(); err == nil {
 			_, _ = db.UpsertAccount(map[string]any{"auth": raw.Auth, "account": raw.Account})
 		}
-		o.managers[uid] = mgr
+		o.setManager(uid, mgr)
 		creds[uid] = mgr
 	}
 	o.pool = pool.New(creds, projectAuths)
@@ -514,7 +545,7 @@ func (o *Orchestrator) enhanceBody(body map[string]any) map[string]any {
 }
 
 func (o *Orchestrator) getHeaders(acc *pool.Account) (map[string]string, *apiError) {
-	mgr := o.managers[acc.UID]
+	mgr := o.manager(acc.UID)
 	if mgr == nil {
 		return nil, errBody(503, "账号凭据不可用", "auth_error")
 	}
@@ -603,7 +634,7 @@ func (o *Orchestrator) openUpstream(ctx context.Context, acc *pool.Account, body
 }
 
 func (o *Orchestrator) refreshCreditsFor(ctx context.Context, acc *pool.Account) {
-	mgr := o.managers[acc.UID]
+	mgr := o.manager(acc.UID)
 	if mgr == nil {
 		return
 	}

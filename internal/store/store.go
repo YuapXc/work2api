@@ -8,6 +8,7 @@
 package store
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -88,6 +89,24 @@ func New(path string) (*DB, error) {
 // Close closes the underlying database.
 func (d *DB) Close() error { return d.db.Close() }
 
+func HiddenAccountKey(uid string) string {
+	return fmt.Sprintf("hidden_workbuddy_%x", sha256.Sum256([]byte(uid)))
+}
+
+// SetAccountHidden persists an internal discovery marker, separate from the
+// user-editable settings whitelist.
+func (d *DB) SetAccountHidden(uid string, hidden bool) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	value := "0"
+	if hidden {
+		value = "1"
+	}
+	_, err := d.db.Exec("INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", HiddenAccountKey(uid), value)
+	d.settingsCache = nil
+	return err
+}
+
 func (d *DB) initSchema() error {
 	const schema = `
 CREATE TABLE IF NOT EXISTS accounts (
@@ -136,6 +155,9 @@ CREATE INDEX IF NOT EXISTS idx_usage_protocol ON usage_logs(protocol);
 		if !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("migrate apps.allowed_models: %w", err)
 		}
+	}
+	if _, err := d.db.Exec("ALTER TABLE usage_logs ADD COLUMN tokens_known INTEGER"); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("migrate usage_logs.tokens_known: %w", err)
 	}
 	if _, err := d.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion)); err != nil {
 		return err

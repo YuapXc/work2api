@@ -100,27 +100,36 @@ const selected = ref<Set<string>>(new Set())
 const modelSearch = ref('')
 const savingModels = ref(false)
 const allModels = ref<ModelInfo[]>([])
+const loadingModels = ref(false)
+const unrestricted = ref(true)
+const catalogModels = computed(() => {
+  const byId = new Map(allModels.value.map((m) => [m.id, m]))
+  for (const id of selected.value) if (!byId.has(id)) byId.set(id, { id, name: '已保存，当前目录未发现', provider: id.startsWith('qoder/') ? 'qoder' : id.startsWith('opencode/') ? 'opencode' : 'workbuddy' })
+  return [...byId.values()].sort((a, b) => (a.provider || 'workbuddy').localeCompare(b.provider || 'workbuddy') || a.id.localeCompare(b.id))
+})
 
 const filteredModels = computed(() => {
   const q = modelSearch.value.trim().toLowerCase()
-  if (!q) return allModels.value
-  return allModels.value.filter((m) => m.id.toLowerCase().includes(q) || (m.name || '').toLowerCase().includes(q))
+  if (!q) return catalogModels.value
+  return catalogModels.value.filter((m) => m.id.toLowerCase().includes(q) || (m.name || '').toLowerCase().includes(q))
 })
 
 async function openModels(app: any) {
   modelsTarget.value = app
   selected.value = new Set(app.allowed_models || [])
+  unrestricted.value = selected.value.size === 0
   modelSearch.value = ''
   modelsOpen.value = true
-  if (!allModels.value.length) {
-    try {
-      const res = await api.models()
-      allModels.value = res.models ?? []
-    } catch { /* 目录加载失败时仍可手动编辑已选项 */ }
-  }
+  loadingModels.value = true
+  try {
+    const res = await api.modelCatalog()
+    allModels.value = res.models ?? []
+  } catch { /* 保留缓存和已保存选择 */ }
+  finally { loadingModels.value = false }
 }
 
 function toggleModel(id: string) {
+  unrestricted.value = false
   const next = new Set(selected.value)
   if (next.has(id)) next.delete(id)
   else next.add(id)
@@ -130,10 +139,11 @@ function toggleModel(id: string) {
 async function saveModels() {
   const target = modelsTarget.value
   if (!target) return
+  if (!unrestricted.value && !selected.value.size) return toast.error('请至少选择一个模型，或明确开启「不限制模型」')
   savingModels.value = true
   try {
-    // 全不选视为「不限制」——与「清空白名单」语义一致，避免把密钥锁死成 0 个模型
-    const list = selected.value.size ? [...selected.value].sort() : []
+    // 仅明确开启「不限制」时发送 null，空选择不能隐式解除限制。
+    const list = unrestricted.value ? [] : [...selected.value].sort()
     const res = await api.setAppModels(target.id, list.length ? list : null)
     if (res.warnings?.length) toast.info(res.warnings[0])
     toast.success(list.length ? `已限定 ${list.length} 个模型` : '已恢复不限制')
@@ -245,11 +255,13 @@ onMounted(load)
     <WModal v-model:open="modelsOpen" title="可用模型">
       <p class="mb-3 text-small text-muted">
         为「{{ modelsTarget?.name }}」限定可调用的模型；白名单外的请求会被网关拒绝（403）。
-        <span class="text-faint">全部不选 = 不限制。</span>
+        <span class="text-faint">仅开启「不限制模型」才允许全部模型。</span>
       </p>
+      <label class="mb-3 flex items-center gap-2 text-small"><WToggle v-model="unrestricted" /> 不限制模型</label>
       <WInput v-model="modelSearch" placeholder="搜索模型…" class="mb-2.5" />
       <div class="max-h-72 space-y-1 overflow-y-auto rounded-lg border border-line p-2">
-        <WSpinner v-if="!allModels.length" center label="加载模型目录" />
+        <WSpinner v-if="loadingModels" center label="加载模型目录" />
+        <p v-if="!loadingModels && !catalogModels.length" class="px-2 py-3 text-center text-micro text-faint">当前没有可用模型目录，请先配置供应商或刷新模型。</p>
         <label
           v-for="m in filteredModels"
           :key="m.id"
@@ -262,7 +274,7 @@ onMounted(load)
             @change="toggleModel(m.id)"
           />
           <span class="mono min-w-0 flex-1 truncate text-ink">{{ m.id }}</span>
-          <span class="shrink-0 text-micro text-faint">{{ m.name }}</span>
+          <span class="shrink-0 text-micro text-faint">{{ m.provider || 'workbuddy' }} · {{ m.name }}</span>
         </label>
         <p v-if="allModels.length && !filteredModels.length" class="px-2 py-3 text-center text-micro text-faint">
           没有匹配「{{ modelSearch }}」的模型
@@ -270,7 +282,7 @@ onMounted(load)
       </div>
       <div class="mt-2 flex items-center justify-between text-micro text-faint">
         <span>已选 {{ selected.size }} 个</span>
-        <button class="transition-colors hover:text-brand" @click="selected = new Set()">清空</button>
+        <button class="transition-colors hover:text-brand" @click="selected = new Set(); unrestricted = false">清空选择</button>
       </div>
       <template #footer>
         <WButton variant="subtle" @click="modelsOpen = false">取消</WButton>

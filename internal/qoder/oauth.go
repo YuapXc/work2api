@@ -63,11 +63,20 @@ func (r *Runtime) OAuthBegin(opts map[string]any) (map[string]any, error) {
 			return
 		}
 		_ = account.SetActive(acct.ID)
+		if err := account.SetGatewayHidden(acct.ID, false); err != nil {
+			r.setOAuth(loginID, &oauthState{status: "error", message: "恢复账户失败：" + err.Error()})
+			return
+		}
+		_ = account.SetGatewayHidden("qoder-local-"+string(acct.Region), false)
+		r.mu.Lock()
+		delete(r.bridges, acct.ID)
+		r.bridgeGeneration[acct.ID]++
+		r.mu.Unlock()
 		r.setOAuth(loginID, &oauthState{status: "ready", account: map[string]any{
 			"id": acct.ID, "label": acct.Name, "region": string(acct.Region),
 		}})
 	}(sess.LoginID)
-	return map[string]any{"login_id": sess.LoginID, "login_url": sess.LoginURL}, nil
+	return map[string]any{"login_id": sess.LoginID, "login_url": sess.LoginURL, "expires_at": sess.ExpiresAt}, nil
 }
 
 // OAuthPoll reports the current login state.

@@ -3,10 +3,13 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 
+	"work2api/internal/store"
 	"work2api/internal/workbuddy/billing"
 	"work2api/internal/workbuddy/credentials"
 )
@@ -35,6 +38,8 @@ func trimDash(s string) string {
 // registerAuthUpload writes an uploaded auth JSON to the project auths/ dir and
 // registers it into the pool + DB.
 func (o *Orchestrator) registerAuthUpload(data []byte) (map[string]any, *apiError) {
+	o.accountMu.Lock()
+	defer o.accountMu.Unlock()
 	var raw map[string]any
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, errBody(400, "auth 文件不是合法 JSON", "invalid_request_error")
@@ -47,6 +52,11 @@ func (o *Orchestrator) registerAuthUpload(data []byte) (map[string]any, *apiErro
 	if uid == "" {
 		return nil, errBody(400, "auth 文件中缺少 uid", "invalid_request_error")
 	}
+	if previous := o.manager(uid); previous != nil {
+		if err := previous.Retire(false); err != nil {
+			return nil, errBody(500, "停止旧账户凭据刷新失败", "server_error")
+		}
+	}
 	if err := os.MkdirAll(o.projectAuths, 0o755); err != nil {
 		return nil, errBody(500, "无法创建 auths 目录", "server_error")
 	}
@@ -55,12 +65,80 @@ func (o *Orchestrator) registerAuthUpload(data []byte) (map[string]any, *apiErro
 		return nil, errBody(500, "写入 auth 文件失败", "server_error")
 	}
 	mgr := credentials.NewManager(path)
+	if err := o.db.SetAccountHidden(uid, false); err != nil {
+		return nil, errBody(500, "恢复账户注册失败", "server_error")
+	}
 	added := o.pool.AddAccount(uid, mgr)
-	o.managers[uid] = mgr
+	o.setManager(uid, mgr)
 	if raw2, err := mgr.RawSession(); err == nil {
 		_, _ = o.db.UpsertAccount(map[string]any{"auth": raw2.Auth, "account": raw2.Account})
 	}
 	return map[string]any{"uid": uid, "added": added}, nil
+}
+
+func hiddenAccountKey(uid string) string {
+	return store.HiddenAccountKey(uid)
+}
+
+// Delete only gateway-owned files whose decoded UID matches this account.
+// Desktop files are left intact; the persisted marker prevents rediscovery.
+func (o *Orchestrator) deleteAccount(uid string) error {
+	o.accountMu.Lock()
+	defer o.accountMu.Unlock()
+	if err := o.db.SetAccountHidden(uid, true); err != nil {
+		return err
+	}
+	o.pool.RemoveAccount(uid)
+	mgr := o.manager(uid)
+	o.setManager(uid, nil)
+	o.limMu.Lock()
+	delete(o.limiters, uid)
+	o.limMu.Unlock()
+	o.mcMu.Lock()
+	for key := range o.modelCooldowns {
+		if strings.HasPrefix(key, uid+"|") {
+			delete(o.modelCooldowns, key)
+		}
+	}
+	o.mcMu.Unlock()
+	if o.sessions != nil {
+		o.sessions.removeAccount(uid)
+	}
+	var failures []string
+	if _, err := o.db.DeleteAccount(uid); err != nil {
+		failures = append(failures, "数据库清理失败: "+err.Error())
+	}
+	if mgr != nil {
+		if err := mgr.Retire(false); err != nil {
+			failures = append(failures, err.Error())
+		}
+	}
+	root, rootErr := filepath.EvalSymlinks(o.projectAuths)
+	if rootErr == nil {
+		for _, path := range credentials.FindAuthFiles(o.projectAuths, "") {
+			resolved, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				continue
+			}
+			rel, err := filepath.Rel(root, resolved)
+			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+				continue
+			}
+			candidate := credentials.NewManager(path)
+			if candidate.Summary()["uid"] != uid {
+				continue
+			}
+			if err := candidate.Retire(true); err != nil {
+				failures = append(failures, err.Error())
+			}
+		}
+	} else if !os.IsNotExist(rootErr) {
+		failures = append(failures, rootErr.Error())
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("账号已隐藏并移出分发，但部分资源清理失败：%s", strings.Join(failures, "; "))
+	}
+	return nil
 }
 
 func billingCheckin(ctx context.Context, mgr *credentials.Manager) (billing.CheckinResult, error) {

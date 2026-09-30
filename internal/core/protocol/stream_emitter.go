@@ -562,7 +562,8 @@ func (emitter *bridgeStreamEmitter) Finish() error {
 			response.Tools = append(response.Tools, bridgeBlock{Kind: "tool_call", ID: tool.ID, Name: tool.Name, ArgumentsJSON: tool.Arguments.String()})
 		}
 		completed := encodeBridgeResponse(Responses, response)
-		return emitter.sse("response.completed", map[string]any{"type": "response.completed", "response": completed, "sequence_number": emitter.nextSequence()})
+		terminal := "response." + fmt.Sprint(completed["status"])
+		return emitter.sse(terminal, map[string]any{"type": terminal, "response": completed, "sequence_number": emitter.nextSequence()})
 	}
 	return nil
 }

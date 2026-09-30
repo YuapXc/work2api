@@ -101,7 +101,7 @@ const total = ref<number | null>(null)
 let timer: ReturnType<typeof setInterval> | null = null
 async function refreshHealth() {
   try {
-    const res = await fetch('/admin/accounts', { credentials: 'same-origin' })
+    const res = await fetch('/admin/health', { credentials: 'same-origin' })
     if (res.status === 401 || res.status === 403) {
       // 会话过期：踢回登录页
       authOk.value = false
@@ -110,15 +110,14 @@ async function refreshHealth() {
     }
     if (!res.ok) { healthy.value = total.value = null; return }
     const data = await res.json()
-    const list = (data.accounts || []) as { healthy?: boolean }[]
-    healthy.value = list.filter((a) => a.healthy).length
-    total.value = list.length
+    healthy.value = data.available_providers ?? 0
+    total.value = data.total_providers ?? 0
   } catch {
     healthy.value = total.value = null
   }
 }
 const serving = computed(() => (healthy.value ?? 0) > 0)
-const gwText = computed(() => (healthy.value == null ? '状态未知' : serving.value ? '正在服务' : '无健康账号'))
+const gwText = computed(() => (healthy.value == null ? '状态未知' : serving.value ? '有可用渠道' : '无可用渠道'))
 
 onMounted(() => {
   checkAuth()

@@ -83,6 +83,7 @@ func (d *DB) SaveSettings(kv map[string]string) error {
 
 // UsageParams are the fields for a usage log entry.
 type UsageParams struct {
+	TokensKnown      *bool
 	Model            string
 	Protocol         string
 	AccountUID       string
@@ -118,11 +119,11 @@ func (d *DB) LogUsage(p UsageParams) error {
 	_, err := d.db.Exec(
 		`INSERT INTO usage_logs (ts, model, protocol, account_uid, input_tokens, output_tokens,
 		   total_tokens, latency_ms, status, error, input_content, output_content,
-		   reasoning_content, credits, app_name, user_id, reasoning_effort)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		   reasoning_content, credits, app_name, user_id, reasoning_effort, tokens_known)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		float64(time.Now().UnixNano())/1e9, p.Model, p.Protocol, p.AccountUID,
 		p.InputTokens, p.OutputTokens, total, p.LatencyMs, p.Status, p.Error,
-		p.InputContent, p.OutputContent, p.ReasoningContent, credits, p.AppName, nil, effort)
+		p.InputContent, p.OutputContent, p.ReasoningContent, credits, p.AppName, nil, effort, p.TokensKnown)
 	return err
 }
 
@@ -281,7 +282,7 @@ func usageWhere(protocol, model string, appName *string, status, search string) 
 	return "WHERE " + strings.Join(clauses, " AND "), params
 }
 
-const usageLightCols = "id, ts, model, protocol, account_uid, input_tokens, output_tokens, total_tokens, latency_ms, status, error, credits, app_name, user_id, reasoning_effort"
+const usageLightCols = "id, ts, model, protocol, account_uid, input_tokens, output_tokens, total_tokens, latency_ms, status, error, credits, app_name, user_id, reasoning_effort, tokens_known"
 
 // UsageRecent returns recent usage records with optional filters.
 func (d *DB) UsageRecent(limit int, protocol, model string, appName *string, status string, light bool, offset int, search string) ([]map[string]any, error) {

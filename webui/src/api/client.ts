@@ -50,6 +50,7 @@ function toastOnce(msg: string) {
 http.interceptors.response.use(
   (resp) => resp.data,
   async (err) => {
+    if (axios.isCancel(err)) return Promise.reject(err)
     const config = err?.config as (InternalAxiosRequestConfig & { _retry?: number }) | undefined
     const method = typeof config?.method === 'string' ? config.method.toLowerCase() : ''
     const status = err?.response?.status as number | undefined
@@ -65,11 +66,12 @@ http.interceptors.response.use(
       await new Promise((r) => setTimeout(r, delay))
       return http(config!)
     }
-    const detail = err?.response?.data?.detail
+    const data = err?.response?.data
+    const detail = data?.detail
     const msg =
       typeof detail === 'string'
         ? detail
-        : detail?.error?.message || detail?.message || err.message
+        : data?.error?.message || (typeof data?.error === 'string' ? data.error : '') || data?.message || detail?.error?.message || detail?.message || err.message
     toastOnce(msg)
     return Promise.reject(err)
   },
@@ -100,13 +102,14 @@ export const api = {
   refreshCredits: () => http.post<unknown, { ok: boolean; accounts: AccountInfo[] }>('/admin/credits/refresh'),
   checkin: () => http.post<unknown, CheckinResponse>('/admin/checkin'),
   checkinHistory: (days = 35) =>
-    http.get<unknown, { days: number; since: string; history: Record<string, string[]> }>(
+    http.get<unknown, { days: number; since: string; history: Record<string, string[]>; calendars: Record<string, { history: Record<string, string[]>; today: string; window_date: string; timezone: string }> }>(
       `/admin/checkin/history?days=${days}`,
     ),
   modelTest: (model: string, prompt: string) =>
     http.post<unknown, { ok: boolean; model: string; latency_ms: number; content?: string; error?: string; finish_reason?: string }>(
       '/admin/models/test',
       { model, prompt },
+      { timeout: 100000 },
     ),
   usageSummary: () => http.get<unknown, UsageSummary>('/admin/usage/summary'),
   usageTimeseries: (granularity = 'hour', points = 24, model?: string) =>
@@ -137,6 +140,7 @@ export const api = {
       statuses: string[]
     }>('/admin/usage/filters'),
   models: () => http.get<unknown, { models: ModelInfo[]; source?: 'dynamic' | 'static' }>('/admin/models'),
+  modelCatalog: () => http.get<unknown, { models: ModelInfo[] }>('/admin/models/catalog'),
   modelsRefresh: () =>
     http.post<unknown, { ok: boolean; models: ModelInfo[]; source?: 'dynamic' | 'static' }>('/admin/models/refresh'),
   // AA（Artificial Analysis）评测：按带命名空间的模型 id 返回智能/编码/数学指数
@@ -177,12 +181,12 @@ export const api = {
   providerOAuthOptions: (name: string) =>
     http.get<unknown, { options: OAuthOption[] }>(`/admin/providers/${encodeURIComponent(name)}/oauth/options`),
   // 发起扫码登录：返回 login_id 与可在浏览器打开的授权链接
-  providerOAuthBegin: (name: string, opts: Record<string, unknown>) =>
-    http.post<unknown, { login_id: string; login_url: string }>(`/admin/providers/${encodeURIComponent(name)}/oauth/begin`, opts),
+  providerOAuthBegin: (name: string, opts: Record<string, unknown>, signal?: AbortSignal) =>
+    http.post<unknown, { login_id: string; login_url: string; expires_at?: number }>(`/admin/providers/${encodeURIComponent(name)}/oauth/begin`, opts, { signal }),
   // 轮询登录状态：pending 等待授权，ready 成功（含 account），error 失败（含 message）
-  providerOAuthPoll: (name: string, loginId: string) =>
-    http.post<unknown, { status: 'pending' | 'ready' | 'error'; message?: string; account?: Record<string, unknown> }>(
-      `/admin/providers/${encodeURIComponent(name)}/oauth/poll`, { login_id: loginId }),
+  providerOAuthPoll: (name: string, loginId: string, signal?: AbortSignal) =>
+    http.post<unknown, { status: 'pending' | 'ready' | 'error' | 'expired'; message?: string; account?: Record<string, unknown> }>(
+      `/admin/providers/${encodeURIComponent(name)}/oauth/poll`, { login_id: loginId }, { signal }),
 
   // 供应商配置编辑（opencode 密钥层级）：读取 / 保存并热重载
   providerGetConfig: (name: string) =>
@@ -206,11 +210,11 @@ export const api = {
 
   // 扫码登录（对齐 work2api Go 后端：sites / begin / poll）
   oauthSites: () => http.get<unknown, { sites: string[] }>('/admin/oauth/sites'),
-  oauthBegin: (site: string) =>
-    http.post<unknown, { state: string; authUrl: string; site: string }>('/admin/oauth/begin', { site }),
-  oauthPoll: (state: string, site: string) =>
-    http.post<unknown, { status: 'pending' | 'ready'; uid?: string; added?: boolean; ok?: boolean }>(
-      '/admin/oauth/poll', { state, site }),
+  oauthBegin: (site: string, signal?: AbortSignal) =>
+    http.post<unknown, { state: string; authUrl: string; site: string; expires_at?: number }>('/admin/oauth/begin', { site }, { signal }),
+  oauthPoll: (state: string, site: string, signal?: AbortSignal) =>
+    http.post<unknown, { status: 'pending' | 'ready' | 'expired' | 'error'; message?: string; uid?: string; added?: boolean; ok?: boolean }>(
+      '/admin/oauth/poll', { state, site }, { signal }),
 
   // 应用 API Key
   apps: () => http.get<unknown, { apps: AppInfo[] }>('/admin/apps'),

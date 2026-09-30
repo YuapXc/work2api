@@ -61,6 +61,7 @@ func (o *Orchestrator) logRuntimeUsage(rep provider.UsageReport, protocol, model
 		Protocol:         protocol,
 		AccountUID:       rep.AccountUID,
 		InputTokens:      rep.InputTokens,
+		TokensKnown:      rep.TokensKnown,
 		OutputTokens:     rep.OutputTokens,
 		LatencyMs:        float64(time.Since(t0).Milliseconds()),
 		Status:           status,
@@ -106,6 +107,18 @@ func (o *Orchestrator) runtimeModels(ctx context.Context) []map[string]any {
 		}
 	}
 	return out
+}
+
+func (o *Orchestrator) refreshRuntimeModels(ctx context.Context) []string {
+	var warnings []string
+	for _, rt := range provider.Runtimes() {
+		if refresh, ok := rt.(provider.ModelRefresher); ok && rt.Ready() {
+			if err := refresh.RefreshModels(ctx); err != nil {
+				warnings = append(warnings, rt.Name()+": "+err.Error())
+			}
+		}
+	}
+	return warnings
 }
 
 // benchTarget is one (provider, namespaced id, display name) the benchmarks

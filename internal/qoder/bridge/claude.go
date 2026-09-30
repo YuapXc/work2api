@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -127,10 +128,7 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 			if d.Err != nil {
 				return
 			}
-			if d.InputTokens > 0 || d.OutputTokens > 0 {
-				totalInputTokens = d.InputTokens
-				totalOutputTokens = d.OutputTokens
-			}
+			result.updateUsage(d, &totalInputTokens, &totalOutputTokens)
 			if d.Reasoning != "" && opts.IsReasoning {
 				if !thinkingBlockOpen {
 					// 先关闭默认的 text block，再开 thinking block
@@ -244,16 +242,13 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 	} else {
 		var full strings.Builder
 		var reasoningBuf strings.Builder
-		var toolCallBuf []interface{}
+		toolCallMerged := map[int]map[string]interface{}{}
 		var totalInputTokens, totalOutputTokens int
 		err := b.CallQoderWithOpts(ctx, "claude", messages, model, tools, opts, func(d Delta) {
 			if d.Err != nil {
 				return
 			}
-			if d.InputTokens > 0 || d.OutputTokens > 0 {
-				totalInputTokens = d.InputTokens
-				totalOutputTokens = d.OutputTokens
-			}
+			result.updateUsage(d, &totalInputTokens, &totalOutputTokens)
 			if d.Reasoning != "" {
 				reasoningBuf.WriteString(d.Reasoning)
 			}
@@ -261,7 +256,7 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 				full.WriteString(d.Content)
 			}
 			if d.ToolCalls != nil {
-				toolCallBuf = append(toolCallBuf, d.ToolCalls...)
+				MergeToolCallChunks(toolCallMerged, d.ToolCalls)
 			}
 		})
 		result.InputTokens = totalInputTokens
@@ -281,8 +276,7 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 		if full.Len() > 0 {
 			content = append(content, map[string]interface{}{"type": "text", "text": full.String()})
 		}
-		for _, tc := range toolCallBuf {
-			tcMap, _ := tc.(map[string]interface{})
+		for _, tcMap := range SortedToolCalls(toolCallMerged) {
 			if tcMap == nil {
 				continue
 			}
@@ -304,7 +298,7 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 		}
 
 		stopReason := "end_turn"
-		if len(toolCallBuf) > 0 {
+		if len(toolCallMerged) > 0 {
 			stopReason = "tool_use"
 		}
 
@@ -314,7 +308,7 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 			"content": content,
 			"usage":   map[string]interface{}{"input_tokens": totalInputTokens, "output_tokens": totalOutputTokens},
 		}
-		logger.Info("[Claude][%s] 完成 stop=%s content_len=%d tool_calls=%d 耗时=%dms", reqID, stopReason, full.Len(), len(toolCallBuf), time.Since(startTime).Milliseconds())
+		logger.Info("[Claude][%s] 完成 stop=%s content_len=%d tool_calls=%d 耗时=%dms", reqID, stopReason, full.Len(), len(toolCallMerged), time.Since(startTime).Milliseconds())
 		logger.Debug("[Claude][%s] 响应体: %s", reqID, func() string { d, _ := json.Marshal(resp); return string(d) }())
 		WriteJSON(w, resp)
 		return result, nil
@@ -402,13 +396,27 @@ func MergeToolCallChunks(merged map[int]map[string]interface{}, chunks []interfa
 		idx := 0
 		if idxF, ok := tc["index"].(float64); ok {
 			idx = int(idxF)
+		} else if idxI, ok := tc["index"].(int); ok {
+			idx = idxI
+		} else if id, ok := tc["id"].(string); ok && id != "" {
+			for key := range merged {
+				if key >= idx {
+					idx = key + 1
+				}
+			}
+			for key, existing := range merged {
+				if existing["id"] == id {
+					idx = key
+					break
+				}
+			}
 		}
 		existing, exists := merged[idx]
 		if !exists {
 			existing = map[string]interface{}{}
 			merged[idx] = existing
 		}
-		if id, ok := tc["id"].(string); ok && id != "" {
+		if id, ok := tc["id"].(string); ok && id != "" && existing["id"] == nil {
 			existing["id"] = id
 		}
 		if t, ok := tc["type"].(string); ok && t != "" {
@@ -436,15 +444,17 @@ func SortedToolCalls(merged map[int]map[string]interface{}) []map[string]interfa
 	if len(merged) == 0 {
 		return nil
 	}
-	maxIdx := 0
+	indices := make([]int, 0, len(merged))
 	for idx := range merged {
-		if idx > maxIdx {
-			maxIdx = idx
-		}
+		indices = append(indices, idx)
 	}
+	sort.Ints(indices)
 	result := make([]map[string]interface{}, 0, len(merged))
-	for i := 0; i <= maxIdx; i++ {
+	for _, i := range indices {
 		if tc, ok := merged[i]; ok {
+			if id, _ := tc["id"].(string); id == "" {
+				tc["id"] = "call_" + cosy.NewRequestID()
+			}
 			result = append(result, tc)
 		}
 	}

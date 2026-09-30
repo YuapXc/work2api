@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -16,7 +17,7 @@ import (
 //   - 只做单模型单次测试，没有批量/全模型入口——避免对上游形成批量探测流量。
 //   - 测试走与用户请求完全相同的推理链路，验证的是真实可用性，消耗真实积分。
 //   - 后端频控：同一时刻只允许一个测试在跑，且两次测试间隔 ≥5s，防手抖连点。
-//   - max_tokens 限 64，prompt 限 200 字符，控制单次测试的成本上限。
+//   - 请求 max_tokens=64，prompt 限 200 字符，减少单次测试用量；上游不保证严格遵守输出预算。
 
 var (
 	testMu       sync.Mutex
@@ -49,8 +50,8 @@ func (s *Server) adminModelTest(w http.ResponseWriter, r *http.Request) {
 	if prompt == "" {
 		prompt = "hi"
 	}
-	if len(prompt) > testMaxPrompt {
-		prompt = prompt[:testMaxPrompt]
+	if chars := []rune(prompt); len(chars) > testMaxPrompt {
+		prompt = string(chars[:testMaxPrompt])
 	}
 
 	// 频控：单飞 + 最小间隔
@@ -84,6 +85,9 @@ func (s *Server) adminModelTest(w http.ResponseWriter, r *http.Request) {
 	raw, _ := json.Marshal(chatBody)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(string(raw)))
+	ctx, cancel := context.WithTimeout(r.Context(), testTimeout)
+	defer cancel()
+	req = req.WithContext(ctx)
 	req.Header.Set("Content-Type", "application/json")
 	// 内部发起：以内部 principal 走完整推理链路（与用户请求同路径），
 	// 不经过 API key 鉴权。会话键留空，不粘住任何账号。
@@ -104,6 +108,12 @@ func (s *Server) adminModelTest(w http.ResponseWriter, r *http.Request) {
 		"ok":         false,
 		"model":      model,
 		"latency_ms": latency,
+	}
+	if ctx.Err() != nil {
+		resp["status"] = http.StatusGatewayTimeout
+		resp["error"] = "模型测试已超时或被取消"
+		writeJSON(w, 200, resp)
+		return
 	}
 	if rec.Code >= 400 {
 		msg := ""
@@ -152,8 +162,8 @@ func (s *Server) adminModelTest(w http.ResponseWriter, r *http.Request) {
 	if content == "" {
 		content = "(空回复)"
 	}
-	if len(content) > 200 {
-		content = content[:200]
+	if chars := []rune(content); len(chars) > 200 {
+		content = string(chars[:200])
 	}
 	resp["ok"] = true
 	resp["content"] = content

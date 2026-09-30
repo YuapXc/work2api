@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import { api } from '@/api/client'
 import type { ProviderSummary, OAuthOption } from '@/types'
 import { toast } from '@/lib/toast'
@@ -215,14 +215,16 @@ function closePkgs() {
 const calOpenFor = ref<string | null>(null)
 const calStyle = ref<Record<string, string>>({})
 const calData = ref<Record<string, string[]>>({})
+const calendars = ref<Record<string, { history: Record<string, string[]>; today: string; window_date: string; timezone: string }>>({})
+let calendarTimer: ReturnType<typeof setInterval> | null = null
+let calendarInflight: Promise<void> | null = null
 const calDays = ref(35)
 const calAnchor = ref<HTMLElement | null>(null)
 
 // 历史接口按完整 uid 索引（checkin_history.account_uid 原样返回），这里必须用
 // 完整 uid 查表——之前用 8 位短码查导致永远查不到、日历全灰。
 function shortUid(r: any): string {
-  const uid = (r.raw?.uid as string) || ''
-  return uid
+  return String(r.id || r.raw?.id || r.raw?.uid || '')
 }
 
 // 该账号是否属于有签到活动的 provider（workbuddy 国内 / qoder 有；国际站无）
@@ -232,13 +234,20 @@ function hasCheckin(r: any): boolean {
 }
 
 function calDatesOf(r: any): string[] {
-  return calData.value[shortUid(r)] || []
+  return calendars.value[r.provider]?.history[shortUid(r)] || (r.provider === 'workbuddy' ? calData.value[shortUid(r)] : []) || []
 }
 
 async function loadCalendar() {
+  if (calendarInflight) return calendarInflight
+  calendarInflight = fetchCalendar()
+  try { await calendarInflight } finally { calendarInflight = null }
+}
+
+async function fetchCalendar() {
   try {
     const res = await api.checkinHistory(calDays.value)
     calData.value = res.history || {}
+    calendars.value = res.calendars || {}
     calDays.value = res.days || 35
   } catch {
     /* 静默：日历是增强信息，失败不打断账号列表 */
@@ -249,7 +258,7 @@ function openCalendar(r: any, e: MouseEvent | FocusEvent) {
   cancelClose()
   calAnchor.value = e.currentTarget as HTMLElement
   calOpenFor.value = pkgKey(r)
-  if (!calData.value[shortUid(r)]) loadCalendar()
+  void loadCalendar()
   nextTick(positionCal)
 }
 
@@ -273,16 +282,17 @@ function closeCalendar() {
 }
 
 // 35 天点阵的格子状态：''（无记录）/ ok（已签）/ future
-const todayStr = new Date().toISOString().slice(0, 10)
-function calGrid(dates: string[]) {
+function calGrid(dates: string[], row: Row) {
   const set = new Set(dates)
   const cells: { date: string; state: '' | 'ok' | 'future' }[] = []
-  const now = new Date()
+  const calendar = calendars.value[row.provider]
+  if (!calendar?.today) return cells
+  const now = new Date(calendar.today + 'T00:00:00Z')
   for (let i = calDays.value - 1; i >= 0; i--) {
     const d = new Date(now)
-    d.setDate(now.getDate() - i)
-    const ds = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-    cells.push({ date: ds, state: ds > todayStr ? 'future' : set.has(ds) ? 'ok' : '' })
+    d.setUTCDate(now.getUTCDate() - i)
+    const ds = d.toISOString().slice(0, 10)
+    cells.push({ date: ds, state: set.has(ds) ? 'ok' : ds > calendar.window_date ? 'future' : '' })
   }
   return cells
 }
@@ -306,7 +316,7 @@ async function activate(r: any) {
 async function removeAccount(r: any) {
   const ok = await confirm({
     title: `删除账号「${label(r)}」？`,
-    body: '删除后该账号不再参与请求分发，历史用量记录保留。',
+    body: '删除后该账号不再参与请求分发，历史用量记录保留；桌面端原始凭据保留并持续隐藏，重新导入或授权可恢复。',
     tone: 'danger',
     okText: '删除',
   })
@@ -344,6 +354,7 @@ async function checkinAll() {
     for (const p of targets) await api.providerCheckin(p.name)
     toast.success('签到完成')
     await load()
+    await loadCalendar()
   } finally {
     busy.value = false
   }
@@ -370,7 +381,10 @@ const oauthChoice = ref<Record<string, string>>({})
 const oauthUrl = ref('')
 const oauthPolling = ref(false)
 const uploadEl = ref<HTMLInputElement | null>(null)
-let pollTimer: ReturnType<typeof setInterval> | null = null
+let pollTimer: ReturnType<typeof setTimeout> | null = null
+let pollGeneration = 0
+let pollController: AbortController | null = null
+const oauthMessage = ref('')
 
 const addProviderOptions = computed(() =>
   providers.value
@@ -386,53 +400,93 @@ async function openAdd() {
 
 async function onAddProviderChange() {
   stopPoll()
+  const generation = pollGeneration
+  const name = addProvider.value
   oauthUrl.value = ''
   oauthChoice.value = {}
   const c = caps(addProvider.value)
   addMethod.value = c.includes('oauth') ? 'oauth' : c.includes('upload') ? 'upload' : 'oauth'
-  if (addProvider.value === 'workbuddy') {
-    oauthSites.value = (await api.oauthSites()).sites || []
+  if (name === 'workbuddy') {
+    const res = await api.oauthSites()
+    if (generation !== pollGeneration) return
+    oauthSites.value = res.sites || []
     oauthOptions.value = []
     if (oauthSites.value.length) oauthChoice.value.site = oauthSites.value[0]
   } else if (c.includes('oauth')) {
-    const res = await api.providerOAuthOptions(addProvider.value)
+    const res = await api.providerOAuthOptions(name)
+    if (generation !== pollGeneration) return
     oauthOptions.value = res.options || []
     for (const o of oauthOptions.value) oauthChoice.value[o.key] = o.default || o.values[0]?.value || ''
   }
 }
 
 function stopPoll() {
-  if (pollTimer) clearInterval(pollTimer)
+  pollGeneration++
+  pollController?.abort()
+  pollController = null
+  if (pollTimer) clearTimeout(pollTimer)
   pollTimer = null
   oauthPolling.value = false
 }
 
 async function beginOAuth() {
+  stopPoll()
+  const generation = pollGeneration
+  const controller = new AbortController()
+  pollController = controller
+  const provider = addProvider.value
+  const site = oauthChoice.value.site
+  oauthMessage.value = ''
   oauthPolling.value = true
   try {
-    if (addProvider.value === 'workbuddy') {
-      const site = oauthChoice.value.site
-      const res = await api.oauthBegin(site)
+    let poll: () => Promise<{ status: string; message?: string }>
+    let deadline = Date.now() + 10 * 60_000
+    if (provider === 'workbuddy') {
+      const res = await api.oauthBegin(site, controller.signal)
+      if (generation !== pollGeneration) return
       oauthUrl.value = res.authUrl
-      window.open(res.authUrl, '_blank')
-      pollTimer = setInterval(async () => {
-        const p = await api.oauthPoll(res.state, site)
-        if (p.status === 'ready') { stopPoll(); toast.success('已添加账号'); addOpen.value = false; await load() }
-      }, 2500)
+      if (res.expires_at) deadline = Math.min(deadline, res.expires_at * 1000)
+      poll = () => api.oauthPoll(res.state, site, controller.signal)
     } else {
-      const res = await api.providerOAuthBegin(addProvider.value, { ...oauthChoice.value })
+      const res = await api.providerOAuthBegin(provider, { ...oauthChoice.value }, controller.signal)
+      if (generation !== pollGeneration) return
       oauthUrl.value = res.login_url
-      window.open(res.login_url, '_blank')
-      pollTimer = setInterval(async () => {
-        const p = await api.providerOAuthPoll(addProvider.value, res.login_id)
-        if (p.status === 'ready') { stopPoll(); toast.success('已添加账号'); addOpen.value = false; await load() }
-        else if (p.status === 'error') { stopPoll(); toast.error(p.message || '登录失败') }
-      }, 2500)
+      if (res.expires_at) deadline = Math.min(deadline, res.expires_at * 1000)
+      poll = () => api.providerOAuthPoll(provider, res.login_id, controller.signal)
     }
+    window.open(oauthUrl.value, '_blank', 'noopener,noreferrer')
+    let failures = 0
+    const tick = async () => {
+      if (generation !== pollGeneration) return
+      if (Date.now() >= deadline) { stopPoll(); oauthMessage.value = '授权已过期，请重新开始'; return }
+      let delay = 2500
+      try {
+        const p = await poll()
+        if (generation !== pollGeneration) return
+        if (p.status === 'ready') { stopPoll(); toast.success('已添加账号'); addOpen.value = false; await load(); return }
+        if (p.status === 'expired' || p.status === 'error') { stopPoll(); oauthMessage.value = p.message || '授权已过期或失败，请重新开始'; return }
+        failures = 0
+        oauthMessage.value = '等待浏览器授权…'
+      } catch (err: any) {
+        if (generation !== pollGeneration || controller.signal.aborted) return
+        const status = err?.response?.status
+        failures++
+        if (status === 400 || status === 401 || status === 403 || failures >= 5) {
+          stopPoll(); oauthMessage.value = '授权轮询失败，请重新开始'; return
+        }
+        delay = Math.min(15000, 2500 * 2 ** failures)
+        oauthMessage.value = '网络暂时异常，正在重试…'
+      }
+      if (generation === pollGeneration) pollTimer = setTimeout(tick, Math.min(delay, Math.max(0, deadline-Date.now())))
+    }
+    pollTimer = setTimeout(tick, 2500)
   } catch {
-    oauthPolling.value = false
+    if (generation === pollGeneration) stopPoll()
   }
 }
+
+watch(addMethod, () => { if (oauthPolling.value) stopPoll() })
+watch(oauthChoice, () => { if (oauthPolling.value) stopPoll() }, { deep: true })
 
 async function onUpload(e: Event) {
   const file = (e.target as HTMLInputElement).files?.[0]
@@ -447,11 +501,19 @@ async function onUpload(e: Event) {
   }
 }
 
-onMounted(load)
+function refreshVisibleCalendar() { if (document.visibilityState === 'visible') void loadCalendar() }
+onMounted(() => {
+  void load()
+  void loadCalendar()
+  calendarTimer = setInterval(refreshVisibleCalendar, 60000)
+  document.addEventListener('visibilitychange', refreshVisibleCalendar)
+})
 // 组件卸载时停掉可能残留的扫码轮询/悬浮层关闭定时器，避免离开页面后仍在轮询
 onUnmounted(() => {
   stopPoll()
   cancelClose()
+  if (calendarTimer) clearInterval(calendarTimer)
+  document.removeEventListener('visibilitychange', refreshVisibleCalendar)
 })
 
 // ---------- 配置型供应商（opencode 密钥层级） ----------
@@ -614,7 +676,8 @@ async function saveConfig() {
           <template #cell-actions="{ row }">
             <div class="flex items-center justify-end gap-1.5">
               <template v-if="isLocalQoder(row)">
-                <WTag tone="muted" title="本机 Qoder 桌面端自动探测的账号，随桌面端登录状态变化，无法在此改名或删除">本机自动探测</WTag>
+                <WTag tone="muted" title="本机自动探测；隐藏不会删除桌面端凭据">本机自动探测</WTag>
+                <WButton size="sm" variant="danger" @click="removeAccount(row)">隐藏</WButton>
               </template>
               <template v-else>
                 <WButton size="sm" variant="subtle" @click="openRename(row)">{{ row.provider === 'workbuddy' ? '别名' : '重命名' }}</WButton>
@@ -696,7 +759,7 @@ async function saveConfig() {
 
       <!-- 上传凭据 -->
       <template v-else-if="addMethod === 'upload'">
-        <input ref="uploadEl" type="file" accept=".json" class="hidden" @change="onUpload" />
+        <input ref="uploadEl" type="file" accept=".info,.json" class="hidden" @change="onUpload" />
         <button
           class="flex w-full flex-col items-center gap-2 rounded-lg border border-dashed border-line py-8 text-muted transition-colors hover:border-brand hover:text-brand"
           @click="uploadEl?.click()"
@@ -706,6 +769,7 @@ async function saveConfig() {
         </button>
       </template>
 
+      <p v-if="oauthMessage" class="mt-3 text-small text-muted">{{ oauthMessage }}</p>
       <template #footer>
         <WButton variant="subtle" @click="addOpen = false">关闭</WButton>
         <WButton
@@ -809,7 +873,7 @@ async function saveConfig() {
         </div>
         <div class="grid grid-cols-7 gap-1">
           <div
-            v-for="c in calGrid(calDatesOf(r))"
+            v-for="c in calGrid(calDatesOf(r), r)"
             :key="c.date"
             class="h-4 w-4 rounded-sm"
             :class="{
@@ -817,7 +881,7 @@ async function saveConfig() {
               'bg-line/50': c.state === '',
               'bg-transparent ring-1 ring-line/30': c.state === 'future',
             }"
-            :title="c.date + (c.state === 'ok' ? ' · 已签到' : c.state === '' ? ' · 未签到' : '')"
+            :title="c.date + (c.state === 'ok' ? ' · 已签到' : c.state === '' ? ' · 未签到' : ' · 签到窗口尚未开放')"
           />
         </div>
         <div class="mt-3 flex items-center justify-between gap-3 text-micro text-faint">
@@ -827,7 +891,10 @@ async function saveConfig() {
           </span>
           <span class="mono whitespace-nowrap">{{ calDatesOf(r).length }} / {{ calDays }} 天</span>
         </div>
-        <div class="mt-2 border-t border-line pt-2 text-micro text-faint">签到历史从本版本开始记录，此前无数据</div>
+        <div class="mt-2 border-t border-line pt-2 text-micro text-faint">
+          按渠道本地记录展示 · {{ calendars[r.provider]?.timezone || '时区未知' }}
+          <span v-if="calendars[r.provider]?.window_date"> · 当前窗口 {{ calendars[r.provider]?.window_date }}</span>
+        </div>
       </div>
     </Teleport>
   </WPage>

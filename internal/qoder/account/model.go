@@ -19,8 +19,9 @@ type Account struct {
 }
 
 type OAuthSession struct {
-	LoginID  string `json:"login_id"`
-	LoginURL string `json:"login_url"`
+	LoginID   string `json:"login_id"`
+	LoginURL  string `json:"login_url"`
+	ExpiresAt int64  `json:"expires_at"`
 }
 
 type Status struct {

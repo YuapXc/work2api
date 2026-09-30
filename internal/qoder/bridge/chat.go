@@ -17,10 +17,20 @@ import (
 // unified runtime can build a provider.UsageReport. The client response has
 // already been written to w by the time this returns.
 type ServeResult struct {
-	InputTokens  int
-	OutputTokens int
-	Output       string
-	Reasoning    string
+	UsageKnown        bool
+	inputTokensKnown  bool
+	outputTokensKnown bool
+	InputTokens       int
+	OutputTokens      int
+	Output            string
+	Reasoning         string
+}
+
+func (r *ServeResult) updateUsage(d Delta, input, output *int) {
+	d.UpdateUsage(input, output)
+	r.inputTokensKnown = r.inputTokensKnown || d.HasInputTokens || d.InputTokens > 0
+	r.outputTokensKnown = r.outputTokensKnown || d.HasOutputTokens || d.OutputTokens > 0
+	r.UsageKnown = r.inputTokensKnown && r.outputTokensKnown
 }
 
 func (b *Bridge) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -76,15 +86,12 @@ func (b *Bridge) ServeChat(ctx context.Context, w http.ResponseWriter, req map[s
 		var streamFull strings.Builder
 		var streamReasoning strings.Builder
 
-		err := b.CallQoder(ctx, InferAgent(model), messages, model, tools, func(d Delta) {
+		err := b.CallQoderWithOpts(ctx, InferAgent(model), messages, model, tools, requestCallOpts(req), func(d Delta) {
 			if d.Err != nil {
 				logger.Error("[Chat][%s] upstream error in stream callback: %v", reqID, d.Err)
 				return
 			}
-			if d.InputTokens > 0 || d.OutputTokens > 0 {
-				totalInputTokens = d.InputTokens
-				totalOutputTokens = d.OutputTokens
-			}
+			result.updateUsage(d, &totalInputTokens, &totalOutputTokens)
 			chunk := MakeChatChunk(reqId, created, model)
 			choices := chunk["choices"].([]interface{})
 			delta := choices[0].(map[string]interface{})["delta"].(map[string]interface{})
@@ -155,11 +162,8 @@ func (b *Bridge) ServeChat(ctx context.Context, w http.ResponseWriter, req map[s
 		var reasoning strings.Builder
 		var toolCallBuf []interface{}
 		var totalInputTokens, totalOutputTokens int
-		err := b.CallQoder(ctx, InferAgent(model), messages, model, tools, func(d Delta) {
-			if d.InputTokens > 0 || d.OutputTokens > 0 {
-				totalInputTokens = d.InputTokens
-				totalOutputTokens = d.OutputTokens
-			}
+		err := b.CallQoderWithOpts(ctx, InferAgent(model), messages, model, tools, requestCallOpts(req), func(d Delta) {
+			result.updateUsage(d, &totalInputTokens, &totalOutputTokens)
 			if d.Reasoning != "" {
 				reasoning.WriteString(d.Reasoning)
 			}

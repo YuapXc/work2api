@@ -323,7 +323,7 @@ func (s *Server) runWorkbuddyCheckin(ctx context.Context) map[string]any {
 	today := time.Now().Format("2006-01-02")
 	dates, _ := s.o.db.CheckinDates()
 	for _, a := range s.o.pool.Accounts() {
-		mgr := s.o.managers[a.UID]
+		mgr := s.o.manager(a.UID)
 		if mgr == nil {
 			continue
 		}

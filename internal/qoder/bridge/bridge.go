@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 	"work2api/internal/qoder/cosy"
 
 	"work2api/internal/qoder/account"
@@ -52,14 +53,21 @@ func ResolveOAuthUserID(userInfo map[string]interface{}) string {
 }
 
 func FetchUserInfoWithToken(token string, region account.Region) (map[string]interface{}, error) {
+	return FetchUserInfoWithTokenContext(context.Background(), token, region)
+}
+
+func FetchUserInfoWithTokenContext(ctx context.Context, token string, region account.Region) (map[string]interface{}, error) {
 	ep := account.GetEndpoints(region)
-	req, _ := http.NewRequest("GET", ep.UserinfoBase, nil)
+	req, _ := http.NewRequestWithContext(ctx, "GET", ep.UserinfoBase, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("userinfo HTTP %d", resp.StatusCode)
+	}
 	var result map[string]interface{}
 	raw, _ := io.ReadAll(resp.Body)
 	if err := json.Unmarshal(raw, &result); err != nil {
@@ -107,6 +115,10 @@ func tokenPrefix(s string, n int) string {
 //  1. OAuth device token (dt-xxx): 直接使用，调用 /api/v1/userinfo 获取用户信息
 //  2. Personal Access Token (PAT): 调用 ExchangeJobToken 转换为 session token
 func NewBridge(pat string, region account.Region, templateBase map[string]interface{}) (*Bridge, error) {
+	return NewBridgeContext(context.Background(), pat, region, templateBase)
+}
+
+func NewBridgeContext(ctx context.Context, pat string, region account.Region, templateBase map[string]interface{}) (*Bridge, error) {
 	logger.Debug("Bridge using token: %s (prefix: %s)", tokenPrefix(pat, 10), tokenPrefix(pat, 4))
 
 	var identity cosy.AuthIdentity
@@ -114,7 +126,7 @@ func NewBridge(pat string, region account.Region, templateBase map[string]interf
 
 	deviceToken, refreshToken := ParseOAuthSecret(pat)
 	if strings.HasPrefix(deviceToken, "dt-") {
-		userInfo, err := FetchUserInfoWithToken(deviceToken, region)
+		userInfo, err := FetchUserInfoWithTokenContext(ctx, deviceToken, region)
 		if err != nil {
 			return nil, fmt.Errorf("fetch user info: %w", err)
 		}
@@ -134,7 +146,7 @@ func NewBridge(pat string, region account.Region, templateBase map[string]interf
 		// jobToken 交换发生在拿到 uid 之前：机器头用凭证种子稳定派生
 		// （hub 的交换请求不带机器头，此处保留 QCCG 原有行为但消除随机漂移）
 		seed := cosy.FingerprintSeed("", pat)
-		jt, err := cosy.ExchangeJobToken(pat, cosy.DeriveMachineID(seed), cosy.DeriveMachineToken(seed), cosy.DeriveMachineType(seed), account.GetEndpoints(region).JobTokenURL)
+		jt, err := cosy.ExchangeJobTokenContext(ctx, pat, cosy.DeriveMachineID(seed), cosy.DeriveMachineToken(seed), cosy.DeriveMachineType(seed), account.GetEndpoints(region).JobTokenURL)
 		if err != nil {
 			return nil, fmt.Errorf("exchangeJobToken: %w", err)
 		}
@@ -174,8 +186,12 @@ func NewBridge(pat string, region account.Region, templateBase map[string]interf
 // ListAvailableModels 通过 cosy 签名调用 /algo/api/v2/model/list 拉取上游模型清单。
 // 返回顶层 assistant 数组中 enable=true 的模型，按 is_default desc + display_name asc 排序。
 func (b *Bridge) ListAvailableModels() ([]QoderModel, error) {
+	return b.ListAvailableModelsContext(context.Background())
+}
+
+func (b *Bridge) ListAvailableModelsContext(ctx context.Context) ([]QoderModel, error) {
 	modelListURL := qoderModelListURL(b.region)
-	resp, err := b.client.callGet(modelListURL)
+	resp, err := b.client.callGetContext(ctx, modelListURL)
 	if err != nil {
 		return nil, err
 	}
@@ -276,6 +292,20 @@ func DeepCopyMap(m map[string]interface{}) map[string]interface{} {
 type CallOpts struct {
 	IsReasoning bool // 是否启用推理模式（对应上游 model_config.is_reasoning）
 	MaxTokens   int  // 客户端请求的 max_tokens，0 表示使用模板默认值
+}
+
+func requestCallOpts(req map[string]interface{}) CallOpts {
+	for _, key := range []string{"max_output_tokens", "max_completion_tokens", "max_tokens"} {
+		if value := req[key]; value != nil {
+			switch n := value.(type) {
+			case int:
+				return CallOpts{MaxTokens: n}
+			case float64:
+				return CallOpts{MaxTokens: int(n)}
+			}
+		}
+	}
+	return CallOpts{}
 }
 
 func (b *Bridge) CallQoder(ctx context.Context, agent string, messages []interface{}, model string, tools interface{}, onDelta func(Delta)) error {

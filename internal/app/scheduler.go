@@ -175,7 +175,7 @@ func (s *Scheduler) doCheckin() []string {
 		if skip[acc.UID] {
 			continue
 		}
-		mgr := s.o.managers[acc.UID]
+		mgr := s.o.manager(acc.UID)
 		if mgr == nil {
 			continue
 		}
@@ -214,7 +214,7 @@ func (s *Scheduler) doKeepalive() {
 		if !acc.Enabled {
 			continue
 		}
-		mgr := s.o.managers[acc.UID]
+		mgr := s.o.manager(acc.UID)
 		if mgr == nil {
 			continue
 		}
@@ -261,6 +261,7 @@ func (s *Scheduler) run() {
 	}
 	s.refreshCredits()
 	s.o.models.Refresh()
+	s.o.refreshRuntimeModels(context.Background())
 	// 同步 lastCredit：否则首个 tick 的周期判据（now-lastCredit >= interval）
 	// 因零值必然命中，刚预热完又对全部账号白刷一遍额度（Workbuddy2API #34 同款）。
 	s.lastCredit = float64(time.Now().Unix())
@@ -343,6 +344,7 @@ func (s *Scheduler) tick() {
 	// --- daily model refresh ---
 	if now.Hour() == parseHour(s.setting("model_refresh_hour", "6"), 6) && s.lastModelRefreshDate != t {
 		s.o.models.Refresh()
+		s.o.refreshRuntimeModels(context.Background())
 		s.lastModelRefreshDate = t
 	}
 

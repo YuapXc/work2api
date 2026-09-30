@@ -33,8 +33,7 @@ async function load() {
 }
 
 const healthy = computed(() => (ov.value?.accounts || []).filter((a) => a.healthy).length)
-const totalAcc = computed(() => (ov.value?.accounts || []).length)
-const serving = computed(() => healthy.value > 0)
+const serving = computed(() => providers.value.some((p) => p.name === 'workbuddy' ? healthy.value > 0 : p.ready))
 const pred = computed(() => ov.value?.prediction)
 
 // 供应商健康灯
@@ -111,7 +110,7 @@ onUnmounted(() => timer && clearInterval(timer))
         </WCard>
 
         <div class="grid grid-cols-2 gap-4">
-          <WStat label="健康账号" :value="`${healthy}/${totalAcc}`" :tone="serving ? 'live' : 'fault'" />
+          <WStat label="可用渠道" :value="`${providers.filter((p) => p.name === 'workbuddy' ? healthy > 0 : p.ready).length}/${providers.length}`" :tone="serving ? 'live' : 'fault'" />
           <WStat label="模型数" :value="int(ov?.model_count)" tone="route" :sub="ov?.model_source === 'dynamic' ? '上游实时' : '内置'" />
           <WStat label="今日请求" :value="int(ov?.usage?.today_requests)" tone="brand" />
           <WStat label="今日 Tokens" :value="abbr(ov?.usage?.today_tokens)" />

@@ -10,6 +10,7 @@ package qoder
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -50,9 +51,13 @@ const fallbackContextWindow = 180000
 // expensive to build (session bootstrap + jobToken exchange), so one is cached
 // per account id.
 type Runtime struct {
-	mu      sync.Mutex
-	bridges map[string]*bridge.Bridge
-	saltSet bool
+	mu               sync.Mutex
+	bridges          map[string]*bridge.Bridge
+	bridgeKeys       map[string][32]byte
+	bridgeGeneration map[string]uint64
+	bridgeInflight   map[string]*bridgeInitialization
+	modelCache       []provider.CatalogModel
+	saltSet          bool
 
 	localOnce  sync.Once
 	localCreds []localcred.Credential
@@ -63,6 +68,13 @@ type Runtime struct {
 	quotaMu       sync.Mutex
 	quotaCache    map[string]quotaEntry
 	quotaInflight map[string]bool
+}
+
+type bridgeInitialization struct {
+	done   chan struct{}
+	key    [32]byte
+	bridge *bridge.Bridge
+	err    error
 }
 
 // quotaEntry caches a per-account quota snapshot with a fetch timestamp so the
@@ -99,10 +111,13 @@ func New(logLevel string) *Runtime {
 	// Gateway LOG_LEVEL wins over the qoder store fallback set above.
 	logger.SetLevel(strings.ToLower(strings.TrimSpace(logLevel)))
 	return &Runtime{
-		bridges:       map[string]*bridge.Bridge{},
-		oauthStates:   map[string]*oauthState{},
-		quotaCache:    map[string]quotaEntry{},
-		quotaInflight: map[string]bool{},
+		bridges:          map[string]*bridge.Bridge{},
+		bridgeKeys:       map[string][32]byte{},
+		bridgeGeneration: map[string]uint64{},
+		bridgeInflight:   map[string]*bridgeInitialization{},
+		oauthStates:      map[string]*oauthState{},
+		quotaCache:       map[string]quotaEntry{},
+		quotaInflight:    map[string]bool{},
 	}
 }
 
@@ -132,7 +147,13 @@ func (r *Runtime) detectLocal() []localcred.Credential {
 			logger.Info("qoder: 探测到 %d 个本地 Qoder 桌面凭据", len(creds))
 		}
 	})
-	return r.localCreds
+	var visible []localcred.Credential
+	for _, c := range r.localCreds {
+		if !account.IsGatewayHidden("qoder-local-" + c.Region) {
+			visible = append(visible, c)
+		}
+	}
+	return visible
 }
 
 // Ready reports whether at least one usable credential exists: a native
@@ -141,7 +162,7 @@ func (r *Runtime) Ready() bool {
 	if dataDirExists() {
 		if accounts, err := account.List(); err == nil {
 			for i := range accounts {
-				if account.HasSecret(accounts[i].ID) {
+				if !account.IsGatewayHidden(accounts[i].ID) && account.HasSecret(accounts[i].ID) {
 					return true
 				}
 			}
@@ -155,14 +176,14 @@ func (r *Runtime) Ready() bool {
 // to a recovered local Qoder desktop credential.
 func (r *Runtime) pickAccount() (*account.Account, string, error) {
 	if dataDirExists() {
-		if acct, _ := account.GetActive(); acct != nil && account.HasSecret(acct.ID) {
+		if acct, _ := account.GetActive(); acct != nil && !account.IsGatewayHidden(acct.ID) && account.HasSecret(acct.ID) {
 			if sec, err := account.GetSecret(acct.ID); err == nil {
 				return acct, sec, nil
 			}
 		}
 		if accounts, err := account.List(); err == nil {
 			for i := range accounts {
-				if account.HasSecret(accounts[i].ID) {
+				if !account.IsGatewayHidden(accounts[i].ID) && account.HasSecret(accounts[i].ID) {
 					if sec, err := account.GetSecret(accounts[i].ID); err == nil {
 						return &accounts[i], sec, nil
 					}
@@ -185,55 +206,118 @@ func (r *Runtime) pickAccount() (*account.Account, string, error) {
 // bridgeFor builds (or returns the cached) bridge for an account. The base
 // prompt template is rendered per-bridge exactly like qoder2api's
 // startBridgeWithAccount (fresh UUIDs + timestamp spliced into the template).
-func (r *Runtime) bridgeFor(acct *account.Account, secret string) (*bridge.Bridge, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	// Ensure the install salt is applied before any fingerprint is derived. Done
-	// lazily (not in New) so a data dir created after startup is still honored.
-	if !r.saltSet {
-		if salt, err := account.EnsureMachineSalt(); err == nil {
-			cosy.SetInstallSalt(salt)
+func (r *Runtime) bridgeFor(ctx context.Context, acct *account.Account, secret string) (*bridge.Bridge, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	key := sha256.Sum256([]byte(string(acct.Region) + "\x00" + secret))
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		r.saltSet = true
-	}
-	if b, ok := r.bridges[acct.ID]; ok && b != nil {
+		r.mu.Lock()
+		// Ensure the install salt is applied before any fingerprint is derived. Done
+		// lazily (not in New) so a data dir created after startup is still honored.
+		if !r.saltSet {
+			if salt, err := account.EnsureMachineSalt(); err == nil {
+				cosy.SetInstallSalt(salt)
+			}
+			r.saltSet = true
+		}
+		if b, ok := r.bridges[acct.ID]; ok && b != nil {
+			if r.bridgeKeys[acct.ID] == key {
+				r.mu.Unlock()
+				return b, nil
+			}
+		}
+		if secret == "" {
+			r.mu.Unlock()
+			return nil, fmt.Errorf("empty qoder secret for %s", acct.ID)
+		}
+		if pending, ok := r.bridgeInflight[acct.ID]; ok {
+			r.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-pending.done:
+				if pending.key == key {
+					return pending.bridge, pending.err
+				}
+				continue
+			}
+		}
+		pending := &bridgeInitialization{done: make(chan struct{}), key: key}
+		r.bridgeInflight[acct.ID] = pending
+		generation := r.bridgeGeneration[acct.ID]
+		r.mu.Unlock()
+		tmpl := string(basePromptJSON)
+		for _, ukey := range []string{"{UUID1}", "{UUID2}", "{UUID3}", "{UUID4}", "{UUID5}"} {
+			tmpl = strings.ReplaceAll(tmpl, ukey, cosy.NewUUID())
+		}
+		tmpl = strings.ReplaceAll(tmpl, "{TIME1}", fmt.Sprintf("%d", cosy.UnixMs()))
+		var templateBase map[string]interface{}
+		_ = json.Unmarshal([]byte(tmpl), &templateBase)
+
+		b, err := bridge.NewBridgeContext(ctx, secret, acct.Region, templateBase)
+		// Re-read native credentials before publishing; external imports may change
+		// the secret while the network initialization is in progress.
+		if err == nil && !strings.HasPrefix(acct.ID, "qoder-local-") {
+			current, readErr := account.GetSecret(acct.ID)
+			if readErr != nil || current != secret {
+				err = fmt.Errorf("qoder credentials changed during initialization")
+			}
+		}
+		r.mu.Lock()
+		if r.bridgeGeneration[acct.ID] != generation || account.IsGatewayHidden(acct.ID) {
+			err = fmt.Errorf("qoder account removed or changed during initialization")
+		}
+		if err == nil {
+			r.bridges[acct.ID] = b
+			r.bridgeKeys[acct.ID] = key
+		}
+		delete(r.bridgeInflight, acct.ID)
+		pending.bridge = b
+		if err != nil {
+			pending.bridge = nil
+			pending.err = fmt.Errorf("create bridge: %w", err)
+		}
+		close(pending.done)
+		r.mu.Unlock()
+		if err != nil {
+			return nil, fmt.Errorf("create bridge: %w", err)
+		}
 		return b, nil
 	}
-	if secret == "" {
-		return nil, fmt.Errorf("empty qoder secret for %s", acct.ID)
-	}
-	tmpl := string(basePromptJSON)
-	for _, ukey := range []string{"{UUID1}", "{UUID2}", "{UUID3}", "{UUID4}", "{UUID5}"} {
-		tmpl = strings.ReplaceAll(tmpl, ukey, cosy.NewUUID())
-	}
-	tmpl = strings.ReplaceAll(tmpl, "{TIME1}", fmt.Sprintf("%d", cosy.UnixMs()))
-	var templateBase map[string]interface{}
-	_ = json.Unmarshal([]byte(tmpl), &templateBase)
-
-	b, err := bridge.NewBridge(secret, acct.Region, templateBase)
-	if err != nil {
-		return nil, fmt.Errorf("create bridge: %w", err)
-	}
-	r.bridges[acct.ID] = b
-	return b, nil
 }
 
 // Models returns the namespaced catalog. It queries the signed model/list
 // endpoint for the active account and falls back to the static key list.
 func (r *Runtime) Models(ctx context.Context) []provider.CatalogModel {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.modelCache) > 0 {
+		return append([]provider.CatalogModel(nil), r.modelCache...)
+	}
+	return r.fallbackModels()
+}
+
+// RefreshModels performs network discovery only on explicit/scheduled refresh.
+// Ordinary catalog and health reads use Models' cached/fallback snapshot.
+func (r *Runtime) RefreshModels(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	acct, secret, err := r.pickAccount()
 	if err != nil {
-		return r.fallbackModels()
+		return err
 	}
-	b, err := r.bridgeFor(acct, secret)
+	b, err := r.bridgeFor(ctx, acct, secret)
 	if err != nil {
 		logger.Error("qoder: models bridge build failed: %v", err)
-		return r.fallbackModels()
+		return err
 	}
-	models, err := b.ListAvailableModels()
+	models, err := b.ListAvailableModelsContext(ctx)
 	if err != nil || len(models) == 0 {
 		logger.Error("qoder: ListAvailableModels failed (%v), using fallback", err)
-		return r.fallbackModels()
+		return fmt.Errorf("qoder model discovery failed: %v", err)
 	}
 	out := make([]provider.CatalogModel, 0, len(models))
 	for _, m := range models {
@@ -257,7 +341,10 @@ func (r *Runtime) Models(ctx context.Context) []provider.CatalogModel {
 			},
 		})
 	}
-	return out
+	r.mu.Lock()
+	r.modelCache = out
+	r.mu.Unlock()
+	return nil
 }
 
 func (r *Runtime) fallbackModels() []provider.CatalogModel {
@@ -286,7 +373,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 	}
 	report.AccountUID = acct.ID
 
-	b, err := r.bridgeFor(acct, secret)
+	b, err := r.bridgeFor(ctx, acct, secret)
 	if err != nil {
 		writeServeError(req, err)
 		report.Status = "error"
@@ -313,6 +400,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 	}
 
 	report.InputTokens = res.InputTokens
+	report.TokensKnown = &res.UsageKnown
 	report.OutputTokens = res.OutputTokens
 	report.Output = res.Output
 	report.Reasoning = res.Reasoning

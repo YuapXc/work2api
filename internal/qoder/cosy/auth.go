@@ -1,6 +1,7 @@
 package cosy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,10 @@ import (
 
 // ExchangeJobToken 将 PAT 或 refresh token 转换为 job token
 func ExchangeJobToken(token, machineId, machineToken, machineType string, jobTokenURL ...string) (map[string]interface{}, error) {
+	return ExchangeJobTokenContext(context.Background(), token, machineId, machineToken, machineType, jobTokenURL...)
+}
+
+func ExchangeJobTokenContext(ctx context.Context, token, machineId, machineToken, machineType string, jobTokenURL ...string) (map[string]interface{}, error) {
 	date := CurrentDate()
 	sig := SignLegacy(date)
 
@@ -47,7 +52,7 @@ func ExchangeJobToken(token, machineId, machineToken, machineType string, jobTok
 		endpoint = jobTokenURL[0]
 	}
 
-	req, err := http.NewRequest("POST", endpoint, strings.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(body))
 	if err != nil {
 		return nil, err
 	}

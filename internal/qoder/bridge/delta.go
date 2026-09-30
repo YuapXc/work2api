@@ -12,17 +12,30 @@ import (
 )
 
 type Delta struct {
-	Role         string
-	Content      string
-	Reasoning    string // 上游推理过程（reasoning_content）
-	ToolCalls    []interface{}
-	InputTokens  int
-	OutputTokens int
-	Err          error // 上游返回业务错误时非 nil
+	Role            string
+	Content         string
+	Reasoning       string // 上游推理过程（reasoning_content）
+	ToolCalls       []interface{}
+	InputTokens     int
+	OutputTokens    int
+	HasInputTokens  bool
+	HasOutputTokens bool
+	Err             error // 上游返回业务错误时非 nil
 }
 
 func (d Delta) isEmpty() bool {
-	return d.Role == "" && d.Content == "" && d.Reasoning == "" && d.ToolCalls == nil && d.InputTokens == 0 && d.OutputTokens == 0 && d.Err == nil
+	return d.Role == "" && d.Content == "" && d.Reasoning == "" && d.ToolCalls == nil && d.InputTokens == 0 && d.OutputTokens == 0 && !d.HasInputTokens && !d.HasOutputTokens && d.Err == nil
+}
+
+// UpdateUsage applies cumulative snapshots, including explicit zero values,
+// without resetting a field omitted by a later frame or summing snapshots.
+func (d Delta) UpdateUsage(input, output *int) {
+	if d.HasInputTokens || d.InputTokens > 0 {
+		*input = d.InputTokens
+	}
+	if d.HasOutputTokens || d.OutputTokens > 0 {
+		*output = d.OutputTokens
+	}
 }
 
 func ExtractDelta(dataLine string) Delta {
@@ -57,7 +70,10 @@ func ExtractDelta(dataLine string) Delta {
 	// 先捕获顶层 usage（上游可能在最后一个 chunk 中与 choices 一起返回），
 	// 不提前 return：同帧若还带 choices 内容，合并进同一个 Delta，避免内容丢失
 	var usageIn, usageOut int
+	var hasIn, hasOut bool
 	if usage, ok := innerJSON["usage"].(map[string]interface{}); ok {
+		_, hasIn = usage["prompt_tokens"]
+		_, hasOut = usage["completion_tokens"]
 		usageIn = int(cosy.FloatVal(usage, "prompt_tokens"))
 		usageOut = int(cosy.FloatVal(usage, "completion_tokens"))
 	}
@@ -77,7 +93,7 @@ func ExtractDelta(dataLine string) Delta {
 		}
 		if role != "" || content != "" || reasoning != "" || toolCalls != nil {
 			return Delta{Role: role, Content: content, Reasoning: reasoning, ToolCalls: toolCalls,
-				InputTokens: usageIn, OutputTokens: usageOut}
+				InputTokens: usageIn, OutputTokens: usageOut, HasInputTokens: hasIn, HasOutputTokens: hasOut}
 		}
 	}
 	// 上游业务错误：{"code":"115","message":"..."}
@@ -90,8 +106,8 @@ func ExtractDelta(dataLine string) Delta {
 		return Delta{Err: err}
 	}
 	// choices 与业务 code 均未命中且 usage > 0：维持返回 usage-only Delta（行为同修复前）
-	if usageIn > 0 || usageOut > 0 {
-		return Delta{InputTokens: usageIn, OutputTokens: usageOut}
+	if hasIn || hasOut {
+		return Delta{InputTokens: usageIn, OutputTokens: usageOut, HasInputTokens: hasIn, HasOutputTokens: hasOut}
 	}
 	logger.Debug("[delta] no valid choices found, inner=%s", inner)
 	return Delta{}

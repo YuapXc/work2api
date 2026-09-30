@@ -40,7 +40,10 @@ func Save(a *Account) error {
 	if a.ID == "" {
 		a.ID = SanitizeID(a.Email + a.Name + fmt.Sprintf("%d", time.Now().UnixNano()))
 	}
-	return saveUnlocked(d, a)
+	if err := saveUnlocked(d, a); err != nil {
+		return err
+	}
+	return SetGatewayHidden(a.ID, false)
 }
 
 func Delete(id string) error {

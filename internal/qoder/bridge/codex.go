@@ -32,8 +32,7 @@ func (b *Bridge) HandleCodexResponses(w http.ResponseWriter, r *http.Request) {
 }
 
 // ServeCodex runs the Codex/Responses conversion + streaming against an
-// already-parsed client body, writing the client response to w. The conversion
-// and streaming logic is byte-identical to the original HTTP handler.
+// already-parsed client body, writing the client response to w.
 func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[string]interface{}) (ServeResult, error) {
 	startTime := time.Now()
 	var result ServeResult
@@ -43,7 +42,7 @@ func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[
 	stream, _ := req["stream"].(bool)
 	model := StrValDefault(req, "model", "auto")
 	instructions, _ := req["instructions"].(string)
-	tools := req["tools"]
+	tools := ConvertResponsesToolsToOpenAI(req["tools"])
 	toolsEnabled := tools != nil
 
 	// Convert input to messages
@@ -100,11 +99,13 @@ func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[
 		})
 		_ = contentPartId
 
-		var toolCallBuf []interface{}
+		toolCallMerged := map[int]map[string]interface{}{}
+		var totalInputTokens, totalOutputTokens int
 		var streamFull strings.Builder
 		var streamReasoning strings.Builder
 
-		err := b.CallQoder(ctx, "codex", messages, model, tools, func(d Delta) {
+		err := b.CallQoderWithOpts(ctx, "codex", messages, model, tools, requestCallOpts(req), func(d Delta) {
+			result.updateUsage(d, &totalInputTokens, &totalOutputTokens)
 			if d.Reasoning != "" {
 				streamReasoning.WriteString(d.Reasoning)
 				writeEvent("response.reasoning_text.delta", map[string]interface{}{
@@ -126,9 +127,11 @@ func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[
 				})
 			}
 			if d.ToolCalls != nil {
-				toolCallBuf = append(toolCallBuf, d.ToolCalls...)
+				MergeToolCallChunks(toolCallMerged, d.ToolCalls)
 			}
 		})
+		result.InputTokens = totalInputTokens
+		result.OutputTokens = totalOutputTokens
 		result.Output = streamFull.String()
 		result.Reasoning = streamReasoning.String()
 		if err != nil {
@@ -146,11 +149,15 @@ func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[
 			"item_id":       outputItemId,
 			"output_index":  0,
 			"content_index": 0,
+			"text":          streamFull.String(),
 		})
+		messageItem := map[string]interface{}{"id": outputItemId, "type": "message", "role": "assistant", "status": "completed", "content": []interface{}{map[string]interface{}{"type": "output_text", "text": streamFull.String(), "annotations": []interface{}{}}}}
+		output := []interface{}{messageItem}
+		writeEvent("response.content_part.done", map[string]interface{}{"type": "response.content_part.done", "item_id": outputItemId, "output_index": 0, "content_index": 0, "part": messageItem["content"].([]interface{})[0]})
+		writeEvent("response.output_item.done", map[string]interface{}{"type": "response.output_item.done", "output_index": 0, "item": messageItem})
 
 		// Emit tool calls as function_call items if any
-		for i, tc := range toolCallBuf {
-			tcMap, _ := tc.(map[string]interface{})
+		for i, tcMap := range SortedToolCalls(toolCallMerged) {
 			if tcMap == nil {
 				continue
 			}
@@ -184,6 +191,12 @@ func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[
 				"output_index": i + 1,
 				"arguments":    args,
 			})
+			item := map[string]interface{}{"id": fcItemId, "type": "function_call", "call_id": callId, "name": name, "arguments": args, "status": "completed"}
+			output = append(output, item)
+			writeEvent("response.output_item.done", map[string]interface{}{"type": "response.output_item.done", "output_index": i + 1, "item": item})
+		}
+		if streamReasoning.Len() > 0 {
+			output = append(output, map[string]interface{}{"type": "reasoning", "id": "rs_" + cosy.NewRequestID(), "summary": []interface{}{map[string]interface{}{"type": "summary_text", "text": streamReasoning.String()}}})
 		}
 
 		status := "completed"
@@ -191,18 +204,21 @@ func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[
 			"type": "response.completed",
 			"response": map[string]interface{}{
 				"id": respId, "model": model, "status": status,
+				"output": output,
 				"usage": map[string]interface{}{
-					"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+					"input_tokens": totalInputTokens, "output_tokens": totalOutputTokens, "total_tokens": totalInputTokens + totalOutputTokens,
 				},
 			},
 		})
-		logger.Info("[Codex][%s] stream 完成 tool_calls=%d 耗时=%dms", reqID, len(toolCallBuf), time.Since(startTime).Milliseconds())
+		logger.Info("[Codex][%s] stream 完成 tool_calls=%d 耗时=%dms", reqID, len(toolCallMerged), time.Since(startTime).Milliseconds())
 		return result, nil
 	} else {
 		var full strings.Builder
 		var reasoning strings.Builder
-		var toolCallBuf []interface{}
-		err := b.CallQoder(ctx, "codex", messages, model, tools, func(d Delta) {
+		toolCallMerged := map[int]map[string]interface{}{}
+		var totalInputTokens, totalOutputTokens int
+		err := b.CallQoderWithOpts(ctx, "codex", messages, model, tools, requestCallOpts(req), func(d Delta) {
+			result.updateUsage(d, &totalInputTokens, &totalOutputTokens)
 			if d.Reasoning != "" {
 				reasoning.WriteString(d.Reasoning)
 			}
@@ -210,9 +226,11 @@ func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[
 				full.WriteString(d.Content)
 			}
 			if d.ToolCalls != nil {
-				toolCallBuf = append(toolCallBuf, d.ToolCalls...)
+				MergeToolCallChunks(toolCallMerged, d.ToolCalls)
 			}
 		})
+		result.InputTokens = totalInputTokens
+		result.OutputTokens = totalOutputTokens
 		result.Output = full.String()
 		result.Reasoning = reasoning.String()
 		if err != nil {
@@ -238,8 +256,7 @@ func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[
 				},
 			})
 		}
-		for _, tc := range toolCallBuf {
-			tcMap, _ := tc.(map[string]interface{})
+		for _, tcMap := range SortedToolCalls(toolCallMerged) {
 			if tcMap == nil {
 				continue
 			}
@@ -260,10 +277,10 @@ func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[
 			"id": respId, "model": model, "status": "completed",
 			"output": output,
 			"usage": map[string]interface{}{
-				"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+				"input_tokens": totalInputTokens, "output_tokens": totalOutputTokens, "total_tokens": totalInputTokens + totalOutputTokens,
 			},
 		}
-		logger.Info("[Codex][%s] 完成 content_len=%d tool_calls=%d 耗时=%dms", reqID, full.Len(), len(toolCallBuf), time.Since(startTime).Milliseconds())
+		logger.Info("[Codex][%s] 完成 content_len=%d tool_calls=%d 耗时=%dms", reqID, full.Len(), len(toolCallMerged), time.Since(startTime).Milliseconds())
 		logger.Debug("[Codex][%s] 响应体: %s", reqID, func() string { d, _ := json.Marshal(resp); return string(d) }())
 		WriteJSON(w, resp)
 		return result, nil
@@ -321,6 +338,31 @@ func CodexInputToMessages(input interface{}, instructions string) []interface{} 
 	}
 
 	return msgs
+}
+
+// ConvertResponsesToolsToOpenAI wraps the Responses function definition in the
+// Chat Completions schema required by Qoder. Already nested tools stay intact.
+func ConvertResponsesToolsToOpenAI(raw interface{}) interface{} {
+	tools, ok := raw.([]interface{})
+	if !ok || len(tools) == 0 {
+		return nil
+	}
+	converted := make([]interface{}, 0, len(tools))
+	for _, tool := range tools {
+		tm, ok := tool.(map[string]interface{})
+		if !ok || tm["type"] != "function" || tm["function"] != nil {
+			converted = append(converted, tool)
+			continue
+		}
+		fn := map[string]interface{}{}
+		for _, key := range []string{"name", "description", "parameters", "strict"} {
+			if value, exists := tm[key]; exists {
+				fn[key] = value
+			}
+		}
+		converted = append(converted, map[string]interface{}{"type": "function", "function": fn})
+	}
+	return converted
 }
 
 func WriteCodexErr(w http.ResponseWriter, err error) {

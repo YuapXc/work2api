@@ -25,6 +25,14 @@ type App struct {
 	AllowedModels []string `json:"allowed_models"`
 }
 
+func (d *DB) HasEncryptedAppKeys() (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var count int
+	err := d.db.QueryRow("SELECT COUNT(*) FROM apps WHERE key_enc IS NOT NULL AND key_enc != ''").Scan(&count)
+	return count > 0, err
+}
+
 // ListApps returns applications with cumulative usage. No ciphertext is
 // returned. (Single-user: no user join.)
 func (d *DB) ListApps() ([]App, error) {
@@ -147,6 +155,14 @@ func parseAllowedModels(raw string) []string {
 }
 
 // GetAppKeyEnc returns the encrypted key token (may be empty for legacy apps).
+func (d *DB) GetAppKeyHash(appID int64) (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var hash string
+	err := d.db.QueryRow("SELECT key_hash FROM apps WHERE id = ?", appID).Scan(&hash)
+	return hash, err
+}
+
 func (d *DB) GetAppKeyEnc(appID int64) (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

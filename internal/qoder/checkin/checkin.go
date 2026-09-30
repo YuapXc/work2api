@@ -163,6 +163,43 @@ type checkinHistory struct {
 
 var historyMu sync.Mutex
 
+var checkinLocation = time.FixedZone("Asia/Shanghai", 8*60*60)
+
+func WindowDate(now time.Time) string {
+	return now.In(checkinLocation).Add(-10 * time.Hour).Format("2006-01-02")
+}
+
+// Calendar reads local campaign-window history without querying the upstream.
+func Calendar(days int) (map[string][]string, string, string, error) {
+	now := time.Now().In(checkinLocation)
+	today := now.Format("2006-01-02")
+	since := now.AddDate(0, 0, -(days - 1)).Format("2006-01-02")
+	historyMu.Lock()
+	defer historyMu.Unlock()
+	out := map[string][]string{}
+	data, err := os.ReadFile(checkinHistoryPath())
+	if os.IsNotExist(err) {
+		return out, today, WindowDate(now), nil
+	}
+	if err != nil {
+		return nil, today, WindowDate(now), err
+	}
+	var history checkinHistory
+	if err := json.Unmarshal(data, &history); err != nil {
+		return nil, today, WindowDate(now), err
+	}
+	for id, records := range history.Accounts {
+		seen := map[string]bool{}
+		for _, record := range records {
+			if _, err := time.Parse("2006-01-02", record.Date); err == nil && record.Date >= since && record.Date <= today && !seen[record.Date] {
+				out[id] = append(out[id], record.Date)
+				seen[record.Date] = true
+			}
+		}
+	}
+	return out, today, WindowDate(now), nil
+}
+
 func checkinHistoryPath() string {
 	return filepath.Join(account.DataRoot(), "checkin_history.json")
 }
@@ -198,7 +235,7 @@ func calcLocalStats(recs []checkinRecord) (streak, totalDays, totalCredits int) 
 	}
 	totalDays = len(recs)
 
-	cursor := time.Now()
+	cursor := time.Now().In(checkinLocation).Add(-10 * time.Hour)
 	if !days[cursor.Format("2006-01-02")] {
 		cursor = cursor.AddDate(0, 0, -1)
 	}
@@ -257,7 +294,7 @@ func LocalStats(accountID string) (streak, totalDays, totalCredits int, claimedT
 	defer historyMu.Unlock()
 	recs := loadCheckinHistory().Accounts[accountID]
 	streak, totalDays, totalCredits = calcLocalStats(recs)
-	today := time.Now().Format("2006-01-02")
+	today := WindowDate(time.Now())
 	for _, r := range recs {
 		if r.Date == today {
 			claimedToday = true
@@ -273,7 +310,7 @@ func applyLocalStreak(accountID string, res *CheckinResult, record bool, date st
 	var streak, totalDays, totalCredits int
 	if record {
 		if date == "" {
-			date = time.Now().Format("2006-01-02")
+			date = WindowDate(time.Now())
 		}
 		streak, totalDays, totalCredits = recordCheckinOn(accountID, date, amount)
 	} else {
@@ -412,7 +449,7 @@ func windowHint(res *CheckinResult, fallback string) string {
 	if res.WindowDate == "" {
 		return fallback
 	}
-	today := time.Now().Format("2006-01-02")
+	today := time.Now().In(checkinLocation).Format("2006-01-02")
 	if res.WindowDate == today {
 		return fallback
 	}
@@ -473,7 +510,7 @@ func campaignsCheckin(deviceToken string, res *CheckinResult) CheckinResult {
 		windowSrc = benefitCampaign
 	}
 	if windowSrc != nil && windowSrc.StartAt > 0 {
-		res.WindowDate = time.Unix(windowSrc.StartAt, 0).Format("2006-01-02")
+		res.WindowDate = time.Unix(windowSrc.StartAt, 0).In(checkinLocation).Format("2006-01-02")
 	}
 
 	if target == nil {
@@ -634,7 +671,7 @@ func runScheduledCheckin() bool {
 		return false
 	}
 
-	now := time.Now()
+	now := time.Now().In(checkinLocation)
 	today := now.Format("2006-01-02")
 
 	// 必须已过 10:00

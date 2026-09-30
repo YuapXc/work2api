@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -88,8 +89,20 @@ func AnthropicRequestToChat(body map[string]any) (map[string]any, error) {
 			if typ == "" {
 				typ = "any"
 			}
-			name, _ := v["name"].(string)
-			chat["tool_choice"] = map[string]any{"type": typ, "function": map[string]any{"name": name}}
+			switch typ {
+			case "any":
+				chat["tool_choice"] = "required"
+			case "auto", "none":
+				chat["tool_choice"] = typ
+			case "tool":
+				name, _ := v["name"].(string)
+				if strings.TrimSpace(name) == "" {
+					return nil, fmt.Errorf("tool_choice.type=tool 必须指定 name")
+				}
+				chat["tool_choice"] = map[string]any{"type": "function", "function": map[string]any{"name": name}}
+			default:
+				return nil, fmt.Errorf("不支持的 tool_choice.type: %s", typ)
+			}
 		case string:
 			if v == "none" || v == "auto" || v == "required" {
 				chat["tool_choice"] = v

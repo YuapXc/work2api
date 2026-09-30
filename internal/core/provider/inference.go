@@ -43,6 +43,7 @@ type CatalogModel struct {
 
 // UsageReport is what Serve returns for the shared usage logger + pool bookkeeping.
 type UsageReport struct {
+	TokensKnown  *bool
 	AccountUID   string
 	InputTokens  int
 	OutputTokens int
@@ -80,6 +81,21 @@ type Runtime interface {
 	// Serve handles one request end-to-end, writing the client response to
 	// req.Writer. The returned UsageReport is logged by the caller.
 	Serve(ctx context.Context, req ServeRequest) (UsageReport, error)
+}
+
+// ModelRefresher discovers models on explicit or scheduled refresh. Ordinary
+// Models calls remain read-only snapshots for management/catalog polling.
+type ModelRefresher interface{ RefreshModels(context.Context) error }
+
+type CheckinCalendar struct {
+	History    map[string][]string `json:"history"`
+	Today      string              `json:"today"`
+	WindowDate string              `json:"window_date"`
+	Timezone   string              `json:"timezone"`
+}
+
+type CheckinHistorian interface {
+	CheckinHistory(context.Context, int) (CheckinCalendar, error)
 }
 
 // runtimes holds registered inference runtimes by name.

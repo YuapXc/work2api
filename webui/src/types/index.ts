@@ -94,7 +94,7 @@ export interface AABenchmark {
 export interface ModelInfo {
   id: string
   /** 模型所属供应商。 */
-  provider?: 'workbuddy' | 'qoder'
+  provider?: 'workbuddy' | 'qoder' | 'opencode'
   name?: string
   context_length?: number
   max_output_tokens?: number

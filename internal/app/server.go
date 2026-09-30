@@ -249,9 +249,34 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		writeAPIErr(w, aerr)
 		return
 	}
+	data := s.modelCatalog(r.Context())
+	settings, _ := s.o.db.GetSettings()
+	aliases := parseModelAliases(settings["model_aliases"])
+	out := make([]map[string]any, 0, len(data))
+	for _, item := range data {
+		id := str2(item["id"])
+		resolved := id
+		if real, ok := aliases[id]; ok {
+			resolved = real
+		}
+		if !modelAllowed(principal, id, resolved) {
+			continue
+		}
+		clean := map[string]any{}
+		for k, v := range item {
+			if k != "account_uids" {
+				clean[k] = v
+			}
+		}
+		out = append(out, clean)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": out})
+}
+
+func (s *Server) modelCatalog(ctx context.Context) []map[string]any {
 	data := s.o.models.ListCached()
 	// Merge all providers before adding aliases and applying the key's policy.
-	data = append(data, s.o.runtimeModels(r.Context())...)
+	data = append(data, s.o.runtimeModels(ctx)...)
 	settings, _ := s.o.db.GetSettings()
 	aliases := parseModelAliases(settings["model_aliases"])
 	if len(aliases) > 0 {
@@ -274,26 +299,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	out := make([]map[string]any, 0, len(data))
-	for _, item := range data {
-		id := str2(item["id"])
-		resolved := id
-		if real, ok := aliases[id]; ok {
-			resolved = real
-		}
-		if !modelAllowed(principal, id, resolved) {
-			continue
-		}
-		clean := map[string]any{}
-		for k, v := range item {
-			if k == "account_uids" {
-				continue
-			}
-			clean[k] = v
-		}
-		out = append(out, clean)
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": out})
+	return data
 }
 
 func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {

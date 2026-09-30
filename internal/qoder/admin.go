@@ -3,7 +3,9 @@ package qoder
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -16,11 +18,17 @@ import (
 // quota and per-account actions. These are read/actioned through the generic
 // /admin/providers/qoder endpoints so the WebUI treats every provider uniformly.
 var (
-	_ provider.AdminRuntime    = (*Runtime)(nil)
-	_ provider.Checkiner       = (*Runtime)(nil)
-	_ provider.CreditRefresher = (*Runtime)(nil)
-	_ provider.AccountManager  = (*Runtime)(nil)
+	_ provider.AdminRuntime     = (*Runtime)(nil)
+	_ provider.Checkiner        = (*Runtime)(nil)
+	_ provider.CreditRefresher  = (*Runtime)(nil)
+	_ provider.AccountManager   = (*Runtime)(nil)
+	_ provider.CheckinHistorian = (*Runtime)(nil)
 )
+
+func (r *Runtime) CheckinHistory(ctx context.Context, days int) (provider.CheckinCalendar, error) {
+	history, today, window, err := checkin.Calendar(days)
+	return provider.CheckinCalendar{History: history, Today: today, WindowDate: window, Timezone: "Asia/Shanghai"}, err
+}
 
 const quotaTTL = 30 * time.Second
 
@@ -40,6 +48,9 @@ func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 	if dataDirExists() {
 		if list, err := account.List(); err == nil {
 			for _, a := range list {
+				if account.IsGatewayHidden(a.ID) {
+					continue
+				}
 				accts = append(accts, r.accountRow(a.ID, a.Name, string(a.Region), "native", a.AuthMode, a.Active))
 			}
 		}
@@ -157,7 +168,9 @@ func (r *Runtime) refreshQuota(id, source, region string) {
 		e.total += q.AddonQuota.Total
 	}
 	r.quotaMu.Lock()
-	r.quotaCache[id] = e
+	if !account.IsGatewayHidden(id) {
+		r.quotaCache[id] = e
+	}
 	r.quotaMu.Unlock()
 }
 
@@ -171,6 +184,7 @@ func (r *Runtime) ActivateAccount(id string) error {
 	}
 	r.mu.Lock()
 	delete(r.bridges, id) // rebuild bridge on next use
+	r.bridgeGeneration[id]++
 	r.mu.Unlock()
 	return nil
 }
@@ -193,9 +207,25 @@ func (r *Runtime) RenameAccount(id, name string) error {
 // DeleteAccount removes a native account and its cached bridge.
 func (r *Runtime) DeleteAccount(id string) error {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := account.SetGatewayHidden(id, true); err != nil {
+		return err
+	}
+	r.bridgeGeneration[id]++
 	delete(r.bridges, id)
-	r.mu.Unlock()
-	return account.Delete(id)
+	delete(r.bridgeKeys, id)
+	r.quotaMu.Lock()
+	delete(r.quotaCache, id)
+	r.quotaMu.Unlock()
+	if strings.HasPrefix(id, "qoder-local-") {
+		return nil
+	}
+	secretErr := account.DeleteSecret(id)
+	acctErr := account.Delete(id)
+	if os.IsNotExist(acctErr) {
+		acctErr = nil
+	}
+	return errors.Join(secretErr, acctErr)
 }
 
 // ExportCredentials implements provider.CredentialExporter: native ~/.qoder2api

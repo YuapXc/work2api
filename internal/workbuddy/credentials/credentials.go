@@ -74,11 +74,12 @@ type Session struct {
 
 // Manager manages one account's credentials: read, expiry, refresh, write-back.
 type Manager struct {
-	path   string
-	client *http.Client
-	mu     sync.Mutex
-	cached *Session
-	mtime  time.Time
+	path    string
+	client  *http.Client
+	mu      sync.Mutex
+	cached  *Session
+	mtime   time.Time
+	retired bool
 }
 
 // NewManager returns a credential manager for one *.info file.
@@ -91,6 +92,23 @@ func NewManager(path string) *Manager {
 
 // Path returns the auth file path (used to classify account source).
 func (m *Manager) Path() string { return m.path }
+
+// Retire prevents an in-flight manager from recreating a deleted auth file.
+func (m *Manager) Retire(removeFile bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.retired = true
+	if removeFile {
+		var failures []error
+		for _, path := range []string{m.path, m.path + ".tmp"} {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				failures = append(failures, err)
+			}
+		}
+		return errors.Join(failures...)
+	}
+	return nil
+}
 
 func (m *Manager) readRaw() (*Session, error) {
 	data, err := os.ReadFile(m.path)
@@ -177,6 +195,9 @@ func (m *Manager) Endpoint() string {
 
 // refresh fetches a new token and writes it back atomically. Caller holds mu.
 func (m *Manager) refresh() error {
+	if m.retired {
+		return errors.New("账号已移除")
+	}
 	s, err := m.session()
 	if err != nil {
 		return err

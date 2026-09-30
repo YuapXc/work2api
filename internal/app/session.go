@@ -87,6 +87,16 @@ func newSessionRouter() *sessionRouter {
 	return &sessionRouter{ttl: 1800, max: 2000, m: map[string]sessionEntry{}}
 }
 
+func (r *sessionRouter) removeAccount(uid string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for key, entry := range r.m {
+		if entry.uid == uid {
+			delete(r.m, key)
+		}
+	}
+}
+
 func (r *sessionRouter) bind(key, uid string) {
 	if key == "" || uid == "" {
 		return
