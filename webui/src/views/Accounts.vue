@@ -211,16 +211,18 @@ function closePkgs() {
 
 // ---------- 签到日历 ----------
 // 悬停/点击「今日签到」列弹出 35 天打卡点阵。数据源 /admin/checkin/history，
-// 一次拉全量按 uid 索引；uid 短码是 8 位十六进制（uid 形如 ea3293e0-...）。
+// 一次拉全量按完整 uid 索引（workbuddy uid 形如 ea3293e0-…，qoder 为账号 id）。
 const calOpenFor = ref<string | null>(null)
 const calStyle = ref<Record<string, string>>({})
 const calData = ref<Record<string, string[]>>({})
 const calDays = ref(35)
 const calAnchor = ref<HTMLElement | null>(null)
 
+// 历史接口按完整 uid 索引（checkin_history.account_uid 原样返回），这里必须用
+// 完整 uid 查表——之前用 8 位短码查导致永远查不到、日历全灰。
 function shortUid(r: any): string {
   const uid = (r.raw?.uid as string) || ''
-  return uid.split('-')[0] || uid
+  return uid
 }
 
 // 该账号是否属于有签到活动的 provider（workbuddy 国内 / qoder 有；国际站无）
