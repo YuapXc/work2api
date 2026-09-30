@@ -95,6 +95,10 @@ type QoderModel struct {
 	Enable          bool    `json:"enable"`
 	IsDefault       bool    `json:"is_default"`
 	IsReasoning     bool    `json:"is_reasoning,omitempty"`
+	// IsVL 上游 vision-language 标记（model/list 条目的 is_vl 字段）：
+	// true 表示该模型接受图片输入（多模态）。Go 版此前漏读该字段导致
+	// 整个 qoder 目录被标成纯文本。
+	IsVL            bool    `json:"is_vl,omitempty"`
 	ContextWindow   int     `json:"context_window,omitempty"`
 	MaxOutputTokens int     `json:"max_output_tokens,omitempty"`
 	MaxInputTokens  int     `json:"max_input_tokens,omitempty"`
@@ -235,6 +239,7 @@ func extractModels(rawList []interface{}) []QoderModel {
 			Enable:         enable,
 			IsDefault:      func() bool { v, _ := m["is_default"].(bool); return v }(),
 			IsReasoning:    func() bool { v, _ := m["is_reasoning"].(bool); return v }(),
+			IsVL:           func() bool { v, _ := m["is_vl"].(bool); return v }(),
 			MaxInputTokens: int(cosy.FloatVal(m, "max_input_tokens")),
 			PriceFactor:    cosy.FloatVal(m, "price_factor"),
 		}

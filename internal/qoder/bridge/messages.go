@@ -19,6 +19,66 @@ func textBlocks(blocks []interface{}, separator string) string {
 	return text.String()
 }
 
+// imageContentParts 把入站消息 content 数组里的图片块归一成上游 COSY 接口
+// 接受的 {"type":"image_url","image_url":{"url":...}} 形式。识别三种入站格式：
+//   - OpenAI Chat:  {"type":"image_url","image_url":{"url":...}}
+//   - Responses:    {"type":"input_image","image_url":"..." 或 {url:...}}
+//   - Anthropic:    {"type":"image","source":{type:url|base64, media_type, data}}
+//
+// base64 图片转成 data: URL（上游按 data URL 接收）。返回 (parts, hasImage)。
+// url 与 base64 数据都缺失的图片块被跳过——上游收到无 url 的图片块会直接拒单。
+func imageContentParts(blocks []interface{}) ([]interface{}, bool) {
+	out := make([]interface{}, 0, len(blocks))
+	hasImage := false
+	appendImage := func(url string) {
+		if url == "" {
+			return
+		}
+		out = append(out, map[string]interface{}{
+			"type":      "image_url",
+			"image_url": map[string]interface{}{"url": url},
+		})
+		hasImage = true
+	}
+	for _, block := range blocks {
+		b, _ := block.(map[string]interface{})
+		if b == nil {
+			continue
+		}
+		switch b["type"] {
+		case "text", "input_text", "output_text":
+			if t, ok := b["text"].(string); ok {
+				out = append(out, map[string]interface{}{"type": "text", "text": t})
+			}
+		case "image_url":
+			// OpenAI: image_url 是 {url} 或裸字符串
+			switch raw := b["image_url"].(type) {
+			case map[string]interface{}:
+				appendImage(StrVal(raw, "url"))
+			case string:
+				appendImage(raw)
+			}
+		case "input_image":
+			// Responses: image_url 可为字符串或 {url}
+			if s, ok := b["image_url"].(string); ok {
+				appendImage(s)
+			} else if m, ok := b["image_url"].(map[string]interface{}); ok {
+				appendImage(StrVal(m, "url"))
+			}
+		case "image":
+			// Anthropic: source {type:"url"} 或 {type:"base64", media_type, data}
+			src, _ := b["source"].(map[string]interface{})
+			if StrVal(src, "type") == "url" {
+				appendImage(StrVal(src, "url"))
+			} else if data := StrVal(src, "data"); data != "" {
+				mediaType := StrValDefault(src, "media_type", "image/png")
+				appendImage("data:" + mediaType + ";base64," + data)
+			}
+		}
+	}
+	return out, hasImage
+}
+
 func BuildQoderMessages(templateMsgs []interface{}, incoming []interface{}, prompt string, toolsEnabled bool) []interface{} {
 	var rebuilt []interface{}
 
@@ -209,6 +269,21 @@ func ConvertIncomingMessage(msg map[string]interface{}, toolsEnabled bool) map[s
 	}
 
 	text := NormalizeMessageContent(msg)
+
+	// user 消息含图片块：content 用归一化数组（text + image_url）透传上游，
+	// 不再附 contents——两者并存时上游只读 contents，图片会丢（Python 版实测结论）。
+	if role == "user" {
+		if contentArr, ok := content.([]interface{}); ok {
+			if parts, hasImage := imageContentParts(contentArr); hasImage {
+				return map[string]interface{}{
+					"role":                        "user",
+					"content":                     parts,
+					"response_meta":               BlankResponseMeta(),
+					"reasoning_content_signature": "",
+				}
+			}
+		}
+	}
 
 	if role == "assistant" && toolsEnabled {
 		if tc, ok := msg["tool_calls"]; ok {

@@ -311,8 +311,10 @@ func CodexInputToMessages(input interface{}, instructions string) []interface{} 
 				if contentStr, ok := content.(string); ok {
 					msgs = append(msgs, map[string]interface{}{"role": role, "content": contentStr})
 				} else if contentArr, ok := content.([]interface{}); ok {
-					text := textBlocks(contentArr, "\n")
-					msgs = append(msgs, map[string]interface{}{"role": role, "content": text})
+					// 保留原数组：user 消息里的 input_image 图片块由
+					// ConvertIncomingMessage→imageContentParts 归一成上游
+					// image_url 形式；纯文本消息最终仍塌缩成字符串。
+					msgs = append(msgs, map[string]interface{}{"role": role, "content": contentArr})
 				}
 			case "function_call":
 				name, _ := itemMap["name"].(string)

@@ -338,6 +338,10 @@ func (b *Bridge) HandleListModels(w http.ResponseWriter, r *http.Request) {
 		if m.IsReasoning {
 			maxOut = 32768
 		}
+		modality := "text"
+		if m.IsVL {
+			modality = "multimodal"
+		}
 		entry := map[string]interface{}{
 			"id":                m.Key,
 			"object":            "model",
@@ -349,6 +353,9 @@ func (b *Bridge) HandleListModels(w http.ResponseWriter, r *http.Request) {
 			"enable":            m.Enable,
 			"is_default":        m.IsDefault,
 			"is_reasoning":      m.IsReasoning,
+			"is_vl":             m.IsVL,
+			"modality":          modality,
+			"supportsImages":    m.IsVL,
 			"price_factor":      m.PriceFactor,
 		}
 		data = append(data, entry)

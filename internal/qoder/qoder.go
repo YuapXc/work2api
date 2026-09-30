@@ -329,15 +329,21 @@ func (r *Runtime) RefreshModels(ctx context.Context) error {
 			ctxWin = fallbackContextWindow
 		}
 		out = append(out, provider.CatalogModel{
-			ID:        runtimePrefix + m.Key,
-			Name:      m.DisplayName,
-			MaxOutput: m.MaxOutputTokens,
-			Context:   ctxWin,
+			ID:         runtimePrefix + m.Key,
+			Name:       m.DisplayName,
+			Vision:     m.IsVL,
+			Modalities: modelModalities(m.IsVL),
+			MaxOutput:  m.MaxOutputTokens,
+			Context:    ctxWin,
 			Extra: map[string]any{
 				"enable":       m.Enable,
 				"is_default":   m.IsDefault,
 				"is_reasoning": m.IsReasoning,
 				"price_factor": m.PriceFactor,
+				// 统一目录暴露标准模态字段：WebUI 的 ModelCard 按
+				// modality/vision/supports_image 判定多模态标签，缺省即显示"文本"。
+				"modality":       modalityOf(m.IsVL),
+				"supportsImages": m.IsVL,
 			},
 		})
 	}
@@ -345,6 +351,23 @@ func (r *Runtime) RefreshModels(ctx context.Context) error {
 	r.modelCache = out
 	r.mu.Unlock()
 	return nil
+}
+
+// modalityOf / modelModalities 把上游 is_vl 布尔翻译成统一目录的标准模态字段，
+// 语义与 workbuddy 目录（models.go extractCaps/withStandardFields）一致：
+// multimodal = 文本 + 图片输入，输出恒为文本。
+func modalityOf(isVL bool) string {
+	if isVL {
+		return "multimodal"
+	}
+	return "text"
+}
+
+func modelModalities(isVL bool) []string {
+	if isVL {
+		return []string{"text", "image"}
+	}
+	return []string{"text"}
 }
 
 func (r *Runtime) fallbackModels() []provider.CatalogModel {
