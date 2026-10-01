@@ -243,7 +243,7 @@ func (d *DB) UsageSummary() (map[string]any, error) {
 	_ = d.db.QueryRow(`SELECT COUNT(*),
 		COALESCE(SUM(cached_tokens),0),
 		COALESCE(SUM(CASE WHEN cached_tokens IS NOT NULL THEN input_tokens - cached_tokens ELSE 0 END),0)
-		FROM usage_logs WHERE cached_tokens IS NOT NULL AND status='ok'`).Scan(&knownRows, &cachedSum, &missSum)
+		FROM usage_logs WHERE cached_tokens IS NOT NULL AND cached_tokens >= 0 AND input_tokens >= cached_tokens AND status='ok'`).Scan(&knownRows, &cachedSum, &missSum)
 	out["cache"] = map[string]any{
 		"known_rows": knownRows, "cached_tokens": cachedSum, "uncached_tokens": missSum,
 		"hit_rate": func() any {

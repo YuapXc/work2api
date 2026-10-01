@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"work2api/internal/store"
+	"work2api/internal/tokenusage"
 	"work2api/internal/workbuddy/pool"
 	"work2api/internal/workbuddy/upstream"
 )
@@ -85,47 +86,12 @@ func clipContent(s string, max int) string {
 }
 
 func usageTokens(u map[string]any) (int, int) {
-	if u == nil {
-		return 0, 0
-	}
-	in := firstInt(u, "prompt_tokens", "input_tokens")
-	out := firstInt(u, "completion_tokens", "output_tokens")
-	return in, out
+	return tokenusage.Totals(u)
 }
 
-// usageCachedTokens 提取上游 prompt-cache 命中 tokens；上游未上报返回 nil。
-// 兼容三种字段风格（实测 deepseek-v4.1-flash / glm-5.3-flash 均报全）：
-//   - OpenAI:  prompt_tokens_details.cached_tokens（或 input_tokens_details）
-//   - DeepSeek: prompt_cache_hit_tokens
-//   - Anthropic: cache_read_input_tokens
+// Missing fields remain unknown; raw numeric anomalies are kept for diagnosis.
 func usageCachedTokens(u map[string]any) *int {
-	if u == nil {
-		return nil
-	}
-	if v := firstInt(u, "prompt_cache_hit_tokens", "cache_read_input_tokens"); v > 0 {
-		return &v
-	}
-	for _, key := range []string{"prompt_tokens_details", "input_tokens_details"} {
-		if det, ok := u[key].(map[string]any); ok {
-			if v := firstInt(det, "cached_tokens"); v > 0 {
-				return &v
-			}
-		}
-	}
-	// 上游报过结构但值为 0：报 0（真实"无命中"），与"未上报"区分
-	for _, key := range []string{"prompt_tokens_details", "input_tokens_details"} {
-		if det, ok := u[key].(map[string]any); ok {
-			if _, has := det["cached_tokens"]; has {
-				zero := 0
-				return &zero
-			}
-		}
-	}
-	if _, has := u["prompt_cache_hit_tokens"]; has {
-		zero := 0
-		return &zero
-	}
-	return nil
+	return tokenusage.Cached(u)
 }
 
 func firstInt(m map[string]any, keys ...string) int {

@@ -218,7 +218,7 @@ onMounted(() => {
         <!-- 缓存命中：有可统计样本才展示（qoder 等不上报的上游自动隐藏） -->
         <WCard v-if="cacheStats" title="提示词缓存" class="mb-4">
           <template #actions>
-            <span class="text-micro text-faint">基于 {{ int(cacheStats.rows) }} 条已知样本（仅统计上报缓存数据的成功请求）</span>
+            <span class="text-micro text-faint">基于 {{ int(cacheStats.rows) }} 条已知样本（仅统计缓存数据有效的成功请求）</span>
           </template>
           <div class="flex flex-wrap items-center gap-6">
             <div class="min-w-24">
@@ -282,7 +282,8 @@ onMounted(() => {
               <div><span class="text-ink">{{ int(row.input_tokens) }}</span><span class="text-faint"> / {{ int(row.output_tokens) }}</span></div>
               <!-- 缓存明细：未命中在前（异常醒目，琥珀色），命中灰色小字；
                    全量未命中整行升级警示；上游未上报则不显示 -->
-              <div v-if="row.cached_tokens === 0" class="text-micro text-warn" title="上游上报了缓存数据，但本次完全未命中（换号/前缀被打散？）">
+              <div v-if="row.cached_tokens != null && (row.cached_tokens < 0 || row.cached_tokens > row.input_tokens)" class="text-micro text-warn" title="上游缓存计数超出输入范围，已排除命中率统计">缓存数据异常 · {{ int(row.cached_tokens) }}</div>
+              <div v-else-if="row.cached_tokens === 0" class="text-micro text-warn" title="上游上报了缓存数据，但本次完全未命中（换号/前缀被打散？）">
                 全量未命中 {{ int(row.input_tokens) }}
               </div>
               <div v-else-if="row.cached_tokens != null && row.input_tokens > row.cached_tokens" class="text-micro">
@@ -335,7 +336,8 @@ onMounted(() => {
           <div v-if="detail.cached_tokens != null">
             <div class="text-micro text-faint">缓存命中</div>
             <div class="mono text-small">
-              <span v-if="detail.cached_tokens === 0" class="text-warn">全量未命中 {{ int(detail.input_tokens) }}</span>
+              <span v-if="detail.cached_tokens < 0 || detail.cached_tokens > detail.input_tokens" class="text-warn">缓存数据异常 · 原始值 {{ int(detail.cached_tokens) }}（不计入命中率）</span>
+              <span v-else-if="detail.cached_tokens === 0" class="text-warn">全量未命中 {{ int(detail.input_tokens) }}</span>
               <span v-else>
                 <span class="text-ink">⚡命中 {{ int(detail.cached_tokens) }}</span>
                 <span v-if="detail.input_tokens > detail.cached_tokens" class="text-warn"> · 未命中 {{ int(detail.input_tokens - detail.cached_tokens) }}</span>

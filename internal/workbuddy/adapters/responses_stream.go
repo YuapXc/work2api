@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"work2api/internal/tokenusage"
 	"work2api/internal/workbuddy/upstream"
 )
 
@@ -283,12 +284,13 @@ func (c *ResponsesStreamConverter) responseObj(status string) map[string]any {
 		if cached != nil {
 			details["cached_tokens"] = *cached
 		}
+		inputTokens, outputTokens := tokenusage.Totals(c.usage)
 		usageMap := map[string]any{
-			"input_tokens":          intOrAny(c.usage, "prompt_tokens", "input_tokens"),
+			"input_tokens":          inputTokens,
 			"input_tokens_details":  details,
-			"output_tokens":         intOrAny(c.usage, "completion_tokens", "output_tokens"),
+			"output_tokens":         outputTokens,
 			"output_tokens_details": map[string]any{"reasoning_tokens": 0},
-			"total_tokens":          intOr(c.usage, "total_tokens"),
+			"total_tokens":          inputTokens + outputTokens,
 		}
 		if cached != nil {
 			usageMap["cache_read_input_tokens"] = *cached
@@ -350,51 +352,10 @@ func intOrAny(m map[string]any, keys ...string) int {
 	return 0
 }
 
-// upstreamCacheCreationTokens 提取上游 usage 里的缓存写入 tokens（本轮新建立
-// 缓存的部分）；上游未报则为 0。兼容 Anthropic（cache_creation_input_tokens）与
-// DeepSeek（prompt_cache_write_tokens）两种风格。
-func upstreamCacheCreationTokens(u map[string]any) int {
-	if u == nil {
-		return 0
-	}
-	if v := intOrAny(u, "cache_creation_input_tokens", "prompt_cache_write_tokens"); v > 0 {
-		return v
-	}
-	return 0
-}
-
-// upstreamCachedTokens 提取上游 usage 里的 prompt-cache 命中 tokens；未上报返回
-// nil。兼容 OpenAI（prompt_tokens_details.cached_tokens）、DeepSeek
-// （prompt_cache_hit_tokens）、Anthropic（cache_read_input_tokens）三种风格。
-// 实测 deepseek-v4.1-flash / glm-5.3-flash 均上报。
+// upstreamCachedTokens returns only valid observations; absence stays unknown.
 func upstreamCachedTokens(u map[string]any) *int {
-	if u == nil {
-		return nil
-	}
-	if v := intOrAny(u, "prompt_cache_hit_tokens", "cache_read_input_tokens"); v > 0 {
-		return &v
-	}
-	sawField := false
-	for _, key := range []string{"prompt_tokens_details", "input_tokens_details"} {
-		det, ok := u[key].(map[string]any)
-		if !ok {
-			continue
-		}
-		if v := intOrAny(det, "cached_tokens"); v > 0 {
-			return &v
-		}
-		if _, has := det["cached_tokens"]; has {
-			sawField = true
-		}
-	}
-	if _, has := u["prompt_cache_hit_tokens"]; has {
-		sawField = true
-	}
-	if sawField {
-		zero := 0 // 上游报了结构但为 0：真实的"无命中"
-		return &zero
-	}
-	return nil
+	read, _ := tokenusage.ValidCache(u)
+	return read
 }
 
 func itoa(n int) string {

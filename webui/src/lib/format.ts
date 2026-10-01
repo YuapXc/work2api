@@ -67,6 +67,6 @@ export function latency(ms: number | undefined | null): string {
 
 // 缓存命中率 0~1 → "87%"；null/undefined → null（调用方渲染占位）
 export function pct(n: number | undefined | null): string | null {
-  if (n == null || isNaN(n)) return null
+  if (n == null || !Number.isFinite(n) || n < 0 || n > 1) return null
   return Math.round(n * 100) + '%'
 }

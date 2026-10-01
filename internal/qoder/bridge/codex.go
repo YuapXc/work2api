@@ -331,7 +331,8 @@ func CodexInputToMessages(input interface{}, instructions string) []interface{} 
 				})
 			case "function_call_output":
 				callId, _ := itemMap["call_id"].(string)
-				output, _ := itemMap["output"].(string)
+				// Preserve image/text output arrays for the shared tool converter.
+				output := itemMap["output"]
 				msgs = append(msgs, map[string]interface{}{
 					"role": "tool", "tool_call_id": callId, "content": output,
 				})

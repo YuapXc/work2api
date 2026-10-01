@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"work2api/internal/tokenusage"
 	"work2api/internal/workbuddy/upstream"
 )
 
@@ -114,28 +115,23 @@ func (c *AnthropicStreamConverter) Finish() string {
 // 因此 input_tokens = prompt_tokens - cached - creation；cache_creation 用上游的
 // write/creation 字段（如无则为 0）。上游未报缓存字段时保持 input=prompt 原语义。
 func anthropicUsage(u map[string]any) map[string]any {
-	out := map[string]any{
-		"input_tokens":  intOr(u, "prompt_tokens"),
-		"output_tokens": intOr(u, "completion_tokens"),
+	input, output := tokenusage.Totals(u)
+	out := map[string]any{"input_tokens": input, "output_tokens": output}
+	read, write := tokenusage.ValidCache(u)
+	fresh := input
+	if read != nil {
+		fresh -= *read
+		out["cache_read_input_tokens"] = *read
 	}
-	cached := upstreamCachedTokens(u)
-	if cached == nil {
-		return out
+	if write != nil {
+		fresh -= *write
+		out["cache_creation_input_tokens"] = *write
 	}
-	creation := upstreamCacheCreationTokens(u)
-	fresh := intOr(u, "prompt_tokens") - *cached - creation
-	if fresh < 0 {
-		fresh = 0
+	// Preserve the established zero creation field when a read observation exists.
+	if read != nil && write == nil {
+		out["cache_creation_input_tokens"] = 0
 	}
 	out["input_tokens"] = fresh
-	if *cached > 0 {
-		out["cache_read_input_tokens"] = *cached
-	} else {
-		// 上游明确报了缓存字段但本轮 0 命中：仍下发 cache_read=0，保持字段
-		// 存在性一致（Claude Code 日志口径稳定，便于下游工具归一化）。
-		out["cache_read_input_tokens"] = 0
-	}
-	out["cache_creation_input_tokens"] = creation
 	return out
 }
 

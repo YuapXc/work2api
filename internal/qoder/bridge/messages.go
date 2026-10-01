@@ -102,29 +102,38 @@ func BuildQoderMessages(templateMsgs []interface{}, incoming []interface{}, prom
 		if !ok {
 			continue
 		}
-		// Handle multi-tool-result: a single Claude user message may contain multiple tool_results
+		// Emit all tool replies before their image attachments, preserving pairing.
 		if role, _ := mm["role"].(string); role == "user" {
-			if contentArr, ok := mm["content"].([]interface{}); ok && len(contentArr) > 0 {
-				if first, ok := contentArr[0].(map[string]interface{}); ok && first["type"] == "tool_result" {
-					for _, block := range contentArr {
-						b, _ := block.(map[string]interface{})
-						if b == nil || b["type"] != "tool_result" {
-							continue
-						}
-						toolCallId, _ := b["tool_use_id"].(string)
-						resultContent := ""
-						switch c := b["content"].(type) {
-						case string:
-							resultContent = c
-						case []interface{}:
-							resultContent = textBlocks(c, "")
-						}
-						rebuilt = append(rebuilt, map[string]interface{}{
-							"role":         "tool",
-							"tool_call_id": toolCallId,
-							"content":      resultContent,
-						})
+			if blocks, ok := mm["content"].([]interface{}); ok && HasBlockType(blocks, "tool_result") {
+				var attachments, siblings []interface{}
+				for _, block := range blocks {
+					b, _ := block.(map[string]interface{})
+					if b == nil || b["type"] != "tool_result" {
+						siblings = append(siblings, block)
+						continue
 					}
+					tool := map[string]interface{}{"role": "tool", "tool_call_id": b["tool_use_id"], "content": b["content"]}
+					reply, image := toolReplyWithImages(tool)
+					rebuilt = append(rebuilt, reply)
+					if image != nil {
+						attachments = append(attachments, image)
+					}
+				}
+				rebuilt = append(rebuilt, attachments...)
+				if user := ConvertIncomingMessage(map[string]interface{}{"role": "user", "content": siblings}, toolsEnabled); user != nil {
+					rebuilt = append(rebuilt, user)
+				}
+				continue
+			}
+		}
+		if mm["role"] == "tool" {
+			if blocks, ok := mm["content"].([]interface{}); ok {
+				if _, images := imageContentParts(blocks); images {
+					reply, image := toolReplyWithImages(mm)
+					rebuilt = append(rebuilt, reply)
+					// Consecutive tool results must stay together. Delay images until
+					// the complete incoming sequence has been rebuilt below.
+					rebuilt = append(rebuilt, image)
 					continue
 				}
 			}
@@ -138,7 +147,60 @@ func BuildQoderMessages(templateMsgs []interface{}, incoming []interface{}, prom
 	if len(rebuilt) == 0 && prompt != "" {
 		rebuilt = append(rebuilt, BuildUserMessage(prompt))
 	}
-	return normalizeOutboundMessages(rebuilt)
+	return normalizeOutboundMessages(orderToolAttachments(rebuilt))
+}
+
+// toolReplyWithImages preserves the tool ID and text, and forwards images as
+// user content because COSY accepts image arrays only in user messages.
+func toolReplyWithImages(tool map[string]interface{}) (map[string]interface{}, map[string]interface{}) {
+	reply := BuildStructuredMessage("tool", NormalizeMessageContent(tool))
+	for _, key := range []string{"tool_call_id", "name"} {
+		if value, ok := tool[key]; ok {
+			reply[key] = value
+		}
+	}
+	blocks, ok := tool["content"].([]interface{})
+	if !ok {
+		if tool["content"] == nil {
+			reply["content"] = ""
+		}
+		return reply, nil
+	}
+	reply["content"] = textBlocks(blocks, "\n")
+	parts, images := imageContentParts(blocks)
+	if !images {
+		return reply, nil
+	}
+	// Text already belongs to the paired tool reply. Attach only the images here.
+	imageParts := []interface{}{map[string]interface{}{"type": "text", "text": "Images returned by tool call " + StrVal(tool, "tool_call_id") + ":"}}
+	for _, part := range parts {
+		if b, ok := part.(map[string]interface{}); ok && b["type"] == "image_url" {
+			imageParts = append(imageParts, part)
+		}
+	}
+	image := ConvertIncomingMessage(map[string]interface{}{"role": "user", "content": imageParts}, false)
+	image["_tool_image_attachment"] = true
+	return reply, image
+}
+
+func orderToolAttachments(messages []interface{}) []interface{} {
+	ordered := make([]interface{}, 0, len(messages))
+	var pending []interface{}
+	flush := func() { ordered = append(ordered, pending...); pending = nil }
+	for _, item := range messages {
+		msg, _ := item.(map[string]interface{})
+		if marker, _ := msg["_tool_image_attachment"].(bool); marker {
+			delete(msg, "_tool_image_attachment")
+			pending = append(pending, item)
+			continue
+		}
+		if msg["role"] != "tool" {
+			flush()
+		}
+		ordered = append(ordered, item)
+	}
+	flush()
+	return ordered
 }
 
 // normalizeOutboundMessages 对即将出站的消息逐条做上游适配。三条上游硬性要求
@@ -216,37 +278,16 @@ func ConvertIncomingMessage(msg map[string]interface{}, toolsEnabled bool) map[s
 			return out
 		}
 
-		// user message with tool_result blocks
-		if role == "user" && blockType == "tool_result" {
-			var results []map[string]interface{}
+		// The full sequence (including images and sibling blocks) is expanded by
+		// BuildQoderMessages; this singular converter preserves the first reply.
+		if role == "user" && HasBlockType(contentArr, "tool_result") {
 			for _, block := range contentArr {
 				b, _ := block.(map[string]interface{})
-				if b == nil || b["type"] != "tool_result" {
-					continue
+				if b != nil && b["type"] == "tool_result" {
+					reply, _ := toolReplyWithImages(map[string]interface{}{"role": "tool", "tool_call_id": b["tool_use_id"], "content": b["content"]})
+					return reply
 				}
-				toolCallId, _ := b["tool_use_id"].(string)
-				resultContent := ""
-				switch c := b["content"].(type) {
-				case string:
-					resultContent = c
-				case []interface{}:
-					resultContent = textBlocks(c, "")
-				}
-				results = append(results, map[string]interface{}{
-					"role":         "tool",
-					"tool_call_id": toolCallId,
-					"content":      resultContent,
-				})
 			}
-			if len(results) == 1 {
-				return results[0]
-			}
-			// Multiple tool results: return first, caller should handle multi
-			// Actually we need to return all - use a special marker
-			if len(results) > 0 {
-				return results[0]
-			}
-			return nil
 		}
 
 		// Handle thinking blocks - skip them
