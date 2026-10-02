@@ -1,10 +1,14 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
+	"strings"
 	"time"
+	"work2api/internal/streamwatch"
 
 	"work2api/internal/core/provider"
 	"work2api/internal/workbuddy/adapters"
@@ -14,19 +18,26 @@ import (
 )
 
 // sseWriter sets SSE headers and returns a flush-writer.
-func sseWriter(w http.ResponseWriter) (func(string), bool) {
-	fl, ok := w.(http.Flusher)
+func sseWriter(w http.ResponseWriter) (func(string) error, bool) {
+	_, ok := w.(http.Flusher)
 	if !ok {
 		return nil, false
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(30 * time.Second))
 	w.WriteHeader(http.StatusOK)
-	fl.Flush()
-	return func(s string) {
-		_, _ = w.Write([]byte(s))
-		fl.Flush()
+	return func(s string) error {
+		controller := http.NewResponseController(w)
+		_ = controller.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		if _, err := w.Write([]byte(s)); err != nil {
+			return errors.Join(context.Canceled, err)
+		}
+		if err := controller.Flush(); err != nil {
+			return errors.Join(context.Canceled, err)
+		}
+		return nil
 	}, true
 }
 
@@ -49,6 +60,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeAPIErr(w, aerr)
 		return
 	}
+	r, release, admitted := s.admitModel(w, r, principal)
+	if !admitted {
+		return
+	}
+	defer release()
 	if s.dispatchRuntime(w, r, provider.ProtocolChat, payload, principal) {
 		return
 	}
@@ -75,27 +91,46 @@ func (s *Server) runChatPath(w http.ResponseWriter, r *http.Request, payload map
 
 	if clientStream {
 		usage := map[string]any{}
-		var out, reason string
-		writeChunk, ok := sseWriter(w)
-		if !ok {
+		var out, reason strings.Builder
+		var send func(string) error
+		opened := false
+		writeChunk := func(chunk string) error {
+			if !opened {
+				send, _ = sseWriter(w)
+				opened = true
+			}
+			return send(chunk)
+		}
+		if _, ok := w.(http.Flusher); !ok {
 			writeJSON(w, 500, errBody(500, "streaming unsupported", "server_error").body)
 			return
 		}
 		sink := func(line string) error {
 			clean := sanitizeChatSSE(line)
 			if clean != "" {
-				writeChunk(clean + "\n\n")
+				if err := writeChunk(clean + "\n\n"); err != nil {
+					return err
+				}
 			}
 			usage = mergeUsageFromLine(line, usage)
 			c, rr := deltaParts(line)
-			out += c
-			reason += rr
+			appendLogText(&out, c, o.cfg.UsageContentMaxBytes)
+			appendLogText(&reason, rr, o.cfg.UsageContentMaxBytes)
 			return nil
 		}
 		served, err := o.openUpstream(r.Context(), acc, body, model, sessionKey, sink, func(fa *pool.Account, e *upstream.UpstreamError) {
 			o.logUsage(logArgs{protocol: "chat", model: model, acc: fa, t0: t0, status: "error", errStr: upstreamErrorText(e.StatusCode, e.Raw), input: input, appName: principal.AppName, updatePool: false})
 		})
 		if err != nil {
+			if !opened {
+				st, detail := errToHTTP(err)
+				if st == 429 && isLocalOverload(detail) {
+					w.Header().Set("Retry-After", "2")
+				}
+				o.logUsage(logArgs{protocol: "chat", model: model, acc: served, t0: t0, status: "error", errStr: err.Error(), input: input, appName: principal.AppName, effort: effort, updatePool: false})
+				writeJSON(w, st, detail)
+				return
+			}
 			if ue, ok := err.(*upstream.UpstreamError); ok {
 				o.logUsage(logArgs{protocol: "chat", model: model, acc: served, t0: t0, status: "error", errStr: upstreamErrorText(ue.StatusCode, ue.Raw), input: input, appName: principal.AppName, effort: effort, updatePool: false})
 				writeChunk("data: " + jsonError(ue.StatusCode, string(ue.Raw)) + "\n\n")
@@ -111,13 +146,21 @@ func (s *Server) runChatPath(w http.ResponseWriter, r *http.Request, payload map
 			writeChunk("data: [DONE]\n\n")
 			return
 		}
-		o.logUsage(logArgs{protocol: "chat", model: model, acc: served, t0: t0, status: "ok", usage: usage, input: input, output: out, reasoning: reason, appName: principal.AppName, effort: effort, updatePool: true})
+		o.logUsage(logArgs{protocol: "chat", model: model, acc: served, t0: t0, status: "ok", usage: usage, input: input, output: out.String(), reasoning: reason.String(), appName: principal.AppName, effort: effort, updatePool: true})
 		return
 	}
 
-	var lines []string
-	sink := func(line string) error { lines = append(lines, line); return nil }
-	served, err := o.openUpstream(r.Context(), acc, body, model, sessionKey, sink, nil)
+	var served *pool.Account
+	collected, err := upstream.CollectStream(model, func(yield upstream.LineFunc) error {
+		var callErr error
+		served, callErr = o.openUpstream(r.Context(), acc, body, model, sessionKey, func(line string) error {
+			if strings.TrimSpace(line) == "data: [DONE]" {
+				return nil
+			}
+			return yield(line)
+		}, nil)
+		return callErr
+	})
 	if err != nil {
 		st, detail := errToHTTP(err)
 		if ue, ok := err.(*upstream.UpstreamError); ok {
@@ -125,19 +168,10 @@ func (s *Server) runChatPath(w http.ResponseWriter, r *http.Request, payload map
 		} else {
 			o.logUsage(logArgs{protocol: "chat", model: model, acc: served, t0: t0, status: "error", errStr: err.Error(), input: input, appName: principal.AppName, effort: effort, updatePool: false})
 		}
-		writeJSON(w, st, detail)
-		return
-	}
-	collected, cerr := upstream.CollectStream(model, func(yield upstream.LineFunc) error {
-		for _, l := range lines {
-			if e := yield(l); e != nil {
-				return e
-			}
+		if st == 429 && isLocalOverload(detail) {
+			w.Header().Set("Retry-After", "2")
 		}
-		return nil
-	})
-	if cerr != nil {
-		writeJSON(w, 502, errBody(502, cerr.Error(), "upstream_error").body)
+		writeJSON(w, st, detail)
 		return
 	}
 	out, reason, usage := collectSummary(collected)
@@ -181,6 +215,11 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 		writeAPIErr(w, aerr)
 		return
 	}
+	r, release, admitted := s.admitModel(w, r, principal)
+	if !admitted {
+		return
+	}
+	defer release()
 	o := s.o
 	// Route namespaced models to their provider runtime (it does its own
 	// protocol conversion from the original anthropic/responses payload).
@@ -240,14 +279,19 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 	streamMode := clientStream && canStream
 	// Only open the SSE header stream when actually streaming; otherwise the
 	// non-stream branches below respond with writeJSON and must own the header.
-	var writeChunk func(string)
-	if streamMode {
-		writeChunk, _ = sseWriter(w)
+	var send func(string) error
+	opened := false
+	writeChunk := func(chunk string) error {
+		if !opened {
+			send, _ = sseWriter(w)
+			opened = true
+		}
+		return send(chunk)
 	}
 	sink := func(line string) error {
 		evt := conv.FeedLine(line)
 		if evt != "" && streamMode {
-			writeChunk(evt)
+			return writeChunk(evt)
 		}
 		return nil
 	}
@@ -262,13 +306,16 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 		}
 		// 账号池处罚已在 openUpstream 统一处理，这里只记日志（updatePool:false）。
 		o.logUsage(logArgs{protocol: protocol, model: model, acc: served, t0: t0, status: "error", errStr: errStr, input: input, appName: principal.AppName, effort: effort, updatePool: false})
-		if streamMode {
+		if streamMode && opened {
 			if protocol == "anthropic" {
 				writeChunk(errAnthropic(st, errStr))
 			} else {
 				writeChunk("data: " + jsonError(st, errStr) + "\n\n")
 			}
 			return
+		}
+		if st == 429 && isLocalOverload(detail) {
+			w.Header().Set("Retry-After", "2")
 		}
 		writeJSON(w, st, detail)
 		return
@@ -284,6 +331,9 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 }
 
 func errToHTTP(err error) (int, map[string]any) {
+	if errors.Is(err, streamwatch.ErrResponseTooLarge) {
+		return 502, errBody(502, "上游响应超过 MAX_RESPONSE_BYTES 限制", "response_too_large").body
+	}
 	if ae, ok := err.(*apiError); ok {
 		return ae.status, ae.body
 	}
@@ -323,4 +373,22 @@ func strOr(v any, def string) string {
 		return s
 	}
 	return def
+}
+
+func appendLogText(b *strings.Builder, text string, limit int) {
+	if limit > 0 {
+		left := limit - b.Len()
+		if left <= 0 {
+			return
+		}
+		if len(text) > left {
+			text = text[:left]
+		}
+	}
+	b.WriteString(text)
+}
+
+func isLocalOverload(body map[string]any) bool {
+	e, _ := body["error"].(map[string]any)
+	return e["type"] == "local_overload"
 }

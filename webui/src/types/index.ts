@@ -225,6 +225,8 @@ export interface UsageRecord {
 }
 
 export interface Overview {
+  admission?: { running: number; queued: number; capacity: number; queue_capacity: number; oldest_wait_ms: number; wait_limit_ms: number; rejected: Record<string,number> }
+  request_body_bytes?: number
   accounts: AccountInfo[]
   /** 预警提示（后端按当前额度状态实时计算，仅用于展示） */
   alerts?: OverviewAlert[]

@@ -32,6 +32,7 @@ type Watch struct {
 	// Err is non-nil once the watchdog fired (Idle/Total breach).
 	Err error
 
+	ctx        context.Context
 	underlying ioCloser
 	idle       time.Duration
 	total      time.Duration
@@ -67,6 +68,7 @@ func NewWatch(body io.ReadCloser, ctx context.Context, idle, total time.Duration
 		total = DefaultTotal
 	}
 	w := &Watch{
+		ctx:        ctx,
 		underlying: body,
 		idle:       idle,
 		total:      total,
@@ -154,4 +156,4 @@ func (a autoTouch) Read(p []byte) (int, error) {
 
 // Reader returns an auto-touching view of any reader (pass resp.Body itself;
 // the watchdog closes the underlying body on breach regardless).
-func (w *Watch) Reader(r io.Reader) io.Reader { return autoTouch{r: r, w: w} }
+func (w *Watch) Reader(r io.Reader) io.Reader { return autoTouch{r: LimitReader(w.ctx, r), w: w} }

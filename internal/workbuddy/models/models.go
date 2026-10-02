@@ -62,10 +62,18 @@ type Registry struct {
 
 // New builds a Registry over an account pool.
 func New(p *pool.Pool, db Settings) *Registry {
+	return NewWithCatalogClient(p, db, httpclient.New(20*time.Second))
+}
+
+// NewWithCatalogClient permits a caller-owned transport for catalog retrieval.
+func NewWithCatalogClient(p *pool.Pool, db Settings, client *http.Client) *Registry {
+	if client == nil {
+		client = httpclient.New(20 * time.Second)
+	}
 	return &Registry{
 		pool:      p,
 		db:        db,
-		client:    httpclient.New(20 * time.Second), // no proxy (mirrors trust_env=False)
+		client:    client,
 		reasoning: map[string]map[string]any{},
 		source:    "static",
 	}

@@ -92,6 +92,15 @@ func (s *Server) adminModelTest(w http.ResponseWriter, r *http.Request) {
 	// 内部发起：以内部 principal 走完整推理链路（与用户请求同路径），
 	// 不经过 API key 鉴权。会话键留空，不粘住任何账号。
 	principal := &Principal{AppName: "model-test"}
+	if aerr := s.prepareModel(principal, chatBody); aerr != nil {
+		writeAPIErr(w, aerr)
+		return
+	}
+	req, release, admitted := s.admitModel(w, req, principal)
+	if !admitted {
+		return
+	}
+	defer release()
 	rec := httptest.NewRecorder()
 
 	t0 := time.Now()

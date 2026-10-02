@@ -180,13 +180,15 @@ func (s *Server) adminOverview(w http.ResponseWriter, r *http.Request) {
 	accounts := s.accountsForDisplay()
 	summary, _ := s.o.db.UsageSummary()
 	writeJSON(w, 200, map[string]any{
-		"accounts":     accounts,
-		"alerts":       s.creditAlerts(accounts),
-		"usage":        decorateByAccount(summary, accounts),
-		"recent":       s.recentLight(),
-		"prediction":   s.creditPrediction(accounts),
-		"model_count":  len(s.o.models.ListCached()),
-		"model_source": s.o.models.Source(),
+		"admission":          s.modelsAdmission.snapshot(),
+		"request_body_bytes": s.bodies.usage(),
+		"accounts":           accounts,
+		"alerts":             s.creditAlerts(accounts),
+		"usage":              decorateByAccount(summary, accounts),
+		"recent":             s.recentLight(),
+		"prediction":         s.creditPrediction(accounts),
+		"model_count":        len(s.o.models.ListCached()),
+		"model_source":       s.o.models.Source(),
 	})
 }
 

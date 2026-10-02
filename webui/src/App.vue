@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { api } from '@/api/client'
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { toast } from '@/lib/toast'
@@ -99,25 +100,26 @@ async function logout() {
 const healthy = ref<number | null>(null)
 const total = ref<number | null>(null)
 let timer: ReturnType<typeof setInterval> | null = null
+const healthRefreshFailed = ref(false)
+let healthRefreshing = false
 async function refreshHealth() {
+  if (healthRefreshing) return
+  healthRefreshing = true
   try {
-    const res = await fetch('/admin/health', { credentials: 'same-origin' })
-    if (res.status === 401 || res.status === 403) {
-      // 会话过期：踢回登录页
-      authOk.value = false
-      healthy.value = total.value = null
-      return
-    }
-    if (!res.ok) { healthy.value = total.value = null; return }
-    const data = await res.json()
+    const data = await api.health()
+    healthRefreshFailed.value = false
     healthy.value = data.available_providers ?? 0
     total.value = data.total_providers ?? 0
-  } catch {
-    healthy.value = total.value = null
-  }
+  } catch (err: any) {
+    healthRefreshFailed.value = true
+    if (err?.response?.status === 401 || err?.response?.status === 403) {
+      authOk.value = false
+      healthy.value = total.value = null
+    }
+  } finally { healthRefreshing = false }
 }
 const serving = computed(() => (healthy.value ?? 0) > 0)
-const gwText = computed(() => (healthy.value == null ? '状态未知' : serving.value ? '有可用渠道' : '无可用渠道'))
+const gwText = computed(() => (healthRefreshFailed.value ? '刷新失败（保留上次状态）' : healthy.value == null ? '状态未知' : serving.value ? '有可用渠道' : '无可用渠道'))
 
 onMounted(() => {
   checkAuth()

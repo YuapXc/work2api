@@ -120,7 +120,7 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provid
 		return report, nil
 	}
 
-	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	responseBody, err := io.ReadAll(streamwatch.LimitReader(ctx, resp.Body))
 	if err != nil {
 		protocol.WriteError(w, external, http.StatusBadGateway, "failed to read upstream response", "upstream_error", ids.Request)
 		return provider.UsageReport{Status: "error", Error: "read upstream failed"}, nil
@@ -187,7 +187,7 @@ func (rt *Runtime) serveSystemOne(ctx context.Context, w http.ResponseWriter, ex
 		_, _ = io.Copy(w, resp.Body)
 		return provider.UsageReport{Status: "ok"}, nil
 	}
-	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	responseBody, err := io.ReadAll(streamwatch.LimitReader(ctx, resp.Body))
 	if err != nil {
 		protocol.WriteError(w, protocol.SystemOne, http.StatusBadGateway, "failed to read upstream response", "upstream_error", ids.Request)
 		return provider.UsageReport{Status: "error", Error: "read upstream failed"}, nil

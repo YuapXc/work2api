@@ -155,7 +155,14 @@ docker run -d --name work2api -p 8787:8787 \
 | — | `ALLOW_EXTERNAL_HOST` | `false` | 允许非回环 Host 访问（防 DNS rebinding，见注意事项） |
 | — | `ADMIN_COOKIE_SECURE` | 随公网模式开启 | 强制管理 Cookie 的 Secure 属性；HTTPS 代理 HTTP 回源时应保持开启 |
 | — | `MAX_REQUEST_BYTES` | `16777216` | 请求体上限（字节，必须大于 0）；登录固定 8 KiB，读取期限 30 秒 |
-| — | `MAX_CONCURRENT_REQUESTS` | `32` | 同时处理的请求数，包含 SSE；超出返回 429 |
+| — | `MAX_CONCURRENT_REQUESTS` | `4` | 模型执行并发（含 SSE 与管理台模型测试）；管理接口独立限额 |
+| — | `MODEL_QUEUE_SIZE` / `MODEL_QUEUE_WAIT_SECONDS` | `8` / `20` | 有界排队与累计等待预算，包含账号节流与重新入池 |
+| — | `MODEL_KEY_QUEUE_SIZE` / `MODEL_KEY_CONCURRENCY_LIMITS` | `8` / 空 | 每 Key 等待上限；JSON 按应用 ID 配置执行上限，例如 `{"2":1}` |
+| — | `ADMIN_CONCURRENCY` / `HEAVY_ADMIN_CONCURRENCY` | `8` / `2` | 轻管理 / 重管理独立限额；同类刷新共享执行结果 |
+| — | `QUERY_CONCURRENCY` / `BODY_READ_CONCURRENCY` | `4` / `4` | 模型列表及 Token 统计 / 请求体读取限额 |
+| — | `REQUEST_BODY_BUDGET` | `33554432` | 执行与排队共享的请求体缓冲容量预算（32 MiB） |
+| — | `MAX_JSON_ITEMS` / `MAX_JSON_DEPTH` | `100000` / `128` | 解码前限制 JSON 结构符号数量与嵌套深度，防止对象数量放大内存 |
+| — | `MAX_RESPONSE_BYTES` | `8388608` | 每次上游响应上限，SSE 含封装，防止输出聚合无界增长 |
 | — | `DESENSITIZE` | `true` | 对 system/developer 消息脱敏 |
 | — | `RATELIMIT` / `RATELIMIT_INTERVAL` | `true` / `1.5` | 每账号限速 |
 | — | `CHECKIN_HOURS` | `9,21` | 每日自动签到小时 |
@@ -235,3 +242,11 @@ work2api 同时开三种协议，**任何兼容客户端都能接**，不只给 
 
 仅供学习交流，见上方免责声明。使用前请确认符合各上游平台的服务条款与你所在地区的法律法规。
 
+
+### 多 Agent 并发调用
+
+建议每个网关最多同时调用 4 个模型，其他子 Agent 在调用端等待。网关按真实 API Key 轮转有界队列：个人 Key 可以使用全部空闲名额，分发 Key 可通过 `MODEL_KEY_CONCURRENCY_LIMITS` 按应用 ID 设置较低上限。WorkBuddy 等待账号节流时会归还模型执行名额，并计入同一份累计等待预算。
+
+本地过载返回 HTTP 429、`error.type=local_overload`、具体 `error.code`（如 `model_queue_full`、`key_queue_full`、`model_queue_timeout`）与 `Retry-After: 2`。调用端仅对此类执行前拒绝添加随机退避，最多重试 2 次；已输出的流或执行结果不明确的断线不自动重放。上游限流与额度错误仍保留各渠道的错误语义。管理台概览显示当前执行数、排队数、最长等待和本次启动后的容量拒绝原因。
+
+原始请求体预算不代表整个进程的内存上限：JSON 解码、协议转换、图片字符串和响应序列化仍会放大内存占用。扩大请求/响应上限或模型并发之前，需在目标服务器以长上下文、图片和非流式响应实测峰值 RSS、延迟与上游错误率。

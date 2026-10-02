@@ -78,3 +78,18 @@ func (l *Limiter) Wait(ctx context.Context) error {
 	l.last = time.Now()
 	return nil
 }
+
+// Try grants an immediately ready account without entering another queue.
+func (l *Limiter) Try() bool {
+	select {
+	case l.turn <- struct{}{}:
+		defer func() { <-l.turn }()
+	default:
+		return false
+	}
+	if len(l.pending) > 0 || time.Since(l.last) < l.minInterval {
+		return false
+	}
+	l.last = time.Now()
+	return true
+}

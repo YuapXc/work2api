@@ -21,17 +21,28 @@ const points = ref<{ bucket: string; bucket_ts: number; count: number; tokens: n
 const loading = ref(true)
 let timer: ReturnType<typeof setInterval> | null = null
 
+const refreshFailed = ref(false)
+let refreshing = false
 async function load() {
+  if (refreshing) return
+  refreshing = true
   try {
     const [o, p, ts] = await Promise.all([api.overview(), api.getProviders(), api.usageTimeseries('hour', 24)])
     ov.value = o
     providers.value = p.providers || []
     points.value = ts.data || []
+    refreshFailed.value = false
+  } catch {
+    refreshFailed.value = true
   } finally {
+    refreshing = false
     loading.value = false
   }
 }
 
+function rejectionLabel(reason: string): string {
+  return ({ model_queue_full: '模型队列满', key_queue_full: '密钥队列满', model_queue_timeout: '等待超时', request_capacity: '普通请求繁忙', heavy_admin_capacity: '重管理请求繁忙', body_read_capacity: '请求体读取繁忙', body_budget_exhausted: '请求体内存不足' } as Record<string,string>)[reason] || reason
+}
 const healthy = computed(() => (ov.value?.accounts || []).filter((a) => a.healthy).length)
 const serving = computed(() => providers.value.some((p) => p.name === 'workbuddy' ? healthy.value > 0 : p.ready))
 const pred = computed(() => ov.value?.prediction)
@@ -72,6 +83,18 @@ onUnmounted(() => timer && clearInterval(timer))
 
 <template>
   <WPage title="概览" sub="网关运行状态与额度续航一览。">
+    <div v-if="refreshFailed" class="mb-4 text-small text-warn">刷新失败，当前显示上次获取的数据。</div>
+    <WCard v-if="ov?.admission" class="mb-4">
+      <div class="flex flex-wrap gap-4 text-small">
+        <span>模型执行 {{ ov.admission.running }} / {{ ov.admission.capacity }}</span>
+        <span>排队 {{ ov.admission.queued }} / {{ ov.admission.queue_capacity }}</span>
+        <span>最长等待 {{ (ov.admission.oldest_wait_ms / 1000).toFixed(1) }} 秒</span>
+        <span>请求体占用 {{ ((ov.request_body_bytes || 0) / 1048576).toFixed(1) }} MiB</span>
+      </div>
+      <div v-if="Object.keys(ov.admission.rejected).length" class="mt-2 text-small text-faint">
+        本次启动以来的容量拒绝：{{ Object.entries(ov.admission.rejected).map(([reason, count]) => `${rejectionLabel(reason)} ${count}`).join(' · ') }}
+      </div>
+    </WCard>
     <WSpinner v-if="loading" center label="加载中" />
     <template v-else>
       <!-- 预警条 -->

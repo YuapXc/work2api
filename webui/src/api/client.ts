@@ -54,16 +54,21 @@ http.interceptors.response.use(
     const config = err?.config as (InternalAxiosRequestConfig & { _retry?: number }) | undefined
     const method = typeof config?.method === 'string' ? config.method.toLowerCase() : ''
     const status = err?.response?.status as number | undefined
+    const localOverload = status === 429 && err?.response?.data?.error?.type === "local_overload"
     // 可重试条件：GET 请求 + （网络错误 / 5xx 服务端错误）+ 未超过重试次数
     const retriable =
       method === 'get' &&
       config !== undefined &&
-      (status === undefined || status >= 500) &&
+      (status === undefined || status >= 500 || localOverload) &&
       (config._retry ?? 0) < MAX_RETRIES
     if (retriable) {
       config!._retry = (config!._retry ?? 0) + 1
-      const delay = 500 * 2 ** ((config!._retry ?? 1) - 1) // 500ms, 1000ms
-      await new Promise((r) => setTimeout(r, delay))
+      const retryAfter = Number(err?.response?.headers?.['retry-after'])
+      const base = localOverload && Number.isFinite(retryAfter) && retryAfter > 0
+        ? Math.min(retryAfter * 1000, 10000) : 500 * 2 ** ((config!._retry ?? 1) - 1)
+      const delay = base + Math.random() * 300
+      await new Promise((resolve) => setTimeout(resolve, delay))
+      if (config!.signal?.aborted) return Promise.reject(new axios.CanceledError())
       return http(config!)
     }
     const data = err?.response?.data
@@ -89,6 +94,7 @@ export function setUserToken(token: string) {
 }
 
 export const api = {
+  health: () => http.get<unknown, { available_providers: number; total_providers: number }>('/admin/health'),
   overview: () => http.get<unknown, Overview>('/admin/overview'),
   accounts: () => http.get<unknown, { accounts: AccountInfo[] }>('/admin/accounts'),
   setEnabled: (uid: string, enabled: boolean) =>

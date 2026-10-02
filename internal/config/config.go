@@ -24,6 +24,18 @@ type Config struct {
 	AdminCookieSecure     bool   // force Secure cookies behind a TLS-terminating proxy
 	MaxRequestBytes       int64
 	MaxConcurrentRequests int
+	ModelQueueSize        int
+	ModelQueueWaitSeconds int
+	ModelKeyQueueSize     int
+	ModelKeyLimits        string
+	AdminConcurrency      int
+	HeavyAdminConcurrency int
+	QueryConcurrency      int
+	BodyReadConcurrency   int
+	RequestBodyBudget     int64
+	MaxResponseBytes      int64
+	MaxJSONItems          int
+	MaxJSONDepth          int
 	DataDir               string // base dir for data (db, attachments, secrets)
 	LogLevel              string
 	LogToFile             bool
@@ -96,7 +108,19 @@ func Load(args []string) *Config {
 		AdminToken:            *adminToken,
 		AdminCookieSecure:     boolEnv("ADMIN_COOKIE_SECURE", boolEnv("ALLOW_EXTERNAL_HOST", false)),
 		MaxRequestBytes:       int64(positiveEnvInt("MAX_REQUEST_BYTES", 16*1024*1024)),
-		MaxConcurrentRequests: positiveEnvInt("MAX_CONCURRENT_REQUESTS", 32),
+		MaxConcurrentRequests: positiveEnvInt("MAX_CONCURRENT_REQUESTS", 4),
+		ModelQueueSize:        positiveEnvInt("MODEL_QUEUE_SIZE", 8),
+		ModelQueueWaitSeconds: positiveEnvInt("MODEL_QUEUE_WAIT_SECONDS", 20),
+		ModelKeyQueueSize:     positiveEnvInt("MODEL_KEY_QUEUE_SIZE", 8),
+		ModelKeyLimits:        env("MODEL_KEY_CONCURRENCY_LIMITS", ""),
+		AdminConcurrency:      positiveEnvInt("ADMIN_CONCURRENCY", 8),
+		HeavyAdminConcurrency: positiveEnvInt("HEAVY_ADMIN_CONCURRENCY", 2),
+		QueryConcurrency:      positiveEnvInt("QUERY_CONCURRENCY", 4),
+		BodyReadConcurrency:   positiveEnvInt("BODY_READ_CONCURRENCY", 4),
+		RequestBodyBudget:     int64(positiveEnvInt("REQUEST_BODY_BUDGET", 32<<20)),
+		MaxResponseBytes:      int64(positiveEnvInt("MAX_RESPONSE_BYTES", 8<<20)),
+		MaxJSONItems:          positiveEnvInt("MAX_JSON_ITEMS", 100000),
+		MaxJSONDepth:          positiveEnvInt("MAX_JSON_DEPTH", 128),
 		LogLevel:              strings.ToUpper(*logLevel),
 		LogToFile:             env("LOG_TO_FILE", "1") != "0",
 

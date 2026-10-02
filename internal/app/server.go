@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,15 +19,21 @@ type Server struct {
 	o *Orchestrator
 	// adminSessions + loginLimiter back the WebUI login (HttpOnly cookie
 	// sessions). In-memory only: restart signs everyone out.
-	sessions     *adminSessionManager
-	loginLimiter *loginRateLimiter
+	sessions                                                    *adminSessionManager
+	loginLimiter                                                *loginRateLimiter
+	modelsAdmission                                             *modelAdmission
+	adminSlots, heavySlots, querySlots, bodySlots, refreshSlots chan struct{}
+	bodies                                                      *bodyBudget
+	refreshMu                                                   sync.Mutex
+	refreshes                                                   map[string]*refreshFlight
 }
 
 type principalContextKey struct{}
 
 // NewServer builds the HTTP server.
 func NewServer(o *Orchestrator) *Server {
-	return &Server{o: o, sessions: newAdminSessionManager(), loginLimiter: newLoginRateLimiter()}
+	return &Server{o: o, sessions: newAdminSessionManager(), loginLimiter: newLoginRateLimiter(),
+		modelsAdmission: newModelAdmission(o.cfg), adminSlots: make(chan struct{}, positiveOr(o.cfg.AdminConcurrency, 8)), heavySlots: make(chan struct{}, positiveOr(o.cfg.HeavyAdminConcurrency, 2)), querySlots: make(chan struct{}, positiveOr(o.cfg.QueryConcurrency, 4)), bodySlots: make(chan struct{}, positiveOr(o.cfg.BodyReadConcurrency, 4)), bodies: &bodyBudget{limit: int64(positiveOr(int(o.cfg.RequestBodyBudget), 32<<20))}, refreshSlots: make(chan struct{}, 8), refreshes: map[string]*refreshFlight{}}
 }
 
 // Handler returns the root handler with all routes mounted and Host guarded.
@@ -46,11 +53,6 @@ func (s *Server) Handler() http.Handler {
 // Bound admission and finish reading bodies before opening a long-lived SSE
 // response. A body deadline must not become a deadline for the response stream.
 func (s *Server) requestGuard(next http.Handler) http.Handler {
-	capacity := s.o.cfg.MaxConcurrentRequests
-	if capacity <= 0 {
-		capacity = 32
-	}
-	slots := make(chan struct{}, capacity)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/v1/") {
 			principal, aerr := s.auth(r)
@@ -60,12 +62,30 @@ func (s *Server) requestGuard(next http.Handler) http.Handler {
 			}
 			r = r.WithContext(context.WithValue(r.Context(), principalContextKey{}, principal))
 		}
-		select {
-		case slots <- struct{}{}:
-			defer func() { <-slots }()
-		default:
-			writeJSON(w, 429, errBody(429, "并发请求过多，请稍后重试", "rate_limit_error").body)
-			return
+		slots := s.adminSlots
+		model := isModelRoute(r)
+		heavy := isHeavyAdmin(r)
+		if strings.HasPrefix(r.URL.Path, "/v1/") {
+			slots = s.querySlots
+		}
+		if heavy {
+			slots = s.heavySlots
+		}
+		if model || r.URL.Path == "/admin/models/test" || r.URL.Path == "/health" || !strings.HasPrefix(r.URL.Path, "/admin/") && !strings.HasPrefix(r.URL.Path, "/v1/") {
+			slots = nil
+		}
+		// Refresh followers share the leader's result, using bounded lightweight admission.
+		if heavy && isRefresh(r) {
+			slots = s.refreshSlots
+		}
+		if slots != nil {
+			select {
+			case slots <- struct{}{}:
+				defer func() { <-slots }()
+			default:
+				s.writeOverload(w, "request_capacity")
+				return
+			}
 		}
 		if r.URL.Path == "/admin/login" && s.o.cfg.AdminToken != "" {
 			sessionOK, headerOK := s.adminAuth(r)
@@ -86,12 +106,28 @@ func (s *Server) requestGuard(next http.Handler) http.Handler {
 				writeJSON(w, 413, errBody(413, "请求体过大", "invalid_request_error").body)
 				return
 			}
-			controller := http.NewResponseController(w)
-			_ = controller.SetReadDeadline(time.Now().Add(30 * time.Second))
-			body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
-			_ = r.Body.Close()
-			_ = controller.SetReadDeadline(time.Time{})
+			select {
+			case s.bodySlots <- struct{}{}:
+			default:
+				s.writeOverload(w, "body_read_capacity")
+				return
+			}
+
+			body, reserved, err := func() ([]byte, int64, error) {
+				defer func() { <-s.bodySlots }()
+				defer r.Body.Close()
+				controller := http.NewResponseController(w)
+				_ = controller.SetReadDeadline(time.Now().Add(30 * time.Second))
+				defer controller.SetReadDeadline(time.Time{})
+				return s.bodies.read(http.MaxBytesReader(w, r.Body, limit), r.ContentLength)
+			}()
+			defer s.bodies.release(reserved)
 			if err != nil {
+				var overload *apiError
+				if errors.As(err, &overload) {
+					s.writeOverload(w, "body_budget_exhausted")
+					return
+				}
 				status := http.StatusBadRequest
 				var tooLarge *http.MaxBytesError
 				var timeout net.Error
@@ -103,7 +139,15 @@ func (s *Server) requestGuard(next http.Handler) http.Handler {
 				writeJSON(w, status, errBody(status, "请求体读取失败或超过限制", "invalid_request_error").body)
 				return
 			}
+			if !jsonWithinComplexity(body, positiveOr(s.o.cfg.MaxJSONItems, 100000), positiveOr(s.o.cfg.MaxJSONDepth, 128)) {
+				writeJSON(w, 400, errBody(400, "JSON 结构过于复杂或嵌套过深", "invalid_request_error").body)
+				return
+			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		if heavy && isRefresh(r) {
+			s.serveRefresh(w, r, next)
+			return
 		}
 		next.ServeHTTP(w, r)
 	})

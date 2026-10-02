@@ -21,6 +21,7 @@ const apps = ref<AppInfo[]>([])
 const loading = ref(true)
 
 const cols: Column[] = [
+  { key: 'id', label: 'ID', mono: true },
   { key: 'name', label: '名称' },
   { key: 'key_prefix', label: '密钥', mono: true },
   { key: 'allowed_models', label: '可用模型' },

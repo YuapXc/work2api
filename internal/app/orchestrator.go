@@ -19,6 +19,7 @@ import (
 	"work2api/internal/opencode"
 	"work2api/internal/qoder"
 	"work2api/internal/store"
+	"work2api/internal/streamwatch"
 	"work2api/internal/workbuddy/billing"
 	"work2api/internal/workbuddy/credentials"
 	"work2api/internal/workbuddy/desensitize"
@@ -563,8 +564,15 @@ func (o *Orchestrator) getHeaders(acc *pool.Account) (map[string]string, *apiErr
 }
 
 func (o *Orchestrator) runOnce(ctx context.Context, acc *pool.Account, body map[string]any, sink func(string) error) (bool, error) {
-	if o.cfg.Ratelimit {
-		if err := o.limiter(acc.UID).Wait(ctx); err != nil {
+	if o.cfg.Ratelimit && !o.limiter(acc.UID).Try() {
+		wait := o.limiter(acc.UID).Wait
+		var err error
+		if lease, ok := ctx.Value(modelLeaseKey{}).(*modelLease); ok {
+			err = lease.throttle(ctx, wait)
+		} else {
+			err = wait(ctx)
+		}
+		if err != nil {
 			if errors.Is(err, ratelimit.ErrQueueFull) {
 				return false, errBody(429, "账号等待队列已满，请稍后重试", "rate_limit_error")
 			}
@@ -580,7 +588,12 @@ func (o *Orchestrator) runOnce(ctx context.Context, acc *pool.Account, body map[
 	}
 	url, _ := siterouting.ChatURLForProfile(acc.Profile)
 	started := false
+	var responseBytes int64
 	wrapped := func(line string) error {
+		responseBytes += int64(len(line))
+		if responseBytes > streamwatch.ResponseLimit(ctx) {
+			return streamwatch.ErrResponseTooLarge
+		}
 		started = true
 		return sink(line)
 	}
@@ -606,6 +619,9 @@ func (o *Orchestrator) openUpstream(ctx context.Context, acc *pool.Account, body
 		started, err := o.runOnce(ctx, acc, body, sink)
 		if err == nil {
 			return acc, nil
+		}
+		if errors.Is(err, streamwatch.ErrResponseTooLarge) {
+			return acc, err
 		}
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return acc, err

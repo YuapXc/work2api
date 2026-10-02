@@ -34,10 +34,13 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 	// strips its own prefix before talking to its upstream.
 	payload["model"] = resolved
 	t0 := time.Now()
-	report, _ := rt.Serve(r.Context(), provider.ServeRequest{
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	writer := &cancelWriter{ResponseWriter: w, cancel: cancel}
+	report, _ := rt.Serve(ctx, provider.ServeRequest{
 		Protocol: proto,
 		Payload:  payload,
-		Writer:   w,
+		Writer:   writer,
 		AppName:  principal.AppName,
 	})
 	s.o.logRuntimeUsage(report, string(proto), resolved, t0, principal.AppName)
@@ -145,4 +148,27 @@ func (o *Orchestrator) benchTargets(ctx context.Context) []benchTarget {
 		out = append(out, benchTarget{toStrLoose(m["provider"]), id, toStrLoose(m["name"])})
 	}
 	return out
+}
+
+// A downstream write failure cancels every provider's upstream context.
+type cancelWriter struct {
+	http.ResponseWriter
+	cancel context.CancelFunc
+}
+
+func (w *cancelWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+func (w *cancelWriter) Write(p []byte) (int, error) {
+	_ = http.NewResponseController(w.ResponseWriter).SetWriteDeadline(time.Now().Add(30 * time.Second))
+	n, err := w.ResponseWriter.Write(p)
+	if err != nil {
+		w.cancel()
+	}
+	return n, err
+}
+func (w *cancelWriter) Flush() {
+	controller := http.NewResponseController(w.ResponseWriter)
+	_ = controller.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	if err := controller.Flush(); err != nil {
+		w.cancel()
+	}
 }
