@@ -85,7 +85,10 @@ type quotaEntry struct {
 	plan      string
 	exceeded  bool
 	expiresAt int64
-	ts        time.Time
+	// packages 活动赠送的专属资源包明细（与 workbuddy credit_packages 同构，
+	// WebUI 账号表可直接复用积分构成弹层）。
+	packages []map[string]any
+	ts       time.Time
 }
 
 // New constructs the qoder runtime. It applies the qoder2api install salt so

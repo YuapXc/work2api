@@ -143,6 +143,7 @@ interface Pkg {
   used: number
   total: number
   expire_at?: number | null
+  reset_time?: string
 }
 
 const pkgOpenFor = ref<string | null>(null) // `${provider}:${id}`
@@ -851,6 +852,7 @@ async function saveConfig() {
               <span v-if="p.expire_at" class="ml-auto mono whitespace-nowrap" :class="pkgExpiring(p) ? 'text-warn' : ''">
                 {{ dt(p.expire_at, pkgExpiring(p) ? 'YYYY-MM-DD HH:mm' : 'YYYY-MM-DD') }}
               </span>
+              <span v-else-if="p.reset_time" class="ml-auto mono whitespace-nowrap text-faint">重置：{{ p.reset_time }}</span>
             </div>
           </div>
         </div>

@@ -50,17 +50,22 @@ type Principal struct {
 	AllowedModels []string
 }
 
+type upstreamStreamer interface {
+	StreamUpstream(context.Context, map[string]string, map[string]any, string, upstream.LineFunc) error
+}
+
 // Orchestrator holds shared runtime state and the request pipeline.
 type Orchestrator struct {
-	cfg       *config.Config
-	db        *store.DB
-	crypto    *crypto.Manager
-	pool      *pool.Pool
-	models    *models.Registry
-	bench     *benchmarks.Store
-	managers  map[string]*credentials.Manager
-	managerMu sync.RWMutex
-	accountMu sync.Mutex
+	upstreamClient upstreamStreamer
+	cfg            *config.Config
+	db             *store.DB
+	crypto         *crypto.Manager
+	pool           *pool.Pool
+	models         *models.Registry
+	bench          *benchmarks.Store
+	managers       map[string]*credentials.Manager
+	managerMu      sync.RWMutex
+	accountMu      sync.Mutex
 
 	limMu    sync.Mutex
 	limiters map[string]*ratelimit.Limiter
@@ -579,7 +584,11 @@ func (o *Orchestrator) runOnce(ctx context.Context, acc *pool.Account, body map[
 		started = true
 		return sink(line)
 	}
-	err := upstream.Shared().StreamUpstream(ctx, headers, body, url, wrapped)
+	client := o.upstreamClient
+	if client == nil {
+		client = upstream.Shared()
+	}
+	err := client.StreamUpstream(ctx, headers, body, url, wrapped)
 	return started, err
 }
 
@@ -611,7 +620,13 @@ func (o *Orchestrator) openUpstream(ctx context.Context, acc *pool.Account, body
 		}
 		ue, ok := err.(*upstream.UpstreamError)
 		if !ok {
-			o.pool.OnFailure(acc.UID, cooldownSoft)
+			// 本机 DNS 解析失败是机器级故障（对所有上游同时生效、通常秒级自愈），
+			// 不是这个账号的毛病。打冷却会把一次抖动放大成整模型不可用、且期间
+			// 连「再探一次」的机会都没有。当前请求快速失败且不处罚账号，
+			// 由后续请求重试，避免对同地域同域名的账号重复解析。
+			if !isLocalDNSFailure(err) {
+				o.pool.OnFailure(acc.UID, cooldownSoft)
+			}
 			return acc, err
 		}
 		// 分类并对该账号施加处罚（禁用/负缓存/冷却/不罚），返回是否应换号。

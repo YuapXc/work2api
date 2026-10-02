@@ -109,8 +109,22 @@ func (p *anonymousPool) MarkSuccess(node *anonymousNode) {
 	node.cooldownUntil.Store(0)
 }
 
+// isLocalDNSFailure 判定本机域名解析失败（机器级故障）。DNS 抖动会让所有
+// node/proxy 同时失败，逐个冷却会把一次秒级抖动放大成整层不可用（buddy-proxy
+// #62 同款事故），照常换下一个但不计数。
+func isLocalDNSFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr)
+}
+
 func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, err error) {
 	if node == nil {
+		return
+	}
+	if err != nil && isLocalDNSFailure(err) {
 		return
 	}
 	if err == nil && resp != nil && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
@@ -235,7 +249,7 @@ func (p *transportPool) checkClaimedProxy(ctx context.Context, proxy *proxyTrans
 // isProxyFailure recognizes only failures that say the proxy route is
 // unavailable. HTTP responses and unrelated errors must not evict a proxy.
 func isProxyFailure(err error) bool {
-	if err == nil {
+	if err == nil || isLocalDNSFailure(err) {
 		return false
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, syscall.ECONNREFUSED) {
@@ -447,6 +461,9 @@ func (p *nodePool) MarkSuccess(node *upstreamNode) {
 }
 
 func (p *nodePool) MarkFailure(node *upstreamNode, resp *http.Response, err error) {
+	if err != nil && isLocalDNSFailure(err) {
+		return
+	}
 	if err == nil && resp != nil && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
 		return
 	}

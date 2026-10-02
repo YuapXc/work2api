@@ -31,6 +31,9 @@ var modalityOverride = map[string]bool{
 	"glm-5.3-flash": true, "glm-5v-turbo": true, "kimi-k3": true, "kimi-k3-1": true,
 	"kimi-k2.7": true, "kimi-k2.6": true, "kimi-k2.5": true, "minimax-m3": true,
 	"deepseek-v4.1-flash": true,
+	// space-bunny 原生多模态（buddy-proxy 实测图片输入可用；id 必须全小写，
+	// Space-Bunny/SPACE-BUNNY 均被上游拒为 11102）
+	"space-bunny": true,
 }
 
 // Settings is the minimal settings source (for model_ttl_min).

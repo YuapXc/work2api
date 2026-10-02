@@ -45,11 +45,27 @@ type Settings struct {
 }
 
 type QuotaInfo struct {
-	Plan            string       `json:"plan"`
-	UserQuota       *QuotaBucket `json:"user_quota,omitempty"`
-	AddonQuota      *QuotaBucket `json:"addon_quota,omitempty"`
-	IsQuotaExceeded bool         `json:"is_quota_exceeded"`
-	ExpiresAt       int64        `json:"expires_at,omitempty"`
+	Plan       string       `json:"plan"`
+	UserQuota  *QuotaBucket `json:"user_quota,omitempty"`
+	AddonQuota *QuotaBucket `json:"addon_quota,omitempty"`
+	// DedicatedPackages 活动赠送的专属资源包（如「Qwen 专属积分」），与订阅
+	// 额度/加油包**并存**，是账号总额度的一部分。上游
+	// /api/v2/quota/usage 的 dedicatedResourcePackages 节点，此前整条丢弃会让
+	// 管理台显示的积分比实际少一截（buddy-proxy #51 实测：2000+2000 只显示 2000）。
+	DedicatedPackages []QuotaPackage `json:"dedicated_packages,omitempty"`
+	IsQuotaExceeded   bool           `json:"is_quota_exceeded"`
+	ExpiresAt         int64          `json:"expires_at,omitempty"`
+}
+
+// QuotaPackage 是一个专属资源包的额度切片。available/status 双信号判活：
+// 失效时上游翻哪个字段没有真样本，只信一个可能把「少显示」翻成「多显示」。
+type QuotaPackage struct {
+	Label     string  `json:"label"`
+	Used      float64 `json:"used"`
+	Total     float64 `json:"total"`
+	Remaining float64 `json:"remaining"`
+	// ExpireAt 包自带的过期时间（毫秒 epoch），通常比账号级的更早；0 表示上游未给。
+	ExpireAt int64 `json:"expire_at,omitempty"`
 }
 
 type QuotaBucket struct {

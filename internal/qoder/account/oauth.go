@@ -309,7 +309,87 @@ func FetchQuota(token string, region Region) (*QuotaInfo, error) {
 		logger.Debug("FetchQuota addonQuota missing")
 	}
 
+	info.DedicatedPackages = extractDedicatedPackages(result)
 	return info, nil
+}
+
+// pkgInactiveHints 是专属资源包 status 枚举里明确表示「不占额度」的片段。活跃态
+// 实测是 QUOTA_DETAIL_STATUS_ACTIVE，失效态没有真样本，按「含这些词就算失效」
+// 匹配；未知状态放行——宁可多显示一行，也不要把活跃包误杀（漏显额度正是这条
+// 链路修过的老 bug）。
+var pkgInactiveHints = []string{"EXPIRED", "INVALID", "INACTIVE", "DISABLED", "USED_UP", "DEPLETED"}
+
+// extractDedicatedPackages 读 dedicatedResourcePackages：available + status 双
+// 保险判活（失效时上游翻哪个字段没有真样本，只查一个会把过期包算进总额度）。
+// 展示名从 displayLabels（dimension=title）取多语言，zh-CN → en-US → value 回退，
+// 兜底 name，最后是通用名——name 常是 act-20260901-170 这类活动代号不适合人看。
+func extractDedicatedPackages(result map[string]interface{}) []QuotaPackage {
+	raw, ok := result["dedicatedResourcePackages"].([]interface{})
+	if !ok {
+		return nil
+	}
+	var out []QuotaPackage
+	for _, item := range raw {
+		pkg, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if avail, has := pkg["available"].(bool); has && !avail {
+			continue
+		}
+		status := strings.ToUpper(strGet(pkg, "status"))
+		inactive := false
+		for _, hint := range pkgInactiveHints {
+			if strings.Contains(status, hint) {
+				inactive = true
+				break
+			}
+		}
+		if inactive {
+			continue
+		}
+		used := toFloat(pkg, "used")
+		total := toFloat(pkg, "total")
+		remaining := toFloat(pkg, "remaining")
+		if total == 0 && used == 0 && remaining == 0 {
+			continue
+		}
+		out = append(out, QuotaPackage{
+			Label:     pkgLabel(pkg),
+			Used:      used,
+			Total:     total,
+			Remaining: remaining,
+			ExpireAt:  int64(toFloat(pkg, "expiresAt")),
+		})
+	}
+	return out
+}
+
+// pkgLabel 按上游 displayLabels 的 zh-CN → en-US → value → name 回退取展示名。
+func pkgLabel(pkg map[string]interface{}) string {
+	if labels, ok := pkg["displayLabels"].([]interface{}); ok {
+		for _, li := range labels {
+			entry, ok := li.(map[string]interface{})
+			if !ok || strGet(entry, "dimension") != "title" {
+				continue
+			}
+			i18n, _ := entry["valueI18n"].(map[string]interface{})
+			if i18n != nil {
+				for _, key := range []string{"zh-CN", "en-US"} {
+					if t := strings.TrimSpace(strGet(i18n, key)); t != "" {
+						return t
+					}
+				}
+			}
+			if t := strings.TrimSpace(strGet(entry, "value")); t != "" {
+				return t
+			}
+		}
+	}
+	if t := strings.TrimSpace(strGet(pkg, "name")); t != "" {
+		return t
+	}
+	return "专属积分"
 }
 
 func extractBucket(data map[string]interface{}, key string) *QuotaBucket {

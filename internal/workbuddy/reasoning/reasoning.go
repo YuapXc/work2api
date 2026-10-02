@@ -29,6 +29,8 @@ var KnownEfforts = map[string][]string{
 	"deepseek-v4.1-flash": {"low", "medium", "high"},
 	"minimax-m3-pay":      {"low", "medium", "high"},
 	"hy3-preview-agent":   {"low", "medium", "high"},
+	// space-bunny 为 onlyReasoning 模型，支持 low..max、默认 max（buddy-proxy 实测补录）
+	"space-bunny": {"low", "medium", "high", "xhigh", "max"},
 }
 
 // Body is the mutable request body.

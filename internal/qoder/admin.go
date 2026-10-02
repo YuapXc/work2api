@@ -107,6 +107,10 @@ func (r *Runtime) accountRow(id, label, region, source, authMode string, active 
 		if q.expiresAt > 0 {
 			row["credits_expire_at"] = q.expiresAt
 		}
+		if len(q.packages) > 0 {
+			// 与 workbuddy 同键名：WebUI 账号表的积分构成弹层直接复用
+			row["credit_packages"] = q.packages
+		}
 	}
 	return row
 }
@@ -158,20 +162,48 @@ func (r *Runtime) refreshQuota(id, source, region string) {
 	if err != nil || q == nil {
 		return
 	}
-	e := quotaEntry{plan: q.Plan, exceeded: q.IsQuotaExceeded, expiresAt: q.ExpiresAt, ts: time.Now()}
-	if q.UserQuota != nil {
-		e.remaining += q.UserQuota.Remaining
-		e.total += q.UserQuota.Total
-	}
-	if q.AddonQuota != nil {
-		e.remaining += q.AddonQuota.Remaining
-		e.total += q.AddonQuota.Total
-	}
+	e := buildQuotaEntry(q)
 	r.quotaMu.Lock()
 	if !account.IsGatewayHidden(id) {
 		r.quotaCache[id] = e
 	}
 	r.quotaMu.Unlock()
+}
+
+func buildQuotaEntry(q *account.QuotaInfo) quotaEntry {
+	e := quotaEntry{plan: q.Plan, exceeded: q.IsQuotaExceeded, expiresAt: q.ExpiresAt, ts: time.Now()}
+	if q.UserQuota != nil {
+		e.remaining += q.UserQuota.Remaining
+		e.total += q.UserQuota.Total
+		e.packages = append(e.packages, quotaBucketPackage("订阅额度", q.UserQuota))
+	}
+	if q.AddonQuota != nil {
+		e.remaining += q.AddonQuota.Remaining
+		e.total += q.AddonQuota.Total
+		e.packages = append(e.packages, quotaBucketPackage("加油包", q.AddonQuota))
+	}
+	// 专属资源包（活动赠送）与订阅/加油包并存：漏掉它会让显示的积分比实际少
+	// 一截（buddy-proxy #51 实测 2000+2000 只显示 2000）。每个包单独一行明细，
+	// 过期时间用包自带的（比账号级的更早）。
+	for _, p := range q.DedicatedPackages {
+		e.remaining += p.Remaining
+		e.total += p.Total
+		pkg := map[string]any{"name": p.Label, "remain": p.Remaining, "used": p.Used, "total": p.Total}
+		if p.ExpireAt > 0 {
+			pkg["expire_at"] = float64(p.ExpireAt) / 1000.0 // 上游毫秒 → 秒（WebUI rel/dt 口径）
+		}
+		e.packages = append(e.packages, pkg)
+	}
+	return e
+}
+
+// ResetTime is a replenishment boundary, not an expiry; keep the two distinct.
+func quotaBucketPackage(name string, bucket *account.QuotaBucket) map[string]any {
+	pkg := map[string]any{"name": name, "remain": bucket.Remaining, "used": bucket.Used, "total": bucket.Total}
+	if bucket.ResetTime != "" {
+		pkg["reset_time"] = bucket.ResetTime
+	}
+	return pkg
 }
 
 // --- provider.AccountManager (per-account actions, native accounts only) ---

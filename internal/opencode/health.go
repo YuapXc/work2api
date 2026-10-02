@@ -17,7 +17,7 @@ const (
 // syncProxyResult updates proxy health from real traffic. Only timeouts and
 // connection refusals mark a proxy unavailable.
 func (rt *Runtime) syncProxyResult(ctx context.Context, proxy *proxyTransport, status int, err error) bool {
-	if proxy == nil {
+	if proxy == nil || isLocalDNSFailure(err) {
 		return false
 	}
 	if isProxyFailure(err) {
