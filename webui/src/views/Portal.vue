@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { api } from '@/api/client'
-import type { PortalOverview, PortalGroup, PortalUser, PortalAccount } from '@/api/portal'
+import type { PortalOverview, PortalGroup, PortalUser, PortalAccount, PortalInvite } from '@/api/portal'
 import { toast } from '@/lib/toast'
 import WButton from '@/components/ui/WButton.vue'
 import WInput from '@/components/ui/WInput.vue'
@@ -15,6 +15,8 @@ const error = ref('')
 const bootstrapName = ref('')
 const bootstrapPass = ref('')
 const inviteDays = ref('7')
+const publicURL = ref('')
+const savedPublicURL = ref('')
 const newGroup = ref('')
 const disabledModels = ref<string[]>([])
 const groupModelSearch = ref('')
@@ -66,6 +68,7 @@ async function load() {
     models.value = catalog.models.filter(m => (m.provider || m.owned_by) === 'workbuddy' && isPublicModel(m.id)).map(m => m.id)
     modelNames.value = Object.fromEntries(catalog.models.map(m => [m.id, m.name || m.id]))
     const disabled = settings.portal_disabled_models
+    publicURL.value = savedPublicURL.value = settings.portal_public_url || ''
     disabledModels.value = parseModels(typeof disabled === 'string' || Array.isArray(disabled) ? disabled as string | string[] : [])
     defaultGroup.value = String(data.value.default_group_id || 0)
     defaultAuto.value = !!data.value.default_auto_grant
@@ -133,6 +136,24 @@ async function createInvite() {
   if (!Number.isFinite(days) || days < 1 || days > 365) return toast.error('有效天数需为 1–365')
   await mutate(() => api.portalWrite('invites', { valid_days: days }), '邀请码已创建')
 }
+function inviteAvailable(invite: PortalInvite) {
+  return !invite.used_by && (!invite.expires_at || invite.expires_at > Date.now() / 1000)
+}
+async function savePublicURL() {
+  await mutate(() => api.saveSettings({ portal_public_url: publicURL.value.trim() }), '公网门户地址已保存')
+}
+async function copyInvite(invite: PortalInvite, link = false) {
+  if (!inviteAvailable(invite)) return toast.error('邀请码已使用或过期')
+  let text = invite.code
+  if (link) {
+    if (!savedPublicURL.value || publicURL.value.trim() !== savedPublicURL.value) return toast.error('请先保存公网门户地址')
+    const url = new URL(savedPublicURL.value)
+    url.searchParams.set('aff', invite.code)
+    text = url.href
+  }
+  try { await navigator.clipboard.writeText(text); toast.success(link ? '邀请链接已复制' : '邀请码已复制') }
+  catch { toast.error('复制失败，请检查浏览器剪贴板权限') }
+}
 </script>
 
 <template>
@@ -183,8 +204,11 @@ async function createInvite() {
     </section>
     <section class="glass rounded-xl p-5 space-y-3">
       <h2 class="font-semibold">邀请码</h2><div class="flex gap-2"><WInput v-model="inviteDays" placeholder="有效天数（1–365）" /><WButton :disabled="busy" @click="createInvite">生成邀请码</WButton></div>
+      <label for="portal-public-url" class="block text-small text-muted">公网门户地址</label>
+      <div class="flex flex-wrap gap-2"><WInput id="portal-public-url" v-model="publicURL" placeholder="https://portal.example.com/" class="min-w-0 flex-1" /><WButton :disabled="busy" @click="savePublicURL">保存地址</WButton></div>
+      <p class="text-micro text-faint">邀请链接使用此地址；通过管理隧道访问时也不会复制出 localhost。每个邀请码只能使用一次。</p>
       <p v-if="!data.invites.length" class="text-small text-faint">暂无邀请码。</p>
-      <div v-for="invite in data.invites" :key="invite.code" class="flex flex-wrap items-center gap-3 border-t border-line py-2 text-small"><code>{{ invite.code }}</code><span class="text-faint">{{ invite.used_by ? `已由 ${username(invite.used_by)} 使用` : invite.expires_at && invite.expires_at < Date.now() / 1000 ? '已过期' : '未使用' }} · {{ invite.expires_at ? fmtTime(invite.expires_at) : '长期有效' }}</span><WButton v-if="!invite.used_by" size="sm" variant="danger" :disabled="busy" @click="mutate(() => api.portalDelete(`invites/${encodeURIComponent(invite.code)}`), '邀请码已撤销')">撤销</WButton></div>
+      <div v-for="invite in data.invites" :key="invite.code" class="flex flex-wrap items-center gap-3 border-t border-line py-2 text-small"><code>{{ invite.code }}</code><span class="text-faint">{{ invite.used_by ? `已由 ${username(invite.used_by)} 使用` : !inviteAvailable(invite) ? '已过期' : '未使用' }} · {{ invite.expires_at ? fmtTime(invite.expires_at) : '长期有效' }}</span><WButton size="sm" :disabled="busy || !inviteAvailable(invite)" @click="copyInvite(invite)">复制邀请码</WButton><WButton size="sm" :disabled="busy || !inviteAvailable(invite) || !savedPublicURL || publicURL.trim() !== savedPublicURL" @click="copyInvite(invite, true)">复制邀请链接</WButton><WButton v-if="!invite.used_by" size="sm" variant="danger" :disabled="busy" @click="mutate(() => api.portalDelete(`invites/${encodeURIComponent(invite.code)}`), '邀请码已撤销')">撤销</WButton></div>
     </section>
     <section class="glass rounded-xl p-5 space-y-3">
       <h2 class="font-semibold">共享池分组</h2>

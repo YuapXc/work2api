@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -841,6 +842,19 @@ func (s *Server) adminSaveSettings(w http.ResponseWriter, r *http.Request) {
 	kv := map[string]string{}
 	for k, v := range body {
 		kv[k] = toStrLoose(v)
+	}
+	if raw, present := kv["portal_public_url"]; present {
+		raw = strings.TrimSpace(raw)
+		if raw != "" {
+			u, err := url.Parse(raw)
+			if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") || strings.EqualFold(u.Hostname(), "localhost") || u.Hostname() == "127.0.0.1" || u.Hostname() == "::1" {
+				writeAPIErr(w, errBody(400, "公网门户地址需为 HTTPS 根地址，不含用户名、查询参数或片段", "invalid_request_error"))
+				return
+			}
+			u.Path = "/"
+			raw = u.String()
+		}
+		kv["portal_public_url"] = raw
 	}
 	if raw, present := kv["portal_disabled_models"]; present {
 		var models []string

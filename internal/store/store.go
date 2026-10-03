@@ -64,6 +64,7 @@ var DefaultSettings = map[string]string{
 	// 用户门户（阶段 A）：管理员可配置的共享模型禁用列表（JSON 数组），从共享
 	// 权限集中扣除。注册方式等部署级开关走环境变量，不进 settings。
 	"portal_disabled_models":    "",
+	"portal_public_url":         "",
 	"portal_default_group":      "0",
 	"portal_default_auto_grant": "0",
 }

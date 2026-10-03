@@ -22,6 +22,14 @@ const showLogin = ref(true) // false = 注册表单
 const username = ref('')
 const password = ref('')
 const invite = ref('')
+// Consume before any API request/navigation; keep the code only in this form's memory.
+const entryURL = new URL(window.location.href)
+if (entryURL.searchParams.has('aff')) {
+  const code = (entryURL.searchParams.get('aff') || '').trim().toUpperCase()
+  if (/^[A-Z0-9]{6,32}$/.test(code)) { invite.value = code; showLogin.value = false }
+  entryURL.searchParams.delete('aff')
+  window.history.replaceState(window.history.state, '', entryURL.pathname + entryURL.search + entryURL.hash)
+}
 const busy = ref(false)
 const error = ref('')
 const connectionError = ref('')
@@ -41,6 +49,7 @@ async function probeOnce() {
     const result = await api.me()
     if (disposed || version !== sessionVersion) return
     me.value = result
+    invite.value = '' // An existing session never redeems or retains the invitation.
     connectionError.value = ''
     lastProbe = Date.now()
   } catch (e) {
