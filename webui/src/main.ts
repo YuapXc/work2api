@@ -16,7 +16,7 @@ document.documentElement.classList.toggle('light', wantLight)
 
 // 功能优先的信息架构：账号/模型跨供应商聚合，供应商降为筛选维度
 const router = createRouter({
-  history: createWebHashHistory(),
+  history: createWebHashHistory('/admin-ui/'),
   routes: [
     { path: '/', redirect: '/overview' },
     { path: '/overview', component: () => import('./views/Overview.vue'), meta: { title: '概览' } },
@@ -25,6 +25,7 @@ const router = createRouter({
     { path: '/keys', component: () => import('./views/Keys.vue'), meta: { title: 'API 密钥' } },
     { path: '/traffic', component: () => import('./views/Traffic.vue'), meta: { title: '流量' } },
     { path: '/settings', component: () => import('./views/Settings.vue'), meta: { title: '设置' } },
+    { path: '/portal', component: () => import('./views/Portal.vue'), meta: { title: '门户管理' } },
     // 旧路径重定向，避免收藏失效
     { path: '/usage', redirect: '/traffic' },
     { path: '/records', redirect: '/traffic?tab=logs' },

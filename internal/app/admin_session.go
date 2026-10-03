@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"work2api/internal/portal/portalauth"
 )
 
 // sessionTTL is how long an admin session cookie stays valid (24h per user
@@ -28,7 +29,9 @@ const maxSessions = 16
 // the raw token is simply stored (process restart invalidates everything,
 // which is the intended fail-safe).
 type adminSessionEntry struct {
-	expires time.Time
+	expires      time.Time
+	userID       int64
+	passwordHash string
 }
 
 // adminSessionManager issues and validates admin login sessions in memory. Nothing
@@ -52,7 +55,9 @@ func newToken() string {
 
 // create signs in and returns the cookie value. Concurrent logins beyond
 // maxSessions evict the soonest-expiring session.
-func (m *adminSessionManager) create() string {
+func (m *adminSessionManager) create() string { return m.createForUser(0, "") }
+
+func (m *adminSessionManager) createForUser(userID int64, passwordHash string) string {
 	token := newToken()
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -69,7 +74,7 @@ func (m *adminSessionManager) create() string {
 		}
 		delete(m.sessions, oldest)
 	}
-	m.sessions[token] = adminSessionEntry{expires: time.Now().Add(sessionTTL)}
+	m.sessions[token] = adminSessionEntry{expires: time.Now().Add(sessionTTL), userID: userID, passwordHash: passwordHash}
 	return token
 }
 
@@ -129,6 +134,16 @@ func (l *loginRateLimiter) allow(ip string) bool {
 	defer l.mu.Unlock()
 	w, ok := l.attempt[ip]
 	if !ok || now.Sub(w.start) >= loginWindowLen {
+		if len(l.attempt) >= 4096 {
+			for k, old := range l.attempt {
+				if now.Sub(old.start) >= loginWindowLen {
+					delete(l.attempt, k)
+				}
+			}
+			if len(l.attempt) >= 4096 {
+				return false
+			}
+		}
 		l.attempt[ip] = &loginWindow{start: now, count: 1}
 		return true
 	}
@@ -150,11 +165,23 @@ func (l *loginRateLimiter) allow(ip string) bool {
 func (s *Server) adminAuth(r *http.Request) (sessionOK, headerOK bool) {
 	if c, err := r.Cookie(cookieName); err == nil && c.Value != "" {
 		sessionOK = s.sessions.validate(c.Value)
+		if sessionOK {
+			s.sessions.mu.Lock()
+			entry := s.sessions.sessions[c.Value]
+			s.sessions.mu.Unlock()
+			if entry.userID > 0 {
+				u, err := s.o.db.GetUser(entry.userID)
+				if err != nil || u == nil || u.Status != "active" || u.Role != "admin" || u.PasswordHash != entry.passwordHash {
+					s.sessions.drop(c.Value)
+					sessionOK = false
+				}
+			}
+		}
 	}
 	if header := r.Header.Get("X-Admin-Token"); header != "" {
-		headerOK = subtle.ConstantTimeCompare([]byte(header), []byte(s.o.cfg.AdminToken)) == 1
+		headerOK = s.o.cfg.AdminToken != "" && subtle.ConstantTimeCompare([]byte(header), []byte(s.o.cfg.AdminToken)) == 1
 	} else if a := r.Header.Get("Authorization"); strings.HasPrefix(a, "Bearer ") {
-		headerOK = subtle.ConstantTimeCompare([]byte(strings.TrimSpace(a[7:])), []byte(s.o.cfg.AdminToken)) == 1
+		headerOK = s.o.cfg.AdminToken != "" && subtle.ConstantTimeCompare([]byte(strings.TrimSpace(a[7:])), []byte(s.o.cfg.AdminToken)) == 1
 	}
 	return sessionOK, headerOK
 }
@@ -164,6 +191,13 @@ func (s *Server) adminAuth(r *http.Request) (sessionOK, headerOK bool) {
 // header) it returns 200 without checking the token, so the WebUI can probe
 // session liveness with a plain GET-style POST of nothing.
 func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	hasAdmin, adminErr := s.adminPasswordState()
+	probe := map[string]any{"password_enabled": hasAdmin, "bootstrap_needed": !hasAdmin}
+	if adminErr != nil {
+		writeAPIErr(w, errBody(503, "管理员状态暂不可用", "server_error"))
+		return
+	}
 	body, err := readJSON(r)
 	if err != nil && err != io.EOF {
 		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").body)
@@ -173,7 +207,7 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	// the WebUI must skip login. The probe (empty body) reports that state as
 	// ok:true/no_login rather than an error, so the frontend never shows the
 	// login page in this mode.
-	if s.o.cfg.AdminToken == "" {
+	if s.o.cfg.AdminToken == "" && !hasAdmin {
 		if len(body) == 0 {
 			writeJSON(w, 200, map[string]any{"ok": true, "probe": true, "no_login": true})
 			return
@@ -185,20 +219,43 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	// get ok + csrf-free status without consuming a rate-limit slot.
 	if len(body) == 0 {
 		if sessionOK, headerOK := s.adminAuth(r); sessionOK || headerOK {
-			writeJSON(w, 200, map[string]any{"ok": true, "probe": true})
+			probe["ok"] = true
+			probe["probe"] = true
+			writeJSON(w, 200, probe)
 			return
 		}
-		writeJSON(w, 401, map[string]any{"ok": false, "probe": true})
+		probe["ok"] = false
+		probe["probe"] = true
+		writeJSON(w, 401, probe)
 		return
 	}
 	// Real login: rate-limit, constant-time compare, issue cookie.
 	token, _ := body["token"].(string)
-	if subtle.ConstantTimeCompare([]byte(token), []byte(s.o.cfg.AdminToken)) != 1 {
+	var userID int64
+	var passwordHash string
+	valid := token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.o.cfg.AdminToken)) == 1
+	if username, ok := body["username"].(string); ok && token == "" {
+		password, _ := body["password"].(string)
+		if !s.loginLimiter.allow("user:" + strings.ToLower(strings.TrimSpace(username))) {
+			writeAPIErr(w, localOverload("login_attempts"))
+			return
+		}
+		u, rawSession, err := portalauth.Login(s.o.db, username, password)
+		if rawSession != "" {
+			portalauth.Logout(s.o.db, rawSession)
+		}
+		if err == nil && u != nil && u.Role == "admin" {
+			valid = true
+			userID = u.ID
+			passwordHash = u.PasswordHash
+		}
+	}
+	if !valid {
 		time.Sleep(200 * time.Millisecond) // blunt brute-force cost
-		writeJSON(w, 401, map[string]any{"ok": false, "message": "Token 无效"})
+		writeJSON(w, 401, map[string]any{"ok": false, "message": "管理员凭据无效"})
 		return
 	}
-	value := s.sessions.create()
+	value := s.sessions.createForUser(userID, passwordHash)
 	http.SetCookie(w, &http.Cookie{
 		Name:     cookieName,
 		Value:    value,
@@ -231,4 +288,25 @@ func clientIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// Forwarded identity is accepted only from explicitly trusted immediate peers.
+func (s *Server) rateLimitIP(r *http.Request) string {
+	peer := net.ParseIP(clientIP(r))
+	for _, raw := range strings.Split(s.o.cfg.TrustedProxyCIDRs, ",") {
+		_, network, err := net.ParseCIDR(strings.TrimSpace(raw))
+		if err == nil && peer != nil && network.Contains(peer) {
+			if ip := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); ip != nil {
+				return ip.String()
+			}
+		}
+	}
+	return clientIP(r)
+}
+
+func (s *Server) adminPasswordState() (bool, error) {
+	if s.o.db == nil {
+		return false, nil
+	}
+	return s.o.db.HasAdminUser()
 }

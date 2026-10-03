@@ -34,6 +34,7 @@ export interface AccountInfo {
 }
 
 export interface Settings {
+  portal_disabled_models?: string
   checkin_hours: string
   credit_refresh_min: string
   model_refresh_hour: string

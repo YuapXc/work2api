@@ -5,7 +5,7 @@
  */
 export default {
   darkMode: 'class',
-  content: ['./index.html', './src/**/*.{vue,ts}'],
+  content: ['./index.html', './portal.html', './src/**/*.{vue,ts}', './src-portal/**/*.{vue,ts}'],
   theme: {
     extend: {
       colors: {

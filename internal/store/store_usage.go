@@ -101,6 +101,9 @@ type UsageParams struct {
 	Credits          *float64
 	AppName          string
 	ReasoningEffort  string
+	// UserID attributes the row to a portal user (0 = private/admin key).
+	UserID int64
+	AppID  int64
 }
 
 // LogUsage inserts one usage record.
@@ -121,16 +124,20 @@ func (d *DB) LogUsage(p UsageParams) error {
 	if p.CachedTokens != nil {
 		cached = *p.CachedTokens
 	}
+	var userID any
+	if p.UserID != 0 {
+		userID = p.UserID
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	_, err := d.db.Exec(
 		`INSERT INTO usage_logs (ts, model, protocol, account_uid, input_tokens, output_tokens,
 		   total_tokens, latency_ms, status, error, input_content, output_content,
-		   reasoning_content, credits, app_name, user_id, reasoning_effort, tokens_known, cached_tokens)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		   reasoning_content, credits, app_name, user_id, reasoning_effort, tokens_known, cached_tokens, app_id)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		float64(time.Now().UnixNano())/1e9, p.Model, p.Protocol, p.AccountUID,
 		p.InputTokens, p.OutputTokens, total, p.LatencyMs, p.Status, p.Error,
-		p.InputContent, p.OutputContent, p.ReasoningContent, credits, p.AppName, nil, effort, p.TokensKnown, cached)
+		p.InputContent, p.OutputContent, p.ReasoningContent, credits, p.AppName, userID, effort, p.TokensKnown, cached, nullableID(p.AppID))
 	return err
 }
 

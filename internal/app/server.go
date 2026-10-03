@@ -21,18 +21,56 @@ type Server struct {
 	// sessions). In-memory only: restart signs everyone out.
 	sessions                                                    *adminSessionManager
 	loginLimiter                                                *loginRateLimiter
+	portalLoginLimiter                                          *loginRateLimiter
+	portalSlots                                                 chan struct{}
 	modelsAdmission                                             *modelAdmission
 	adminSlots, heavySlots, querySlots, bodySlots, refreshSlots chan struct{}
 	bodies                                                      *bodyBudget
 	refreshMu                                                   sync.Mutex
 	refreshes                                                   map[string]*refreshFlight
+	// 用户门户状态（HANDOFF §8）：扫码任务表（内存，带 TTL）与每用户轮询限频。
+	portalMu          sync.Mutex
+	portalTasks       map[string]*portalContributionTask
+	portalPollMu      sync.Mutex
+	portalPollLimiter map[int64]*pollLimiter
+}
+
+// portalUserKey keys the authenticated portal user in the request context.
+type portalUserKey struct{}
+
+// pollLimiter is a fixed-window per-user rate limit for contribution polling
+// (roughly 1 req/s sustained is plenty for a device-flow status check).
+type pollLimiter struct {
+	mu     sync.Mutex
+	window int64
+	count  int
+}
+
+const pollLimitPerWindow = 5 // per 10s window
+
+func newPollLimiter() *pollLimiter { return &pollLimiter{} }
+
+func (p *pollLimiter) allow() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	w := time.Now().Unix() / 10
+	if p.window != w {
+		p.window = w
+		p.count = 0
+	}
+	if p.count >= pollLimitPerWindow {
+		return false
+	}
+	p.count++
+	return true
 }
 
 type principalContextKey struct{}
 
 // NewServer builds the HTTP server.
 func NewServer(o *Orchestrator) *Server {
-	return &Server{o: o, sessions: newAdminSessionManager(), loginLimiter: newLoginRateLimiter(),
+	return &Server{o: o, sessions: newAdminSessionManager(), loginLimiter: newLoginRateLimiter(), portalLoginLimiter: newLoginRateLimiter(), portalSlots: make(chan struct{}, 8),
+		portalTasks: map[string]*portalContributionTask{}, portalPollLimiter: map[int64]*pollLimiter{},
 		modelsAdmission: newModelAdmission(o.cfg), adminSlots: make(chan struct{}, positiveOr(o.cfg.AdminConcurrency, 8)), heavySlots: make(chan struct{}, positiveOr(o.cfg.HeavyAdminConcurrency, 2)), querySlots: make(chan struct{}, positiveOr(o.cfg.QueryConcurrency, 4)), bodySlots: make(chan struct{}, positiveOr(o.cfg.BodyReadConcurrency, 4)), bodies: &bodyBudget{limit: int64(positiveOr(int(o.cfg.RequestBodyBudget), 32<<20))}, refreshSlots: make(chan struct{}, 8), refreshes: map[string]*refreshFlight{}}
 }
 
@@ -46,8 +84,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/messages/count_tokens", s.handleCountTokens)
 	mux.HandleFunc("POST /v1/responses", s.handleResponses)
 	s.mountAdmin(mux)
+	s.mountPortal(mux)
 	s.mountWebUI(mux)
-	return s.hostGuard(s.adminGuard(s.requestGuard(mux)))
+	return s.hostGuard(s.adminGuard(s.portalGuard(s.requestGuard(mux))))
 }
 
 // Bound admission and finish reading bodies before opening a long-lived SSE
@@ -55,6 +94,8 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) requestGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/v1/") {
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Vary", "Authorization, X-Api-Key")
 			principal, aerr := s.auth(r)
 			if aerr != nil {
 				writeAPIErr(w, aerr)
@@ -87,9 +128,9 @@ func (s *Server) requestGuard(next http.Handler) http.Handler {
 				return
 			}
 		}
-		if r.URL.Path == "/admin/login" && s.o.cfg.AdminToken != "" {
+		if r.URL.Path == "/admin/login" {
 			sessionOK, headerOK := s.adminAuth(r)
-			if !sessionOK && !headerOK && !s.loginLimiter.allow(clientIP(r)) {
+			if !sessionOK && !headerOK && !s.loginLimiter.allow(s.rateLimitIP(r)) {
 				writeJSON(w, 429, errBody(429, "尝试次数过多，请 10 分钟后再试", "rate_limit_error").body)
 				return
 			}
@@ -99,7 +140,7 @@ func (s *Server) requestGuard(next http.Handler) http.Handler {
 			if limit <= 0 {
 				limit = 16 * 1024 * 1024
 			}
-			if r.URL.Path == "/admin/login" {
+			if r.URL.Path == "/admin/login" || strings.HasPrefix(r.URL.Path, "/portal/api/") {
 				limit = 8 * 1024
 			}
 			if r.ContentLength > limit {
@@ -172,6 +213,7 @@ func (s *Server) adminGuard(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		w.Header().Set("Cache-Control", "no-store")
 		if r.URL.Path == "/admin/login" || r.URL.Path == "/admin/logout" {
 			if !s.adminOriginAllowed(r, false) {
 				writeJSON(w, 403, errBody(403, "拒绝跨源管理请求", "forbidden").body)
@@ -181,7 +223,12 @@ func (s *Server) adminGuard(next http.Handler) http.Handler {
 			return
 		}
 		token := s.o.cfg.AdminToken
-		if token == "" {
+		hasAdmin, stateErr := s.adminPasswordState()
+		if stateErr != nil {
+			writeAPIErr(w, errBody(503, "管理员状态暂不可用", "server_error"))
+			return
+		}
+		if token == "" && !hasAdmin {
 			// Loopback check MUST use the peer address (r.RemoteAddr), not the
 			// Host header: the header is client-controlled, so a remote
 			// attacker could send "Host: 127.0.0.1" and walk straight in when
@@ -303,7 +350,13 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		if real, ok := aliases[id]; ok {
 			resolved = real
 		}
-		if !modelAllowed(principal, id, resolved) {
+		// Portal keys see exactly the shared scope (deny by default); private
+		// keys keep the unrestricted-catalog behavior.
+		if principal.UserID > 0 {
+			if !s.portalModelAllowed(principal, id, resolved) {
+				continue
+			}
+		} else if !modelAllowed(principal, id, resolved) {
 			continue
 		}
 		clean := map[string]any{}

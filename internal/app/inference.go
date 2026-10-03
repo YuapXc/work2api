@@ -23,10 +23,21 @@ type logArgs struct {
 	input, output   string
 	reasoning       string
 	appName, effort string
+	userID          int64
+	appID           int64
+	quota           *portalQuotaReservation
 	updatePool      bool
 }
 
 func (o *Orchestrator) logUsage(a logArgs) {
+	if a.quota != nil && a.status == "ok" {
+		a.quota.observe(a.usage)
+	}
+	if a.userID > 0 {
+		a.input = ""
+		a.output = ""
+		a.reasoning = ""
+	}
 	if a.acc != nil && a.updatePool {
 		if a.status == "ok" {
 			o.pool.OnSuccess(a.acc.UID)
@@ -39,6 +50,7 @@ func (o *Orchestrator) logUsage(a logArgs) {
 		}
 	}
 	inTok, outTok := usageTokens(a.usage)
+	known := usageCountsKnown(a.usage)
 	var credits *float64
 	if a.usage != nil {
 		if c, ok := a.usage["credit"].(float64); ok {
@@ -58,6 +70,7 @@ func (o *Orchestrator) logUsage(a logArgs) {
 		Protocol:         a.protocol,
 		AccountUID:       uid,
 		InputTokens:      inTok,
+		TokensKnown:      &known,
 		OutputTokens:     outTok,
 		CachedTokens:     usageCachedTokens(a.usage),
 		LatencyMs:        float64(time.Since(a.t0).Milliseconds()),
@@ -68,6 +81,8 @@ func (o *Orchestrator) logUsage(a logArgs) {
 		ReasoningContent: clipContent(a.reasoning, o.cfg.UsageContentMaxBytes),
 		Credits:          credits,
 		AppName:          a.appName,
+		UserID:           a.userID,
+		AppID:            a.appID,
 		ReasoningEffort:  effort,
 	})
 }
@@ -87,6 +102,25 @@ func clipContent(s string, max int) string {
 
 func usageTokens(u map[string]any) (int, int) {
 	return tokenusage.Totals(u)
+}
+
+func usageCountsKnown(u map[string]any) bool {
+	valid := func(keys ...string) bool {
+		for _, key := range keys {
+			switch n := u[key].(type) {
+			case int:
+				if n >= 0 {
+					return true
+				}
+			case float64:
+				if n >= 0 && n < 1e12 && n == float64(int64(n)) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return valid("prompt_tokens", "input_tokens") && valid("completion_tokens", "output_tokens")
 }
 
 // Missing fields remain unknown; raw numeric anomalies are kept for diagnosis.

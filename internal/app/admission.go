@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,7 @@ type modelTicket struct {
 	limit          int
 	ready, running bool
 	since          time.Time
+	shared         bool
 }
 
 // A single bounded queue rotates between authenticated applications. Parked
@@ -28,6 +30,7 @@ type modelAdmission struct {
 	wait                          time.Duration
 	limits                        map[string]int
 	active                        int
+	sharedActive, sharedCapacity  int
 	byKey                         map[string]int
 	queue                         []*modelTicket
 	served                        map[string]uint64
@@ -59,6 +62,13 @@ func newModelAdmission(c *config.Config) *modelAdmission {
 			a.limits = map[string]int{}
 		}
 	}
+	a.sharedCapacity = positiveOr(c.PortalSharedConcurrency, 3)
+	if a.capacity > 1 && a.sharedCapacity >= a.capacity {
+		a.sharedCapacity = a.capacity - 1
+	}
+	if a.sharedCapacity > a.capacity {
+		a.sharedCapacity = a.capacity
+	}
 	return a
 }
 
@@ -74,7 +84,7 @@ func (a *modelAdmission) dispatchLocked() {
 	for a.active < a.capacity {
 		pick := -1
 		for i, t := range a.queue {
-			if !t.ready || a.byKey[t.key] >= t.limit {
+			if !t.ready || a.byKey[t.key] >= t.limit || (t.shared && a.sharedActive >= a.sharedCapacity) {
 				continue
 			}
 			if pick < 0 || a.served[t.key] < a.served[a.queue[pick].key] {
@@ -88,6 +98,9 @@ func (a *modelAdmission) dispatchLocked() {
 		a.queue = append(a.queue[:pick], a.queue[pick+1:]...)
 		t.running = true
 		a.active++
+		if t.shared {
+			a.sharedActive++
+		}
 		a.byKey[t.key]++
 		a.sequence++
 		a.served[t.key] = a.sequence
@@ -114,6 +127,14 @@ func (a *modelAdmission) enqueueLocked(t *modelTicket) *apiError {
 }
 
 func (a *modelAdmission) acquire(ctx context.Context, key string) (*modelLease, error) {
+	return a.acquireWithLimit(ctx, key, 0)
+}
+
+// acquireWithLimit admits under an explicit per-key concurrency cap (0 = use
+// the configured MODEL_KEY_CONCURRENCY_LIMITS entry or global capacity). The
+// portal user path passes PortalUserConcurrency so several keys of one user
+// share a single cap.
+func (a *modelAdmission) acquireWithLimit(ctx context.Context, key string, limitOverride int) (*modelLease, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -121,14 +142,20 @@ func (a *modelAdmission) acquire(ctx context.Context, key string) (*modelLease, 
 	if n := a.limits[key]; n > 0 && n < limit {
 		limit = n
 	}
-	t := &modelTicket{key: key, limit: limit, ready: true, since: time.Now()}
+	if limitOverride > 0 && limitOverride < limit {
+		limit = limitOverride
+	}
+	t := &modelTicket{key: key, limit: limit, ready: true, since: time.Now(), shared: strings.HasPrefix(key, "portal-user-")}
 	l := &modelLease{a: a, t: t, remaining: a.wait}
 	a.mu.Lock()
 	// Existing runnable waiters always get first chance.
 	a.dispatchLocked()
-	if a.active < a.capacity && a.byKey[key] < limit {
+	if a.active < a.capacity && a.byKey[key] < limit && (!t.shared || a.sharedActive < a.sharedCapacity) {
 		t.running = true
 		a.active++
+		if t.shared {
+			a.sharedActive++
+		}
 		a.byKey[key]++
 		a.sequence++
 		a.served[key] = a.sequence
@@ -147,6 +174,9 @@ func (l *modelLease) removeLocked() {
 	a, t := l.a, l.t
 	if t.running {
 		a.active--
+		if t.shared {
+			a.sharedActive--
+		}
 		a.byKey[t.key]--
 		if a.byKey[t.key] == 0 {
 			delete(a.byKey, t.key)
@@ -227,6 +257,9 @@ func (l *modelLease) throttle(ctx context.Context, wait func(context.Context) er
 		return err
 	}
 	a.active--
+	if l.t.shared {
+		a.sharedActive--
+	}
 	a.byKey[l.t.key]--
 	if a.byKey[l.t.key] == 0 {
 		delete(a.byKey, l.t.key)
@@ -287,6 +320,21 @@ func (s *Server) admitModel(w http.ResponseWriter, r *http.Request, p *Principal
 	if p.AppName == "model-test" && p.AppID == 0 {
 		key = "admin-test"
 	}
+	// 门户 Key 的并发上限按用户计（PORTAL_USER_CONCURRENCY，默认 1）：同一
+	// 用户多个 Key 共享一个并发槽，跨 Key 合并限流（HANDOFF §8）。
+	if p.UserID > 0 {
+		key = "portal-user-" + strconv.FormatInt(p.UserID, 10)
+		l, err := s.modelsAdmission.acquireWithLimit(r.Context(), key, positiveOr(s.o.cfg.PortalUserConcurrency, 1))
+		if err != nil {
+			st, body := errToHTTP(err)
+			if st == 429 {
+				w.Header().Set("Retry-After", "2")
+			}
+			writeJSON(w, st, body)
+			return r, func() {}, false
+		}
+		return s.finishAdmit(w, r, l)
+	}
 	l, err := s.modelsAdmission.acquire(r.Context(), key)
 	if err != nil {
 		st, body := errToHTTP(err)
@@ -296,6 +344,14 @@ func (s *Server) admitModel(w http.ResponseWriter, r *http.Request, p *Principal
 		writeJSON(w, st, body)
 		return r, func() {}, false
 	}
+	w.Header().Set("X-Queue-Wait-Ms", strconv.FormatInt(time.Since(l.t.since).Milliseconds(), 10))
+	ctx := streamwatch.WithResponseLimit(r.Context(), int64(positiveOr(int(s.o.cfg.MaxResponseBytes), 8<<20)))
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	return r.WithContext(context.WithValue(ctx, modelLeaseKey{}, l)), func() { cancel(); l.release(); _ = http.NewResponseController(w).SetWriteDeadline(time.Time{}) }, true
+}
+
+// finishAdmit is the tail shared by both admission paths (headers + context).
+func (s *Server) finishAdmit(w http.ResponseWriter, r *http.Request, l *modelLease) (*http.Request, func(), bool) {
 	w.Header().Set("X-Queue-Wait-Ms", strconv.FormatInt(time.Since(l.t.since).Milliseconds(), 10))
 	ctx := streamwatch.WithResponseLimit(r.Context(), int64(positiveOr(int(s.o.cfg.MaxResponseBytes), 8<<20)))
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)

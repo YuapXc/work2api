@@ -291,13 +291,16 @@ func TestFourRealSSEHandlersLeaveManagementUsable(t *testing.T) {
 	o.upstreamClient = h
 	s := NewServer(o)
 	done := make(chan struct{}, 4)
+	if _, err := o.db.CreateApp("test", o.hashKey("test-private-key"), "", "", "", "", 0); err != nil {
+		t.Fatal(err)
+	}
 	var cancels []context.CancelFunc
 	for i := 0; i < 4; i++ {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancels = append(cancels, cancel)
 		defer cancel()
-		ctx = context.WithValue(ctx, principalContextKey{}, &Principal{AppID: 1, AppName: "test"})
 		r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"auto","messages":[{"role":"user","content":"hi"}],"stream":true}`)).WithContext(ctx)
+		r.Header.Set("Authorization", "Bearer test-private-key")
 		go func() {
 			s.requestGuard(http.HandlerFunc(s.handleChat)).ServeHTTP(httptest.NewRecorder(), r)
 			done <- struct{}{}

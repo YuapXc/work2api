@@ -478,7 +478,7 @@ func (s *Server) adminCreateApp(w http.ResponseWriter, r *http.Request) {
 	}
 	key := s.o.genAPIKey()
 	enc, _ := s.o.crypto.Encrypt(key)
-	id, err := s.o.db.CreateApp(name, s.o.hashKey(key), key[:min(10, len(key))]+"…", note, enc, allowed)
+	id, err := s.o.db.CreateApp(name, s.o.hashKey(key), key[:min(10, len(key))]+"…", note, enc, allowed, 0)
 	if err != nil {
 		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
 		return
@@ -833,10 +833,21 @@ func (s *Server) adminGetSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) adminSaveSettings(w http.ResponseWriter, r *http.Request) {
-	body, _ := readJSON(r)
+	body, err := readJSON(r)
+	if err != nil {
+		writeAPIErr(w, errBody(400, "请求体格式错误", "invalid_request_error"))
+		return
+	}
 	kv := map[string]string{}
 	for k, v := range body {
 		kv[k] = toStrLoose(v)
+	}
+	if raw, present := kv["portal_disabled_models"]; present {
+		var models []string
+		if json.Unmarshal([]byte(raw), &models) != nil || models == nil {
+			writeAPIErr(w, errBody(400, "禁用模型必须是 JSON 字符串数组", "invalid_request_error"))
+			return
+		}
 	}
 	// 勾选「清除已保存的密钥」时前端不再发 aa_api_key，这里显式清空。
 	if b, ok := body["clear_aa_api_key"].(bool); ok && b {

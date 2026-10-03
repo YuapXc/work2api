@@ -452,10 +452,24 @@ func (p *Pool) ClearCooldown(uid string) {
 // AddAccount registers an account, hot-updating credentials if it exists.
 // Returns true if newly added.
 func (p *Pool) AddAccount(uid string, mgr Credential) bool {
+	return p.addAccount(uid, mgr, false)
+}
+
+// AddAccountDisabled prevents a new contribution becoming schedulable before
+// its ownership and group transaction has committed.
+func (p *Pool) AddAccountDisabled(uid string, mgr Credential) bool {
+	return p.addAccount(uid, mgr, true)
+}
+
+func (p *Pool) addAccount(uid string, mgr Credential, disabled bool) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, a := range p.accounts {
 		if a.UID == uid {
+			if disabled {
+				a.Enabled = false
+				a.DisabledReason = "贡献验证中"
+			}
 			a.Mgr = mgr
 			a.Profile = safeProfile(mgr)
 			if s := mgr.Summary(); s != nil {
@@ -466,7 +480,12 @@ func (p *Pool) AddAccount(uid string, mgr Credential) bool {
 			return false
 		}
 	}
-	p.accounts = append(p.accounts, newAccount(uid, mgr))
+	a := newAccount(uid, mgr)
+	if disabled {
+		a.Enabled = false
+		a.DisabledReason = "贡献验证中"
+	}
+	p.accounts = append(p.accounts, a)
 	return true
 }
 

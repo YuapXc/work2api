@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"log"
 	"strconv"
@@ -44,11 +45,21 @@ func errBody(status int, message, typ string) *apiError {
 
 // Principal is the authenticated application. AllowedModels is the per-key
 // model allowlist (nil = unrestricted); enforced in authorizeModel before any
-// upstream dispatch.
+// upstream dispatch. Portal fields (HANDOFF §7): UserID > 0 marks a portal
+// user's key; AccountScope is the user's shared-group account UIDs (scheduling
+// restricted to that set, never falling back to the private pool); PortalModels
+// is the group ∩ eligibility ∩ −disabled model set. PortalModels nil on a
+// portal key = no permission at all; that is a DIFFERENT meaning from a private
+// key's empty AllowedModels ("unrestricted"), so the two never conflate.
 type Principal struct {
 	AppName       string
 	AppID         int64
 	AllowedModels []string
+	UserID        int64
+	AccountScope  map[string]bool
+	PortalModels  map[string]bool
+	ModelScopes   map[string]map[string]bool
+	quota         *portalQuotaReservation
 }
 
 type upstreamStreamer interface {
@@ -162,6 +173,10 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 		creds[uid] = mgr
 	}
 	o.pool = pool.New(creds, projectAuths)
+	contributions, err := db.ListContributions()
+	if err != nil {
+		return nil, err
+	}
 	if rows, err := db.ListAccounts(); err == nil {
 		for _, row := range rows {
 			uid, _ := row["uid"].(string)
@@ -182,6 +197,11 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 				}
 				o.pool.SetEnabled(uid, false, reason)
 			}
+		}
+	}
+	for _, c := range contributions {
+		if c.Status != "active" {
+			o.pool.SetEnabled(c.AccountUID, false, "共享贡献不可用")
 		}
 	}
 	o.models = models.New(o.pool, db)
@@ -234,16 +254,139 @@ func (o *Orchestrator) checkAPIKey(authorization, xAPIKey string) (*Principal, *
 	}
 	name, _ := app["name"].(string)
 	id, _ := app["id"].(int64)
-	allowed, _ := o.db.AllowedModelsOf(id)
-	return &Principal{AppName: name, AppID: id, AllowedModels: allowed}, nil
+	userID, _ := app["user_id"].(int64)
+	allowed, err := o.db.AllowedModelsOf(id)
+	if err != nil {
+		return nil, errBody(503, "密钥权限查询失败", "server_error")
+	}
+	p := &Principal{AppName: name, AppID: id, AllowedModels: allowed, UserID: userID}
+	if userID > 0 {
+		if aerr := o.attachPortalScope(p); aerr != nil {
+			return nil, aerr
+		}
+	}
+	return p, nil
+}
+
+// attachPortalScope computes the scheduling scope and permission model set for
+// a portal user's key (HANDOFF §6/§7). Called on every authenticated request:
+// group accounts and eligibility come from SQLite (hot path OK — GetSettings
+// memoization pattern aside, these are two small indexed queries), and a
+// revoked contribution or disabled group takes effect immediately without any
+// cache invalidation.
+func (o *Orchestrator) attachPortalScope(p *Principal) *apiError {
+	if !o.cfg.PortalEnabled {
+		return errBody(403, "共享服务已关闭", "portal_disabled")
+	}
+	user, err := o.db.GetUser(p.UserID)
+	if err != nil || user == nil || user.Status != "active" {
+		return errBody(403, "账号不可用，请联系管理员", "portal_user_disabled")
+	}
+	eligible, err := o.db.ActiveContributionUIDs(p.UserID)
+	if err != nil {
+		return errBody(500, "资格查询失败", "server_error")
+	}
+	// 资格为空必须拒绝，不能转换成"不受限制"的 Principal（HANDOFF §7）。
+	if len(eligible) == 0 {
+		return errBody(403, "当前没有有效的共享贡献，无法使用模型接口。请在门户完成账号贡献后重试", "portal_no_eligibility")
+	}
+	// Eligibility interacts with the group scope: an account that left all
+	// enabled groups or whose contribution was revoked drops out here.
+	p.AccountScope = map[string]bool{}
+	p.ModelScopes = map[string]map[string]bool{}
+	models := map[string]bool{}
+	settings, err := o.db.GetSettings()
+	if err != nil {
+		return errBody(503, "模型权限查询失败", "server_error")
+	}
+	aliases := parseModelAliases(settings["model_aliases"])
+	resolve := func(m string) string {
+		if target, ok := aliases[m]; ok {
+			return target
+		}
+		return m
+	}
+	disabled := map[string]bool{}
+	for _, m := range parseJSONStringArray(settings["portal_disabled_models"]) {
+		disabled[m] = true
+		disabled[resolve(m)] = true
+	}
+	grants, err := o.db.GrantedGroups(p.UserID)
+	if err != nil {
+		return errBody(500, "资格查询失败", "server_error")
+	}
+	configured := false
+	for _, g := range grants {
+		if !g.Enabled || g.Provider != "workbuddy" {
+			continue
+		}
+		// 未配置共享模型范围的分组保持关闭（HANDOFF §2）：空串 = 未配置。
+		if strings.TrimSpace(g.AllowedModels) == "" {
+			continue
+		}
+		configured = true
+		uids, err := o.db.GroupAccountUIDsWithActiveContribution(g.ID)
+		if err != nil {
+			return errBody(503, "共享账户查询失败", "server_error")
+		}
+		for _, m := range parseJSONStringArray(g.AllowedModels) {
+			resolved := resolve(m)
+			if disabled[m] || disabled[resolved] || resolved == "auto" || strings.Contains(resolved, "/") {
+				continue
+			}
+			models[resolved] = true
+			if p.ModelScopes[resolved] == nil {
+				p.ModelScopes[resolved] = map[string]bool{}
+			}
+			for _, uid := range uids {
+				p.ModelScopes[resolved][uid] = true
+			}
+		}
+	}
+	if !configured {
+		return errBody(403, "共享模型范围尚未配置，公共模型调用保持关闭", "portal_models_not_configured")
+	}
+	// 管理员禁用模型从允许集中扣除：disabled_reason 标记的账号只是账号级冷却；
+	// 模型禁用由管理端 settings 维护的 portal_disabled_models 列表承担。
+	p.PortalModels = models
+	return nil
+}
+
+// parseJSONStringArray decodes a stored JSON array of strings, returning nil
+// for garbage (display/config values, never auth-critical alone).
+func parseJSONStringArray(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	if json.Unmarshal([]byte(raw), &out) != nil {
+		return nil
+	}
+	return out
 }
 
 // authorizeModel enforces the principal's per-key model allowlist. The model
 // is checked as-requested AND alias-resolved, so a key allowing "gpt" permits
 // calls made via that alias, and a key listing real ids permits aliases resolving
-// to those ids. Empty allowlist = unrestricted.
+// to those ids. Empty allowlist = unrestricted (private keys only — a portal
+// key is separately gated by PortalModels, and portal authorization is deny by
+// default). Retry/failover must not widen this: both paths share modelAllowed.
 func (s *Server) authorizeModel(principal *Principal, requestedModel string) *apiError {
-	if principal == nil || len(principal.AllowedModels) == 0 {
+	if principal == nil {
+		return nil
+	}
+	if principal.UserID > 0 {
+		model := strings.TrimSpace(requestedModel)
+		if model == "" {
+			model = "auto"
+		}
+		if !s.portalModelAllowed(principal, model, s.o.resolveModel(model)) {
+			return errBody(403, "该模型不在共享范围或当前资格不允许（模型："+model+"）", "model_not_allowed")
+		}
+		return nil
+	}
+	if len(principal.AllowedModels) == 0 {
 		return nil
 	}
 	model := strings.TrimSpace(requestedModel)
@@ -254,6 +397,28 @@ func (s *Server) authorizeModel(principal *Principal, requestedModel string) *ap
 		return nil
 	}
 	return errBody(403, "该 API 密钥未被授权使用模型 "+model+"（可在 WebUI「API 密钥」中调整可用模型）", "model_not_allowed")
+}
+
+// portalModelAllowed applies HANDOFF §7: 分组 ∩ 资格 ∩ Key 白名单 − 禁用.
+// PortalModels already carries group∩eligibility−disabled; the key allowlist
+// narrows further. Deny by default: a portal principal with no PortalModels
+// permits nothing.
+func (s *Server) portalModelAllowed(principal *Principal, model, resolved string) bool {
+	if principal == nil || principal.PortalModels == nil {
+		return false
+	}
+	if !principal.PortalModels[resolved] || resolved == "auto" || strings.Contains(resolved, "/") {
+		return false
+	}
+	if len(principal.AllowedModels) == 0 {
+		return false
+	}
+	for _, allowed := range principal.AllowedModels {
+		if s.o.resolveModel(allowed) == resolved {
+			return true
+		}
+	}
+	return false
 }
 
 // modelAllowed shares the same requested-id/alias-target policy between
@@ -286,7 +451,25 @@ func (s *Server) prepareModel(principal *Principal, payload map[string]any) *api
 	}
 	if model == "" {
 		model = "auto"
-		if principal != nil {
+		if principal != nil && principal.UserID > 0 {
+			// Portal keys: auto is a real WorkBuddy model and must not act as an
+			// implicit fallback (HANDOFF §7). Exactly one permitted model → use
+			// it; zero or multiple → require explicit model.
+			allowed := map[string]bool{}
+			for m := range principal.PortalModels {
+				if s.portalModelAllowed(principal, m, s.o.resolveModel(m)) {
+					allowed[m] = true
+				}
+			}
+			switch len(allowed) {
+			case 1:
+				for m := range allowed {
+					model = m
+				}
+			default:
+				return errBody(400, "请明确指定 model（可通过 /v1/models 查询可用模型）", "invalid_request_error")
+			}
+		} else if principal != nil {
 			switch len(principal.AllowedModels) {
 			case 1:
 				model = principal.AllowedModels[0]
@@ -298,7 +481,16 @@ func (s *Server) prepareModel(principal *Principal, payload map[string]any) *api
 		}
 	}
 	payload["model"] = model
-	return s.authorizeModel(principal, model)
+	if aerr := s.authorizeModel(principal, model); aerr != nil {
+		return aerr
+	}
+	if principal != nil && principal.UserID > 0 {
+		principal.AccountScope = principal.ModelScopes[s.o.resolveModel(model)]
+		if principal.AccountScope == nil {
+			principal.AccountScope = map[string]bool{}
+		}
+	}
+	return nil
 }
 
 func (o *Orchestrator) limiter(uid string) *ratelimit.Limiter {
@@ -405,6 +597,17 @@ func (o *Orchestrator) modelAccountUIDs(model string) (map[string]bool, *apiErro
 	return out, nil
 }
 
+// pickAccountFor returns the account picker entry point for a principal.
+// Portal principals schedule ONLY inside their shared-group scope (HANDOFF §7
+// 池隔离): failure/rotation/cooldowns stay within that candidate set and can
+// never fall back to the private pool.
+func (s *Server) pickAccountFor(principal *Principal, model, sessionKey string) (*pool.Account, *apiError) {
+	if principal != nil && principal.UserID > 0 {
+		return s.o.pickAccountExcludingIn(model, sessionKey, nil, principal.AccountScope)
+	}
+	return s.o.pickAccount(model, sessionKey)
+}
+
 func (o *Orchestrator) pickAccount(model, sessionKey string) (*pool.Account, *apiError) {
 	return o.pickAccountExcluding(model, sessionKey, nil)
 }
@@ -413,6 +616,17 @@ func (o *Orchestrator) pickAccount(model, sessionKey string) (*pool.Account, *ap
 // from the ready candidates, so failover can rotate through fresh accounts until
 // the candidate set is exhausted. tried nil = first pick (no exclusions).
 func (o *Orchestrator) pickAccountExcluding(model, sessionKey string, tried map[string]bool) (*pool.Account, *apiError) {
+	return o.pickAccountExcludingIn(model, sessionKey, tried, nil)
+}
+
+// pickAccountExcludingIn is pickAccountExcluding with an optional UID scope
+// (nil = whole pool). Portal principals pass AccountScope so neither the
+// initial pick nor any failover rotation can leave the shared pool (HANDOFF
+// §7 池隔离).
+func (o *Orchestrator) pickAccountExcludingIn(model, sessionKey string, tried map[string]bool, scope map[string]bool) (*pool.Account, *apiError) {
+	if scope != nil {
+		return o.pickInScope(model, sessionKey, tried, scope)
+	}
 	allowed, aerr := o.modelAccountUIDs(model)
 	if aerr != nil {
 		return nil, aerr
@@ -460,6 +674,44 @@ func (o *Orchestrator) pickAccountExcluding(model, sessionKey string, tried map[
 		o.sessions.bind(sessionKey, acc.UID)
 	}
 	return acc, nil
+}
+
+// pickInScope is the scoped candidate filter (portal shared pool): the same
+// pick pipeline but candidates ∩ scope from the start, so a portal request
+// never touches a private account — including via failover rotation.
+func (o *Orchestrator) pickInScope(model, sessionKey string, tried map[string]bool, scope map[string]bool) (*pool.Account, *apiError) {
+	allowed, aerr := o.modelAccountUIDs(model)
+	if aerr != nil {
+		return nil, aerr
+	}
+	if len(allowed) == 0 {
+		return nil, errBody(503, "共享池中模型 "+model+" 暂无可用账号，请稍后重试", "model_unavailable")
+	}
+	ready := map[string]bool{}
+	now := nowSec()
+	for uid := range allowed {
+		if tried[uid] || !scope[uid] {
+			continue
+		}
+		if o.modelCooldownUntil(uid, model) <= 0+now {
+			ready[uid] = true
+		}
+	}
+	if len(ready) == 0 {
+		return nil, errPoolExhausted(model, tried)
+	}
+	acc := o.pool.Pick(ready, o.modelCostByUID(model, ready), o.expiryWindowDays())
+	if acc == nil {
+		return nil, errPoolExhausted(model, nil)
+	}
+	return acc, nil
+}
+
+func errPoolExhausted(model string, tried map[string]bool) *apiError {
+	if len(tried) > 0 {
+		return errBody(503, "共享池中模型 "+model+" 的可用账号均已尝试或冷却", "auth_error")
+	}
+	return errBody(503, "共享池中模型 "+model+" 暂无可用账号（冷却或额度耗尽），请稍后重试", "auth_error")
 }
 
 // modelCostByUID maps each ready account UID to its per-model cost coefficient
@@ -582,6 +834,11 @@ func (o *Orchestrator) runOnce(ctx context.Context, acc *pool.Account, body map[
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
+	if validate, ok := ctx.Value(portalDispatchCheckKey{}).(func(string, string) *apiError); ok {
+		if aerr := validate(acc.UID, strOr(body["model"], "")); aerr != nil {
+			return false, aerr
+		}
+	}
 	headers, aerr := o.getHeaders(acc)
 	if aerr != nil {
 		return false, aerr
@@ -610,8 +867,23 @@ func (o *Orchestrator) runOnce(ctx context.Context, acc *pool.Account, body map[
 // request) until it succeeds or the candidate set is exhausted — capped at
 // maxFailoverAttempts total tries so a full upstream outage can't turn one
 // client request into an unbounded sequential sweep of a large pool. A failure
-// after bytes have been streamed is never retried (can't un-send).
+// after bytes have been streamed is never retried (can't un-send). A non-nil
+// scope confines every rotation pick to those UIDs (portal pool isolation —
+// retries must not widen permissions).
 func (o *Orchestrator) openUpstream(ctx context.Context, acc *pool.Account, body map[string]any, model, sessionKey string, sink func(string) error, onRetryFail func(*pool.Account, *upstream.UpstreamError)) (*pool.Account, error) {
+	return o.openUpstreamScoped(ctx, acc, body, model, sessionKey, sink, onRetryFail, nil)
+}
+
+func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account, body map[string]any, model, sessionKey string, sink func(string) error, onRetryFail func(*pool.Account, *upstream.UpstreamError), scope map[string]bool) (served *pool.Account, callErr error) {
+	defer func() {
+		if scope != nil {
+			if ue, ok := callErr.(*upstream.UpstreamError); ok {
+				copyErr := *ue
+				copyErr.Raw = []byte(`{"error":{"message":"共享上游暂不可用，请稍后重试","type":"upstream_error"}}`)
+				callErr = &copyErr
+			}
+		}
+	}()
 	const maxFailoverAttempts = 5
 	tried := map[string]bool{}
 	for attempt := 0; ; attempt++ {
@@ -626,7 +898,7 @@ func (o *Orchestrator) openUpstream(ctx context.Context, acc *pool.Account, body
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return acc, err
 		}
-		if aerr, ok := err.(*apiError); ok && aerr.status == 429 {
+		if aerr, ok := err.(*apiError); ok && (aerr.status == 429 || aerr.status == 401 || aerr.status == 403) {
 			return acc, err
 		}
 		if started {
@@ -653,7 +925,7 @@ func (o *Orchestrator) openUpstream(ctx context.Context, acc *pool.Account, body
 		if attempt+1 >= maxFailoverAttempts {
 			return acc, err
 		}
-		alt, aerr := o.pickAccountExcluding(model, sessionKey, tried)
+		alt, aerr := o.pickAccountExcludingIn(model, sessionKey, tried, scope)
 		if aerr != nil {
 			return acc, err // 候选耗尽：返回最后一次的上游错误
 		}

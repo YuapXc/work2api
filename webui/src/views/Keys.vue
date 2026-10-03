@@ -93,7 +93,8 @@ async function remove(app: any) {
 }
 
 // ---------- 可用模型白名单 ----------
-// 空 = 不限制（所有模型可用）；勾选后仅白名单内模型可被该密钥调用，
+// 私人 Key 空范围 = 不限制；门户用户 Key 空范围 = 拒绝全部。
+// 勾选后仅白名单内模型可被该密钥调用，
 // 越权请求在网关入口直接 403。别名条目按其原样保存（网关按别名/实名双重匹配）。
 const modelsOpen = ref(false)
 const modelsTarget = ref<AppInfo | null>(null)
@@ -118,7 +119,7 @@ const filteredModels = computed(() => {
 async function openModels(app: any) {
   modelsTarget.value = app
   selected.value = new Set(app.allowed_models || [])
-  unrestricted.value = selected.value.size === 0
+  unrestricted.value = !app.user_id && selected.value.size === 0
   modelSearch.value = ''
   modelsOpen.value = true
   loadingModels.value = true
@@ -140,14 +141,14 @@ function toggleModel(id: string) {
 async function saveModels() {
   const target = modelsTarget.value
   if (!target) return
-  if (!unrestricted.value && !selected.value.size) return toast.error('请至少选择一个模型，或明确开启「不限制模型」')
+  if (!target.user_id && !unrestricted.value && !selected.value.size) return toast.error('请至少选择一个模型，或明确开启「不限制模型」')
   savingModels.value = true
   try {
     // 仅明确开启「不限制」时发送 null，空选择不能隐式解除限制。
     const list = unrestricted.value ? [] : [...selected.value].sort()
-    const res = await api.setAppModels(target.id, list.length ? list : null)
+    const res = await api.setAppModels(target.id, target.user_id ? list : list.length ? list : null)
     if (res.warnings?.length) toast.info(res.warnings[0])
-    toast.success(list.length ? `已限定 ${list.length} 个模型` : '已恢复不限制')
+    toast.success(list.length ? `已限定 ${list.length} 个模型` : target.user_id ? '该用户 Key 已拒绝全部模型' : '已恢复不限制')
     modelsOpen.value = false
     await load()
   } finally {
@@ -157,7 +158,7 @@ async function saveModels() {
 
 function modelCell(app: any) {
   const list = app.allowed_models || []
-  if (!list.length) return '全部模型'
+  if (!list.length) return app.user_id > 0 ? '拒绝全部模型' : '全部模型'
   if (list.length <= 3) return list.join('、')
   return `${list[0]}、${list[1]} 等 ${list.length} 个`
 }
@@ -256,9 +257,9 @@ onMounted(load)
     <WModal v-model:open="modelsOpen" title="可用模型">
       <p class="mb-3 text-small text-muted">
         为「{{ modelsTarget?.name }}」限定可调用的模型；白名单外的请求会被网关拒绝（403）。
-        <span class="text-faint">仅开启「不限制模型」才允许全部模型。</span>
+        <span class="text-faint">{{ modelsTarget?.user_id ? '用户 Key 空选择拒绝全部模型，并始终受共享资格限制。' : '仅开启「不限制模型」才允许全部模型。' }}</span>
       </p>
-      <label class="mb-3 flex items-center gap-2 text-small"><WToggle v-model="unrestricted" /> 不限制模型</label>
+      <label v-if="!modelsTarget?.user_id" class="mb-3 flex items-center gap-2 text-small"><WToggle v-model="unrestricted" /> 不限制模型</label>
       <WInput v-model="modelSearch" placeholder="搜索模型…" class="mb-2.5" />
       <div class="max-h-72 space-y-1 overflow-y-auto rounded-lg border border-line p-2">
         <WSpinner v-if="loadingModels" center label="加载模型目录" />

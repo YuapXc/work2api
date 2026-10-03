@@ -22,6 +22,7 @@ type Config struct {
 	DBPath                string // SQLite file path
 	AdminToken            string // admin/WebUI auth; empty => loopback-only
 	AdminCookieSecure     bool   // force Secure cookies behind a TLS-terminating proxy
+	TrustedProxyCIDRs     string // explicit peers permitted to supply overwritten X-Real-IP
 	MaxRequestBytes       int64
 	MaxConcurrentRequests int
 	ModelQueueSize        int
@@ -39,6 +40,19 @@ type Config struct {
 	DataDir               string // base dir for data (db, attachments, secrets)
 	LogLevel              string
 	LogToFile             bool
+
+	// 用户门户（HANDOFF §8 方案）：注册模式 invite|open|closed；贡献扫码任务
+	// 上限（防批量任务耗尽内存）；用户级并发与每日用量（0 = 不启用该限制，
+	// 但共享调用要求先配置模型范围）。
+	PortalRegistrationMode  string
+	PortalMaxTasksPerUser   int
+	PortalUserConcurrency   int
+	PortalSharedConcurrency int
+	PortalDailyRequests     int
+	PortalDailyInputTokens  int
+	PortalDailyOutputTokens int
+	PortalKeyMaxPerUser     int
+	PortalEnabled           bool
 
 	// workbuddy provider knobs (ported from workbuddy_one/config.py)
 	AllowExternalHost  bool
@@ -107,6 +121,7 @@ func Load(args []string) *Config {
 		DBPath:                dbp,
 		AdminToken:            *adminToken,
 		AdminCookieSecure:     boolEnv("ADMIN_COOKIE_SECURE", boolEnv("ALLOW_EXTERNAL_HOST", false)),
+		TrustedProxyCIDRs:     envOr("TRUSTED_PROXY_CIDRS", ""),
 		MaxRequestBytes:       int64(positiveEnvInt("MAX_REQUEST_BYTES", 16*1024*1024)),
 		MaxConcurrentRequests: positiveEnvInt("MAX_CONCURRENT_REQUESTS", 4),
 		ModelQueueSize:        positiveEnvInt("MODEL_QUEUE_SIZE", 8),
@@ -123,6 +138,16 @@ func Load(args []string) *Config {
 		MaxJSONDepth:          positiveEnvInt("MAX_JSON_DEPTH", 128),
 		LogLevel:              strings.ToUpper(*logLevel),
 		LogToFile:             env("LOG_TO_FILE", "1") != "0",
+
+		PortalRegistrationMode:  strings.ToLower(strings.TrimSpace(envOr("PORTAL_REGISTRATION_MODE", envOr("PORTAL_INVITE_MODE", "invite")))),
+		PortalMaxTasksPerUser:   positiveEnvInt("PORTAL_MAX_TASKS_PER_USER", 3),
+		PortalUserConcurrency:   positiveEnvInt("PORTAL_USER_CONCURRENCY", 1),
+		PortalSharedConcurrency: positiveEnvInt("PORTAL_SHARED_CONCURRENCY", 3),
+		PortalDailyRequests:     envInt("PORTAL_DAILY_REQUESTS", 0),
+		PortalDailyInputTokens:  envInt("PORTAL_DAILY_INPUT_TOKENS", 0),
+		PortalDailyOutputTokens: envInt("PORTAL_DAILY_OUTPUT_TOKENS", 0),
+		PortalKeyMaxPerUser:     positiveEnvInt("PORTAL_KEY_MAX_PER_USER", 2),
+		PortalEnabled:           boolEnv("PORTAL_ENABLED", true),
 
 		AllowExternalHost:  boolEnv("ALLOW_EXTERNAL_HOST", false),
 		Desensitize:        boolEnv("DESENSITIZE", true),
@@ -203,6 +228,14 @@ func resolvePath(p string) string {
 
 func env(k, def string) string {
 	if v, ok := os.LookupEnv(k); ok {
+		return v
+	}
+	return def
+}
+
+// envOr is env but treats an empty configured value as unset (alias chains).
+func envOr(k, def string) string {
+	if v, ok := os.LookupEnv(k); ok && strings.TrimSpace(v) != "" {
 		return v
 	}
 	return def

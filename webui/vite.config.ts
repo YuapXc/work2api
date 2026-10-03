@@ -15,7 +15,7 @@ export default defineConfig({
       // 开发时把管理、模型及用户门户接口代理到后端
       '/admin': { target: 'http://127.0.0.1:8787', changeOrigin: true },
       '/v1': { target: 'http://127.0.0.1:8787', changeOrigin: true },
-      '/user': { target: 'http://127.0.0.1:8787', changeOrigin: true },
+      '/portal': { target: 'http://127.0.0.1:8787', changeOrigin: true },
       '/health': { target: 'http://127.0.0.1:8787', changeOrigin: true },
     },
   },
@@ -23,7 +23,12 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
     chunkSizeWarningLimit: 900,
+      // 双入口：管理 WebUI 挂 /admin-ui/，用户门户挂 / 与 /portal/。
     rollupOptions: {
+      input: {
+        index: fileURLToPath(new URL('./index.html', import.meta.url)),
+        portal: fileURLToPath(new URL('./portal.html', import.meta.url)),
+      },
       output: {
         manualChunks(id) {
           if (id.includes('node_modules')) {

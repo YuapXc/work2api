@@ -94,6 +94,9 @@ export function setUserToken(token: string) {
 }
 
 export const api = {
+  portalOverview: () => http.get<unknown, import('./portal').PortalOverview>('/admin/portal/overview'),
+  portalWrite: (path: string, body: unknown) => http.post<unknown, Record<string, unknown>>('/admin/portal/' + path, body),
+  portalDelete: (path: string) => http.delete<unknown, { ok: boolean }>('/admin/portal/' + path),
   health: () => http.get<unknown, { available_providers: number; total_providers: number }>('/admin/health'),
   overview: () => http.get<unknown, Overview>('/admin/overview'),
   accounts: () => http.get<unknown, { accounts: AccountInfo[] }>('/admin/accounts'),

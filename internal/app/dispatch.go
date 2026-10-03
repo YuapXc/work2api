@@ -30,6 +30,10 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 	if !ok {
 		return false
 	}
+	if principal.UserID > 0 {
+		writeAPIErr(w, errBody(403, "当前共享服务仅支持 WorkBuddy 模型", "model_not_allowed"))
+		return true
+	}
 	// Hand the runtime the alias-resolved, still-namespaced id; the runtime
 	// strips its own prefix before talking to its upstream.
 	payload["model"] = resolved
@@ -43,14 +47,14 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 		Writer:   writer,
 		AppName:  principal.AppName,
 	})
-	s.o.logRuntimeUsage(report, string(proto), resolved, t0, principal.AppName)
+	s.o.logRuntimeUsage(report, string(proto), resolved, t0, principal.AppName, principal.UserID, principal.AppID)
 	return true
 }
 
 // logRuntimeUsage records a usage row for a runtime-served request. Unlike the
 // workbuddy path it does not touch the workbuddy pool (runtimes own their own
 // accounts), so it writes directly to the usage log with the report's fields.
-func (o *Orchestrator) logRuntimeUsage(rep provider.UsageReport, protocol, model string, t0 time.Time, appName string) {
+func (o *Orchestrator) logRuntimeUsage(rep provider.UsageReport, protocol, model string, t0 time.Time, appName string, userID int64, appIDs ...int64) {
 	effort := rep.Effort
 	if effort == "" {
 		effort = "default"
@@ -58,6 +62,15 @@ func (o *Orchestrator) logRuntimeUsage(rep provider.UsageReport, protocol, model
 	status := rep.Status
 	if status == "" {
 		status = "ok"
+	}
+	var appID int64
+	if len(appIDs) > 0 {
+		appID = appIDs[0]
+	}
+	if userID > 0 {
+		rep.Input = ""
+		rep.Output = ""
+		rep.Reasoning = ""
 	}
 	_ = o.db.LogUsage(store.UsageParams{
 		Model:            model,
@@ -74,6 +87,8 @@ func (o *Orchestrator) logRuntimeUsage(rep provider.UsageReport, protocol, model
 		ReasoningContent: clipContent(rep.Reasoning, o.cfg.UsageContentMaxBytes),
 		Credits:          rep.Credits,
 		AppName:          appName,
+		UserID:           userID,
+		AppID:            appID,
 		ReasoningEffort:  effort,
 	})
 }

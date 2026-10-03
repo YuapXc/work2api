@@ -11,15 +11,19 @@ import (
 
 // App is a returned application-key row with usage stats.
 type App struct {
-	ID        int64   `json:"id"`
-	Name      string  `json:"name"`
-	KeyPrefix string  `json:"key_prefix"`
-	Note      string  `json:"note"`
-	Enabled   bool    `json:"enabled"`
-	CreatedAt float64 `json:"created_at"`
-	Requests  int64   `json:"requests"`
-	Tokens    int64   `json:"tokens"`
-	Credits   float64 `json:"credits"`
+	ID           int64   `json:"id"`
+	Name         string  `json:"name"`
+	KeyPrefix    string  `json:"key_prefix"`
+	Note         string  `json:"note"`
+	Enabled      bool    `json:"enabled"`
+	CreatedAt    float64 `json:"created_at"`
+	Requests     int64   `json:"requests"`
+	Tokens       int64   `json:"tokens"`
+	Credits      float64 `json:"credits"`
+	TokensKnown  bool    `json:"tokens_known"`
+	CreditsKnown bool    `json:"credits_known"`
+	// UserID 0 = private/admin key (pre-portal keys stay private — HANDOFF §4).
+	UserID int64 `json:"user_id"`
 	// AllowedModels is the per-key model allowlist (JSON array of model ids);
 	// empty/nil means unrestricted. Parsed for display convenience.
 	AllowedModels []string `json:"allowed_models"`
@@ -38,7 +42,7 @@ func (d *DB) HasEncryptedAppKeys() (bool, error) {
 func (d *DB) ListApps() ([]App, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	rows, err := d.db.Query("SELECT id, name, key_prefix, note, enabled, created_at, allowed_models FROM apps ORDER BY id ASC")
+	rows, err := d.db.Query("SELECT id, name, key_prefix, note, enabled, created_at, allowed_models, COALESCE(user_id,0) FROM apps ORDER BY id ASC")
 	if err != nil {
 		return nil, err
 	}
@@ -48,7 +52,7 @@ func (d *DB) ListApps() ([]App, error) {
 		var a App
 		var note, allowed sql.NullString
 		var enabled int
-		if err := rows.Scan(&a.ID, &a.Name, &a.KeyPrefix, &note, &enabled, &a.CreatedAt, &allowed); err != nil {
+		if err := rows.Scan(&a.ID, &a.Name, &a.KeyPrefix, &note, &enabled, &a.CreatedAt, &allowed, &a.UserID); err != nil {
 			return nil, err
 		}
 		a.Note = note.String
@@ -56,27 +60,45 @@ func (d *DB) ListApps() ([]App, error) {
 		a.AllowedModels = parseAllowedModels(allowed.String)
 		apps = append(apps, a)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
 	// per-app usage stats
 	for i := range apps {
 		var c, t int64
 		var cr float64
-		_ = d.db.QueryRow(
-			"SELECT COUNT(l.id), COALESCE(SUM(l.total_tokens),0), COALESCE(SUM(l.credits),0) FROM usage_logs l WHERE l.app_name = ? AND l.ts >= ?",
-			apps[i].Name, apps[i].CreatedAt).Scan(&c, &t, &cr)
+		if err := d.db.QueryRow(
+			"SELECT COUNT(l.id), COALESCE(SUM(l.total_tokens),0), COALESCE(SUM(l.credits),0), COUNT(CASE WHEN l.tokens_known=0 THEN 1 END)=0, COUNT(CASE WHEN l.credits IS NULL THEN 1 END)=0 FROM usage_logs l WHERE l.app_id = ? AND COALESCE(l.user_id,0) = ?",
+			apps[i].ID, apps[i].UserID).Scan(&c, &t, &cr, &apps[i].TokensKnown, &apps[i].CreditsKnown); err != nil {
+			return nil, err
+		}
 		apps[i].Requests, apps[i].Tokens, apps[i].Credits = c, t, cr
 	}
 	return apps, nil
 }
 
 // CreateApp inserts a new application key and returns its id. allowedJSON is
-// the raw JSON array string of allowed model ids ("" = unrestricted).
-func (d *DB) CreateApp(name, keyHash, keyPrefix, note, keyEnc, allowedJSON string) (int64, error) {
+// the raw JSON array string of allowed model ids ("" = unrestricted). userID
+// 0 = admin/private key (portal keys carry the owner's user id). Name
+// uniqueness is per-user (UNIQUE(user_id, name)); a same-name key owned by
+// another user is fine — HANDOFF §5.
+func (d *DB) CreateApp(name, keyHash, keyPrefix, note, keyEnc, allowedJSON string, userID int64) (int64, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	var uid any
+	if userID != 0 {
+		uid = userID
+	}
 	res, err := d.db.Exec(
 		"INSERT INTO apps (name, key_hash, key_prefix, note, enabled, created_at, key_enc, user_id, allowed_models) VALUES (?,?,?,?,1,?,?,?,?)",
-		name, keyHash, keyPrefix, note, float64(time.Now().UnixNano())/1e9, keyEnc, nil, allowedJSON)
+		name, keyHash, keyPrefix, note, float64(time.Now().UnixNano())/1e9, keyEnc, uid, allowedJSON)
 	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			return 0, ErrConflict
+		}
 		return 0, err
 	}
 	return res.LastInsertId()
@@ -202,6 +224,134 @@ func (d *DB) DeleteApp(appID int64) (bool, error) {
 	return n > 0, nil
 }
 
+// --- portal-side per-user key operations (ownership is part of every query) ---
+
+// UserApps lists one user's keys with usage stats.
+func (d *DB) UserApps(userID int64) ([]App, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	rows, err := d.db.Query("SELECT id, name, key_prefix, note, enabled, created_at, allowed_models, COALESCE(user_id,0) FROM apps WHERE user_id=? ORDER BY id ASC", userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	apps := []App{}
+	for rows.Next() {
+		var a App
+		var note, allowed sql.NullString
+		var enabled int
+		if err := rows.Scan(&a.ID, &a.Name, &a.KeyPrefix, &note, &enabled, &a.CreatedAt, &allowed, &a.UserID); err != nil {
+			return nil, err
+		}
+		a.Note = note.String
+		a.Enabled = enabled != 0
+		a.AllowedModels = parseAllowedModels(allowed.String)
+		apps = append(apps, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for i := range apps {
+		var c, t int64
+		var cr float64
+		if err := d.db.QueryRow(
+			"SELECT COUNT(l.id), COALESCE(SUM(l.total_tokens),0), COALESCE(SUM(l.credits),0), COUNT(CASE WHEN l.tokens_known=0 THEN 1 END)=0, COUNT(CASE WHEN l.credits IS NULL THEN 1 END)=0 FROM usage_logs l WHERE l.user_id = ? AND l.app_id = ?",
+			userID, apps[i].ID).Scan(&c, &t, &cr, &apps[i].TokensKnown, &apps[i].CreditsKnown); err != nil {
+			return nil, err
+		}
+		apps[i].Requests, apps[i].Tokens, apps[i].Credits = c, t, cr
+	}
+	return apps, nil
+}
+
+// UserAppOwned returns the app row only when it belongs to userID; nil when
+// missing OR foreign (the handler reports the same 404 for both — HANDOFF
+// ownership matrix: no existence oracle for other users' keys).
+func (d *DB) UserAppOwned(appID, userID int64) (map[string]any, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	rows, err := d.db.Query("SELECT * FROM apps WHERE id=? AND user_id=?", appID, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	list, err := scanRows(rows)
+	if err != nil || len(list) == 0 {
+		return nil, err
+	}
+	return list[0], nil
+}
+
+// ToggleAppOwned flips a user's own key; owned=false means not found/foreign.
+func (d *DB) ToggleAppOwned(appID, userID int64) (enabled, owned bool, err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var cur int
+	if err := d.db.QueryRow("SELECT enabled FROM apps WHERE id=? AND user_id=?", appID, userID).Scan(&cur); err != nil {
+		if err == sql.ErrNoRows {
+			return false, false, nil
+		}
+		return false, false, err
+	}
+	newVal := 0
+	if cur == 0 {
+		newVal = 1
+	}
+	if _, err := d.db.Exec("UPDATE apps SET enabled=? WHERE id=? AND user_id=?", newVal, appID, userID); err != nil {
+		return false, false, err
+	}
+	return newVal != 0, true, nil
+}
+
+// DeleteAppOwned removes a user's own key; returns owned=false when missing/foreign.
+func (d *DB) DeleteAppOwned(appID, userID int64) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	res, err := d.db.Exec("DELETE FROM apps WHERE id=? AND user_id=?", appID, userID)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// SetAppModelsOwned rebinds a user's own key allowlist (users may only narrow
+// their own keys; the caller validates models against eligibility).
+func (d *DB) SetAppModelsOwned(appID, userID int64, allowedJSON string) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	res, err := d.db.Exec("UPDATE apps SET allowed_models=? WHERE id=? AND user_id=?", allowedJSON, appID, userID)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// CountUserApps returns how many keys a user owns (portal cap check).
+func (d *DB) CountUserApps(userID int64) (int, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var c int
+	err := d.db.QueryRow("SELECT COUNT(*) FROM apps WHERE user_id=?", userID).Scan(&c)
+	return c, err
+}
+
+// UserDailyUsage sums today's request count and tokens across all of a user's
+// apps (multi-key merged budget — HANDOFF §8). dayStart is unix seconds of
+// local midnight, passed in so cross-day handling stays with the caller.
+func (d *DB) UserDailyUsage(userID int64, dayStart float64) (requests, inputTokens, outputTokens int64, err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	err = d.db.QueryRow(
+		"SELECT COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0) FROM usage_logs WHERE user_id=? AND ts>=?",
+		userID, dayStart).Scan(&requests, &inputTokens, &outputTokens)
+	return requests, inputTokens, outputTokens, err
+}
+
 // --- shared helpers ---
 
 // scanRows scans all rows into []map[string]any with driver-native types,
@@ -281,4 +431,59 @@ func i64(n int64) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+func nullableID(id int64) any {
+	if id == 0 {
+		return nil
+	}
+	return id
+}
+
+// CreateAppForUserLimited checks the owner cap and creates the key under one
+// database transaction. options are allowed-model JSON and display prefix.
+func (d *DB) CreateAppForUserLimited(userID int64, name, keyHash, keyEnc string, max int, options ...string) (int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var count int
+	if err := tx.QueryRow("SELECT COUNT(*) FROM apps WHERE user_id=?", userID).Scan(&count); err != nil {
+		return 0, err
+	}
+	if max > 0 && count >= max {
+		return 0, ErrKeyLimit
+	}
+	allowed, prefix := "", ""
+	if len(options) > 0 {
+		allowed = options[0]
+	}
+	if len(options) > 1 {
+		prefix = options[1]
+	}
+	res, err := tx.Exec("INSERT INTO apps(name,key_hash,key_prefix,note,enabled,created_at,key_enc,user_id,allowed_models) VALUES(?,?,?,'门户 Key',1,?,?,?,?)", name, keyHash, prefix, float64(time.Now().UnixNano())/1e9, keyEnc, userID, allowed)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			return 0, ErrConflict
+		}
+		return 0, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	return id, tx.Commit()
+}
+
+// UserDailyUsageKnown reports whether every logged token value is known.
+// Legacy NULL markers retain their old semantics; explicit false is unknown.
+func (d *DB) UserDailyUsageKnown(userID int64, since float64) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var known bool
+	err := d.db.QueryRow("SELECT NOT EXISTS(SELECT 1 FROM usage_logs WHERE user_id=? AND ts>=? AND tokens_known=0)", userID, since).Scan(&known)
+	return known, err
 }
