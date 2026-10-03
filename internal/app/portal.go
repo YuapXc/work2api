@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -61,10 +62,12 @@ func (s *Server) mountPortal(mux *http.ServeMux) {
 	mux.HandleFunc("POST /portal/api/contributions/cancel", s.portalContributionCancel)
 	mux.HandleFunc("POST /portal/api/contributions/{id}/revoke", s.portalRevokeContribution)
 	mux.HandleFunc("POST /portal/api/contributions/{id}/share", s.portalShareContribution)
+	mux.HandleFunc("POST /portal/api/contributions/{id}/models/refresh", s.portalRefreshContributionModels)
 	mux.HandleFunc("GET /portal/api/usage", s.portalUsage)
 	// 管理端（/admin 前缀 → adminGuard 自然生效：会话/令牌 + CSRF）
 	mux.HandleFunc("GET /admin/portal/users", s.adminPortalUsers)
 	mux.HandleFunc("POST /admin/portal/users/{id}/status", s.adminPortalUserStatus)
+	mux.HandleFunc("POST /admin/portal/users/{id}/concurrency", s.adminPortalUserConcurrency)
 	mux.HandleFunc("POST /admin/portal/users/{id}/password", s.adminPortalResetPassword)
 	mux.HandleFunc("GET /admin/portal/invites", s.adminPortalInvites)
 	mux.HandleFunc("POST /admin/portal/invites", s.adminPortalCreateInvite)
@@ -133,7 +136,8 @@ func (s *Server) portalGuard(next http.Handler) http.Handler {
 			return
 		}
 		if path == "/portal/api/auth/state" || path == "/portal/api/auth/register" || path == "/portal/api/auth/login" || path == "/portal/api/auth/logout" {
-			if r.Method == http.MethodPost && path != "/portal/api/auth/logout" && !s.portalLoginLimiter.allow(s.rateLimitIP(r)) {
+			if r.Method == http.MethodPost && path != "/portal/api/auth/logout" && (!s.portalLoginLimiter.allowLimit("ip:"+s.rateLimitIP(r), 60) || !s.portalLoginLimiter.allowLimit("global", 300)) {
+				w.Header().Set("Retry-After", "600")
 				writeJSON(w, 429, errBody(429, "尝试次数过多，请 10 分钟后再试", "rate_limit_error").body)
 				return
 			}
@@ -146,7 +150,7 @@ func (s *Server) portalGuard(next http.Handler) http.Handler {
 			return
 		}
 		// 轮询端点单独限流（每用户），防高频打上游。
-		if path == "/portal/api/contributions/poll" || path == "/portal/api/contributions/begin" {
+		if path == "/portal/api/contributions/poll" || path == "/portal/api/contributions/begin" || strings.HasSuffix(path, "/models/refresh") {
 			s.portalPollMu.Lock()
 			if len(s.portalPollLimiter) >= 1024 {
 				window := time.Now().Unix() / 10
@@ -800,9 +804,12 @@ func (s *Server) portalContributionPoll(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, 200, map[string]any{"status": "failed", "message": err.Error()})
 		return
 	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	verified := s.o.models.RefreshAccount(ctx, uid)
 	// 脱敏输出（HANDOFF §6）：只回打码 uid。
 	writeJSON(w, 200, map[string]any{
-		"status": "ready", "account_uid_masked": maskUID(uid), "site": site,
+		"status": "ready", "account_uid_masked": maskUID(uid), "site": site, "models_verified": verified,
 	})
 }
 
@@ -990,6 +997,47 @@ func (s *Server) portalRevokeContribution(w http.ResponseWriter, r *http.Request
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
+func (s *Server) contributionCatalogStatus(uid string) string {
+	a := s.o.pool.Get(uid)
+	if a == nil || !a.Enabled {
+		return "unavailable"
+	}
+	for _, model := range s.o.models.ListCached() {
+		if s.o.modelEntryAccountUIDs(model)[uid] {
+			return "ready"
+		}
+	}
+	return "pending"
+}
+
+func (s *Server) portalRefreshContributionModels(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	cons, err := s.o.db.UserContributions(portalCtx(r).ID)
+	if err != nil {
+		writeAPIErr(w, errBody(503, "账号查询失败，请稍后重试", "server_error"))
+		return
+	}
+	for _, c := range cons {
+		if c.ID != id {
+			continue
+		}
+		if c.Status != "active" && c.Status != "private" {
+			writeAPIErr(w, errBody(409, "请先重新授权账号", "account_unavailable"))
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		if !s.o.models.RefreshAccount(ctx, c.AccountUID) {
+			w.Header().Set("Retry-After", "10")
+			writeAPIErr(w, errBody(503, "模型目录暂未验证，请稍后重试；账号已保留", "catalog_pending"))
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "catalog_status": "ready"})
+		return
+	}
+	writeAPIErr(w, errBody(404, "账号不存在", "not_found"))
+}
+
 func (s *Server) portalListContributions(w http.ResponseWriter, r *http.Request) {
 	user := portalCtx(r)
 	cons, err := s.o.db.UserContributions(user.ID)
@@ -1000,12 +1048,13 @@ func (s *Server) portalListContributions(w http.ResponseWriter, r *http.Request)
 	out := []map[string]any{}
 	for _, c := range cons {
 		out = append(out, map[string]any{
-			"id":         c.ID,
-			"provider":   c.Provider,
-			"site":       c.Site,
-			"status":     c.Status,
-			"account":    maskUID(c.AccountUID),
-			"created_at": c.CreatedAt,
+			"id":             c.ID,
+			"provider":       c.Provider,
+			"site":           c.Site,
+			"status":         c.Status,
+			"account":        maskUID(c.AccountUID),
+			"catalog_status": s.contributionCatalogStatus(c.AccountUID),
+			"created_at":     c.CreatedAt,
 		})
 	}
 	writeJSON(w, 200, map[string]any{"contributions": out})
@@ -1146,7 +1195,7 @@ func (s *Server) adminPortalOverview(w http.ResponseWriter, r *http.Request) {
 		writeAPIErr(w, errBody(503, "默认共享池查询失败", "server_error"))
 		return
 	}
-	writeJSON(w, 200, map[string]any{"users": users, "invites": invites, "groups": groups, "contributions": contributions, "accounts": accounts, "account_count": len(accounts), "registration_mode": s.o.cfg.PortalRegistrationMode, "default_group_id": intOf(settings["portal_default_group"]), "default_auto_grant": settings["portal_default_auto_grant"] == "1"})
+	writeJSON(w, 200, map[string]any{"users": users, "invites": invites, "groups": groups, "contributions": contributions, "accounts": accounts, "account_count": len(accounts), "registration_mode": s.o.cfg.PortalRegistrationMode, "user_concurrency": s.portalUserLimit(0), "user_concurrency_overrides": portalConcurrencyOverrides(settings), "default_group_id": intOf(settings["portal_default_group"]), "default_auto_grant": settings["portal_default_auto_grant"] == "1"})
 }
 
 func (s *Server) adminPortalDefaultGroup(w http.ResponseWriter, r *http.Request) {
@@ -1223,7 +1272,67 @@ func (s *Server) portalGroupViews() ([]map[string]any, error) {
 		if models == nil {
 			models = []string{}
 		}
-		out = append(out, map[string]any{"id": g.ID, "name": g.Name, "provider": g.Provider, "enabled": g.Enabled, "allowed_models": models, "accounts": accounts, "grants": grants, "created_at": g.CreatedAt})
+		backed, err := s.o.db.GroupAccountUIDsWithActiveContribution(g.ID)
+		if err != nil {
+			return nil, err
+		}
+		ready := map[string]bool{}
+		for _, uid := range backed {
+			if a := s.o.pool.Get(uid); a != nil && a.Enabled && a.CooldownUntil <= nowSec() {
+				ready[uid] = true
+			}
+		}
+		usable := map[string]bool{}
+		settings, err := s.o.db.GetSettings()
+		if err != nil {
+			return nil, err
+		}
+		disabled := map[string]bool{}
+		for _, id := range parseJSONStringArray(settings["portal_disabled_models"]) {
+			disabled[id] = true
+		}
+		for _, model := range s.o.models.ListCached() {
+			id := str2(model["id"])
+			if disabled[id] || id == "auto" || !slices.Contains(models, id) {
+				continue
+			}
+			for uid := range s.o.modelEntryAccountUIDs(model) {
+				if ready[uid] && s.o.modelCooldownUntil(uid, id) <= nowSec() {
+					usable[id] = true
+					break
+				}
+			}
+		}
+		eligibleUsers := 0
+		users, err := s.o.db.ListUsers()
+		if err != nil {
+			return nil, err
+		}
+		if g.Enabled && len(usable) > 0 {
+			for _, u := range users {
+				if u.Status != "active" {
+					continue
+				}
+				active, err := s.o.db.ActiveContributionUIDs(u.ID)
+				if err != nil {
+					return nil, err
+				}
+				if len(active) == 0 {
+					continue
+				}
+				groups, err := s.o.db.GrantedGroups(u.ID)
+				if err != nil {
+					return nil, err
+				}
+				for _, granted := range groups {
+					if granted.ID == g.ID {
+						eligibleUsers++
+						break
+					}
+				}
+			}
+		}
+		out = append(out, map[string]any{"id": g.ID, "name": g.Name, "provider": g.Provider, "enabled": g.Enabled, "allowed_models": models, "accounts": accounts, "grants": grants, "created_at": g.CreatedAt, "ready_accounts": len(ready), "usable_models": len(usable), "eligible_users": eligibleUsers})
 	}
 	return out, nil
 }
@@ -1256,6 +1365,62 @@ func (s *Server) adminPortalRevokeInvite(w http.ResponseWriter, r *http.Request)
 	}
 	if !ok {
 		writeJSON(w, 404, errBody(404, "邀请码不存在或已使用", "invalid_request_error").body)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func portalConcurrencyOverrides(settings map[string]string) map[string]int {
+	limits := map[string]int{}
+	_ = json.Unmarshal([]byte(settings["portal_user_concurrency_limits"]), &limits)
+	return limits
+}
+
+func (s *Server) portalUserLimit(id int64) int {
+	limit := positiveOr(s.o.cfg.PortalUserConcurrency, 2)
+	if settings, err := s.o.db.GetSettings(); err == nil {
+		if n := portalConcurrencyOverrides(settings)[strconv.FormatInt(id, 10)]; id > 0 && n > 0 {
+			limit = n
+		}
+	}
+	max := s.modelsAdmission.sharedCapacity
+	if limit > max {
+		limit = max
+	}
+	return positiveOr(limit, 1)
+}
+
+func (s *Server) adminPortalUserConcurrency(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	user, err := s.o.db.GetUser(id)
+	if err != nil || user == nil {
+		writeAPIErr(w, errBody(404, "用户不存在", "not_found"))
+		return
+	}
+	body, err := readJSON(r)
+	raw, ok := body["limit"].(float64)
+	n := int(raw)
+	if err != nil || !ok || raw != float64(n) || n < 0 || n > s.modelsAdmission.sharedCapacity {
+		writeAPIErr(w, errBody(400, "并发需为 0（默认）至共享执行上限之间的整数", "invalid_request_error"))
+		return
+	}
+	s.o.accountMu.Lock()
+	defer s.o.accountMu.Unlock()
+	settings, err := s.o.db.GetSettings()
+	if err != nil {
+		writeAPIErr(w, errBody(503, "读取设置失败", "server_error"))
+		return
+	}
+	limits := portalConcurrencyOverrides(settings)
+	key := strconv.FormatInt(id, 10)
+	if n == 0 {
+		delete(limits, key)
+	} else {
+		limits[key] = n
+	}
+	encoded, _ := json.Marshal(limits)
+	if err := s.o.db.SaveSettings(map[string]string{"portal_user_concurrency_limits": string(encoded)}); err != nil {
+		writeAPIErr(w, errBody(503, "保存设置失败", "server_error"))
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})

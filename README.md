@@ -1,5 +1,13 @@
 # work2api
 
+用户门户入口为 `/portal/`（根路径也进入门户），管理台为 `/admin-ui/`。公网反代应阻断 `/admin/` 与 `/admin-ui/`，管理台通过 SSH 隧道访问。用户本人账号不依赖共享池授权，仍遵守 Key 模型白名单和全局用户模型禁用。停止共享保留本人调用权；目前仅 WorkBuddy 支持用户共享。
+
+默认全局执行 4、共享执行 3、每用户执行 2；每用户等待最多 4，共享等待合计最多 6，全局等待最多 8。多 Key 按用户合并计算，可信用户可在管理门户单独调整执行并发。每日次数和 token 预算默认不限（0）。排队及账号节流共用等待预算；部署可设置 `MODEL_QUEUE_WAIT_SECONDS=60`，但 EdgeOne 回源超时须同时容纳排队和模型首包处理。
+
+门户登录/注册限制为每 IP 60 次、整体 300 次/10 分钟，登录另有每用户名 10 次/10 分钟限制。应用仅接受明确可信即时代理的 `X-Real-IP`；反代须覆盖此头，并用官方回源范围或私密回源鉴权验证 EdgeOne。不可直接信任公网提交的转发头。
+
+凭证 JSON 导出仅用于账号迁移，不能恢复完整用户系统。完整备份须包含 SQLite 一致性快照、主密钥、各渠道凭据、服务及反代配置。恢复前须隔离公网并确认 schema 与版本兼容。
+
 **统一的 Go 单体网关**：把 WorkBuddy / CodeBuddy、Qoder、OpenCode 三个「to-API」上游整合进**一个进程**，对外统一提供 OpenAI Chat / Anthropic Messages / OpenAI Responses **三协议兼容** API，并自带 Vue3 明/暗双主题管理台（WebUI）。
 
 - 一次启动，三家供应商各司其职、互不影响：`workbuddy`（默认，无前缀）、`qoder/*`、`opencode/*`。
@@ -17,7 +25,7 @@
 - 项目内的自动签到、匿名模式、本机凭据探测等能力可能触碰上游 ToS，**是否使用、如何使用由使用者自行判断并承担全部风险**。
 - 使用者须自行遵守各上游平台的服务条款；作者不对任何因使用本项目产生的直接或间接损失负责。
 - 若你所在地区或平台规定不允许此类工具，请勿使用。
-- 本项目不分发、不代管任何账号或密钥；所有凭据均来自使用者自己的本机环境。
+- 本项目不会提供上游账号；凭据由使用者自行导入或授权。启用用户共享时，服务器保存贡献账号凭据，并按所有权和共享池规则限定访问。
 
 ---
 
@@ -54,7 +62,7 @@
 
 ## 技术栈
 
-- 后端：Go 1.25、标准库 `net/http`、`modernc.org/sqlite`（纯 Go，免 CGO）
+- 后端：Go 1.26、标准库 `net/http`、`modernc.org/sqlite`（纯 Go，免 CGO）
 - 前端：Vue3 + Vite + TailwindCSS 自定义设计系统（青色系、明/暗双主题、轻玻璃质感），`go:embed` 进二进制
 - 无外部服务依赖（无需数据库/Redis），数据落在本地 SQLite
 
@@ -62,8 +70,8 @@
 
 ### 1. 环境要求
 
-- **Go ≥ 1.25**（Windows 默认安装在 `C:\Program Files\Go\bin`，若未加入 PATH 需自行指定）
-- 仅当**要改前端**时才需要 **Node ≥ 18**（前端产物已 `embed` 进仓库，纯后端构建无需 Node）
+- **Go ≥ 1.26**（Windows 默认安装在 `C:\Program Files\Go\bin`，若未加入 PATH 需自行指定）
+- 仅当**要改前端**时才需要 **Node ≥ 22**（前端产物已 `embed` 进仓库，纯后端构建无需 Node）
 
 ### 2. 编译后端（前端已内置）
 
@@ -94,7 +102,7 @@ npx vite build                      # 产物在 webui/dist/
 
 ### 4. 打开管理台 & 创建 Key & 调用
 
-1. 浏览器打开 `http://127.0.0.1:8787/`（本机回环访问**无需**登录）。
+1. 浏览器打开 `http://127.0.0.1:8787/admin-ui/`（本机回环访问**无需**登录）。
 2. 进入「API 密钥」页 → 新建应用 → 复制返回的 `sk-...` Key。
 3. 进入「账号」页确认目标供应商已就绪（WorkBuddy 需先扫码登录/导入账号；Qoder 若本机装了桌面端会自动探测；OpenCode 点「编辑配置」填 key 或启用匿名层）。
 4. 调用（模型名带前缀即路由到对应供应商）：
@@ -156,7 +164,7 @@ docker run -d --name work2api -p 8787:8787 \
 | — | `ADMIN_COOKIE_SECURE` | 随公网模式开启 | 强制管理 Cookie 的 Secure 属性；HTTPS 代理 HTTP 回源时应保持开启 |
 | — | `MAX_REQUEST_BYTES` | `16777216` | 请求体上限（字节，必须大于 0）；登录固定 8 KiB，读取期限 30 秒 |
 | — | `MAX_CONCURRENT_REQUESTS` | `4` | 模型执行并发（含 SSE 与管理台模型测试）；管理接口独立限额 |
-| — | `MODEL_QUEUE_SIZE` / `MODEL_QUEUE_WAIT_SECONDS` | `8` / `20` | 有界排队与累计等待预算，包含账号节流与重新入池 |
+| — | `MODEL_QUEUE_SIZE` / `MODEL_QUEUE_WAIT_SECONDS` | `8` / `60` | 有界排队与累计等待预算，包含账号节流与重新入池 |
 | — | `MODEL_KEY_QUEUE_SIZE` / `MODEL_KEY_CONCURRENCY_LIMITS` | `8` / 空 | 每 Key 等待上限；JSON 按应用 ID 配置执行上限，例如 `{"2":1}` |
 | — | `ADMIN_CONCURRENCY` / `HEAVY_ADMIN_CONCURRENCY` | `8` / `2` | 轻管理 / 重管理独立限额；同类刷新共享执行结果 |
 | — | `QUERY_CONCURRENCY` / `BODY_READ_CONCURRENCY` | `4` / `4` | 模型列表及 Token 统计 / 请求体读取限额 |

@@ -2,6 +2,23 @@ package app
 
 import "testing"
 
+func TestSessionAffinityIsolatedByUserAndModel(t *testing.T) {
+	body := map[string]any{"prompt_cache_key": "same-conversation"}
+	a := principalSessionKey(&Principal{UserID: 1}, "model-a", body)
+	for _, other := range []string{
+		principalSessionKey(&Principal{UserID: 2}, "model-a", body),
+		principalSessionKey(&Principal{UserID: 1}, "model-b", body),
+		principalSessionKey(&Principal{}, "model-a", body),
+	} {
+		if a == other || len(a) != 64 {
+			t.Fatal("affinity namespace collision")
+		}
+	}
+	if a != principalSessionKey(&Principal{UserID: 1}, "model-a", body) {
+		t.Fatal("unstable affinity")
+	}
+}
+
 func TestExtractSessionKey(t *testing.T) {
 	cases := []struct {
 		name string

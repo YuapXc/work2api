@@ -2,7 +2,7 @@
 // 贡献账号：WorkBuddy 扫码（设备授权流程）。弹出授权链接，用户在新窗口
 // 打开登录后这里轮询；完成即获得资格。也可随时撤回（立即停止共享调度）。
 import { ref, onMounted, onUnmounted } from 'vue'
-import { api, fmtTime, type ContributionInfo, type Me } from '../api'
+import { api, PortalAPIError, fmtTime, type ContributionInfo, type Me } from '../api'
 import { toast } from '../../src/lib/toast'
 import WButton from '../../src/components/ui/WButton.vue'
 
@@ -16,6 +16,9 @@ const begining = ref(false)
 const authUrl = ref('')
 const taskId = ref('')
 const pollStatus = ref('')
+const pollError = ref('')
+let expiresAt = 0
+let retries = 0
 let timer: ReturnType<typeof setTimeout> | null = null
 let disposed = false
 const cancelling = ref(false)
@@ -36,6 +39,9 @@ async function begin() {
     if (disposed) { void api.contributionCancel(res.task_id).catch(() => {}); return }
     authUrl.value = res.auth_url
     taskId.value = res.task_id
+    expiresAt = res.expires_at * 1000
+    retries = 0
+    pollError.value = ''
     window.open(res.auth_url, '_blank', 'noopener')
     timer = setTimeout(poll, 3000)
   } catch (e: any) {
@@ -46,14 +52,17 @@ async function begin() {
 async function poll() {
   const id = taskId.value
   if (!id || disposed || cancelling.value) return
+  if (Date.now() >= expiresAt) { void api.contributionCancel(id).catch(() => {}); taskId.value = authUrl.value = ''; toast.error('登录会话已过期，请重新发起'); return }
   try {
     const res = await api.contributionPoll(id)
     if (disposed || id !== taskId.value || cancelling.value) return
+    retries = 0
+    pollError.value = ''
     pollStatus.value = res.status
     if (res.status === 'pending') { timer = setTimeout(poll, 3000); return }
     stopPoll()
     if (res.status === 'ready') {
-      toast.success(`账号 ${res.account_uid_masked} 已添加，可查看本人可用模型并创建 Key；共享池另需管理员授权`)
+      toast.success(res.models_verified ? `账号 ${res.account_uid_masked} 已添加，可查看本人可用模型并创建 Key` : `账号 ${res.account_uid_masked} 已添加，模型目录暂未验证，可在账号列表重试`)
       taskId.value = authUrl.value = ''
       await load()
       emit('refresh')
@@ -67,8 +76,15 @@ async function poll() {
   } catch (e: any) {
     if (disposed || id !== taskId.value || cancelling.value) return
     stopPoll()
-    toast.error(e?.message || '轮询失败')
-    taskId.value = authUrl.value = ''
+    if (e instanceof PortalAPIError && e.retryable) {
+      pollError.value = `${e.message}，会话已保留，将自动重试。`
+      const delay = Math.max(Math.min(30000, 3000 * 2 ** Math.min(retries++, 3)), e.retryAfter * 1000)
+      timer = setTimeout(poll, Math.min(delay, Math.max(0, expiresAt - Date.now())))
+    } else {
+      void api.contributionCancel(id).catch(() => {})
+      toast.error(e?.message || '轮询失败')
+      taskId.value = authUrl.value = ''
+    }
   }
 }
 
@@ -92,6 +108,14 @@ async function revoke(c: ContributionInfo) {
   } catch (e: any) { toast.error(e?.message || '撤回失败') }
 }
 
+const refreshing = ref<number | null>(null)
+async function refreshModels(c: ContributionInfo) {
+ if (refreshing.value !== null) return
+ refreshing.value = c.id
+ try { await api.refreshContributionModels(c.id); await load(); emit('refresh'); toast.success('模型目录已验证') }
+ catch (e: any) { toast.error(e.message) }
+ finally { refreshing.value = null }
+}
 const statusText: Record<string, string> = {
   active: '共享中', private: '仅本人使用', revoked: '已撤回，需重新验证', unavailable: '暂不可用', invalid: '已失效', verifying: '验证中',
 }
@@ -120,6 +144,7 @@ async function share(c: ContributionInfo) {
       </div>
       <div v-if="taskId" class="mt-4 rounded-xl border border-route/40 bg-route/8 p-4">
         <div class="text-small text-ink">{{ pollStatus === 'pending' ? '等待登录确认…' : '处理中…' }}</div>
+        <p v-if="pollError" class="mt-1 text-micro text-muted">{{ pollError }}</p>
         <p class="mt-1 text-micro text-faint">
           已在新窗口打开授权页面；若未弹出，
           <a :href="authUrl" target="_blank" rel="noopener" class="text-brand hover:underline">点此打开授权链接</a>。
@@ -137,6 +162,8 @@ async function share(c: ContributionInfo) {
           <span class="h-2 w-2 rounded-full" :class="c.status === 'active' ? 'bg-live' : 'bg-faint'" />
           <code class="mono text-small">{{ c.account }}</code>
           <span class="rounded-md bg-bg/60 px-2 py-0.5 text-micro text-muted">{{ statusText[c.status] || c.status }}</span>
+          <span v-if="c.catalog_status !== 'ready'" class="text-micro text-faint">{{ c.catalog_status === 'unavailable' ? '账号暂不可用，请联系管理员' : '模型待验证' }}</span>
+          <WButton v-if="c.catalog_status === 'pending' && ['active', 'private'].includes(c.status)" size="sm" variant="subtle" :loading="refreshing === c.id" :disabled="refreshing !== null" @click="refreshModels(c)">验证模型</WButton>
           <span class="mono ml-auto text-micro text-faint">{{ fmtTime(c.created_at) }}</span>
           <WButton v-if="c.status === 'active'" size="sm" variant="subtle" @click="revoke(c)">停止共享</WButton>
           <WButton v-if="c.status === 'private'" size="sm" variant="subtle" @click="share(c)">恢复共享</WButton>

@@ -1,9 +1,9 @@
 <script setup lang="ts">
 // 门户外壳：登录/注册门 + 已登录的简单顶栏导航。风格与管理 WebUI 一致
 // （同一套设计令牌），但结构极简：用户只需要看到资格、密钥和用量。
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { api, type Me } from './api'
+import { api, PortalAPIError, type Me } from './api'
 import WToaster from '../src/components/ui/WToaster.vue'
 import WButton from '../src/components/ui/WButton.vue'
 import WInput from '../src/components/ui/WInput.vue'
@@ -24,19 +24,43 @@ const password = ref('')
 const invite = ref('')
 const busy = ref(false)
 const error = ref('')
+const connectionError = ref('')
+let probing: Promise<void> | null = null
+let lastProbe = 0
+let disposed = false
+let sessionVersion = 0
 
 async function probe() {
-  checking.value = true
-  try {
-    me.value = await api.me()
-  } catch {
-    me.value = null
-    try {
-      mode.value = (await api.authState()).mode
-    } catch { /* 后端不可达时保持默认 */ }
-  }
-  checking.value = false
+  if (probing) return probing
+  probing = probeOnce().finally(() => { probing = null })
+  return probing
 }
+async function probeOnce() {
+  const version = sessionVersion
+  try {
+    const result = await api.me()
+    if (disposed || version !== sessionVersion) return
+    me.value = result
+    connectionError.value = ''
+    lastProbe = Date.now()
+  } catch (e) {
+    if (disposed) return
+    if (e instanceof PortalAPIError && e.status === 401) {
+      if (version !== sessionVersion && me.value) return
+      me.value = null
+      const stateVersion = sessionVersion
+      try {
+        const state = await api.authState()
+        if (disposed || stateVersion !== sessionVersion) return
+        mode.value = state.mode; connectionError.value = ''
+      } catch (err: any) { if (!disposed && stateVersion === sessionVersion) connectionError.value = err.message }
+    } else if (version === sessionVersion) { connectionError.value = e instanceof Error ? e.message : '暂时无法获取账号信息' }
+  } finally {
+    if (!disposed) checking.value = false
+  }
+}
+function expireSession() { sessionVersion++; me.value = null }
+function refreshIfStale() { if (Date.now() - lastProbe > 15000) void probe() }
 
 async function submit() {
   if (busy.value) return
@@ -48,6 +72,8 @@ async function submit() {
     } else {
       await api.register(username.value.trim(), password.value, invite.value.trim())
     }
+    sessionVersion++
+    if (probing) await probing
     await probe()
     username.value = password.value = invite.value = ''
   } catch (e: any) {
@@ -58,7 +84,7 @@ async function submit() {
 }
 
 async function logout() {
-  try { await api.logout(); me.value = null } catch (e: any) { toast.error(e?.message || '退出失败，请重试') }
+  try { await api.logout(); expireSession() } catch (e: any) { toast.error(e?.message || '退出失败，请重试') }
 }
 
 const nav = [
@@ -79,7 +105,9 @@ function toggleTheme() {
   localStorage.setItem('w2a_theme', isLight.value ? 'light' : 'dark')
 }
 
-onMounted(probe)
+watch(() => route.path, refreshIfStale)
+onMounted(() => { void probe(); window.addEventListener('focus', refreshIfStale); window.addEventListener('portal-session-expired', expireSession) })
+onUnmounted(() => { disposed = true; window.removeEventListener('focus', refreshIfStale); window.removeEventListener('portal-session-expired', expireSession) })
 </script>
 
 <template>
@@ -96,6 +124,8 @@ onMounted(probe)
         <span class="mono text-lg font-semibold tracking-tight text-ink">work2api</span>
         <span class="ml-auto text-micro text-faint">用户门户</span>
       </div>
+
+      <p v-if="connectionError" class="mb-4 text-micro text-fault">{{ connectionError }} <button class="text-brand hover:underline" @click="probe">重试连接</button></p>
 
       <template v-if="mode === 'closed' && !showLogin">
         <h1 class="mb-1 text-base font-semibold text-ink">暂未开放注册</h1>
@@ -173,7 +203,7 @@ onMounted(probe)
         >{{ item.label }}</button>
       </nav>
     </header>
-    <main class="mx-auto w-full max-w-4xl flex-1 px-4 py-6"><router-view :me="me" @refresh="probe" /></main>
+    <main class="mx-auto w-full max-w-4xl flex-1 px-4 py-6"><p v-if="connectionError" class="mb-4 text-micro text-fault">{{ connectionError }} <button class="text-brand hover:underline" @click="probe">重试连接</button></p><router-view :me="me" @refresh="probe" /></main>
   </div>
 
   <WToaster />

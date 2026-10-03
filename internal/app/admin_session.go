@@ -128,7 +128,9 @@ func newLoginRateLimiter() *loginRateLimiter {
 }
 
 // allow reports whether an attempt from ip may proceed.
-func (l *loginRateLimiter) allow(ip string) bool {
+func (l *loginRateLimiter) allow(ip string) bool { return l.allowLimit(ip, loginWindowMax) }
+
+func (l *loginRateLimiter) allowLimit(ip string, max int) bool {
 	now := time.Now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -156,7 +158,7 @@ func (l *loginRateLimiter) allow(ip string) bool {
 			}
 		}
 	}
-	return w.count <= loginWindowMax
+	return w.count <= max
 }
 
 // adminAuth resolves the admin auth state of a request: a valid session cookie

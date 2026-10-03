@@ -62,8 +62,8 @@ func StartLogin(region Region) (*OAuthSession, error) {
 	if pending != nil {
 		pending.cancel()
 	}
-	ctx, cancel := context.WithCancel(context.Background())
 	deadline := time.Now().Add(10 * time.Minute)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	pending = &pendingOAuth{
 		loginID:  loginID,
 		nonce:    nonce,
@@ -91,6 +91,14 @@ func WaitLogin(loginID string) (*Account, error) {
 		return nil, fmt.Errorf("no pending login for id %s", loginID)
 	}
 
+	defer func() {
+		p.cancel()
+		pendingMu.Lock()
+		if pending == p {
+			pending = nil
+		}
+		pendingMu.Unlock()
+	}()
 	ep := GetEndpoints(p.region)
 
 	logger.Info("OAuth: Starting poll loop")
@@ -106,19 +114,16 @@ func WaitLogin(loginID string) (*Account, error) {
 			logger.Info("OAuth: Cancelled")
 			return nil, fmt.Errorf("oauth login cancelled")
 		case <-ticker.C:
-			deviceToken, refreshToken, err := pollToken(p.nonce, p.verifier, ep)
+			deviceToken, refreshToken, err := pollToken(p.ctx, p.nonce, p.verifier, ep)
 			if err != nil {
 				continue
 			}
 			logger.Info("OAuth: Got token, building account")
-			acct, err := buildAccountFromToken(deviceToken, refreshToken, p.region, ep)
+			acct, err := buildAccountFromToken(p.ctx, deviceToken, refreshToken, p.region, ep)
 			if err != nil {
 				logger.Error("OAuth: Build account error: %v", err)
 				return nil, err
 			}
-			pendingMu.Lock()
-			pending = nil
-			pendingMu.Unlock()
 			logger.Info("OAuth: Success! Account: %s", acct.Name)
 			return acct, nil
 		}
@@ -135,7 +140,7 @@ func CancelLogin(loginID string) {
 }
 
 // pollToken 轮询 deviceToken/poll 端点
-func pollToken(nonce, verifier string, ep Endpoints) (string, string, error) {
+func pollToken(ctx context.Context, nonce, verifier string, ep Endpoints) (string, string, error) {
 	reqURL := fmt.Sprintf("%s?nonce=%s&verifier=%s&challenge_method=S256",
 		ep.PollEndpoint,
 		url.QueryEscape(nonce),
@@ -143,30 +148,10 @@ func pollToken(nonce, verifier string, ep Endpoints) (string, string, error) {
 
 	logger.Debug("OAuth: Polling %s", ep.PollEndpoint)
 
-	resp, err := http.Get(reqURL)
+	result, err := oauthJSON(ctx, reqURL, "")
 	if err != nil {
-		logger.Error("OAuth: Poll error: %v", err)
 		return "", "", err
 	}
-	defer resp.Body.Close()
-
-	raw, _ := io.ReadAll(resp.Body)
-	logger.Debug("OAuth: Response status=%d", resp.StatusCode)
-
-	// 404 表示还没授权，继续等待
-	if resp.StatusCode == 404 {
-		return "", "", fmt.Errorf("not authorized yet")
-	}
-
-	if resp.StatusCode != 200 {
-		return "", "", fmt.Errorf("poll: HTTP %d", resp.StatusCode)
-	}
-
-	var result map[string]interface{}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return "", "", err
-	}
-
 	deviceToken, _ := result["token"].(string)
 	refreshToken, _ := result["refresh_token"].(string)
 
@@ -182,12 +167,12 @@ func pollToken(nonce, verifier string, ep Endpoints) (string, string, error) {
 }
 
 // buildAccountFromToken 使用 device token 构建账号信息
-func buildAccountFromToken(deviceToken, refreshToken string, region Region, ep Endpoints) (*Account, error) {
-	info, err := fetchUserInfo(deviceToken, ep)
+func buildAccountFromToken(ctx context.Context, deviceToken, refreshToken string, region Region, ep Endpoints) (*Account, error) {
+	info, err := oauthJSON(ctx, ep.UserinfoBase, deviceToken)
 	if err != nil {
 		return nil, fmt.Errorf("fetch user info: %w", err)
 	}
-	plan := fetchPlan(deviceToken, ep)
+	plan := fetchPlan(ctx, deviceToken, ep)
 
 	id := SanitizeID(strGet(info, "userId") + strGet(info, "email"))
 	if id == "" {
@@ -213,37 +198,57 @@ func buildAccountFromToken(deviceToken, refreshToken string, region Region, ep E
 	if err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := SaveSecret(id, string(secretPayload)); err != nil {
 		return nil, err
 	}
 	return acct, nil
 }
 
-func fetchUserInfo(token string, ep Endpoints) (map[string]interface{}, error) {
-	req, _ := http.NewRequest("GET", ep.UserinfoBase, nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
+var oauthClient = &http.Client{Timeout: 20 * time.Second}
+
+// OAuth metadata is small. Bound time and bytes, and never interpret error pages as credentials.
+func oauthJSON(ctx context.Context, endpoint, token string) (map[string]interface{}, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := oauthClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("upstream HTTP %d", resp.StatusCode)
+	}
+	const maxBytes = 1 << 20
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > maxBytes {
+		return nil, fmt.Errorf("upstream metadata exceeds size limit")
+	}
 	var result map[string]interface{}
-	raw, _ := io.ReadAll(resp.Body)
-	json.Unmarshal(raw, &result)
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("invalid upstream JSON: %w", err)
+	}
+	if result == nil {
+		return nil, fmt.Errorf("empty upstream metadata")
+	}
 	return result, nil
 }
 
-func fetchPlan(token string, ep Endpoints) string {
-	req, _ := http.NewRequest("GET", ep.PlanEndpoint, nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
+func fetchPlan(ctx context.Context, token string, ep Endpoints) string {
+	result, err := oauthJSON(ctx, ep.PlanEndpoint, token)
 	if err != nil {
 		return ""
-	}
-	defer resp.Body.Close()
-	var result map[string]interface{}
-	raw, _ := io.ReadAll(resp.Body)
-	json.Unmarshal(raw, &result)
+	} // Optional metadata must not invalidate a valid account.
 	return strGet(result, "plan_tier_name")
 }
 
@@ -272,25 +277,19 @@ func strGet(m map[string]interface{}, key string) string {
 }
 
 func FetchQuota(token string, region Region) (*QuotaInfo, error) {
+	return FetchQuotaContext(context.Background(), token, region)
+}
+
+func FetchQuotaContext(ctx context.Context, token string, region Region) (*QuotaInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
 	ep := GetEndpoints(region)
-	req, _ := http.NewRequest("GET", ep.QuotaEndpoint, nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
+	result, err := oauthJSON(ctx, ep.QuotaEndpoint, token)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-
-	logger.Debug("FetchQuota %s raw: %s", ep.QuotaEndpoint, string(raw))
-
-	var result map[string]interface{}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return nil, err
-	}
-
 	info := &QuotaInfo{
-		Plan:            fetchPlan(token, ep),
+		Plan:            fetchPlan(ctx, token, ep),
 		IsQuotaExceeded: result["isQuotaExceeded"] == true,
 		ExpiresAt:       int64(toFloat(result, "expiresAt")),
 	}

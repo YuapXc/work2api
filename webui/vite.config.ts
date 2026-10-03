@@ -15,7 +15,7 @@ export default defineConfig({
       // 开发时把管理、模型及用户门户接口代理到后端
       '/admin': { target: 'http://127.0.0.1:8787', changeOrigin: true },
       '/v1': { target: 'http://127.0.0.1:8787', changeOrigin: true },
-      '/portal': { target: 'http://127.0.0.1:8787', changeOrigin: true },
+      '/portal/api': { target: 'http://127.0.0.1:8787', changeOrigin: true },
       '/health': { target: 'http://127.0.0.1:8787', changeOrigin: true },
     },
   },

@@ -3,6 +3,7 @@
 #   pwsh -File scripts/run.ps1            # 构建 work2api.exe 并运行
 #   pwsh -File scripts/run.ps1 -Sign      # 额外做本地自签名（减少"未知发布者"提示）
 #   pwsh -File scripts/run.ps1 -NoRun     # 只构建不运行
+#   pwsh -File scripts/run.ps1 -NoBrowser # 启动但不自动打开管理面板
 #
 # 说明：用固定路径的 work2api.exe，而不是 `go run`（后者编译到临时目录再执行，
 # 更容易被火绒等 AV 的启发式拦截）。首次仍可能被报 Trojan/Intercept.a（误报）——
@@ -10,12 +11,40 @@
 
 param(
   [switch]$Sign,
-  [switch]$NoRun
+  [switch]$NoRun,
+  [switch]$NoBrowser
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
+
+# Reuse this checkout's running process before attempting to overwrite its executable.
+$exePath = Join-Path $root 'work2api.exe'
+$existing = Get-Process -Name work2api -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exePath } | Select-Object -First 1
+if ($existing) {
+  if ($NoRun -or $Sign) { throw '本项目服务正在运行，请先关闭服务再构建或签名。' }
+  $listener = Get-NetTCPConnection -State Listen -OwningProcess $existing.Id -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $listener) { throw '本项目服务正在启动，请稍后重试。' }
+  $existingURL = "http://localhost:$($listener.LocalPort)/admin-ui/"
+  Write-Host "服务已运行 (PID $($existing.Id))，管理面板: $existingURL" -ForegroundColor Green
+  if (-not $NoBrowser) { Start-Process $existingURL }
+  return
+}
+
+$localPort = 8787
+$portText = $env:PORT
+if (-not $portText -and (Test-Path -LiteralPath (Join-Path $root '.env'))) {
+  foreach ($line in Get-Content -LiteralPath (Join-Path $root '.env')) {
+    if ($line -match '^\s*PORT\s*=\s*(.*?)\s*$') { $portText = $Matches[1].Trim().Trim('"').Trim("'") }
+  }
+}
+if ($portText) {
+  if (-not [int]::TryParse($portText, [ref]$localPort) -or $localPort -lt 1 -or $localPort -gt 65535) { throw 'PORT 必须为 1–65535 的整数' }
+}
+if (-not $NoRun -and (Get-NetTCPConnection -State Listen -LocalPort $localPort -ErrorAction SilentlyContinue)) {
+  throw "端口 $localPort 被其他服务占用，请配置 PORT 后再启动。"
+}
 
 # 保证 go 在 PATH（未加入系统 PATH 时用默认安装路径）
 if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
@@ -53,6 +82,28 @@ if ($Sign) {
 }
 
 if (-not $NoRun) {
+  $browserHelper = $null
+  if (-not $NoBrowser) {
+    $adminURL = "http://localhost:$localPort/admin-ui/"
+    Write-Host "管理面板: $adminURL（服务就绪后自动打开）" -ForegroundColor Cyan
+    $browserCode = @"
+`$deadline = [DateTime]::UtcNow.AddSeconds(30)
+while ([DateTime]::UtcNow -lt `$deadline) {
+  try {
+    `$response = Invoke-WebRequest -Uri '$adminURL' -UseBasicParsing -TimeoutSec 2
+    if (`$response.StatusCode -eq 200) { Start-Process '$adminURL'; break }
+  } catch {}
+  Start-Sleep -Milliseconds 500
+}
+"@
+    $encodedBrowserCode = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($browserCode))
+    $browserHelper = Start-Process -FilePath (Get-Process -Id $PID).Path `
+      -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedBrowserCode `
+      -WindowStyle Hidden -PassThru
+  }
   Write-Host "启动 (Ctrl+C 退出) ..." -ForegroundColor Cyan
-  & .\work2api.exe
+  try { & .\work2api.exe -port $localPort -strict-port }
+  finally {
+    if ($browserHelper -and -not $browserHelper.HasExited) { $browserHelper.Kill() }
+  }
 }

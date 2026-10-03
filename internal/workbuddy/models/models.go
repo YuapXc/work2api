@@ -6,6 +6,7 @@ package models
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"sort"
@@ -52,6 +53,7 @@ type Registry struct {
 	db     Settings
 	client *http.Client
 
+	refreshMu sync.Mutex
 	mu        sync.Mutex
 	models    []map[string]any
 	reasoning map[string]map[string]any
@@ -157,6 +159,8 @@ func (r *Registry) CreditsByRegion(model string) map[string]float64 {
 
 // Refresh force-refreshes the model cache.
 func (r *Registry) Refresh() []map[string]any {
+	r.refreshMu.Lock()
+	defer r.refreshMu.Unlock()
 	fetched := r.fetchFromUpstream()
 	if fetched == nil {
 		r.mu.Lock()
@@ -369,7 +373,96 @@ func (r *Registry) fetchFromUpstream() []fetchedModel {
 	return out
 }
 
+// RefreshAccount verifies only this account and merges its confirmed model IDs.
+// Do not extend the TTL of other accounts or infer permissions from a profile.
+func (r *Registry) RefreshAccount(ctx context.Context, uid string) bool {
+	if !r.refreshMu.TryLock() {
+		return false
+	}
+	defer r.refreshMu.Unlock()
+	account := r.pool.Get(uid)
+	if account == nil || !account.Enabled {
+		return false
+	}
+	got := r.fetchOneContext(ctx, account)
+	if len(got) == 0 {
+		return false
+	}
+	if account.Provider == "workbuddy" {
+		hasAuto := false
+		for _, f := range got {
+			if f.id == "auto" {
+				hasAuto = true
+			}
+		}
+		if !hasAuto {
+			e := entry("auto", "Auto", 0, 0)
+			e["reasoning"] = map[string]any{"supportsReasoning": true, "onlyReasoning": true}
+			got = append(got, fetchedModel{id: "auto", entry: e, reasoning: e["reasoning"].(map[string]any)})
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	updated := []map[string]any{}
+	byID := map[string]map[string]any{}
+	for _, old := range cloneAll(r.models) {
+		uids, _ := old["account_uids"].([]string)
+		remaining := []string{}
+		for _, id := range uids {
+			if id != uid {
+				remaining = append(remaining, id)
+			}
+		}
+		if len(remaining) == 0 {
+			delete(r.reasoning, str(old["id"]))
+			continue
+		}
+		old["account_uids"] = remaining
+		updated = append(updated, old)
+		byID[str(old["id"])] = old
+	}
+	for _, f := range got {
+		e := byID[f.id]
+		if e == nil {
+			e = f.entry
+			e["account_uids"] = []string{}
+			e["profiles"] = []string{}
+			byID[f.id] = e
+			updated = append(updated, e)
+			if f.reasoning != nil {
+				r.reasoning[f.id] = f.reasoning
+			}
+		}
+		ids, _ := e["account_uids"].([]string)
+		e["account_uids"] = append(ids, uid)
+		profiles, _ := e["profiles"].([]string)
+		if !contains(profiles, account.Profile) {
+			e["profiles"] = append(profiles, account.Profile)
+		}
+		if cost, ok := f.entry["credits"].(float64); ok {
+			oldCosts, _ := e["credits_by_region"].(map[string]float64)
+			cbr := map[string]float64{}
+			for region, value := range oldCosts {
+				cbr[region] = value
+			}
+			if cbr == nil {
+				cbr = map[string]float64{}
+			}
+			cbr[siterouting.ProfileSite(account.Profile)] = cost
+			e["credits_by_region"] = cbr
+		}
+	}
+	r.models = updated
+	r.source = "dynamic"
+	r.lastFail = 0
+	return true
+}
+
 func (r *Registry) fetchOne(account *pool.Account) []fetchedModel {
+	return r.fetchOneContext(context.Background(), account)
+}
+
+func (r *Registry) fetchOneContext(ctx context.Context, account *pool.Account) []fetchedModel {
 	if account.Provider == "qoder" {
 		return nil // qoder deferred
 	}
@@ -385,13 +478,15 @@ func (r *Registry) fetchOne(account *pool.Account) []fetchedModel {
 	if err != nil {
 		return nil
 	}
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 	resp, err := r.client.Do(req)
 	if err != nil {
-		r.pool.OnFailure(account.UID, 60)
+		if ctx.Err() == nil {
+			r.pool.OnFailure(account.UID, 60)
+		}
 		return nil
 	}
 	defer resp.Body.Close()
@@ -401,7 +496,7 @@ func (r *Registry) fetchOne(account *pool.Account) []fetchedModel {
 		return nil
 	}
 	var data map[string]any
-	if json.NewDecoder(resp.Body).Decode(&data) != nil {
+	if json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&data) != nil {
 		return nil
 	}
 	d, _ := data["data"].(map[string]any)

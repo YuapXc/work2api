@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -13,6 +14,106 @@ import (
 	"work2api/internal/portal/portalauth"
 	"work2api/internal/store"
 )
+
+func TestPortalAuthLimitsKeepProxyIdentitiesSeparate(t *testing.T) {
+	s, _ := portalFixture(t)
+	s.o.cfg.TrustedProxyCIDRs = "127.0.0.1/32"
+	h := s.portalGuard(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	request := func(peer, claimed string) int {
+		r := httptest.NewRequest("POST", "/portal/api/auth/login", strings.NewReader(`{}`))
+		r.RemoteAddr = peer
+		r.Header.Set("X-Real-IP", claimed)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+	for i := 0; i < 60; i++ {
+		if code := request("127.0.0.1:5000", "192.0.2.1"); code != 200 {
+			t.Fatal(i, code)
+		}
+	}
+	if request("127.0.0.1:5000", "192.0.2.1") != 429 {
+		t.Fatal("IP cap missing")
+	}
+	for i := 0; i < 400; i++ {
+		if request("127.0.0.1:5000", "192.0.2.1") != 429 {
+			t.Fatal("blocked IP escaped cap")
+		}
+	}
+	if request("127.0.0.1:5000", "192.0.2.2") != 200 {
+		t.Fatal("different client blocked")
+	}
+	r := httptest.NewRequest("POST", "/", nil)
+	r.RemoteAddr = "198.51.100.1:9"
+	r.Header.Set("X-Real-IP", "192.0.2.2")
+	if s.rateLimitIP(r) != "198.51.100.1" {
+		t.Fatal("untrusted peer spoofed identity")
+	}
+	r.RemoteAddr = "127.0.0.1:9"
+	r.Header.Set("X-Real-IP", "invalid, 192.0.2.2")
+	if s.rateLimitIP(r) != "127.0.0.1" {
+		t.Fatal("invalid proxy identity accepted")
+	}
+	for i := 0; i < 10; i++ {
+		if !s.portalLoginLimiter.allow("user:target") {
+			t.Fatal(i)
+		}
+	}
+	if s.portalLoginLimiter.allow("user:target") {
+		t.Fatal("username cap missing")
+	}
+	admin := newLoginRateLimiter()
+	for i := 0; i < 10; i++ {
+		if !admin.allow("admin-ip") {
+			t.Fatal(i)
+		}
+	}
+	if admin.allow("admin-ip") {
+		t.Fatal("admin limit changed")
+	}
+	global := newLoginRateLimiter()
+	for i := 0; i < 300; i++ {
+		if !global.allowLimit("global", 300) {
+			t.Fatal(i)
+		}
+	}
+	if global.allowLimit("global", 300) {
+		t.Fatal("global cap missing")
+	}
+	global.attempt["global"].start = time.Now().Add(-loginWindowLen)
+	if !global.allowLimit("global", 300) {
+		t.Fatal("expired window did not recover")
+	}
+}
+
+func TestSharedQueueReservesPrivateWaitCapacity(t *testing.T) {
+	a := newModelAdmission(&config.Config{MaxConcurrentRequests: 4})
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i := 0; i < 6; i++ {
+		if err := a.enqueueLocked(&modelTicket{key: fmt.Sprintf("portal-user-%d", i/4), shared: true}); err != nil {
+			t.Fatal(i, err)
+		}
+	}
+	if a.enqueueLocked(&modelTicket{key: "portal-user-another", shared: true}) == nil {
+		t.Fatal("shared queue exceeded cap")
+	}
+	if a.enqueueLocked(&modelTicket{key: "private-a"}) != nil || a.enqueueLocked(&modelTicket{key: "private-b"}) != nil {
+		t.Fatal("private waiting capacity lost")
+	}
+	if a.enqueueLocked(&modelTicket{key: "private-c"}) == nil {
+		t.Fatal("global queue exceeded cap")
+	}
+	b := newModelAdmission(&config.Config{MaxConcurrentRequests: 4})
+	for i := 0; i < 4; i++ {
+		if b.enqueueLocked(&modelTicket{key: "portal-user-one", shared: true}) != nil {
+			t.Fatal(i)
+		}
+	}
+	if b.enqueueLocked(&modelTicket{key: "portal-user-one", shared: true}) == nil {
+		t.Fatal("per-user cap missing")
+	}
+}
 
 func TestSharedAdmissionReservesPrivateCapacityAndRecovers(t *testing.T) {
 	a := newModelAdmission(&config.Config{MaxConcurrentRequests: 4, PortalSharedConcurrency: 3})

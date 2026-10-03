@@ -737,9 +737,25 @@ func (o *Orchestrator) pickInScope(model, sessionKey string, tried map[string]bo
 	if len(ready) == 0 {
 		return nil, errPoolExhausted(model, tried)
 	}
+	if sessionKey != "" {
+		if uid := o.sessions.lookup(sessionKey); uid != "" {
+			if ready[uid] {
+				if a := o.pool.Get(uid); a != nil && a.Enabled && a.CooldownUntil-now <= sessionStickyMaxCooldown {
+					return a, nil
+				}
+			}
+			o.sessions.unbind(sessionKey)
+		}
+	}
 	acc := o.pool.Pick(ready, o.modelCostByUID(model, ready), o.expiryWindowDays())
 	if acc == nil {
 		return nil, errPoolExhausted(model, nil)
+	}
+	if acc.CooldownUntil-now > sessionStickyMaxCooldown {
+		return nil, errPoolExhausted(model, tried)
+	}
+	if sessionKey != "" {
+		o.sessions.bind(sessionKey, acc.UID)
 	}
 	return acc, nil
 }

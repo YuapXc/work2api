@@ -87,7 +87,7 @@ func (s *Server) runChatPath(w http.ResponseWriter, r *http.Request, payload map
 	body := s.o.enhanceBody(upstream.BuildUpstreamBody(payload))
 	model := strOr(body["model"], "auto")
 	// 会话键从原始 payload 提取（BuildUpstreamBody 已剥掉 prompt_cache_key/metadata）
-	sessionKey := extractSessionKey(payload)
+	sessionKey := principalSessionKey(principal, model, payload)
 	acc, aerr := s.pickAccountFor(principal, model, sessionKey)
 	if aerr != nil {
 		writeAPIErr(w, aerr)
@@ -277,7 +277,7 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 	}
 	chatBody = o.enhanceBody(chatBody)
 	model := strOr(chatBody["model"], "auto")
-	sessionKey := extractSessionKey(payload)
+	sessionKey := principalSessionKey(principal, model, payload)
 	acc, aerr := s.pickAccountFor(principal, model, sessionKey)
 	if aerr != nil {
 		writeAPIErr(w, aerr)

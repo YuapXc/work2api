@@ -16,6 +16,43 @@ import (
 	"work2api/internal/workbuddy/ratelimit"
 )
 
+func TestNewContributionCatalogVerificationAndScopeAffinity(t *testing.T) {
+	s, owner := portalFixture(t)
+	acc := s.o.pool.Accounts()[0]
+	s.o.pool = pool.New(map[string]pool.Credential{acc.UID: catalogOffline{acc.Mgr}}, "")
+	s.o.models = models.NewWithCatalogClient(s.o.pool, s.o.db, &http.Client{Transport: catalogTransport{}})
+	if _, err := s.o.db.CreateContribution(owner.ID, acc.UID, "workbuddy", "codebuddy", "active"); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.portalAvailableModels(owner.ID)) != 0 {
+		t.Fatal("unverified account got models")
+	}
+	if !s.o.models.RefreshAccount(context.Background(), acc.UID) {
+		t.Fatal("account catalog not verified")
+	}
+	if !s.portalAvailableModels(owner.ID)["test-model"] {
+		t.Fatal("verified model not available immediately")
+	}
+	key := principalSessionKey(&Principal{UserID: owner.ID}, "test-model", map[string]any{"prompt_cache_key": "chat"})
+	scope := map[string]bool{acc.UID: true}
+	if _, err := s.o.pickInScope("test-model", key, nil, scope); err != nil {
+		t.Fatal(err)
+	}
+	if s.o.sessions.lookup(key) != acc.UID {
+		t.Fatal("scoped account not bound")
+	}
+	if _, err := s.o.pickInScope("test-model", key, nil, map[string]bool{}); err == nil {
+		t.Fatal("stale affinity bypassed scope revocation")
+	}
+	w := httptest.NewRecorder()
+	r := portalRequest(owner, "/portal/api/contributions/999/models/refresh", `{}`)
+	r.SetPathValue("id", "999")
+	s.portalRefreshContributionModels(w, r)
+	if w.Code != 404 {
+		t.Fatal("unknown ownership accepted", w.Code)
+	}
+}
+
 func TestPersonalAccountAccessSurvivesWithdrawalWithoutGroup(t *testing.T) {
 	s, owner := portalFixture(t)
 	acc := s.o.pool.Accounts()[0]

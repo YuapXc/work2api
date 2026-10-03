@@ -849,6 +849,8 @@ func (s *Server) adminSaveSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// User concurrency can only be changed through the validated owner-management endpoint.
+	delete(kv, "portal_user_concurrency_limits")
 	// 勾选「清除已保存的密钥」时前端不再发 aa_api_key，这里显式清空。
 	if b, ok := body["clear_aa_api_key"].(bool); ok && b {
 		kv["aa_api_key"] = ""

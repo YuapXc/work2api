@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "build:embed": "npm run build && node scripts/sync-embed.mjs",
+    "check:embed": "node scripts/sync-embed.mjs --check"
   },
   "dependencies": {
     "@fontsource-variable/inter": "^5.1.0",

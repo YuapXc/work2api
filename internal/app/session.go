@@ -11,9 +11,24 @@ package app
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"strconv"
 	"strings"
 	"sync"
 )
+
+// Keep account affinity isolated between users and models; retain only a bounded hash.
+func principalSessionKey(p *Principal, model string, body map[string]any) string {
+	key := extractSessionKey(body)
+	if key == "" {
+		return ""
+	}
+	namespace := "private"
+	if p != nil && p.UserID > 0 {
+		namespace = "portal:" + strconv.FormatInt(p.UserID, 10)
+	}
+	hash := sha256.Sum256([]byte(namespace + "\x00" + model + "\x00" + key))
+	return hex.EncodeToString(hash[:])
+}
 
 // extractSessionKey 从（转换前的原始）客户端请求体提取会话键；无会话特征返回空串。
 // 必须在 BuildUpstreamBody 的白名单剥字段之前提取，否则丢失 prompt_cache_key/metadata。

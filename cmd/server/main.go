@@ -41,7 +41,7 @@ func main() {
 	sched.Start()
 
 	srv := app.NewServer(orch)
-	ln, addr, err := listen(cfg.Host, cfg.Port)
+	ln, addr, err := listen(cfg.Host, cfg.Port, cfg.AllowPortFallback)
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
@@ -76,10 +76,10 @@ func main() {
 // 8790), announcing each bump so clients aren't left guessing. A port the
 // operator set explicitly (anything other than 8787) is never auto-avoided:
 // if it is occupied we fail with an actionable hint, respecting their choice.
-func listen(host string, port int) (net.Listener, string, error) {
+func listen(host string, port int, fallback ...bool) (net.Listener, string, error) {
 	const defaultPort = 8787
 	const maxBumps = 3
-	autoAvoid := port == defaultPort
+	autoAvoid := port == defaultPort && (len(fallback) == 0 || fallback[0])
 	attempts := 1
 	if autoAvoid {
 		attempts += maxBumps

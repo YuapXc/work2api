@@ -31,6 +31,7 @@ type modelAdmission struct {
 	limits                        map[string]int
 	active                        int
 	sharedActive, sharedCapacity  int
+	userQueue, sharedQueue        int
 	byKey                         map[string]int
 	queue                         []*modelTicket
 	served                        map[string]uint64
@@ -55,12 +56,17 @@ func positiveOr(v, fallback int) int {
 }
 
 func newModelAdmission(c *config.Config) *modelAdmission {
-	a := &modelAdmission{capacity: positiveOr(c.MaxConcurrentRequests, 4), queueSize: positiveOr(c.ModelQueueSize, 8), keyQueue: positiveOr(c.ModelKeyQueueSize, 8), wait: time.Duration(positiveOr(c.ModelQueueWaitSeconds, 20)) * time.Second, limits: map[string]int{}, byKey: map[string]int{}, served: map[string]uint64{}, changed: make(chan struct{}), rejected: map[string]int64{}}
+	a := &modelAdmission{capacity: positiveOr(c.MaxConcurrentRequests, 4), queueSize: positiveOr(c.ModelQueueSize, 8), keyQueue: positiveOr(c.ModelKeyQueueSize, 8), wait: time.Duration(positiveOr(c.ModelQueueWaitSeconds, 60)) * time.Second, limits: map[string]int{}, byKey: map[string]int{}, served: map[string]uint64{}, changed: make(chan struct{}), rejected: map[string]int64{}}
 	if c.ModelKeyLimits != "" {
 		if err := json.Unmarshal([]byte(c.ModelKeyLimits), &a.limits); err != nil {
 			log.Print("MODEL_KEY_CONCURRENCY_LIMITS 无效，使用全局并发限制")
 			a.limits = map[string]int{}
 		}
+	}
+	a.userQueue = positiveOr(c.PortalUserQueueSize, 4)
+	a.sharedQueue = positiveOr(c.PortalSharedQueueSize, 6)
+	if a.queueSize > 1 && a.sharedQueue >= a.queueSize {
+		a.sharedQueue = a.queueSize - 1
 	}
 	a.sharedCapacity = positiveOr(c.PortalSharedConcurrency, 3)
 	if a.capacity > 1 && a.sharedCapacity >= a.capacity {
@@ -110,13 +116,22 @@ func (a *modelAdmission) dispatchLocked() {
 
 func (a *modelAdmission) enqueueLocked(t *modelTicket) *apiError {
 	code := "model_queue_full"
-	count := 0
+	count, sharedCount := 0, 0
 	for _, q := range a.queue {
+		if q.shared {
+			sharedCount++
+		}
 		if q.key == t.key {
 			count++
 		}
 	}
-	if count >= a.keyQueue {
+	queueLimit := a.keyQueue
+	if t.shared && a.userQueue < queueLimit {
+		queueLimit = a.userQueue
+	}
+	if t.shared && sharedCount >= a.sharedQueue {
+		code = "shared_queue_full"
+	} else if count >= queueLimit {
 		code = "key_queue_full"
 	} else if len(a.queue) < a.queueSize {
 		a.queue = append(a.queue, t)
@@ -312,7 +327,13 @@ func (a *modelAdmission) snapshot() map[string]any {
 	for k, v := range a.rejected {
 		rejected[k] = v
 	}
-	return map[string]any{"running": a.active, "queued": len(a.queue), "capacity": a.capacity, "queue_capacity": a.queueSize, "wait_limit_ms": a.wait.Milliseconds(), "oldest_wait_ms": oldest.Milliseconds(), "rejected": rejected}
+	sharedQueued := 0
+	for _, t := range a.queue {
+		if t.shared {
+			sharedQueued++
+		}
+	}
+	return map[string]any{"shared_running": a.sharedActive, "shared_capacity": a.sharedCapacity, "shared_queued": sharedQueued, "shared_queue_capacity": a.sharedQueue, "user_queue_capacity": a.userQueue, "running": a.active, "queued": len(a.queue), "capacity": a.capacity, "queue_capacity": a.queueSize, "wait_limit_ms": a.wait.Milliseconds(), "oldest_wait_ms": oldest.Milliseconds(), "rejected": rejected}
 }
 
 func (s *Server) admitModel(w http.ResponseWriter, r *http.Request, p *Principal) (*http.Request, func(), bool) {
@@ -320,11 +341,11 @@ func (s *Server) admitModel(w http.ResponseWriter, r *http.Request, p *Principal
 	if p.AppName == "model-test" && p.AppID == 0 {
 		key = "admin-test"
 	}
-	// 门户 Key 的并发上限按用户计（PORTAL_USER_CONCURRENCY，默认 1）：同一
+	// 门户 Key 的并发上限按用户计（PORTAL_USER_CONCURRENCY，默认 2）：同一
 	// 用户多个 Key 共享一个并发槽，跨 Key 合并限流（HANDOFF §8）。
 	if p.UserID > 0 {
 		key = "portal-user-" + strconv.FormatInt(p.UserID, 10)
-		l, err := s.modelsAdmission.acquireWithLimit(r.Context(), key, positiveOr(s.o.cfg.PortalUserConcurrency, 1))
+		l, err := s.modelsAdmission.acquireWithLimit(r.Context(), key, s.portalUserLimit(p.UserID))
 		if err != nil {
 			st, body := errToHTTP(err)
 			if st == 429 {

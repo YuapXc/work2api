@@ -28,6 +28,7 @@ const modelNames = ref<Record<string, string>>({})
 const groupDrafts = ref<Record<number, string[]>>({})
 const passwords = ref<Record<number, string>>({})
 const accountDrafts = ref<Record<number, string>>({})
+const concurrencyDrafts = ref<Record<number, string>>({})
 const userDrafts = ref<Record<number, string>>({})
 const adminsExist = computed(() => data.value.users.some(u => u.role === 'admin'))
 function parseModels(value: string[] | string): string[] {
@@ -70,6 +71,7 @@ async function load() {
     defaultAuto.value = !!data.value.default_auto_grant
     for (const a of data.value.accounts || []) sharingDrafts.value[a.uid] = { mode: a.sharing_mode || 'private', groups: data.value.groups.filter(g => accountsOf(g).includes(a.uid)).map(g => g.id) }
     for (const g of data.value.groups) groupDrafts.value[g.id] = parseModels(g.allowed_models).filter(isPublicModel)
+    for (const u of data.value.users) concurrencyDrafts.value[u.id] = String(data.value.user_concurrency_overrides?.[String(u.id)] || 0)
     loaded.value = true
   } catch (e: any) { error.value = e?.response?.data?.error?.message || e?.message || '加载失败' }
   finally { loading.value = false }
@@ -172,8 +174,9 @@ async function createInvite() {
       <WInput v-model="bootstrapName" placeholder="管理员用户名" /><WInput v-model="bootstrapPass" type="password" placeholder="8–72 字节密码" /><WButton variant="primary" :loading="busy" @click="bootstrap">初始化</WButton>
     </div>
     <section class="glass rounded-xl p-5 space-y-3">
-      <h2 class="font-semibold">用户与密码恢复</h2><p v-if="!data.users.length" class="text-small text-faint">暂无用户。</p>
+      <h2 class="font-semibold">用户与密码恢复</h2><p class="text-micro text-faint">默认每用户同时执行 {{ data.user_concurrency || 2 }} 个请求；所有 Key 合并计算。可信用户可提高到 3，共享和全局上限仍生效。调整适用于后续请求。</p><p v-if="!data.users.length" class="text-small text-faint">暂无用户。</p>
       <div v-for="u in data.users" :key="u.id" class="rounded-lg border border-line p-3 space-y-2">
+        <div class="flex items-center gap-2 text-small"><label :for="`concurrency-${u.id}`">执行并发</label><select :id="`concurrency-${u.id}`" v-model="concurrencyDrafts[u.id]" :disabled="busy" class="rounded-lg border border-line bg-bg p-2"><option value="0">默认</option><option value="1">1</option><option value="2">2</option><option value="3">3（可信用户）</option></select><WButton size="sm" :disabled="busy" @click="mutate(() => api.portalWrite(`users/${u.id}/concurrency`, { limit: Number(concurrencyDrafts[u.id]) }), '并发上限已更新')">保存并发</WButton></div>
         <div class="flex flex-wrap items-center gap-3"><span>{{ u.username }} <span class="text-micro text-faint">#{{ u.id }} · {{ u.role }} · {{ u.status }}</span></span><WButton size="sm" :disabled="busy" @click="mutate(() => api.portalWrite(`users/${u.id}/status`, { status: u.status === 'active' ? 'disabled' : 'active' }), '用户状态已更新')">{{ u.status === 'active' ? '停用' : '启用' }}</WButton></div>
         <div class="flex gap-2"><WInput v-model="passwords[u.id]" type="password" placeholder="新密码（8–72 字节）" /><WButton size="sm" :disabled="busy" @click="resetPassword(u)">重置密码并退出设备</WButton></div>
       </div>
@@ -200,6 +203,7 @@ async function createInvite() {
         <WButton size="sm" :disabled="busy" @click="mutate(() => api.portalWrite(`groups/${g.id}/models`, { allowed_models: groupDrafts[g.id] || [] }), '模型范围已保存')">保存模型范围</WButton>
         <p class="text-small">共享账号</p><div v-for="uid in accountsOf(g)" :key="uid" class="flex flex-wrap items-center gap-2 text-micro"><span :title="uid">{{ accountLabelByUID(uid) }}</span><WButton size="sm" :disabled="busy" @click="mutate(() => api.portalWrite(`groups/${g.id}/accounts`, { action: 'remove', account_uid: uid }), '账号已移出')">移出</WButton></div>
         <div class="flex gap-2"><select v-model="accountDrafts[g.id]" class="min-w-0 flex-1 rounded-lg border border-line bg-bg px-2 text-small"><option value="">选择可共享账号</option><option v-for="a in sharedAccounts.filter(a => !accountsOf(g).includes(a.uid))" :key="a.uid" :value="a.uid">{{ accountLabel(a) }}</option></select><WButton size="sm" :disabled="busy || !accountDrafts[g.id]" @click="mutate(() => api.portalWrite(`groups/${g.id}/accounts`, { action: 'add', account_uid: accountDrafts[g.id] }), '账号已加入')">加入</WButton></div>
+        <p class="text-micro text-faint">当前就绪账号 {{ g.ready_accounts || 0 }} · 可用授权模型 {{ g.usable_models || 0 }} · 实际具备共享资格用户 {{ g.eligible_users || 0 }}{{ !g.enabled ? ' · 池未启用' : !g.usable_models ? ' · 请配置模型并检查账号状态或刷新目录' : '' }}</p>
         <p class="text-small">获授权用户</p><div v-for="id in grantsOf(g)" :key="id" class="flex items-center gap-2 text-small"><span>{{ username(id) }}</span><WButton size="sm" :disabled="busy" @click="mutate(() => api.portalWrite(`groups/${g.id}/grants`, { action: 'revoke', user_id: id }), '授权已撤销')">撤销授权</WButton></div>
         <div class="flex gap-2"><select v-model="userDrafts[g.id]" class="min-w-0 flex-1 rounded-lg border border-line bg-bg px-2 text-small"><option value="">选择用户</option><option v-for="u in data.users.filter(u => u.status === 'active' && !grantsOf(g).includes(u.id))" :key="u.id" :value="String(u.id)">{{ u.username }}</option></select><WButton size="sm" :disabled="busy || !userDrafts[g.id]" @click="mutate(() => api.portalWrite(`groups/${g.id}/grants`, { action: 'grant', user_id: Number(userDrafts[g.id]) }), '授权已授予')">授权</WButton></div>
       </article>

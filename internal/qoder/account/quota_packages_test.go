@@ -1,9 +1,42 @@
 package account
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+func TestOAuthMetadataRejectsStatusMalformedAndOversizedResponses(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"upstream failure", 503, `{"userId":"wrong"}`},
+		{"invalid JSON", 200, `<html>error</html>`},
+		{"null", 200, `null`},
+		{"oversized", 200, `{"padding":"` + strings.Repeat("x", 1<<20) + `"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer s.Close()
+			if _, err := oauthJSON(context.Background(), s.URL, ""); err == nil {
+				t.Fatal("invalid upstream metadata accepted")
+			}
+		})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := oauthJSON(ctx, "https://example.invalid", ""); err == nil {
+		t.Fatal("cancelled request was not rejected")
+	}
+}
 
 // 专属资源包解析（buddy-proxy #51）：available/status 双保险判活、多语言标签
 // 回退、额度并入总额度。此前整条节点丢弃会让面板显示比实际少一截。

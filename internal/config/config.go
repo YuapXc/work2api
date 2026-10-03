@@ -19,6 +19,7 @@ import (
 type Config struct {
 	Host                  string // listen host
 	Port                  int    // listen port
+	AllowPortFallback     bool   // only an unconfigured default port may auto-avoid
 	DBPath                string // SQLite file path
 	AdminToken            string // admin/WebUI auth; empty => loopback-only
 	AdminCookieSecure     bool   // force Secure cookies behind a TLS-terminating proxy
@@ -47,6 +48,8 @@ type Config struct {
 	PortalRegistrationMode  string
 	PortalMaxTasksPerUser   int
 	PortalUserConcurrency   int
+	PortalUserQueueSize     int
+	PortalSharedQueueSize   int
 	PortalSharedConcurrency int
 	PortalDailyRequests     int
 	PortalDailyInputTokens  int
@@ -95,6 +98,7 @@ func Load(args []string) *Config {
 	fs := flag.NewFlagSet("work2api", flag.ContinueOnError)
 	host := fs.String("host", env("HOST", "127.0.0.1"), "listen host")
 	port := fs.Int("port", envInt("PORT", 8787), "listen port")
+	strictPort := fs.Bool("strict-port", false, "disable automatic port fallback")
 	dataDir := fs.String("data-dir", env("DATA_DIR", "data"), "data directory")
 	dbPath := fs.String("db", env("DB_PATH", ""), "sqlite db path (default <data-dir>/work2api.db)")
 	adminToken := fs.String("admin-token", env("ADMIN_TOKEN", ""), "admin/webui token; empty => loopback only")
@@ -114,7 +118,14 @@ func Load(args []string) *Config {
 		dbp = resolvePath(dbp)
 	}
 
+	explicitPort := os.Getenv("PORT") != "" || *strictPort
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "port" {
+			explicitPort = true
+		}
+	})
 	return &Config{
+		AllowPortFallback:     !explicitPort,
 		Host:                  *host,
 		Port:                  *port,
 		DataDir:               dd,
@@ -125,7 +136,7 @@ func Load(args []string) *Config {
 		MaxRequestBytes:       int64(positiveEnvInt("MAX_REQUEST_BYTES", 16*1024*1024)),
 		MaxConcurrentRequests: positiveEnvInt("MAX_CONCURRENT_REQUESTS", 4),
 		ModelQueueSize:        positiveEnvInt("MODEL_QUEUE_SIZE", 8),
-		ModelQueueWaitSeconds: positiveEnvInt("MODEL_QUEUE_WAIT_SECONDS", 20),
+		ModelQueueWaitSeconds: positiveEnvInt("MODEL_QUEUE_WAIT_SECONDS", 60),
 		ModelKeyQueueSize:     positiveEnvInt("MODEL_KEY_QUEUE_SIZE", 8),
 		ModelKeyLimits:        env("MODEL_KEY_CONCURRENCY_LIMITS", ""),
 		AdminConcurrency:      positiveEnvInt("ADMIN_CONCURRENCY", 8),
@@ -141,7 +152,9 @@ func Load(args []string) *Config {
 
 		PortalRegistrationMode:  strings.ToLower(strings.TrimSpace(envOr("PORTAL_REGISTRATION_MODE", envOr("PORTAL_INVITE_MODE", "invite")))),
 		PortalMaxTasksPerUser:   positiveEnvInt("PORTAL_MAX_TASKS_PER_USER", 3),
-		PortalUserConcurrency:   positiveEnvInt("PORTAL_USER_CONCURRENCY", 1),
+		PortalUserConcurrency:   positiveEnvInt("PORTAL_USER_CONCURRENCY", 2),
+		PortalUserQueueSize:     positiveEnvInt("PORTAL_USER_QUEUE_SIZE", 4),
+		PortalSharedQueueSize:   positiveEnvInt("PORTAL_SHARED_QUEUE_SIZE", 6),
 		PortalSharedConcurrency: positiveEnvInt("PORTAL_SHARED_CONCURRENCY", 3),
 		PortalDailyRequests:     envInt("PORTAL_DAILY_REQUESTS", 0),
 		PortalDailyInputTokens:  envInt("PORTAL_DAILY_INPUT_TOKENS", 0),

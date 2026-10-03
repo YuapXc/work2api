@@ -328,7 +328,7 @@ func (r *Runtime) AdminRefreshCredits(ctx context.Context) (map[string]any, erro
 		return map[string]any{"ok": false, "account_id": acct.ID, "unsupported": true,
 			"message": "该账号为 PAT，暂不支持额度查询（仅设备令牌账号支持）"}, nil
 	}
-	q, err := account.FetchQuota(token, acct.Region)
+	q, err := account.FetchQuotaContext(ctx, token, acct.Region)
 	if err != nil {
 		return nil, err
 	}
