@@ -4,7 +4,7 @@ export interface PortalGroup {
   id: number; name: string; provider: string; enabled: boolean; allowed_models: string[] | string
   accounts?: string[]; grants?: number[]; account_uids?: string[]; user_ids?: number[]
 }
-export interface PortalAccount { uid: string; provider: string; site?: string; nickname?: string; enabled: boolean; contribution_user_id?: number; status?: string; owner_kind?: 'platform' | 'user'; sharing_mode?: string }
+export interface PortalAccount { uid: string; provider: string; site?: string; alias?: string; nickname?: string; enabled: boolean; contribution_user_id?: number; status?: string; owner_kind?: 'platform' | 'user'; sharing_mode?: string }
 export interface PortalContribution { id: number; user_id: number; account_uid: string; status: string }
 export interface PortalOverview {
   users: PortalUser[]; invites: PortalInvite[]; groups: PortalGroup[]; accounts?: PortalAccount[]

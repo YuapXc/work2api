@@ -96,6 +96,7 @@ export interface ModelInfo {
   id: string
   /** 模型所属供应商。 */
   provider?: 'workbuddy' | 'qoder' | 'opencode'
+  owned_by?: string
   name?: string
   context_length?: number
   max_output_tokens?: number

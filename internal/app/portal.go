@@ -1129,7 +1129,7 @@ func (s *Server) adminPortalOverview(w http.ResponseWriter, r *http.Request) {
 		if mode == "" {
 			mode = "private"
 		}
-		row := map[string]any{"uid": uid, "nickname": a["nickname"], "provider": a["provider"], "profile": a["profile"], "enabled": a["enabled"], "sharing_mode": mode, "owner_kind": "platform"}
+		row := map[string]any{"uid": uid, "alias": a["alias"], "nickname": a["nickname"], "provider": a["provider"], "profile": a["profile"], "enabled": a["enabled"], "sharing_mode": mode, "owner_kind": "platform"}
 		if c, ok := owners[uid]; ok {
 			row["owner_kind"] = "user"
 			row["contribution_user_id"] = c.UserID
