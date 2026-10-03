@@ -64,7 +64,8 @@ async function logout() {
 const nav = [
   { key: '/', label: '首页' },
   { key: '/keys', label: 'API 密钥' },
-  { key: '/contribute', label: '贡献账号' },
+  { key: '/models', label: '可用模型' },
+  { key: '/contribute', label: '我的账号' },
   { key: '/usage', label: '用量' },
 ]
 const activeKey = computed(() => '/' + (route.path.split('/')[1] || ''))
@@ -153,7 +154,7 @@ onMounted(probe)
           >{{ item.label }}</button>
         </nav>
         <div class="ml-auto flex items-center gap-2">
-          <span class="hidden text-micro text-muted sm:inline">{{ me.user.username }}</span>
+          <span class="hidden max-w-24 truncate text-micro text-muted lg:inline" :title="me.user.username">{{ me.user.username }}</span>
           <button class="flex h-8 items-center gap-1.5 rounded-lg border border-line px-2.5 text-micro text-muted transition-colors hover:border-brand hover:text-brand" @click="toggleTheme">
             {{ isLight ? '暗色' : '浅色' }}
           </button>

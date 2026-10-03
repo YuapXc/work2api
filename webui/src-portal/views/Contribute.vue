@@ -53,7 +53,7 @@ async function poll() {
     if (res.status === 'pending') { timer = setTimeout(poll, 3000); return }
     stopPoll()
     if (res.status === 'ready') {
-      toast.success(`共享成功（账号 ${res.account_uid_masked}），等待管理员加入分组后即可调用`)
+      toast.success(`账号 ${res.account_uid_masked} 已添加，可查看本人可用模型并创建 Key；共享池另需管理员授权`)
       taskId.value = authUrl.value = ''
       await load()
       emit('refresh')
@@ -83,27 +83,32 @@ async function cancelPoll() {
 }
 
 async function revoke(c: ContributionInfo) {
-  if (!confirm('撤回后该账号立即停止共享调度（进行中的请求会跑完，但不会再被选中）。确定撤回？')) return
+  if (!confirm('停止共享后，该账号仅供你本人使用。其他用户正在执行的请求可以完成，后续请求不能再选中该账号。确定停止共享？')) return
   try {
     await api.revokeContribution(c.id)
     await load()
     emit('refresh')
-    toast.success('已撤回共享')
+    toast.success('已停止共享，本人仍可使用该账号')
   } catch (e: any) { toast.error(e?.message || '撤回失败') }
 }
 
 const statusText: Record<string, string> = {
-  active: '共享中', revoked: '已撤回', unavailable: '暂不可用', invalid: '已失效', verifying: '验证中',
+  active: '共享中', private: '仅本人使用', revoked: '已撤回，需重新验证', unavailable: '暂不可用', invalid: '已失效', verifying: '验证中',
+}
+async function share(c: ContributionInfo) {
+  if (!confirm('恢复共享后，获授权用户可使用此账号并消耗它的额度。你仍保留本人使用权，账号原有停用和冷却状态不会被清除。确认恢复共享？')) return
+  try { await api.shareContribution(c.id); await load(); emit('refresh'); toast.success('已恢复共享') }
+  catch (e: any) { toast.error(e?.message || '恢复共享失败') }
 }
 </script>
 
 <template>
   <div class="space-y-5">
     <div class="glass rounded-2xl p-6">
-      <h1 class="text-base font-semibold">贡献 WorkBuddy 账号</h1>
+      <h1 class="text-base font-semibold">我的 WorkBuddy 账号</h1>
       <p class="mt-1 text-micro text-faint">
-        扫码登录你的 WorkBuddy 账号即可加入共享池。你的账号只会被用于共享分组的模型调用（含重试也绝不会落入私人池），
-        消耗的是该账号自己的额度；随时可以撤回。服务器会保存授权凭据以进行模型调用；撤回后停止共享，凭据与贡献记录仍保留用于审计和恢复。
+        扫码添加并共享账号后，你无需共享分组授权即可调用本人账号。其他用户只能通过获授权的共享池使用它，调用消耗该账号额度。
+        你可以随时停止共享，账号会保留为仅本人使用。服务器会保存授权凭据；共享记录和凭据也会保留，用于本人调用及重新授权。
       </p>
       <label class="mt-4 flex cursor-pointer items-start gap-2 text-small text-muted">
         <input v-model="accepted" type="checkbox" class="mt-0.5" />
@@ -124,7 +129,7 @@ const statusText: Record<string, string> = {
     </div>
 
     <div class="glass rounded-2xl p-6">
-      <h2 class="text-base font-semibold">我的贡献</h2>
+      <h2 class="text-base font-semibold">我的账号与共享状态</h2>
       <div v-if="loading" class="mt-4 text-small text-faint">加载中…</div>
       <div v-else-if="!list.length" class="mt-4 text-small text-faint">还没有贡献记录。</div>
       <div v-else class="mt-4 space-y-3">
@@ -133,8 +138,9 @@ const statusText: Record<string, string> = {
           <code class="mono text-small">{{ c.account }}</code>
           <span class="rounded-md bg-bg/60 px-2 py-0.5 text-micro text-muted">{{ statusText[c.status] || c.status }}</span>
           <span class="mono ml-auto text-micro text-faint">{{ fmtTime(c.created_at) }}</span>
-          <WButton v-if="c.status === 'active'" size="sm" variant="danger" @click="revoke(c)">撤回</WButton>
-          <span v-if="c.status === 'revoked'" class="text-micro text-faint">恢复共享：在上方重新扫码同一账号并授权。</span>
+          <WButton v-if="c.status === 'active'" size="sm" variant="subtle" @click="revoke(c)">停止共享</WButton>
+          <WButton v-if="c.status === 'private'" size="sm" variant="subtle" @click="share(c)">恢复共享</WButton>
+          <span v-if="c.status === 'revoked'" class="text-micro text-faint">重新验证：在上方扫码同一账号并授权。</span>
         </div>
       </div>
     </div>

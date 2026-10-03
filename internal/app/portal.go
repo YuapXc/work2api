@@ -49,6 +49,7 @@ func (s *Server) mountPortal(mux *http.ServeMux) {
 	mux.HandleFunc("POST /portal/api/auth/password", s.portalChangePassword)
 	// 会话内接口
 	mux.HandleFunc("GET /portal/api/me", s.portalMe)
+	mux.HandleFunc("GET /portal/api/models", s.portalModels)
 	mux.HandleFunc("GET /portal/api/keys", s.portalListKeys)
 	mux.HandleFunc("POST /portal/api/keys", s.portalCreateKey)
 	mux.HandleFunc("POST /portal/api/keys/{id}/toggle", s.portalToggleKey)
@@ -59,6 +60,7 @@ func (s *Server) mountPortal(mux *http.ServeMux) {
 	mux.HandleFunc("POST /portal/api/contributions/poll", s.portalContributionPoll)
 	mux.HandleFunc("POST /portal/api/contributions/cancel", s.portalContributionCancel)
 	mux.HandleFunc("POST /portal/api/contributions/{id}/revoke", s.portalRevokeContribution)
+	mux.HandleFunc("POST /portal/api/contributions/{id}/share", s.portalShareContribution)
 	mux.HandleFunc("GET /portal/api/usage", s.portalUsage)
 	// 管理端（/admin 前缀 → adminGuard 自然生效：会话/令牌 + CSRF）
 	mux.HandleFunc("GET /admin/portal/users", s.adminPortalUsers)
@@ -76,6 +78,8 @@ func (s *Server) mountPortal(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /admin/portal/groups/{id}", s.adminPortalGroupDelete)
 	mux.HandleFunc("GET /admin/portal/overview", s.adminPortalOverview)
 	mux.HandleFunc("POST /admin/portal/bootstrap", s.adminPortalBootstrap)
+	mux.HandleFunc("POST /admin/portal/default-group", s.adminPortalDefaultGroup)
+	mux.HandleFunc("POST /admin/portal/accounts/{uid}/sharing", s.adminPortalAccountSharing)
 }
 
 // adminPortalBootstrap creates the first portal admin user. One-time and
@@ -383,11 +387,28 @@ func portalUserView(u *store.User) map[string]any {
 // the portal can show 可用模型 without probing /v1/models.
 func (s *Server) portalMe(w http.ResponseWriter, r *http.Request) {
 	user := portalCtx(r)
-	eligible, _ := s.o.db.HasActiveContribution(user.ID)
-	accounts, _ := s.o.db.ActiveContributionUIDs(user.ID)
-	groups, _ := s.o.db.GrantedGroups(user.ID)
+	accounts, err := s.o.db.OwnedAccountUIDs(user.ID)
+	if err != nil {
+		writeAPIErr(w, errBody(503, "账号查询失败", "server_error"))
+		return
+	}
+	groups, err := s.o.db.GrantedGroups(user.ID)
+	if err != nil {
+		writeAPIErr(w, errBody(503, "共享权限查询失败", "server_error"))
+		return
+	}
 	enabledGroups := 0
-	available := s.portalAvailableModels(user.ID)
+	p := &Principal{UserID: user.ID}
+	if aerr := s.o.attachPortalScope(p); aerr != nil && aerr.status >= 500 {
+		writeAPIErr(w, aerr)
+		return
+	}
+	available := s.o.portalCatalogPermissions(p)
+	for model := range p.SharedModels {
+		if !available[model] {
+			delete(p.SharedModels, model)
+		}
+	}
 	for _, g := range groups {
 		if !g.Enabled || strings.TrimSpace(g.AllowedModels) == "" {
 			continue
@@ -401,11 +422,22 @@ func (s *Server) portalMe(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(models)
 	writeJSON(w, 200, map[string]any{
 		"user":              portalUserView(user),
-		"eligible":          eligible,
+		"eligible":          len(available) > 0,
 		"eligible_accounts": len(accounts),
+		"own_models":        sortedPortalModels(p.OwnedModels),
+		"shared_models":     sortedPortalModels(p.SharedModels),
 		"groups_enabled":    enabledGroups,
 		"available_models":  models,
 	})
+}
+
+func sortedPortalModels(models map[string]bool) []string {
+	list := make([]string, 0, len(models))
+	for model := range models {
+		list = append(list, model)
+	}
+	sort.Strings(list)
+	return list
 }
 
 // --- Key 管理 ---
@@ -515,7 +547,57 @@ func (s *Server) portalAvailableModels(userID int64) map[string]bool {
 	if s.o.attachPortalScope(p) != nil {
 		return map[string]bool{}
 	}
-	return p.PortalModels
+	return s.o.portalCatalogPermissions(p)
+}
+
+// Catalog visibility also requires a supporting account within the user's
+// model scope. A model existing only on someone else's site is not usable.
+func (o *Orchestrator) portalCatalogPermissions(p *Principal) map[string]bool {
+	allowed := map[string]bool{}
+	for _, entry := range o.models.ListCached() {
+		id := str2(entry["id"])
+		if !p.PortalModels[id] {
+			continue
+		}
+		for uid := range o.modelEntryAccountUIDs(entry) {
+			if p.ModelScopes[id][uid] {
+				allowed[id] = true
+				break
+			}
+		}
+	}
+	return allowed
+}
+
+// portalModels exposes catalog metadata only, never account identifiers or
+// credentials. Listing uses the same permission scope as model execution.
+func (s *Server) portalModels(w http.ResponseWriter, r *http.Request) {
+	p := &Principal{UserID: portalCtx(r).ID}
+	items := []map[string]any{}
+	if aerr := s.o.attachPortalScope(p); aerr != nil {
+		if aerr.status >= 500 {
+			writeAPIErr(w, aerr)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"models": items, "source": s.o.models.Source()})
+		return
+	}
+	visible := s.o.portalCatalogPermissions(p)
+	for _, model := range s.o.models.ListCached() {
+		id := str2(model["id"])
+		if !visible[id] {
+			continue
+		}
+		item := map[string]any{"id": id, "own_account": p.OwnedModels[id], "shared_pool": p.SharedModels[id]}
+		for _, field := range []string{"name", "context_length", "max_output_tokens", "vision", "reasoning", "input_modalities", "output_modalities"} {
+			if value, ok := model[field]; ok {
+				item[field] = value
+			}
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool { return str2(items[i]["id"]) < str2(items[j]["id"]) })
+	writeJSON(w, 200, map[string]any{"models": items, "source": s.o.models.Source()})
 }
 
 func (s *Server) portalToggleKey(w http.ResponseWriter, r *http.Request) {
@@ -896,7 +978,7 @@ func (s *Server) portalRevokeContribution(w http.ResponseWriter, r *http.Request
 		writeJSON(w, 404, errBody(404, "贡献不存在", "invalid_request_error").body)
 		return
 	}
-	ok, err := s.o.db.SetContributionStatus(id, user.ID, "active", "revoked", reason)
+	ok, err := s.o.db.WithdrawContribution(id, user.ID, reason)
 	if err != nil {
 		writeJSON(w, 500, errBody(500, "操作失败", "server_error").body)
 		return
@@ -904,18 +986,6 @@ func (s *Server) portalRevokeContribution(w http.ResponseWriter, r *http.Request
 	if !ok {
 		writeJSON(w, 404, errBody(404, "贡献不存在或状态不允许撤回", "invalid_request_error").body)
 		return
-	}
-	s.o.pool.SetEnabled(owned.AccountUID, false, reason)
-	groups, err := s.o.db.ListResourceGroups()
-	if err != nil {
-		writeJSON(w, 500, errBody(500, "贡献已撤回，分组清理失败", "server_error").body)
-		return
-	}
-	for _, g := range groups {
-		if err := s.o.db.RemoveGroupAccount(g.ID, owned.AccountUID); err != nil {
-			writeJSON(w, 500, errBody(500, "贡献已撤回，分组清理失败", "server_error").body)
-			return
-		}
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
@@ -939,6 +1009,35 @@ func (s *Server) portalListContributions(w http.ResponseWriter, r *http.Request)
 		})
 	}
 	writeJSON(w, 200, map[string]any{"contributions": out})
+}
+
+func (s *Server) portalShareContribution(w http.ResponseWriter, r *http.Request) {
+	if !s.o.cfg.PortalEnabled {
+		writeAPIErr(w, errBody(403, "共享服务已关闭", "portal_disabled"))
+		return
+	}
+	body, err := readJSON(r)
+	if err != nil || body["accepted"] != true {
+		writeAPIErr(w, errBody(400, "请先确认共享账号及额度的使用说明", "invalid_request_error"))
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeAPIErr(w, errBody(404, "账号不存在", "not_found"))
+		return
+	}
+	s.o.accountMu.Lock()
+	defer s.o.accountMu.Unlock()
+	ok, err := s.o.db.RestoreContributionSharing(id, portalCtx(r).ID)
+	if err != nil {
+		writeAPIErr(w, errBody(503, "恢复共享失败，请重试", "server_error"))
+		return
+	}
+	if !ok {
+		writeAPIErr(w, errBody(404, "账号不存在或需要重新验证", "not_found"))
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 // --- 用量 ---
@@ -1015,10 +1114,94 @@ func (s *Server) adminPortalOverview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	accounts := []map[string]any{}
-	for _, a := range rawAccounts {
-		accounts = append(accounts, map[string]any{"uid": a["uid"], "nickname": a["nickname"], "provider": a["provider"], "profile": a["profile"], "enabled": a["enabled"]})
+	modes, err := s.o.db.PlatformSharingModes()
+	if err != nil {
+		writeAPIErr(w, errBody(503, "账号使用范围查询失败", "server_error"))
+		return
 	}
-	writeJSON(w, 200, map[string]any{"users": users, "invites": invites, "groups": groups, "contributions": contributions, "accounts": accounts, "account_count": len(accounts), "registration_mode": s.o.cfg.PortalRegistrationMode})
+	owners := map[string]store.Contribution{}
+	for _, c := range contributions {
+		owners[c.AccountUID] = c
+	}
+	for _, a := range rawAccounts {
+		uid := str2(a["uid"])
+		mode := modes[uid]
+		if mode == "" {
+			mode = "private"
+		}
+		row := map[string]any{"uid": uid, "nickname": a["nickname"], "provider": a["provider"], "profile": a["profile"], "enabled": a["enabled"], "sharing_mode": mode, "owner_kind": "platform"}
+		if c, ok := owners[uid]; ok {
+			row["owner_kind"] = "user"
+			row["contribution_user_id"] = c.UserID
+			row["status"] = c.Status
+			row["sharing_mode"] = "personal"
+			if c.Status == "active" {
+				row["sharing_mode"] = "personal_shared"
+			}
+		}
+		accounts = append(accounts, row)
+	}
+	settings, err := s.o.db.GetSettings()
+	if err != nil {
+		writeAPIErr(w, errBody(503, "默认共享池查询失败", "server_error"))
+		return
+	}
+	writeJSON(w, 200, map[string]any{"users": users, "invites": invites, "groups": groups, "contributions": contributions, "accounts": accounts, "account_count": len(accounts), "registration_mode": s.o.cfg.PortalRegistrationMode, "default_group_id": intOf(settings["portal_default_group"]), "default_auto_grant": settings["portal_default_auto_grant"] == "1"})
+}
+
+func (s *Server) adminPortalDefaultGroup(w http.ResponseWriter, r *http.Request) {
+	body, err := readJSON(r)
+	if err != nil {
+		writeAPIErr(w, errBody(400, "无效请求", "invalid_request_error"))
+		return
+	}
+	n, ok := body["group_id"].(float64)
+	if !ok || n < 0 || n > 1e12 || n != float64(int64(n)) {
+		writeAPIErr(w, errBody(400, "请选择有效共享池", "invalid_request_error"))
+		return
+	}
+	auto, ok := body["auto_grant"].(bool)
+	if !ok {
+		writeAPIErr(w, errBody(400, "请明确自动授权规则", "invalid_request_error"))
+		return
+	}
+	s.o.accountMu.Lock()
+	defer s.o.accountMu.Unlock()
+	if err := s.o.db.SetDefaultPortalGroup(int64(n), auto); err != nil {
+		writeAPIErr(w, errBody(400, err.Error(), "invalid_request_error"))
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func (s *Server) adminPortalAccountSharing(w http.ResponseWriter, r *http.Request) {
+	body, err := readJSON(r)
+	if err != nil {
+		writeAPIErr(w, errBody(400, "无效请求", "invalid_request_error"))
+		return
+	}
+	mode, _ := body["mode"].(string)
+	raw, ok := body["group_ids"].([]any)
+	if !ok {
+		writeAPIErr(w, errBody(400, "请选择共享池列表", "invalid_request_error"))
+		return
+	}
+	ids := []int64{}
+	for _, value := range raw {
+		n, ok := value.(float64)
+		if !ok || n <= 0 || n > 1e12 || n != float64(int64(n)) {
+			writeAPIErr(w, errBody(400, "共享池 ID 无效", "invalid_request_error"))
+			return
+		}
+		ids = append(ids, int64(n))
+	}
+	s.o.accountMu.Lock()
+	defer s.o.accountMu.Unlock()
+	if err := s.o.db.SetPlatformAccountSharing(r.PathValue("uid"), mode, ids); err != nil {
+		writeAPIErr(w, errBody(400, err.Error(), "invalid_request_error"))
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 func (s *Server) portalGroupViews() ([]map[string]any, error) {
@@ -1242,7 +1425,12 @@ func (s *Server) adminPortalGroupAccounts(w http.ResponseWriter, r *http.Request
 	switch action {
 	case "add":
 		c, checkErr := s.o.db.ContributionByAccount(uid)
-		if checkErr != nil || c == nil || c.Status != "active" || c.Provider != "workbuddy" {
+		valid := checkErr == nil && c != nil && c.Status == "active" && c.Provider == "workbuddy"
+		if checkErr == nil && c == nil {
+			modes, e := s.o.db.PlatformSharingModes()
+			valid = e == nil && (modes[uid] == "shared" || modes[uid] == "both")
+		}
+		if !valid {
 			writeAPIErr(w, errBody(400, "仅可加入有效的 WorkBuddy 共享贡献账户", "invalid_request_error"))
 			return
 		}

@@ -18,6 +18,7 @@ document.documentElement.classList.toggle('light', wantLight)
 const router = createRouter({
   history: createWebHashHistory(),
   routes: [
+    { path: '/models', component: () => import('./views/Models.vue'), meta: { title: '可用模型' } },
     { path: '/', component: () => import('./views/Home.vue'), meta: { title: '首页' } },
     { path: '/keys', component: () => import('./views/Keys.vue'), meta: { title: 'API 密钥' } },
     { path: '/contribute', component: () => import('./views/Contribute.vue'), meta: { title: '贡献账号' } },

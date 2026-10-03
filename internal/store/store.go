@@ -29,7 +29,7 @@ import (
 // contributions, resource_groups, group_accounts, user_group_grants) and
 // rebuilds apps to drop the global-unique name constraint (per-user naming).
 // v16 adds stable usage app IDs and independent daily execution quotas.
-const SchemaVersion = 16
+const SchemaVersion = 17
 
 // DB wraps the SQLite connection.
 type DB struct {
@@ -63,7 +63,9 @@ var DefaultSettings = map[string]string{
 	"qoder_machine_salt":      "",
 	// 用户门户（阶段 A）：管理员可配置的共享模型禁用列表（JSON 数组），从共享
 	// 权限集中扣除。注册方式等部署级开关走环境变量，不进 settings。
-	"portal_disabled_models": "",
+	"portal_disabled_models":    "",
+	"portal_default_group":      "0",
+	"portal_default_auto_grant": "0",
 }
 
 // New opens (creating if needed) the SQLite database at path.
@@ -292,11 +294,20 @@ CREATE TABLE IF NOT EXISTS group_accounts (
     account_uid TEXT NOT NULL,
     PRIMARY KEY (group_id, account_uid)
 );
+CREATE TABLE IF NOT EXISTS platform_account_sharing (
+    account_uid TEXT PRIMARY KEY REFERENCES accounts(uid) ON DELETE CASCADE,
+    mode TEXT NOT NULL CHECK(mode IN ('private','shared','both'))
+);
 CREATE TABLE IF NOT EXISTS user_group_grants (
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     group_id INTEGER NOT NULL REFERENCES resource_groups(id) ON DELETE CASCADE,
     granted_at REAL,
     PRIMARY KEY (user_id, group_id)
+);
+CREATE TABLE IF NOT EXISTS user_group_denials (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    group_id INTEGER NOT NULL REFERENCES resource_groups(id) ON DELETE CASCADE,
+    PRIMARY KEY(user_id,group_id)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON user_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON user_sessions(expires_at);

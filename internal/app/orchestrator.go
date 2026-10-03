@@ -46,9 +46,10 @@ func errBody(status int, message, typ string) *apiError {
 // Principal is the authenticated application. AllowedModels is the per-key
 // model allowlist (nil = unrestricted); enforced in authorizeModel before any
 // upstream dispatch. Portal fields (HANDOFF §7): UserID > 0 marks a portal
-// user's key; AccountScope is the user's shared-group account UIDs (scheduling
-// restricted to that set, never falling back to the private pool); PortalModels
-// is the group ∩ eligibility ∩ −disabled model set. PortalModels nil on a
+// user's key; AccountScope contains own accounts plus authorized shared accounts,
+// restricted per model and never falling back to the unrestricted pool.
+// PortalModels applies catalog ownership, group eligibility and disabled models.
+// PortalModels nil on a
 // portal key = no permission at all; that is a DIFFERENT meaning from a private
 // key's empty AllowedModels ("unrestricted"), so the two never conflate.
 type Principal struct {
@@ -59,6 +60,8 @@ type Principal struct {
 	AccountScope  map[string]bool
 	PortalModels  map[string]bool
 	ModelScopes   map[string]map[string]bool
+	OwnedModels   map[string]bool
+	SharedModels  map[string]bool
 	quota         *portalQuotaReservation
 }
 
@@ -200,7 +203,7 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 		}
 	}
 	for _, c := range contributions {
-		if c.Status != "active" {
+		if c.Status != "active" && c.Status != "private" {
 			o.pool.SetEnabled(c.AccountUID, false, "共享贡献不可用")
 		}
 	}
@@ -270,10 +273,8 @@ func (o *Orchestrator) checkAPIKey(authorization, xAPIKey string) (*Principal, *
 
 // attachPortalScope computes the scheduling scope and permission model set for
 // a portal user's key (HANDOFF §6/§7). Called on every authenticated request:
-// group accounts and eligibility come from SQLite (hot path OK — GetSettings
-// memoization pattern aside, these are two small indexed queries), and a
-// revoked contribution or disabled group takes effect immediately without any
-// cache invalidation.
+// personal ownership and shared-group permissions are read from SQLite.
+// Withdrawal and disabled groups take effect without permission caching.
 func (o *Orchestrator) attachPortalScope(p *Principal) *apiError {
 	if !o.cfg.PortalEnabled {
 		return errBody(403, "共享服务已关闭", "portal_disabled")
@@ -287,13 +288,19 @@ func (o *Orchestrator) attachPortalScope(p *Principal) *apiError {
 		return errBody(500, "资格查询失败", "server_error")
 	}
 	// 资格为空必须拒绝，不能转换成"不受限制"的 Principal（HANDOFF §7）。
-	if len(eligible) == 0 {
-		return errBody(403, "当前没有有效的共享贡献，无法使用模型接口。请在门户完成账号贡献后重试", "portal_no_eligibility")
+	owned, err := o.db.OwnedAccountUIDs(p.UserID)
+	if err != nil {
+		return errBody(503, "本人账号查询失败", "server_error")
+	}
+	if len(owned) == 0 {
+		return errBody(403, "请先添加并验证你的 WorkBuddy 账号", "portal_no_eligibility")
 	}
 	// Eligibility interacts with the group scope: an account that left all
 	// enabled groups or whose contribution was revoked drops out here.
 	p.AccountScope = map[string]bool{}
 	p.ModelScopes = map[string]map[string]bool{}
+	p.OwnedModels = map[string]bool{}
+	p.SharedModels = map[string]bool{}
 	models := map[string]bool{}
 	settings, err := o.db.GetSettings()
 	if err != nil {
@@ -311,23 +318,44 @@ func (o *Orchestrator) attachPortalScope(p *Principal) *apiError {
 		disabled[m] = true
 		disabled[resolve(m)] = true
 	}
+	// Personal rights derive from the owner's verified account and the actual
+	// catalog, independently of shared-group membership. Never widen to a site
+	// or another user's account when an explicit UID scope exists.
+	for _, entry := range o.models.ListCached() {
+		m := str2(entry["id"])
+		if m == "" || m == "auto" || strings.Contains(m, "/") || disabled[m] {
+			continue
+		}
+		uids := o.modelEntryAccountUIDs(entry)
+		for uid := range uids {
+			if !owned[uid] {
+				continue
+			}
+			if p.ModelScopes[m] == nil {
+				p.ModelScopes[m] = map[string]bool{}
+			}
+			p.ModelScopes[m][uid] = true
+			models[m], p.OwnedModels[m] = true, true
+		}
+	}
 	grants, err := o.db.GrantedGroups(p.UserID)
 	if err != nil {
 		return errBody(500, "资格查询失败", "server_error")
 	}
-	configured := false
 	for _, g := range grants {
-		if !g.Enabled || g.Provider != "workbuddy" {
+		if len(eligible) == 0 || !g.Enabled || g.Provider != "workbuddy" {
 			continue
 		}
 		// 未配置共享模型范围的分组保持关闭（HANDOFF §2）：空串 = 未配置。
 		if strings.TrimSpace(g.AllowedModels) == "" {
 			continue
 		}
-		configured = true
 		uids, err := o.db.GroupAccountUIDsWithActiveContribution(g.ID)
 		if err != nil {
 			return errBody(503, "共享账户查询失败", "server_error")
+		}
+		if len(uids) == 0 {
+			continue
 		}
 		for _, m := range parseJSONStringArray(g.AllowedModels) {
 			resolved := resolve(m)
@@ -335,6 +363,7 @@ func (o *Orchestrator) attachPortalScope(p *Principal) *apiError {
 				continue
 			}
 			models[resolved] = true
+			p.SharedModels[resolved] = true
 			if p.ModelScopes[resolved] == nil {
 				p.ModelScopes[resolved] = map[string]bool{}
 			}
@@ -342,9 +371,6 @@ func (o *Orchestrator) attachPortalScope(p *Principal) *apiError {
 				p.ModelScopes[resolved][uid] = true
 			}
 		}
-	}
-	if !configured {
-		return errBody(403, "共享模型范围尚未配置，公共模型调用保持关闭", "portal_models_not_configured")
 	}
 	// 管理员禁用模型从允许集中扣除：disabled_reason 标记的账号只是账号级冷却；
 	// 模型禁用由管理端 settings 维护的 portal_disabled_models 列表承担。
@@ -576,12 +602,16 @@ func (o *Orchestrator) modelAccountUIDs(model string) (map[string]bool, *apiErro
 	if entry == nil {
 		return nil, errBody(400, "模型 "+model+" 不在当前模型目录中，请检查模型名或刷新模型目录", "invalid_request_error")
 	}
+	return o.modelEntryAccountUIDs(entry), nil
+}
+
+func (o *Orchestrator) modelEntryAccountUIDs(entry map[string]any) map[string]bool {
 	out := map[string]bool{}
 	if uids, ok := entry["account_uids"].([]string); ok {
 		for _, u := range uids {
 			out[u] = true
 		}
-		return out, nil
+		return out
 	}
 	profiles := map[string]bool{}
 	if ps, ok := entry["profiles"].([]string); ok {
@@ -594,7 +624,7 @@ func (o *Orchestrator) modelAccountUIDs(model string) (map[string]bool, *apiErro
 			out[a.UID] = true
 		}
 	}
-	return out, nil
+	return out
 }
 
 // pickAccountFor returns the account picker entry point for a principal.
@@ -630,6 +660,13 @@ func (o *Orchestrator) pickAccountExcludingIn(model, sessionKey string, tried ma
 	allowed, aerr := o.modelAccountUIDs(model)
 	if aerr != nil {
 		return nil, aerr
+	}
+	privateOnly, err := o.db.PrivatePoolExcludedUIDs()
+	if err != nil {
+		return nil, errBody(503, "账号权限查询失败", "server_error")
+	}
+	for uid := range privateOnly {
+		delete(allowed, uid)
 	}
 	if allowed != nil && len(allowed) == 0 {
 		return nil, errBody(503, "模型 "+model+" 当前没有可调用账号，请检查账号状态或刷新模型目录", "model_unavailable")

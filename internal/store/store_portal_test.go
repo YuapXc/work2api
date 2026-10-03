@@ -20,6 +20,163 @@ func mustDB(t *testing.T) *DB {
 	return db
 }
 
+func TestPlatformSharingConversionAndDefaultQualification(t *testing.T) {
+	db := mustDB(t)
+	owner, _ := db.CreateUser("shared-owner", "hash", "user")
+	noContribution, _ := db.CreateUser("no-contribution", "hash", "user")
+	g, _ := db.CreateResourceGroup("default", "workbuddy", `["test-model"]`)
+	other, _ := db.CreateResourceGroup("special", "workbuddy", `["test-model"]`)
+	if err := db.SetGroupEnabled(g, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec("INSERT INTO accounts(uid,provider,enabled,disabled_reason) VALUES('platform','workbuddy',0,'manual'),('owned','workbuddy',0,'manual'),('qoder-account','qoder',1,'')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetPlatformAccountSharing("platform", "both", []int64{g}); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := db.GroupAccountUIDsWithActiveContribution(g)
+	if err != nil || len(ids) != 1 || ids[0] != "platform" {
+		t.Fatal(ids, err)
+	}
+	excluded, err := db.PrivatePoolExcludedUIDs()
+	if err != nil || excluded["platform"] {
+		t.Fatal(excluded, err)
+	}
+	if err := db.SetPlatformAccountSharing("platform", "shared", []int64{g}); err != nil {
+		t.Fatal(err)
+	}
+	excluded, _ = db.PrivatePoolExcludedUIDs()
+	if !excluded["platform"] {
+		t.Fatal("shared-only entered private pool")
+	}
+	if err := db.SetPlatformAccountSharing("platform", "private", nil); err != nil {
+		t.Fatal(err)
+	}
+	ids, _ = db.GroupAccountUIDsWithActiveContribution(g)
+	if len(ids) != 0 {
+		t.Fatal("private retained shared membership", ids)
+	}
+	var enabled int
+	var reason string
+	if err := db.db.QueryRow("SELECT enabled,disabled_reason FROM accounts WHERE uid='platform'").Scan(&enabled, &reason); err != nil || enabled != 0 || reason != "manual" {
+		t.Fatal("conversion changed account state", enabled, reason, err)
+	}
+	if err := db.SetPlatformAccountSharing("qoder-account", "both", []int64{g}); err == nil {
+		t.Fatal("unsupported provider entered shared pool")
+	}
+	if err := db.SetDefaultPortalGroup(g, true); err != nil {
+		t.Fatal(err)
+	}
+	id, _ := db.CreateContribution(owner, "owned", "workbuddy", "workbuddy", "verifying")
+	if err := db.ActivateContributionWithGroups(id, owner); err != nil {
+		t.Fatal(err)
+	}
+	ids, _ = db.GroupAccountUIDs(g)
+	if len(ids) != 1 || ids[0] != "owned" {
+		t.Fatal(ids)
+	}
+	ids, _ = db.GroupAccountUIDs(other)
+	if len(ids) != 0 {
+		t.Fatal("new contribution entered custom group", ids)
+	}
+	grants, err := db.GrantedGroups(owner)
+	if err != nil || len(grants) != 1 || grants[0].ID != g {
+		t.Fatal(grants, err)
+	}
+	grants, err = db.GrantedGroups(noContribution)
+	if err != nil || len(grants) != 0 {
+		t.Fatal("noncontributor auto granted", grants, err)
+	}
+	if err := db.RevokeGroup(owner, g); err != nil {
+		t.Fatal(err)
+	}
+	grants, _ = db.GrantedGroups(owner)
+	if len(grants) != 0 {
+		t.Fatal("automatic rule overrode explicit revocation")
+	}
+	if err := db.GrantGroup(owner, g); err != nil {
+		t.Fatal(err)
+	}
+	grants, _ = db.GrantedGroups(owner)
+	if len(grants) != 1 {
+		t.Fatal("explicit grant did not clear denial")
+	}
+	if _, err := db.db.Exec("DELETE FROM user_group_grants WHERE user_id=? AND group_id=?", owner, g); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetPlatformAccountSharing("owned", "private", nil); err == nil {
+		t.Fatal("user ownership reassigned to platform")
+	}
+	if ok, err := db.WithdrawContribution(id, owner, "withdraw"); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	grants, _ = db.GrantedGroups(owner)
+	if len(grants) != 0 {
+		t.Fatal("withdrawal retained automatic grant")
+	}
+	if ok, err := db.RestoreContributionSharing(id, noContribution); err != nil || ok {
+		t.Fatal("other user restored sharing", ok, err)
+	}
+	if _, err := db.db.Exec("UPDATE accounts SET enabled=0,disabled_reason='manual' WHERE uid='owned'"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := db.RestoreContributionSharing(id, owner); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	if err := db.db.QueryRow("SELECT enabled,disabled_reason FROM accounts WHERE uid='owned'").Scan(&enabled, &reason); err != nil || enabled != 0 || reason != "manual" {
+		t.Fatal("restore enabled disabled account", enabled, reason, err)
+	}
+	if ok, err := db.DeleteResourceGroup(g); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	settings, err := db.GetSettings()
+	if err != nil || settings["portal_default_group"] != "0" || settings["portal_default_auto_grant"] != "0" {
+		t.Fatal("deleted default retained policy", settings, err)
+	}
+}
+
+func TestPersonalOwnershipSurvivesDatabaseReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ownership.db")
+	db, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := db.CreateUser("owner", "hash", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := db.CreateContribution(user, "own-uid", "workbuddy", "workbuddy", "active")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := db.WithdrawContribution(id, user, "stop sharing"); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	owned, err := db.OwnedAccountUIDs(user)
+	if err != nil || !owned["own-uid"] {
+		t.Fatal("reopen lost personal ownership", owned, err)
+	}
+	active, err := db.ActiveContributionUIDs(user)
+	if err != nil || len(active) != 0 {
+		t.Fatal("withdrawal restored sharing after reopen", active, err)
+	}
+	if other, err := db.OwnedAccountUIDs(user + 1); err != nil || len(other) != 0 {
+		t.Fatal("cross-user ownership leak", other, err)
+	}
+	if ok, err := db.WithdrawContribution(id, user+1, "other"); err != nil || ok {
+		t.Fatal("cross-user withdrawal accepted", ok, err)
+	}
+}
+
 // v15 migration must be idempotent and preserve pre-portal apps rows.
 func TestPortalMigrationPreservesApps(t *testing.T) {
 	dir := t.TempDir()

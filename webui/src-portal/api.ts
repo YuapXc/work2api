@@ -21,6 +21,19 @@ export interface Me {
   eligible_accounts: number
   groups_enabled: number
   available_models: string[]
+  own_models: string[]
+  shared_models: string[]
+}
+
+export interface PortalModel {
+  id: string
+  name?: string
+  context_length?: number
+  max_output_tokens?: number
+  vision?: boolean
+  reasoning?: { supportsReasoning?: boolean }
+  own_account: boolean
+  shared_pool: boolean
 }
 
 export interface KeyInfo {
@@ -56,6 +69,7 @@ export const api = {
   changePassword: (old_password: string, new_password: string) =>
     call<{ ok: boolean }>('POST', '/portal/api/auth/password', { old_password, new_password }),
   me: () => call<Me>('GET', '/portal/api/me'),
+  models: () => call<{ models: PortalModel[]; source: string }>('GET', '/portal/api/models'),
   keys: () => call<{ keys: KeyInfo[] }>('GET', '/portal/api/keys'),
   createKey: (name: string, allowed_models?: string[]) =>
     call<{ id: number; key: string }>('POST', '/portal/api/keys', { name, allowed_models }),
@@ -74,6 +88,7 @@ export const api = {
     ),
   contributionCancel: (task_id: string) => call<{ ok: boolean }>('POST', '/portal/api/contributions/cancel', { task_id }),
   revokeContribution: (id: number) => call<{ ok: boolean }>('POST', `/portal/api/contributions/${id}/revoke`, {}),
+  shareContribution: (id: number) => call<{ ok: boolean }>('POST', `/portal/api/contributions/${id}/share`, { accepted: true }),
   usage: () =>
     call<{
        today: { requests: number; input_tokens: number | null; output_tokens: number | null; daily_limit_requests: number; daily_limit_input: number; daily_limit_output: number }

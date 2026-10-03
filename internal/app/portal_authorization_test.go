@@ -11,8 +11,173 @@ import (
 
 	"work2api/internal/portal/portalauth"
 	"work2api/internal/store"
+	"work2api/internal/workbuddy/models"
+	"work2api/internal/workbuddy/pool"
 	"work2api/internal/workbuddy/ratelimit"
 )
+
+func TestPersonalAccountAccessSurvivesWithdrawalWithoutGroup(t *testing.T) {
+	s, owner := portalFixture(t)
+	acc := s.o.pool.Accounts()[0]
+	s.o.pool = pool.New(map[string]pool.Credential{acc.UID: catalogOffline{acc.Mgr}}, "")
+	s.o.models = models.NewWithCatalogClient(s.o.pool, s.o.db, &http.Client{Transport: catalogTransport{}})
+	s.o.models.Refresh()
+	id, err := s.o.db.CreateContribution(owner.ID, acc.UID, "workbuddy", "codebuddy", "active")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := "personal-key"
+	appID, err := s.o.db.CreateApp("personal", s.o.hashKey(key), "", "", "", `["test-model"]`, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := portalKeyPrincipal(t, s, key)
+	if err := s.prepareModel(p, map[string]any{"model": "test-model"}); err != nil {
+		t.Fatal(err.body)
+	}
+	if !p.AccountScope[acc.UID] || len(p.AccountScope) != 1 || !p.OwnedModels["test-model"] || p.SharedModels["test-model"] {
+		t.Fatal(p)
+	}
+	otherID, err := portalauth.CreateUser(s.o.db, "other-user", "otherpassword", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, _ := s.o.db.GetUser(otherID)
+	if _, err := s.o.db.CreateContribution(other.ID, "other-account", "workbuddy", "codebuddy", "active"); err != nil {
+		t.Fatal(err)
+	}
+	group := portalGrant(t, s, other, "shared", acc.UID, []string{"test-model"})
+	otherKey := "other-key"
+	if _, err := s.o.db.CreateApp("other", s.o.hashKey(otherKey), "", "", "", `["test-model"]`, other.ID); err != nil {
+		t.Fatal(err)
+	}
+	otherPrincipal := portalKeyPrincipal(t, s, otherKey)
+	payload := map[string]any{"model": "test-model"}
+	if err := s.prepareModel(otherPrincipal, payload); err != nil {
+		t.Fatal(err.body)
+	}
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer "+otherKey)
+	req, ok := s.refreshPortalRequest(httptest.NewRecorder(), req, otherPrincipal, payload)
+	if !ok {
+		t.Fatal("shared request should initially be authorized")
+	}
+	w := httptest.NewRecorder()
+	withdraw := portalRequest(owner, "/portal/api/contributions/revoke", `{}`)
+	withdraw.SetPathValue("id", itoa(int(id)))
+	s.portalRevokeContribution(w, withdraw)
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	if ids, err := s.o.db.GroupAccountUIDs(group); err != nil || len(ids) != 0 {
+		t.Fatal(ids, err)
+	}
+	check := req.Context().Value(portalDispatchCheckKey{}).(func(string, string) *apiError)
+	if err := check(acc.UID, "test-model"); err == nil {
+		t.Fatal("queued shared request survived withdrawal")
+	}
+	p = portalKeyPrincipal(t, s, key)
+	if err := s.prepareModel(p, map[string]any{"model": "test-model"}); err != nil || !p.AccountScope[acc.UID] {
+		t.Fatal("owner lost personal access", err)
+	}
+	if _, err := s.o.pickAccountExcludingIn("test-model", "", nil, nil); err == nil {
+		t.Fatal("private-only account entered unrestricted pool")
+	}
+	if _, err := s.o.pickAccountExcludingIn("test-model", "", nil, p.AccountScope); err != nil {
+		t.Fatal("owner could not select own account", err)
+	}
+	restore := portalRequest(owner, "/portal/api/contributions/share", `{"accepted":true}`)
+	restore.SetPathValue("id", itoa(int(id)))
+	otherRestore := portalRequest(other, "/portal/api/contributions/share", `{"accepted":true}`)
+	otherRestore.SetPathValue("id", itoa(int(id)))
+	w = httptest.NewRecorder()
+	s.portalShareContribution(w, otherRestore)
+	if w.Code != 404 {
+		t.Fatal("nonowner restored sharing", w.Code)
+	}
+	w = httptest.NewRecorder()
+	s.portalShareContribution(w, restore)
+	if w.Code != 200 {
+		t.Fatal("owner could not restore sharing", w.Code, w.Body.String())
+	}
+	// Restore only joins the default pool; custom memberships stay removed.
+	if ids, err := s.o.db.GroupAccountUIDs(group); err != nil || len(ids) != 0 {
+		t.Fatal("restore silently rejoined custom pool", ids, err)
+	}
+	w = httptest.NewRecorder()
+	s.portalModels(w, portalRequest(owner, "/portal/api/models", `{}`))
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"own_account":true`) || strings.Contains(w.Body.String(), acc.UID) || strings.Contains(w.Body.String(), "account_uids") {
+		t.Fatal("model view did not respect privacy or ownership", w.Code, w.Body.String())
+	}
+	if err := s.o.db.SetAppModels(appID, `[]`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.prepareModel(portalKeyPrincipal(t, s, key), map[string]any{"model": "test-model"}); err == nil {
+		t.Fatal("personal rights bypassed key whitelist")
+	}
+	if err := s.o.db.SetAppModels(appID, `["test-model"]`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.o.db.SaveSettings(map[string]string{"portal_disabled_models": `["test-model"]`}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.prepareModel(portalKeyPrincipal(t, s, key), map[string]any{"model": "test-model"}); err == nil {
+		t.Fatal("personal rights bypassed global model disable")
+	}
+}
+
+func TestPlatformAccountSharingRechecksPrivateDispatch(t *testing.T) {
+	s, u := portalFixture(t)
+	acc := s.o.pool.Accounts()[0]
+	s.o.pool = pool.New(map[string]pool.Credential{acc.UID: catalogOffline{acc.Mgr}}, "")
+	s.o.models = models.NewWithCatalogClient(s.o.pool, s.o.db, &http.Client{Transport: catalogTransport{}})
+	s.o.models.Refresh()
+	if _, err := s.o.db.UpsertAccount(map[string]any{"auth": map[string]any{"access_token": "test-token"}, "account": map[string]any{"uid": acc.UID, "nickname": "platform"}}); err != nil {
+		t.Fatal(err)
+	}
+	g := portalGrant(t, s, u, "platform-pool", acc.UID, []string{"test-model"})
+	if _, err := s.o.db.CreateContribution(u.ID, "user-own-account", "workbuddy", "workbuddy", "active"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.o.db.CreateApp("private", s.o.hashKey("private-platform-key"), "", "", "", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	p := portalKeyPrincipal(t, s, "private-platform-key")
+	body := map[string]any{"model": "test-model"}
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer private-platform-key")
+	req, ok := s.refreshPortalRequest(httptest.NewRecorder(), req, p, body)
+	if !ok {
+		t.Fatal("private fixture not authorized")
+	}
+	if err := s.o.db.SetPlatformAccountSharing(acc.UID, "shared", []int64{g}); err != nil {
+		t.Fatal(err)
+	}
+	check := req.Context().Value(portalDispatchCheckKey{}).(func(string, string) *apiError)
+	if err := check(acc.UID, "test-model"); err == nil {
+		t.Fatal("private dispatch survived shared-only conversion")
+	}
+	userPrincipal := &Principal{UserID: u.ID, AllowedModels: []string{"test-model"}}
+	if err := s.o.attachPortalScope(userPrincipal); err != nil {
+		t.Fatal(err.body)
+	}
+	if err := s.prepareModel(userPrincipal, map[string]any{"model": "test-model"}); err != nil || !userPrincipal.AccountScope[acc.UID] {
+		t.Fatal("shared user could not access supplied platform account", err)
+	}
+	if err := s.o.db.SetPlatformAccountSharing(acc.UID, "private", nil); err != nil {
+		t.Fatal(err)
+	}
+	userPrincipal = &Principal{UserID: u.ID, AllowedModels: []string{"test-model"}}
+	if err := s.o.attachPortalScope(userPrincipal); err != nil {
+		t.Fatal(err.body)
+	}
+	if err := s.prepareModel(userPrincipal, map[string]any{"model": "test-model"}); err == nil {
+		t.Fatal("private conversion left shared access")
+	}
+	if _, err := s.o.pickAccountExcludingIn("test-model", "", nil, nil); err != nil {
+		t.Fatal("private conversion did not restore platform access", err)
+	}
+}
 
 func portalAuthorizeFixture(t *testing.T) (*Server, *store.User, int64, string) {
 	t.Helper()

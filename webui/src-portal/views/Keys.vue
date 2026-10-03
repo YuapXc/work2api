@@ -7,7 +7,7 @@ import { toast } from '../../src/lib/toast'
 import WButton from '../../src/components/ui/WButton.vue'
 import WInput from '../../src/components/ui/WInput.vue'
 
-defineProps<{ me: Me }>()
+const props = defineProps<{ me: Me }>()
 const baseURL = window.location.origin + '/v1'
 
 const keys = ref<KeyInfo[]>([])
@@ -28,6 +28,7 @@ onMounted(load)
 
 async function create() {
   if (creating.value) return
+  if (!props.me.available_models.length) return toast.error('请先添加账号并确认可用模型，再创建 Key')
   const name = newName.value.trim()
   if (!name) return toast.error('请填写 Key 名称')
   creating.value = true
@@ -64,8 +65,9 @@ async function saveModels(k: KeyInfo, selected: string[]) {
   if (savingModels.value) return
   savingModels.value = true
   try {
-    await api.setKeyModels(k.id, selected)
-    k.allowed_models = selected
+    const allowed = selected.filter(m => props.me.available_models.includes(m))
+    await api.setKeyModels(k.id, allowed)
+    k.allowed_models = allowed
     toast.success('模型范围已更新')
   } catch (e: any) { toast.error(e?.message || '保存失败') }
   finally { savingModels.value = false }
@@ -77,12 +79,13 @@ async function saveModels(k: KeyInfo, selected: string[]) {
     <div class="glass rounded-2xl p-6">
       <h1 class="text-base font-semibold">创建 API 密钥</h1>
       <p class="mt-1 text-micro text-faint">
-        新 Key 默认允许「首页」列出的全部可用模型；你也可以在创建后收窄范围。Base URL：<code class="mono text-brand">{{ baseURL }}</code>
+        新 Key 默认允许当前本人账号与获授权共享池的全部可用模型；之后可调整范围。新增模型不会自动扩大旧 Key 权限。Base URL：<code class="mono text-brand">{{ baseURL }}</code>
       </p>
       <div class="mt-4 flex gap-2">
         <WInput v-model="newName" placeholder="Key 名称（如：我的笔记应用）" class="max-w-xs" @enter="create" />
-        <WButton variant="primary" :loading="creating" @click="create">创建</WButton>
+        <WButton variant="primary" :disabled="!me.available_models.length" :loading="creating" @click="create">创建</WButton>
       </div>
+      <p v-if="!me.available_models.length" class="mt-3 text-small text-muted">暂无可用模型。先到「我的账号」添加账号，再到「可用模型」确认范围。</p>
       <div v-if="freshKey" class="mt-4 rounded-xl border border-brand/40 bg-brand/8 p-4">
         <div class="text-micro text-brand">请立即复制，明文只显示这一次：</div>
         <code class="mono mt-1.5 block break-all text-small text-ink">{{ freshKey }}</code>
@@ -115,7 +118,7 @@ async function saveModels(k: KeyInfo, selected: string[]) {
           <!-- 模型收窄面板 -->
           <div v-if="showModelsOf === k.id" class="mt-3 border-t border-line pt-3">
             <div class="flex flex-wrap gap-2">
-              <label v-for="m in me.available_models" :key="m" class="flex cursor-pointer items-center gap-1.5 rounded-md bg-bg/60 px-2 py-1 text-micro">
+              <label v-for="m in [...new Set([...me.available_models, ...modelListOf(k)])]" :key="m" class="flex cursor-pointer items-center gap-1.5 rounded-md bg-bg/60 px-2 py-1 text-micro">
                 <input
                   type="checkbox"
                   :disabled="savingModels"
@@ -124,10 +127,10 @@ async function saveModels(k: KeyInfo, selected: string[]) {
                     ? saveModels(k, [...modelListOf(k), m])
                     : saveModels(k, modelListOf(k).filter((x) => x !== m))"
                 />
-                <span class="mono text-muted">{{ m }}</span>
+                <span class="mono text-muted">{{ m }}{{ me.available_models.includes(m) ? '' : '（当前无权限）' }}</span>
               </label>
             </div>
-            <p class="mt-2 text-micro text-faint">只能收窄到可用范围内；全不勾选表示该 Key 拒绝一切调用。</p>
+            <p class="mt-2 text-micro text-faint">可添加当前有权限的模型；保存时会移除已经失去权限的旧模型。全不勾选表示该 Key 拒绝全部调用。</p>
           </div>
         </div>
       </div>

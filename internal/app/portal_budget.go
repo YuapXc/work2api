@@ -37,6 +37,15 @@ func (s *Server) refreshPortalRequest(w http.ResponseWriter, r *http.Request, p 
 		if fresh.UserID > 0 && uid != "" && !fresh.AccountScope[uid] {
 			return errBody(403, "共享账户资格已撤销，请重新发起请求", "portal_no_eligibility")
 		}
+		if fresh.UserID == 0 && uid != "" {
+			privateOnly, err := s.o.db.PrivatePoolExcludedUIDs()
+			if err != nil {
+				return errBody(503, "账号权限查询失败", "server_error")
+			}
+			if privateOnly[uid] {
+				return errBody(403, "该账号不再允许私人池调用，请重新发起请求", "account_not_allowed")
+			}
+		}
 		reservation := p.quota
 		if fresh.UserID > 0 {
 			clear(scope)

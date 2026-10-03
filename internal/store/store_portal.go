@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -14,7 +15,7 @@ import (
 //
 // Status enums are plain strings for readability in SQL and admin tooling:
 //   - users.status: active / disabled
-//   - contributions.status: verifying / active / unavailable / invalid / revoked
+//   - contributions.status: verifying / active / private / unavailable / invalid / revoked
 //   - invite_codes: single-use; used_at IS NULL means unconsumed.
 
 var ErrConflict = errors.New("资源冲突")
@@ -425,6 +426,96 @@ func (d *DB) HasActiveContribution(userID int64) (bool, error) {
 	return c > 0, err
 }
 
+// OwnedAccountUIDs includes verified accounts retained for personal use after
+// withdrawal. Historical revoked/invalid/verifying accounts stay unavailable.
+func (d *DB) OwnedAccountUIDs(userID int64) (map[string]bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	rows, err := d.db.Query("SELECT account_uid FROM contributions WHERE user_id=? AND provider='workbuddy' AND status IN ('active','private')", userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var uid string
+		if err := rows.Scan(&uid); err != nil {
+			return nil, err
+		}
+		out[uid] = true
+	}
+	return out, rows.Err()
+}
+
+// PrivatePoolExcludedUIDs prevents historical platform keys from selecting
+// user-owned credentials or platform accounts configured for shared use only.
+func (d *DB) PrivatePoolExcludedUIDs() (map[string]bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	rows, err := d.db.Query("SELECT account_uid FROM contributions UNION SELECT account_uid FROM platform_account_sharing WHERE mode='shared'")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var uid string
+		if err := rows.Scan(&uid); err != nil {
+			return nil, err
+		}
+		out[uid] = true
+	}
+	return out, rows.Err()
+}
+
+// WithdrawContribution atomically stops sharing while preserving ownership.
+func (d *DB) WithdrawContribution(id, userID int64, reason string) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	tx, err := d.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec("UPDATE contributions SET status='private',revoked_at=?,revoked_reason=? WHERE id=? AND user_id=? AND status='active'", float64(time.Now().UnixNano())/1e9, reason, id, userID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n == 0 {
+		return false, err
+	}
+	if _, err := tx.Exec("DELETE FROM group_accounts WHERE account_uid=(SELECT account_uid FROM contributions WHERE id=?)", id); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+// RestoreContributionSharing preserves verified ownership and account state.
+// Only the owner may opt back in; invalid/historical revoked accounts need OAuth.
+func (d *DB) RestoreContributionSharing(id, userID int64) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	tx, err := d.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE contributions SET status='active',revoked_at=NULL,revoked_reason=''
+ WHERE id=? AND user_id=? AND status='private' AND EXISTS(SELECT 1 FROM users WHERE id=? AND status='active')`, id, userID, userID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n == 0 {
+		return false, err
+	}
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO group_accounts(group_id,account_uid) SELECT rg.id,c.account_uid FROM resource_groups rg JOIN contributions c ON c.id=? AND c.user_id=? WHERE rg.provider=c.provider AND rg.id=CAST((SELECT value FROM settings WHERE key='portal_default_group') AS INTEGER)`, id, userID); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
 // SetContributionStatus transitions one of the user's own contributions.
 // updateOnly keeps the transition explicit: callers pass the expected current
 // status so a revoke racing a re-verify cannot clobber unexpectedly.
@@ -541,14 +632,38 @@ func (d *DB) SetGroupEnabled(id int64, enabled bool) error {
 func (d *DB) DeleteResourceGroup(id int64) (bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	res, err := d.db.Exec("DELETE FROM resource_groups WHERE id=?", id)
+	tx, err := d.db.Begin()
 	if err != nil {
 		return false, err
 	}
-	_, _ = d.db.Exec("DELETE FROM group_accounts WHERE group_id=?", id)
-	_, _ = d.db.Exec("DELETE FROM user_group_grants WHERE group_id=?", id)
+	defer tx.Rollback()
+	res, err := tx.Exec("DELETE FROM resource_groups WHERE id=?", id)
+	if err != nil {
+		return false, err
+	}
 	n, err := res.RowsAffected()
-	return n > 0, err
+	if err != nil || n == 0 {
+		return false, err
+	}
+	for _, table := range []string{"group_accounts", "user_group_grants", "user_group_denials"} {
+		if _, err := tx.Exec("DELETE FROM "+table+" WHERE group_id=?", id); err != nil {
+			return false, err
+		}
+	}
+	var isDefault bool
+	if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM settings WHERE key='portal_default_group' AND value=?)", strconv.FormatInt(id, 10)).Scan(&isDefault); err != nil {
+		return false, err
+	}
+	if isDefault {
+		if _, err := tx.Exec("UPDATE settings SET value='0' WHERE key IN ('portal_default_group','portal_default_auto_grant')"); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	d.settingsCache = nil
+	return true, nil
 }
 
 // AddGroupAccount links an account into a group, idempotent.
@@ -571,41 +686,62 @@ func (d *DB) RemoveGroupAccount(groupID int64, accountUID string) error {
 func (d *DB) GrantGroup(userID, groupID int64) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	_, err := d.db.Exec("INSERT OR IGNORE INTO user_group_grants (user_id, group_id, granted_at) VALUES (?,?,?)",
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec("INSERT OR IGNORE INTO user_group_grants (user_id, group_id, granted_at) VALUES (?,?,?)",
 		userID, groupID, float64(time.Now().UnixNano())/1e9)
-	return err
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM user_group_denials WHERE user_id=? AND group_id=?", userID, groupID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // RevokeGroup removes a user's group grant.
 func (d *DB) RevokeGroup(userID, groupID int64) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	_, err := d.db.Exec("DELETE FROM user_group_grants WHERE user_id=? AND group_id=?", userID, groupID)
-	return err
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM user_group_grants WHERE user_id=? AND group_id=?", userID, groupID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("INSERT OR IGNORE INTO user_group_denials(user_id,group_id) VALUES(?,?)", userID, groupID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // GroupAccountsOf returns the union of account UIDs across all enabled groups
 // the user holds grants for. This is the shared-pool scheduling scope for one
 // request: the caller intersects it with per-model account candidates.
 func (d *DB) GroupAccountsOf(userID int64) (map[string]bool, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	rows, err := d.db.Query(
-		"SELECT DISTINCT ga.account_uid FROM group_accounts ga JOIN user_group_grants g ON g.group_id=ga.group_id JOIN resource_groups rg ON rg.id=ga.group_id JOIN contributions c ON c.account_uid=ga.account_uid AND c.status='active' AND c.provider=rg.provider WHERE g.user_id=? AND rg.enabled=1",
-		userID)
+	groups, err := d.GrantedGroups(userID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	out := map[string]bool{}
-	for rows.Next() {
-		var uid string
-		if err := rows.Scan(&uid); err != nil {
+	for _, g := range groups {
+		if !g.Enabled {
+			continue
+		}
+		uids, err := d.GroupAccountUIDsWithActiveContribution(g.ID)
+		if err != nil {
 			return nil, err
 		}
-		out[uid] = true
+		for _, uid := range uids {
+			out[uid] = true
+		}
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // GrantedGroups lists the groups a user has grants for (enabled and disabled
@@ -615,7 +751,12 @@ func (d *DB) GrantedGroups(userID int64) ([]ResourceGroup, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	rows, err := d.db.Query(
-		"SELECT rg.id, rg.name, rg.provider, rg.allowed_models, rg.enabled, rg.created_at FROM resource_groups rg JOIN user_group_grants g ON g.group_id=rg.id WHERE g.user_id=? ORDER BY rg.id", userID)
+		`SELECT rg.id,rg.name,rg.provider,rg.allowed_models,rg.enabled,rg.created_at FROM resource_groups rg
+ WHERE (EXISTS(SELECT 1 FROM user_group_grants g WHERE g.group_id=rg.id AND g.user_id=?)
+ OR (rg.provider='workbuddy' AND rg.id=CAST((SELECT value FROM settings WHERE key='portal_default_group') AS INTEGER)
+ AND (SELECT value FROM settings WHERE key='portal_default_auto_grant')='1'
+ AND EXISTS(SELECT 1 FROM contributions WHERE user_id=? AND provider='workbuddy' AND status='active')))
+ AND NOT EXISTS(SELECT 1 FROM user_group_denials deny WHERE deny.user_id=? AND deny.group_id=rg.id) ORDER BY rg.id`, userID, userID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -706,7 +847,12 @@ func (d *DB) HasAdminUser() (bool, error) {
 func (d *DB) GroupUserIDs(groupID int64) ([]int64, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	rows, err := d.db.Query("SELECT user_id FROM user_group_grants WHERE group_id=? ORDER BY user_id", groupID)
+	rows, err := d.db.Query(`SELECT u.id FROM users u WHERE
+ (EXISTS(SELECT 1 FROM user_group_grants g WHERE g.group_id=? AND g.user_id=u.id)
+ OR (u.status='active' AND ?=CAST((SELECT value FROM settings WHERE key='portal_default_group') AS INTEGER)
+ AND (SELECT value FROM settings WHERE key='portal_default_auto_grant')='1'
+ AND EXISTS(SELECT 1 FROM contributions c WHERE c.user_id=u.id AND c.provider='workbuddy' AND c.status='active')))
+ AND NOT EXISTS(SELECT 1 FROM user_group_denials deny WHERE deny.group_id=? AND deny.user_id=u.id) ORDER BY u.id`, groupID, groupID, groupID)
 	if err != nil {
 		return nil, err
 	}
@@ -732,7 +878,12 @@ func (d *DB) groupAccountUIDs(groupID int64, active bool) ([]string, error) {
 	defer d.mu.Unlock()
 	q := "SELECT ga.account_uid FROM group_accounts ga WHERE ga.group_id=? ORDER BY ga.account_uid"
 	if active {
-		q = "SELECT ga.account_uid FROM group_accounts ga JOIN resource_groups rg ON rg.id=ga.group_id JOIN contributions c ON c.account_uid=ga.account_uid AND c.status='active' AND c.provider=rg.provider WHERE ga.group_id=? AND rg.enabled=1 ORDER BY ga.account_uid"
+		q = `SELECT ga.account_uid FROM group_accounts ga JOIN resource_groups rg ON rg.id=ga.group_id
+ WHERE ga.group_id=? AND rg.enabled=1 AND
+ (EXISTS(SELECT 1 FROM contributions c WHERE c.account_uid=ga.account_uid AND c.status='active' AND c.provider=rg.provider)
+ OR (rg.provider='workbuddy' AND NOT EXISTS(SELECT 1 FROM contributions c WHERE c.account_uid=ga.account_uid)
+ AND EXISTS(SELECT 1 FROM platform_account_sharing ps JOIN accounts a ON a.uid=ps.account_uid WHERE ps.account_uid=ga.account_uid AND ps.mode IN ('shared','both') AND a.provider='workbuddy')))
+ ORDER BY ga.account_uid`
 	}
 	rows, err := d.db.Query(q, groupID)
 	if err != nil {
@@ -858,7 +1009,7 @@ func (d *DB) ActivateContributionWithGroups(id, userID int64) error {
 	}
 	if _, err := tx.Exec(`INSERT OR IGNORE INTO group_accounts(group_id,account_uid)
  SELECT rg.id,c.account_uid FROM resource_groups rg JOIN contributions c ON c.id=? AND c.user_id=?
- WHERE rg.provider=c.provider`, id, userID); err != nil {
+ WHERE rg.provider=c.provider AND rg.id=CAST((SELECT value FROM settings WHERE key='portal_default_group') AS INTEGER)`, id, userID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -866,6 +1017,112 @@ func (d *DB) ActivateContributionWithGroups(id, userID int64) error {
 
 // CreateInvitedUser commits a new ordinary identity and one invite consumption
 // together, so authentication can never observe a registration that will roll back.
+func (d *DB) PlatformSharingModes() (map[string]string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	rows, err := d.db.Query("SELECT account_uid,mode FROM platform_account_sharing")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var uid, mode string
+		if err := rows.Scan(&uid, &mode); err != nil {
+			return nil, err
+		}
+		out[uid] = mode
+	}
+	return out, rows.Err()
+}
+
+func (d *DB) SetPlatformAccountSharing(uid, mode string, groupIDs []int64) error {
+	if mode != "private" && mode != "shared" && mode != "both" {
+		return errors.New("使用范围无效")
+	}
+	if mode != "private" && len(groupIDs) == 0 {
+		return errors.New("请选择至少一个共享池")
+	}
+	if mode == "private" && len(groupIDs) > 0 {
+		return errors.New("私人账号不能加入共享池")
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var valid bool
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM accounts a WHERE a.uid=? AND a.provider='workbuddy' AND NOT EXISTS(SELECT 1 FROM contributions c WHERE c.account_uid=a.uid))`, uid).Scan(&valid); err != nil {
+		return err
+	}
+	if !valid {
+		return errors.New("仅可转换平台所属的 WorkBuddy 账号，不能更改用户账号归属")
+	}
+	for _, id := range groupIDs {
+		if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM resource_groups WHERE id=? AND provider='workbuddy')", id).Scan(&valid); err != nil {
+			return err
+		}
+		if !valid {
+			return errors.New("共享池不存在或渠道不匹配")
+		}
+	}
+	if _, err := tx.Exec("INSERT INTO platform_account_sharing(account_uid,mode) VALUES(?,?) ON CONFLICT(account_uid) DO UPDATE SET mode=excluded.mode", uid, mode); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM group_accounts WHERE account_uid=?", uid); err != nil {
+		return err
+	}
+	for _, id := range groupIDs {
+		if _, err := tx.Exec("INSERT OR IGNORE INTO group_accounts(group_id,account_uid) VALUES(?,?)", id, uid); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (d *DB) SetDefaultPortalGroup(id int64, autoGrant bool) error {
+	if id < 0 {
+		return errors.New("默认共享池无效")
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if id > 0 {
+		var valid bool
+		if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM resource_groups WHERE id=? AND provider='workbuddy')", id).Scan(&valid); err != nil {
+			return err
+		}
+		if !valid {
+			return errors.New("默认共享池不存在")
+		}
+	}
+	flag := "0"
+	if id > 0 && autoGrant {
+		flag = "1"
+	}
+	for key, value := range map[string]string{"portal_default_group": strconv.FormatInt(id, 10), "portal_default_auto_grant": flag} {
+		if _, err := tx.Exec("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", key, value); err != nil {
+			return err
+		}
+	}
+	if id > 0 {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO group_accounts(group_id,account_uid) SELECT ?,account_uid FROM contributions WHERE status='active' AND provider='workbuddy'`, id); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	d.settingsCache = nil
+	return nil
+}
+
 func (d *DB) CreateInvitedUser(username, passwordHash, code string) (int64, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
