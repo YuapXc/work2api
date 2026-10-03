@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -60,6 +61,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeAPIErr(w, aerr)
 		return
 	}
+	r = r.WithContext(context.WithValue(r.Context(), requestStreamKey{}, boolVal(payload["stream"])))
 	r, release, admitted := s.admitModel(w, r, principal)
 	if !admitted {
 		return
@@ -89,10 +91,6 @@ func (s *Server) runChatPath(w http.ResponseWriter, r *http.Request, payload map
 	// 会话键从原始 payload 提取（BuildUpstreamBody 已剥掉 prompt_cache_key/metadata）
 	sessionKey := principalSessionKey(principal, model, payload)
 	acc, aerr := s.pickAccountFor(principal, model, sessionKey)
-	if aerr != nil {
-		writeAPIErr(w, aerr)
-		return
-	}
 	if aerr != nil {
 		writeAPIErr(w, aerr)
 		return
@@ -171,7 +169,10 @@ func (s *Server) runChatPath(w http.ResponseWriter, r *http.Request, payload map
 				return nil
 			}
 			return yield(line)
-		}, nil, principal.AccountScope)
+		}, func(fa *pool.Account, e *upstream.UpstreamError) {
+			// 非流式路径的换号重试同样要留痕，否则连续 failover 无法排查。
+			o.logUsage(logArgs{protocol: "chat", model: model, acc: fa, t0: t0, status: "error", errStr: upstreamErrorText(e.StatusCode, e.Raw), input: input, appName: principal.AppName, userID: principal.UserID, appID: principal.AppID, quota: principal.quota, updatePool: false})
+		}, principal.AccountScope)
 		return callErr
 	})
 	if err != nil {
@@ -202,10 +203,11 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 // converter is the shared interface of the two stream converters.
 type converter interface {
+	SetNonstream()
 	FeedLine(string) string
 	Finish() string
 	GetNonstreamResponse() map[string]any
-	ToolsSummary() string
+	ToolsSummaryLimited(int) string
 	TextContent() string
 	Reasoning() string
 	Usage() map[string]any
@@ -228,6 +230,11 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 		writeAPIErr(w, aerr)
 		return
 	}
+	streamHint := true
+	if value, ok := payload["stream"]; ok {
+		streamHint = boolVal(value)
+	}
+	r = r.WithContext(context.WithValue(r.Context(), requestStreamKey{}, streamHint))
 	r, release, admitted := s.admitModel(w, r, principal)
 	if !admitted {
 		return
@@ -299,6 +306,9 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 	}
 	_, canStream := w.(http.Flusher)
 	streamMode := clientStream && canStream
+	if !streamMode {
+		conv.SetNonstream()
+	}
 	// Only open the SSE header stream when actually streaming; otherwise the
 	// non-stream branches below respond with writeJSON and must own the header.
 	var send func(string) error
@@ -342,11 +352,43 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 		writeJSON(w, st, detail)
 		return
 	}
-	finish := conv.Finish()
-	out := conv.TextContent() + conv.ToolsSummary()
+	var outLog strings.Builder
+	appendLogText(&outLog, conv.TextContent(), o.cfg.UsageContentMaxBytes)
+	remaining := o.cfg.UsageContentMaxBytes - outLog.Len()
+	if o.cfg.UsageContentMaxBytes <= 0 || remaining > 0 {
+		appendLogText(&outLog, conv.ToolsSummaryLimited(remaining), o.cfg.UsageContentMaxBytes)
+	}
+	out := outLog.String()
 	o.logUsage(logArgs{protocol: protocol, model: model, acc: served, t0: t0, status: "ok", usage: conv.Usage(), input: input, output: out, reasoning: conv.Reasoning(), appName: principal.AppName, userID: principal.UserID, appID: principal.AppID, quota: principal.quota, effort: effort, updatePool: true})
 	if streamMode {
-		writeChunk(finish)
+		if responses, ok := conv.(*adapters.ResponsesStreamConverter); ok {
+			// Each done/completed event retains its official full payload; only
+			// the encoding/writing is incremental to bound transient copies.
+			if !opened {
+				if err := writeChunk(""); err != nil {
+					return
+				}
+			}
+			controller := http.NewResponseController(w)
+			err := responses.FinishEvents(func(event map[string]any) error {
+				_ = controller.SetWriteDeadline(time.Now().Add(30 * time.Second))
+				if _, err := io.WriteString(w, "data: "); err != nil {
+					return err
+				}
+				if err := json.NewEncoder(w).Encode(event); err != nil {
+					return err
+				}
+				if _, err := io.WriteString(w, "\n"); err != nil {
+					return err
+				}
+				return controller.Flush()
+			})
+			if err != nil {
+				return
+			}
+		} else {
+			_ = writeChunk(conv.Finish())
+		}
 		return
 	}
 	writeJSON(w, 200, conv.GetNonstreamResponse())

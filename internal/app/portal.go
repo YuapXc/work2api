@@ -113,6 +113,13 @@ func (s *Server) adminPortalBootstrap(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "id": id, "username": strings.ToLower(strings.TrimSpace(username))})
 }
 
+// isPortalAuthPath reports whether the portal API path is one of the
+// unauthenticated auth endpoints (rate-limited per-IP, no session required).
+func isPortalAuthPath(path string) bool {
+	return path == "/portal/api/auth/state" || path == "/portal/api/auth/register" ||
+		path == "/portal/api/auth/login" || path == "/portal/api/auth/logout"
+}
+
 // portalGuard authenticates /portal/api/* and enforces same-origin writes.
 func (s *Server) portalGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -130,12 +137,13 @@ func (s *Server) portalGuard(next http.Handler) http.Handler {
 			s.writeOverload(w, "portal_capacity")
 			return
 		}
-		// 写操作（含认证接口）一律同源校验。
-		if r.Method != http.MethodGet && r.Method != http.MethodHead && !s.adminOriginAllowed(r, false) {
+		// 写操作（含认证接口）一律同源校验；带会话的写请求要求浏览器信号
+		// （与 adminGuard 一致），认证接口保持宽松以兼容旧客户端。
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && !s.adminOriginAllowed(r, !isPortalAuthPath(path)) {
 			writeJSON(w, 403, errBody(403, "拒绝跨源请求", "forbidden").body)
 			return
 		}
-		if path == "/portal/api/auth/state" || path == "/portal/api/auth/register" || path == "/portal/api/auth/login" || path == "/portal/api/auth/logout" {
+		if isPortalAuthPath(path) {
 			if r.Method == http.MethodPost && path != "/portal/api/auth/logout" && (!s.portalLoginLimiter.allowLimit("ip:"+s.rateLimitIP(r), 60) || !s.portalLoginLimiter.allowLimit("global", 300)) {
 				w.Header().Set("Retry-After", "600")
 				writeJSON(w, 429, errBody(429, "尝试次数过多，请 10 分钟后再试", "rate_limit_error").body)
@@ -303,7 +311,9 @@ func (s *Server) portalLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	username, _ := body["username"].(string)
 	password, _ := body["password"].(string)
-	if !s.portalLoginLimiter.allow("user:" + strings.ToLower(strings.TrimSpace(username))) {
+	// 「用户名+IP」联合计数：纯用户名键可被第三方用来定向锁死任意已知用户，
+	// 联合后只有同一来源的尝试才消耗该键的额度；per-IP 与 global 闸不变。
+	if !s.portalLoginLimiter.allow("user:" + s.rateLimitIP(r) + ":" + strings.ToLower(strings.TrimSpace(username))) {
 		writeAPIErr(w, localOverload("login_attempts"))
 		return
 	}
@@ -886,6 +896,20 @@ func (s *Server) completePortalContribution(userID int64, uid, site string, res 
 	if err != nil {
 		return errors.New("授权数据无效")
 	}
+	// Check before reserving ownership or retiring credentials, including retries.
+	path := filepath.Join(s.o.projectAuths, "workbuddy-"+safeUID(uid)+".info")
+	if old, err := os.ReadFile(path); err == nil {
+		var saved struct {
+			Account struct {
+				UID string `json:"uid"`
+			} `json:"account"`
+		}
+		if existing == nil || json.Unmarshal(old, &saved) != nil || saved.Account.UID != uid {
+			return errors.New("账号凭据文件冲突，请联系管理员处理")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return errors.New("账号凭据文件无法读取，请联系管理员处理")
+	}
 	id := int64(0)
 	if existing == nil {
 		id, err = s.o.db.CreateContribution(userID, uid, "workbuddy", site, "verifying")
@@ -908,7 +932,6 @@ func (s *Server) completePortalContribution(userID int64, uid, site string, res 
 	if err := os.MkdirAll(s.o.projectAuths, 0700); err != nil {
 		return errors.New("凭据保存失败，请重试")
 	}
-	path := filepath.Join(s.o.projectAuths, "workbuddy-"+safeUID(uid)+".info")
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		return errors.New("凭据保存失败，请重试")
 	}
@@ -1376,16 +1399,17 @@ func portalConcurrencyOverrides(settings map[string]string) map[string]int {
 	return limits
 }
 
+// portalUserLimit applies the user override within the static shared hard cap.
 func (s *Server) portalUserLimit(id int64) int {
-	limit := positiveOr(s.o.cfg.PortalUserConcurrency, 2)
+	limit := positiveOr(s.o.cfg.PortalUserConcurrency, 4)
 	if settings, err := s.o.db.GetSettings(); err == nil {
 		if n := portalConcurrencyOverrides(settings)[strconv.FormatInt(id, 10)]; id > 0 && n > 0 {
 			limit = n
 		}
 	}
-	max := s.modelsAdmission.sharedCapacity
-	if limit > max {
-		limit = max
+	maxCap := s.modelsAdmission.sharedCapacity
+	if limit > 0 && maxCap > 0 && limit > maxCap {
+		limit = maxCap
 	}
 	return positiveOr(limit, 1)
 }
@@ -1400,7 +1424,8 @@ func (s *Server) adminPortalUserConcurrency(w http.ResponseWriter, r *http.Reque
 	body, err := readJSON(r)
 	raw, ok := body["limit"].(float64)
 	n := int(raw)
-	if err != nil || !ok || raw != float64(n) || n < 0 || n > s.modelsAdmission.sharedCapacity {
+	upper := s.modelsAdmission.sharedCapacity
+	if err != nil || !ok || raw != float64(n) || n < 0 || n > upper {
 		writeAPIErr(w, errBody(400, "并发需为 0（默认）至共享执行上限之间的整数", "invalid_request_error"))
 		return
 	}

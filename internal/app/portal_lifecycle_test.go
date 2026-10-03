@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -31,8 +32,38 @@ func portalFixture(t *testing.T) (*Server, *store.User) {
 	}
 	return NewServer(o), u
 }
+
+func TestContributionCollisionCannotOverwriteOnRetry(t *testing.T) {
+	s, user := portalFixture(t)
+	uid := "collision/uid"
+	path := filepath.Join(s.o.projectAuths, "workbuddy-"+safeUID(uid)+".info")
+	original := []byte(`{"auth":{"accessToken":"original"},"account":{"uid":"collision:uid"}}`)
+	if err := os.WriteFile(path, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	res := map[string]any{"auth": map[string]any{"accessToken": "new-token"}, "account": map[string]any{"uid": uid}}
+	if err := s.completePortalContribution(user.ID, uid, "codebuddy", res); err == nil {
+		t.Fatal("initial collision accepted")
+	}
+	if c, err := s.o.db.ContributionByAccount(uid); err != nil || c != nil {
+		t.Fatal("failed collision reserved identity", c, err)
+	}
+	// Simulate the verifying row created by the previous implementation.
+	if _, err := s.o.db.CreateContribution(user.ID, uid, "workbuddy", "codebuddy", "verifying"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.completePortalContribution(user.ID, uid, "codebuddy", res); err == nil {
+		t.Fatal("retry bypassed collision check")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(got, original) {
+		t.Fatal("other account credential overwritten", err)
+	}
+}
 func portalRequest(user *store.User, path, body string) *http.Request {
 	r := httptest.NewRequest("POST", path, strings.NewReader(body))
+	// 写请求要求同源浏览器信号（与 adminGuard 一致），测试统一补 Origin。
+	r.Header.Set("Origin", "http://"+r.Host)
 	return r.WithContext(context.WithValue(r.Context(), portalUserKey{}, user))
 }
 
@@ -43,6 +74,7 @@ func TestPortalPasswordRouteAuthenticatesAndRevokesSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := httptest.NewRequest("POST", "/portal/api/auth/password", strings.NewReader(`{"old_password":"oldpassword","new_password":"newpassword"}`))
+	r.Header.Set("Origin", "http://"+r.Host)
 	r.AddCookie(&http.Cookie{Name: portalauth.UserCookieName, Value: token})
 	w := httptest.NewRecorder()
 	s.portalGuard(http.HandlerFunc(s.portalChangePassword)).ServeHTTP(w, r)
@@ -56,7 +88,9 @@ func TestPortalPasswordRouteAuthenticatesAndRevokesSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	w = httptest.NewRecorder()
-	s.portalGuard(http.HandlerFunc(s.portalChangePassword)).ServeHTTP(w, httptest.NewRequest("POST", "/portal/api/auth/password", strings.NewReader(`{}`)))
+	second := httptest.NewRequest("POST", "/portal/api/auth/password", strings.NewReader(`{}`))
+	second.Header.Set("Origin", "http://"+second.Host)
+	s.portalGuard(http.HandlerFunc(s.portalChangePassword)).ServeHTTP(w, second)
 	if w.Code != 401 || w.Header().Get("Cache-Control") != "no-store" {
 		t.Fatal(w.Code, w.Header())
 	}

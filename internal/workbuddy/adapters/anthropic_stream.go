@@ -17,6 +17,7 @@ type AnthropicStreamConverter struct {
 	model     string
 	createdAt int64
 
+	nonstream    bool
 	emittedStart bool
 
 	textContent   strings.Builder
@@ -296,7 +297,12 @@ func (c *AnthropicStreamConverter) processChunk(chunk map[string]any) string {
 	return events.String()
 }
 
+func (c *AnthropicStreamConverter) SetNonstream() { c.nonstream = true }
+
 func (c *AnthropicStreamConverter) evt(eventType string, data map[string]any) string {
+	if c.nonstream {
+		return ""
+	}
 	payload := map[string]any{"type": eventType}
 	for k, v := range data {
 		payload[k] = v
@@ -331,7 +337,9 @@ func (c *AnthropicStreamConverter) buildContentBlocks() []any {
 }
 
 // ToolsSummary returns a compact tool-call summary for usage logging.
-func (c *AnthropicStreamConverter) ToolsSummary() string {
+func (c *AnthropicStreamConverter) ToolsSummary() string { return c.ToolsSummaryLimited(0) }
+
+func (c *AnthropicStreamConverter) ToolsSummaryLimited(limit int) string {
 	idxs := make([]int, len(c.toolOrder))
 	copy(idxs, c.toolOrder)
 	sort.Ints(idxs)
@@ -342,7 +350,18 @@ func (c *AnthropicStreamConverter) ToolsSummary() string {
 		if name == "" {
 			name = "?"
 		}
-		parts.WriteString("<tool_call:" + name + " " + tc.args.String() + ">")
+		for _, part := range []string{"<tool_call:", name, " ", tc.args.String(), ">"} {
+			if limit > 0 {
+				remaining := limit - parts.Len()
+				if remaining <= 0 {
+					return parts.String()
+				}
+				if len(part) > remaining {
+					part = part[:remaining]
+				}
+			}
+			parts.WriteString(part)
+		}
 	}
 	return parts.String()
 }

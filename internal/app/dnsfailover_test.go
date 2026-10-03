@@ -55,7 +55,7 @@ func newDNSFailoverOrch(t *testing.T, client *failingUpstream) (*Orchestrator, *
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	p := pool.New(map[string]pool.Credential{uid: mgr}, "")
-	o := &Orchestrator{db: db, cfg: &config.Config{}, pool: p, models: models.New(p, db), managers: map[string]*credentials.Manager{uid: mgr}, modelCooldowns: map[string]cdEntry{}, sessions: newSessionRouter(), upstreamClient: client}
+	o := &Orchestrator{db: db, cfg: &config.Config{MaxConcurrentRequests: 4, PortalUserConcurrency: 2}, pool: p, models: models.New(p, db), managers: map[string]*credentials.Manager{uid: mgr}, modelCooldowns: map[string]cdEntry{}, sessions: newSessionRouter(), upstreamClient: client}
 	acc := p.Get(uid)
 	if acc == nil || acc.Profile == "" {
 		t.Fatal("fixture must contain a routable pooled account")

@@ -62,7 +62,10 @@ type Principal struct {
 	ModelScopes   map[string]map[string]bool
 	OwnedModels   map[string]bool
 	SharedModels  map[string]bool
-	quota         *portalQuotaReservation
+	// EffectiveModel is the resolved model name after prepareModel (empty
+	// before). Keeps queue accounting and post-wait model authorization aligned.
+	EffectiveModel string
+	quota          *portalQuotaReservation
 }
 
 type upstreamStreamer interface {
@@ -507,6 +510,7 @@ func (s *Server) prepareModel(principal *Principal, payload map[string]any) *api
 		}
 	}
 	payload["model"] = model
+	principal.EffectiveModel = s.o.resolveModel(model)
 	if aerr := s.authorizeModel(principal, model); aerr != nil {
 		return aerr
 	}
@@ -726,15 +730,24 @@ func (o *Orchestrator) pickInScope(model, sessionKey string, tried map[string]bo
 	}
 	ready := map[string]bool{}
 	now := nowSec()
+	scopedCandidates := 0
 	for uid := range allowed {
 		if tried[uid] || !scope[uid] {
 			continue
 		}
-		if o.modelCooldownUntil(uid, model) <= 0+now {
+		if account := o.pool.Get(uid); account == nil || !account.Enabled {
+			continue
+		}
+		scopedCandidates++
+		if o.modelCooldownUntil(uid, model) <= now {
 			ready[uid] = true
 		}
 	}
 	if len(ready) == 0 {
+		// Only real enabled scoped candidates in model cooldown justify a 429.
+		if len(tried) == 0 && scopedCandidates > 0 {
+			return nil, errBody(429, "模型 "+model+" 的授权账号暂处于冷却，请稍后重试", "rate_limit_error")
+		}
 		return nil, errPoolExhausted(model, tried)
 	}
 	if sessionKey != "" {
@@ -940,6 +953,31 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 	const maxFailoverAttempts = 5
 	tried := map[string]bool{}
 	for attempt := 0; ; attempt++ {
+		if lease, ok := ctx.Value(modelLeaseKey{}).(*modelLease); ok {
+			choose, chooseErr := o.accountSelector(model, acc.UID, tried, scope)
+			if chooseErr != nil {
+				return acc, chooseErr
+			}
+			selected, selectErr := lease.bindAccount(ctx, choose)
+			if selectErr != nil {
+				return acc, selectErr
+			}
+			acc = selected
+			// A private account may be moved to shared-only while this request
+			// waits. Recheck ownership after waiting, before reading credentials.
+			if scope == nil {
+				excluded, err := o.db.PrivatePoolExcludedUIDs()
+				if err != nil {
+					return acc, errBody(503, "账号权限查询失败", "server_error")
+				}
+				if excluded[acc.UID] {
+					return acc, errBody(403, "账号使用范围已变更，请重新请求", "permission_error")
+				}
+			}
+			if sessionKey != "" {
+				o.sessions.bind(sessionKey, acc.UID)
+			}
+		}
 		tried[acc.UID] = true
 		started, err := o.runOnce(ctx, acc, body, sink)
 		if err == nil {
@@ -987,6 +1025,67 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 		}
 		acc = alt
 	}
+}
+
+// Capture authorized candidates outside admission's mutex. Dispatch consults
+// live cooldown/enable state; portal authority is revalidated just before sending.
+// The selector is synchronous and does not perform network or database I/O.
+func (o *Orchestrator) accountSelector(model, preferred string, tried map[string]bool, scope map[string]bool) (func(map[string]bool) (*pool.Account, *apiError), *apiError) {
+	allowed, aerr := o.modelAccountUIDs(model)
+	if aerr != nil {
+		return nil, aerr
+	}
+	if scope == nil {
+		excluded, err := o.db.PrivatePoolExcludedUIDs()
+		if err != nil {
+			return nil, errBody(503, "账号权限查询失败", "server_error")
+		}
+		for uid := range excluded {
+			delete(allowed, uid)
+		}
+	} else {
+		for uid := range allowed {
+			if !scope[uid] {
+				delete(allowed, uid)
+			}
+		}
+	}
+	for uid := range tried {
+		delete(allowed, uid)
+	}
+	cost := o.modelCostByUID(model, allowed)
+	window := o.expiryWindowDays()
+	return func(busy map[string]bool) (*pool.Account, *apiError) {
+		ready := map[string]bool{}
+		now := nowSec()
+		for _, candidate := range o.pool.Accounts() {
+			// Keep the original selected account's short account-cooldown grace;
+			// model cooldown remains a strict exclusion as in the original picker.
+			preferredGrace := candidate.UID == preferred && candidate.Enabled && candidate.CooldownUntil-now <= sessionStickyMaxCooldown
+			if !allowed[candidate.UID] || (!candidate.Healthy(now) && !preferredGrace) || o.modelCooldownUntil(candidate.UID, model) > now {
+				continue
+			}
+			ready[candidate.UID] = true
+		}
+		if len(ready) == 0 {
+			return nil, errPoolExhausted(model, tried)
+		}
+		// Preserve original routing before considering occupancy. Busy accounts
+		// must not lose affinity or cost/expiry preference merely to fill slots.
+		var selected *pool.Account
+		if ready[preferred] {
+			selected = o.pool.Get(preferred)
+		} else {
+			selected = o.pool.Pick(ready, cost, window)
+			if selected != nil {
+				preferred = selected.UID
+			}
+		}
+		if selected != nil && busy[selected.UID] {
+			return nil, nil
+		}
+		return selected, nil
+	}, nil
 }
 
 func (o *Orchestrator) refreshCreditsFor(ctx context.Context, acc *pool.Account) {

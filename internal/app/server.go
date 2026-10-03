@@ -25,6 +25,7 @@ type Server struct {
 	portalSlots                                                 chan struct{}
 	modelsAdmission                                             *modelAdmission
 	adminSlots, heavySlots, querySlots, bodySlots, refreshSlots chan struct{}
+	bodyWaiting                                                 chan struct{}
 	bodies                                                      *bodyBudget
 	refreshMu                                                   sync.Mutex
 	refreshes                                                   map[string]*refreshFlight
@@ -71,7 +72,7 @@ type principalContextKey struct{}
 func NewServer(o *Orchestrator) *Server {
 	return &Server{o: o, sessions: newAdminSessionManager(), loginLimiter: newLoginRateLimiter(), portalLoginLimiter: newLoginRateLimiter(), portalSlots: make(chan struct{}, 8),
 		portalTasks: map[string]*portalContributionTask{}, portalPollLimiter: map[int64]*pollLimiter{},
-		modelsAdmission: newModelAdmission(o.cfg), adminSlots: make(chan struct{}, positiveOr(o.cfg.AdminConcurrency, 8)), heavySlots: make(chan struct{}, positiveOr(o.cfg.HeavyAdminConcurrency, 2)), querySlots: make(chan struct{}, positiveOr(o.cfg.QueryConcurrency, 4)), bodySlots: make(chan struct{}, positiveOr(o.cfg.BodyReadConcurrency, 4)), bodies: &bodyBudget{limit: int64(positiveOr(int(o.cfg.RequestBodyBudget), 32<<20))}, refreshSlots: make(chan struct{}, 8), refreshes: map[string]*refreshFlight{}}
+		bodyWaiting: make(chan struct{}, positiveOr(o.cfg.ModelQueueSize, 32)), modelsAdmission: newModelAdmission(o.cfg), adminSlots: make(chan struct{}, positiveOr(o.cfg.AdminConcurrency, 8)), heavySlots: make(chan struct{}, positiveOr(o.cfg.HeavyAdminConcurrency, 2)), querySlots: make(chan struct{}, positiveOr(o.cfg.QueryConcurrency, 4)), bodySlots: make(chan struct{}, positiveOr(o.cfg.BodyReadConcurrency, 4)), bodies: &bodyBudget{limit: int64(positiveOr(int(o.cfg.RequestBodyBudget), 32<<20))}, refreshSlots: make(chan struct{}, 8), refreshes: map[string]*refreshFlight{}}
 }
 
 // Handler returns the root handler with all routes mounted and Host guarded.
@@ -150,8 +151,28 @@ func (s *Server) requestGuard(next http.Handler) http.Handler {
 			select {
 			case s.bodySlots <- struct{}{}:
 			default:
-				s.writeOverload(w, "body_read_capacity")
-				return
+				// A short bounded wait absorbs Agent fan-out before body parsing;
+				// readers and raw-byte allocations retain their existing limits.
+				select {
+				case s.bodyWaiting <- struct{}{}:
+				default:
+					s.writeOverload(w, "body_read_capacity")
+					return
+				}
+				timer := time.NewTimer(5 * time.Second)
+				select {
+				case s.bodySlots <- struct{}{}:
+					timer.Stop()
+					<-s.bodyWaiting
+				case <-r.Context().Done():
+					timer.Stop()
+					<-s.bodyWaiting
+					return
+				case <-timer.C:
+					<-s.bodyWaiting
+					s.writeOverload(w, "body_read_capacity")
+					return
+				}
 			}
 
 			body, reserved, err := func() ([]byte, int64, error) {
@@ -455,6 +476,10 @@ func readJSON(r *http.Request) (map[string]any, error) {
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(&body); err != nil {
 		return nil, err
+	}
+	// 拒绝 JSON 后缀数据（{"a":1} {"b":2}），与 requestGuard 的复杂度检查语义一致。
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return nil, errors.New("JSON 后存在多余数据")
 	}
 	return body, nil
 }

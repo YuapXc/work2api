@@ -41,7 +41,7 @@ async function load() {
 }
 
 function rejectionLabel(reason: string): string {
-  return ({ model_queue_full: '模型队列满', key_queue_full: '密钥队列满', model_queue_timeout: '等待超时', request_capacity: '普通请求繁忙', heavy_admin_capacity: '重管理请求繁忙', body_read_capacity: '请求体读取繁忙', body_budget_exhausted: '请求体内存不足' } as Record<string,string>)[reason] || reason
+  return ({ model_queue_full: '模型队列满', key_queue_full: '密钥队列满', model_queue_timeout: '等待超时', request_capacity: '普通请求繁忙', heavy_admin_capacity: '重管理请求繁忙', body_read_capacity: '请求体读取繁忙', body_budget_exhausted: '请求体内存不足', shared_queue_full: '用户池队列满', response_buffer_budget: '单请求响应预算不足' } as Record<string,string>)[reason] || reason
 }
 const healthy = computed(() => (ov.value?.accounts || []).filter((a) => a.healthy).length)
 const serving = computed(() => providers.value.some((p) => p.name === 'workbuddy' ? healthy.value > 0 : p.ready))
@@ -86,7 +86,10 @@ onUnmounted(() => timer && clearInterval(timer))
     <div v-if="refreshFailed" class="mb-4 text-small text-warn">刷新失败，当前显示上次获取的数据。</div>
     <WCard v-if="ov?.admission" class="mb-4">
       <div class="flex flex-wrap gap-4 text-small">
-        <span>模型执行 {{ ov.admission.running }} / {{ ov.admission.capacity }}</span>
+        <span>模型执行 {{ ov.admission.running }} / {{ ov.admission.capacity }}（硬上限）</span>
+        <span v-if="ov.admission.shared_capacity != null">用户池 {{ ov.admission.shared_running }} / {{ ov.admission.shared_capacity }}</span>
+        <span v-if="ov.admission.buffer_budget_bytes">响应预留 {{ ((ov.admission.buffer_reserved_bytes || 0) / 1048576).toFixed(0) }} / {{ (ov.admission.buffer_budget_bytes / 1048576).toFixed(0) }} MiB</span>
+        <span v-if="ov.admission.memory_pressure" class="text-warn">内存压力保护中，新请求等待恢复</span>
         <span>排队 {{ ov.admission.queued }} / {{ ov.admission.queue_capacity }}</span>
         <span>最长等待 {{ (ov.admission.oldest_wait_ms / 1000).toFixed(1) }} 秒</span>
         <span>请求体占用 {{ ((ov.request_body_bytes || 0) / 1048576).toFixed(1) }} MiB</span>

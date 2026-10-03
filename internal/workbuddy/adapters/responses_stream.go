@@ -18,6 +18,7 @@ type ResponsesStreamConverter struct {
 	model     string
 	createdAt int64
 
+	nonstream          bool
 	emittedCreated     bool
 	emittedMsgItem     bool
 	emittedContentPart bool
@@ -78,34 +79,58 @@ func (c *ResponsesStreamConverter) FeedLine(line string) string {
 // Finish emits closing events (done + completed).
 func (c *ResponsesStreamConverter) Finish() string {
 	var events strings.Builder
+	_ = c.FinishEvents(func(event map[string]any) error {
+		b, _ := json.Marshal(event)
+		events.WriteString("data: ")
+		events.Write(b)
+		events.WriteString("\n\n")
+		return nil
+	})
+	return events.String()
+}
+
+// FinishEvents emits each full protocol event separately. Production callers
+// encode directly to their writer, avoiding one large concatenated SSE string.
+func (c *ResponsesStreamConverter) FinishEvents(send func(map[string]any) error) error {
+	var err error
+	emit := func(kind string, data map[string]any) {
+		if err != nil {
+			return
+		}
+		data["type"] = kind
+		err = send(data)
+	}
 	if c.emittedContentPart {
-		events.WriteString(c.evt("response.output_text.done", map[string]any{
+		emit("response.output_text.done", map[string]any{
 			"output_index": 0, "content_index": 0, "text": c.content.String(),
-		}))
-		events.WriteString(c.evt("response.content_part.done", map[string]any{
+		})
+		emit("response.content_part.done", map[string]any{
 			"output_index": 0, "content_index": 0,
 			"part": map[string]any{"type": "output_text", "text": c.content.String(), "annotations": []any{}},
-		}))
+		})
 	}
 	if c.emittedMsgItem {
-		events.WriteString(c.evt("response.output_item.done", map[string]any{
+		emit("response.output_item.done", map[string]any{
 			"output_index": 0, "item": c.msgItem("completed", false),
-		}))
+		})
 	}
 	for _, idx := range sortedKeys(c.toolOrder) {
 		tc := c.toolCalls[idx]
 		if tc.emitted {
-			events.WriteString(c.evt("response.function_call_arguments.done", map[string]any{
+			emit("response.function_call_arguments.done", map[string]any{
 				"output_index": tc.outputIdx, "arguments": tc.args.String(),
-			}))
-			events.WriteString(c.evt("response.output_item.done", map[string]any{
+			})
+			emit("response.output_item.done", map[string]any{
 				"output_index": tc.outputIdx, "item": c.fcItem(tc, "completed"),
-			}))
+			})
 		}
 	}
-	events.WriteString(c.evt("response.completed", map[string]any{"response": c.responseObj("completed")}))
-	return events.String()
+	emit("response.completed", map[string]any{"response": c.responseObj("completed")})
+	return err
 }
+
+// SetNonstream suppresses event serialization while preserving accumulated state.
+func (c *ResponsesStreamConverter) SetNonstream() { c.nonstream = true }
 
 // GetNonstreamResponse returns the full non-streaming Response object.
 func (c *ResponsesStreamConverter) GetNonstreamResponse() map[string]any {
@@ -222,6 +247,9 @@ func (c *ResponsesStreamConverter) processChunk(chunk map[string]any) string {
 }
 
 func (c *ResponsesStreamConverter) evt(eventType string, data map[string]any) string {
+	if c.nonstream {
+		return ""
+	}
 	payload := map[string]any{"type": eventType}
 	for k, v := range data {
 		payload[k] = v
@@ -314,7 +342,9 @@ func (c *ResponsesStreamConverter) responseObj(status string) map[string]any {
 }
 
 // ToolsSummary returns a compact tool-call summary for usage logging.
-func (c *ResponsesStreamConverter) ToolsSummary() string {
+func (c *ResponsesStreamConverter) ToolsSummary() string { return c.ToolsSummaryLimited(0) }
+
+func (c *ResponsesStreamConverter) ToolsSummaryLimited(limit int) string {
 	var parts strings.Builder
 	for _, idx := range sortedKeys(c.toolOrder) {
 		tc := c.toolCalls[idx]
@@ -322,7 +352,18 @@ func (c *ResponsesStreamConverter) ToolsSummary() string {
 		if name == "" {
 			name = "?"
 		}
-		parts.WriteString("<tool_call:" + name + " " + tc.args.String() + ">")
+		for _, part := range []string{"<tool_call:", name, " ", tc.args.String(), ">"} {
+			if limit > 0 {
+				remaining := limit - parts.Len()
+				if remaining <= 0 {
+					return parts.String()
+				}
+				if len(part) > remaining {
+					part = part[:remaining]
+				}
+			}
+			parts.WriteString(part)
+		}
 	}
 	return parts.String()
 }

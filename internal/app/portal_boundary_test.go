@@ -87,7 +87,7 @@ func TestPortalAuthLimitsKeepProxyIdentitiesSeparate(t *testing.T) {
 }
 
 func TestSharedQueueReservesPrivateWaitCapacity(t *testing.T) {
-	a := newModelAdmission(&config.Config{MaxConcurrentRequests: 4})
+	a := newModelAdmission(&config.Config{MaxConcurrentRequests: 4, ModelQueueSize: 8, PortalUserQueueSize: 4, PortalSharedQueueSize: 6})
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for i := 0; i < 6; i++ {
@@ -104,7 +104,7 @@ func TestSharedQueueReservesPrivateWaitCapacity(t *testing.T) {
 	if a.enqueueLocked(&modelTicket{key: "private-c"}) == nil {
 		t.Fatal("global queue exceeded cap")
 	}
-	b := newModelAdmission(&config.Config{MaxConcurrentRequests: 4})
+	b := newModelAdmission(&config.Config{MaxConcurrentRequests: 4, ModelQueueSize: 8, PortalUserQueueSize: 4, PortalSharedQueueSize: 6})
 	for i := 0; i < 4; i++ {
 		if b.enqueueLocked(&modelTicket{key: "portal-user-one", shared: true}) != nil {
 			t.Fatal(i)
@@ -119,7 +119,7 @@ func TestSharedAdmissionReservesPrivateCapacityAndRecovers(t *testing.T) {
 	a := newModelAdmission(&config.Config{MaxConcurrentRequests: 4, PortalSharedConcurrency: 3})
 	var leases []*modelLease
 	for i := 0; i < 3; i++ {
-		l, err := a.acquireWithLimit(context.Background(), fmt.Sprintf("portal-user-%d", i), 1)
+		l, err := a.acquireWithLimit(context.Background(), fmt.Sprintf("portal-user-%d", i), 1, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -129,7 +129,7 @@ func TestSharedAdmissionReservesPrivateCapacityAndRecovers(t *testing.T) {
 	defer cancel()
 	result := make(chan error, 1)
 	go func() {
-		l, err := a.acquireWithLimit(ctx, "portal-user-4", 1)
+		l, err := a.acquireWithLimit(ctx, "portal-user-4", 1, "")
 		if l != nil {
 			l.release()
 		}

@@ -2,6 +2,9 @@ package adapters
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -181,4 +184,79 @@ func TestAnthropicRequestBudgetToEffort(t *testing.T) {
 	if _, has := chat["reasoning_effort"]; has {
 		t.Fatalf("no thinking must not set reasoning_effort")
 	}
+}
+
+func TestResponsesFinishEventsPreserveCompletePayloadAndOrder(t *testing.T) {
+	c := NewResponsesStreamConverter("m")
+	c.FeedLine(chatChunk(map[string]any{"content": "完整文本<>&"}))
+	c.FeedLine(chatChunk(map[string]any{"tool_calls": []any{map[string]any{"index": 0, "id": "call-1", "function": map[string]any{"name": "tool", "arguments": `{"value":"完整参数"}`}}}}))
+	legacy := c.Finish()
+	var want []map[string]any
+	for _, line := range strings.Split(legacy, "\n") {
+		if strings.HasPrefix(line, "data: ") {
+			var e map[string]any
+			if err := json.Unmarshal([]byte(line[6:]), &e); err != nil {
+				t.Fatal(err)
+			}
+			want = append(want, e)
+		}
+	}
+	var got []map[string]any
+	if err := c.FinishEvents(func(event map[string]any) error {
+		b, _ := json.Marshal(event)
+		var e map[string]any
+		json.Unmarshal(b, &e)
+		got = append(got, e)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(want, got) {
+		t.Fatal("incremental finishing changed protocol")
+	}
+	if got[0]["text"] != "完整文本<>&" || got[len(got)-1]["type"] != "response.completed" {
+		t.Fatal(got)
+	}
+	stopped := errors.New("disconnected")
+	calls := 0
+	if err := c.FinishEvents(func(map[string]any) error { calls++; return stopped }); !errors.Is(err, stopped) || calls != 1 {
+		t.Fatal("continued after disconnect", err, calls)
+	}
+}
+func TestNonstreamConvertersSuppressSSEWithoutLosingContent(t *testing.T) {
+	for _, c := range []interface {
+		SetNonstream()
+		FeedLine(string) string
+		TextContent() string
+		GetNonstreamResponse() map[string]any
+	}{NewResponsesStreamConverter("m"), NewAnthropicStreamConverter("m")} {
+		c.SetNonstream()
+		if s := c.FeedLine(chatChunk(map[string]any{"content": "保留正文", "tool_calls": []any{map[string]any{"index": 0, "id": "call-1", "function": map[string]any{"name": "tool", "arguments": `{"x":1}`}}}})); s != "" {
+			t.Fatal("serialized unused SSE")
+		}
+		if c.TextContent() != "保留正文" {
+			t.Fatal("text lost")
+		}
+		b, _ := json.Marshal(c.GetNonstreamResponse())
+		if !strings.Contains(string(b), "tool") || !strings.Contains(string(b), "保留正文") {
+			t.Fatal(string(b))
+		}
+	}
+}
+
+func BenchmarkResponsesFinishCopies(b *testing.B) {
+	c := NewResponsesStreamConverter("m")
+	c.FeedLine(chatChunk(map[string]any{"content": strings.Repeat("x", 8<<20)}))
+	b.Run("combined-SSE", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = c.Finish()
+		}
+	})
+	b.Run("incremental-JSON", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = c.FinishEvents(func(event map[string]any) error { return json.NewEncoder(io.Discard).Encode(event) })
+		}
+	})
 }

@@ -20,6 +20,7 @@ func (s *Server) refreshPortalRequest(w http.ResponseWriter, r *http.Request, p 
 		return r, true
 	}
 	scope := p.AccountScope
+	admittedModel := p.EffectiveModel
 	refresh := func(uid, actualModel string) *apiError {
 		fresh, aerr := s.o.checkAPIKey(r.Header.Get("Authorization"), r.Header.Get("X-Api-Key"))
 		if aerr != nil {
@@ -30,6 +31,9 @@ func (s *Server) refreshPortalRequest(w http.ResponseWriter, r *http.Request, p 
 		}
 		if aerr := s.prepareModel(fresh, payload); aerr != nil {
 			return aerr
+		}
+		if admittedModel != "" && fresh.EffectiveModel != admittedModel {
+			return errBody(403, "模型映射已改变，请重新发起请求", "model_not_allowed")
 		}
 		if actualModel != "" && s.o.resolveModel(strOr(payload["model"], "")) != actualModel {
 			return errBody(403, "模型映射已改变，请重新发起请求", "model_not_allowed")
@@ -121,7 +125,8 @@ func (q *portalQuotaReservation) settle() {
 		return
 	}
 	if err := q.db.SettleUserDailyQuota(q.userID, q.day, 1, q.input, q.output, 1, q.actualInput, q.actualOutput); err != nil {
-		log.Print("共享额度结算失败，保留预占额度")
+		// 没有独立预占记录时，不能从共享日桶无条件扣款补偿；这会扣掉别的请求。
+		log.Printf("共享额度结算失败，保留预占（user=%d day=%d）：%v", q.userID, int64(q.day), err)
 	}
 }
 
@@ -165,6 +170,11 @@ func (s *Server) reservePortalBudget(w http.ResponseWriter, p *Principal, payloa
 			payload["max_output_tokens"] = output
 		}
 	}
+	// 注意：input 预占单位是请求体字节数（非 token），而结算写回上游真实
+	// input_tokens——同一列两种口径。中文/长 prompt 下字节数约为 token 数的
+	// 3~6 倍，并发窗口内会互相挤占并产生偏保守的 429。启用输入日预算前
+	// （PortalDailyInputTokens>0）必须先统一口径（按字符估算 token 或改名
+	// 为「输入字节数上限」）。当前默认 0 不启用，仅作警示。
 	q := &portalQuotaReservation{db: s.o.db, userID: p.UserID, day: float64(localMidnightUnix()), input: int64(len(raw)), output: int64(output)}
 	err = s.o.db.ReserveUserDailyQuota(q.userID, q.day, 1, q.input, q.output, int64(c.PortalDailyRequests), int64(c.PortalDailyInputTokens), int64(c.PortalDailyOutputTokens))
 	if err != nil {

@@ -228,7 +228,7 @@ export interface UsageRecord {
 }
 
 export interface Overview {
-  admission?: { running: number; queued: number; capacity: number; queue_capacity: number; oldest_wait_ms: number; wait_limit_ms: number; rejected: Record<string,number> }
+  admission?: { memory_pressure?: boolean; buffer_reserved_bytes?: number; buffer_budget_bytes?: number; shared_running?: number; shared_capacity?: number; account_running?: Record<string,number>; account_capacity?: number; running: number; queued: number; capacity: number; queue_capacity: number; oldest_wait_ms: number; wait_limit_ms: number; rejected: Record<string,number> }
   request_body_bytes?: number
   accounts: AccountInfo[]
   /** 预警提示（后端按当前额度状态实时计算，仅用于展示） */

@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -95,6 +96,11 @@ func New(path string) (*DB, error) {
 	if err := d.initSchema(); err != nil {
 		sqldb.Close()
 		return nil, err
+	}
+	// Retain recent buckets for cross-midnight requests. Maintenance failures
+	// must not make an otherwise healthy database unavailable at startup.
+	if _, err := d.CleanupOldDailyQuota(); err != nil {
+		log.Printf("清理过期日额度失败，稍后由日维护重试: %v", err)
 	}
 	return d, nil
 }

@@ -245,6 +245,11 @@ func (s *Scheduler) cleanupUsage() {
 		log.Printf("使用记录清理完成（保留 %d 天，删除 %d 条）", s.o.cfg.UsageRetentionDays, n)
 	}
 	s.checkUsageRows()
+	if n, err := s.o.db.CleanupOldDailyQuota(); err != nil {
+		log.Printf("日额度记录清理异常: %v", err)
+	} else if n > 0 {
+		log.Printf("日额度记录清理完成（删除 %d 条）", n)
+	}
 }
 
 // run is the once-per-minute scheduling loop. Each branch is idempotent per day

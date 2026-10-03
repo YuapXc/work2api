@@ -975,6 +975,18 @@ func (d *DB) UserDailyQuota(userID int64, day float64) (requests, input, output 
 	return
 }
 
+// CleanupOldDailyQuota keeps buckets newer than 48 hours for cross-midnight settlements.
+// Called at startup and from daily maintenance.
+func (d *DB) CleanupOldDailyQuota() (int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	res, err := d.db.Exec("DELETE FROM user_daily_quota WHERE day<?", float64(time.Now().Unix()-2*86400))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // ActivateContributionWithGroups commits qualification and membership together.
 // Only a pending verification may activate; a concurrent revoke wins.
 func (d *DB) ActivateContributionWithGroups(id, userID int64) error {

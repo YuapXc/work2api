@@ -17,30 +17,33 @@ import (
 
 // Config is the fully-resolved runtime configuration.
 type Config struct {
-	Host                  string // listen host
-	Port                  int    // listen port
-	AllowPortFallback     bool   // only an unconfigured default port may auto-avoid
-	DBPath                string // SQLite file path
-	AdminToken            string // admin/WebUI auth; empty => loopback-only
-	AdminCookieSecure     bool   // force Secure cookies behind a TLS-terminating proxy
-	TrustedProxyCIDRs     string // explicit peers permitted to supply overwritten X-Real-IP
-	MaxRequestBytes       int64
-	MaxConcurrentRequests int
-	ModelQueueSize        int
-	ModelQueueWaitSeconds int
-	ModelKeyQueueSize     int
-	ModelKeyLimits        string
-	AdminConcurrency      int
-	HeavyAdminConcurrency int
-	QueryConcurrency      int
-	BodyReadConcurrency   int
-	RequestBodyBudget     int64
-	MaxResponseBytes      int64
-	MaxJSONItems          int
-	MaxJSONDepth          int
-	DataDir               string // base dir for data (db, attachments, secrets)
-	LogLevel              string
-	LogToFile             bool
+	Host                   string // listen host
+	Port                   int    // listen port
+	AllowPortFallback      bool   // only an unconfigured default port may auto-avoid
+	DBPath                 string // SQLite file path
+	AdminToken             string // admin/WebUI auth; empty => loopback-only
+	AdminCookieSecure      bool   // force Secure cookies behind a TLS-terminating proxy
+	TrustedProxyCIDRs      string // explicit peers permitted to supply overwritten X-Real-IP
+	MaxRequestBytes        int64
+	ModelMemoryGuard       bool
+	ModelBufferBudgetBytes int64
+	ModelMemoryHighBytes   int64
+	MaxConcurrentRequests  int
+	ModelQueueSize         int
+	ModelQueueWaitSeconds  int
+	ModelKeyQueueSize      int
+	ModelKeyLimits         string
+	AdminConcurrency       int
+	HeavyAdminConcurrency  int
+	QueryConcurrency       int
+	BodyReadConcurrency    int
+	RequestBodyBudget      int64
+	MaxResponseBytes       int64
+	MaxJSONItems           int
+	MaxJSONDepth           int
+	DataDir                string // base dir for data (db, attachments, secrets)
+	LogLevel               string
+	LogToFile              bool
 
 	// 用户门户（HANDOFF §8 方案）：注册模式 invite|open|closed；贡献扫码任务
 	// 上限（防批量任务耗尽内存）；用户级并发与每日用量（0 = 不启用该限制，
@@ -51,11 +54,13 @@ type Config struct {
 	PortalUserQueueSize     int
 	PortalSharedQueueSize   int
 	PortalSharedConcurrency int
-	PortalDailyRequests     int
-	PortalDailyInputTokens  int
-	PortalDailyOutputTokens int
-	PortalKeyMaxPerUser     int
-	PortalEnabled           bool
+	// Bound simultaneous WorkBuddy requests per UID across users, models and pools.
+	WorkBuddyAccountConcurrency int
+	PortalDailyRequests         int
+	PortalDailyInputTokens      int
+	PortalDailyOutputTokens     int
+	PortalKeyMaxPerUser         int
+	PortalEnabled               bool
 
 	// workbuddy provider knobs (ported from workbuddy_one/config.py)
 	AllowExternalHost  bool
@@ -125,42 +130,47 @@ func Load(args []string) *Config {
 		}
 	})
 	return &Config{
-		AllowPortFallback:     !explicitPort,
-		Host:                  *host,
-		Port:                  *port,
-		DataDir:               dd,
-		DBPath:                dbp,
-		AdminToken:            *adminToken,
-		AdminCookieSecure:     boolEnv("ADMIN_COOKIE_SECURE", boolEnv("ALLOW_EXTERNAL_HOST", false)),
-		TrustedProxyCIDRs:     envOr("TRUSTED_PROXY_CIDRS", ""),
-		MaxRequestBytes:       int64(positiveEnvInt("MAX_REQUEST_BYTES", 16*1024*1024)),
-		MaxConcurrentRequests: positiveEnvInt("MAX_CONCURRENT_REQUESTS", 4),
-		ModelQueueSize:        positiveEnvInt("MODEL_QUEUE_SIZE", 8),
-		ModelQueueWaitSeconds: positiveEnvInt("MODEL_QUEUE_WAIT_SECONDS", 60),
-		ModelKeyQueueSize:     positiveEnvInt("MODEL_KEY_QUEUE_SIZE", 8),
-		ModelKeyLimits:        env("MODEL_KEY_CONCURRENCY_LIMITS", ""),
-		AdminConcurrency:      positiveEnvInt("ADMIN_CONCURRENCY", 8),
-		HeavyAdminConcurrency: positiveEnvInt("HEAVY_ADMIN_CONCURRENCY", 2),
-		QueryConcurrency:      positiveEnvInt("QUERY_CONCURRENCY", 4),
-		BodyReadConcurrency:   positiveEnvInt("BODY_READ_CONCURRENCY", 4),
-		RequestBodyBudget:     int64(positiveEnvInt("REQUEST_BODY_BUDGET", 32<<20)),
-		MaxResponseBytes:      int64(positiveEnvInt("MAX_RESPONSE_BYTES", 8<<20)),
-		MaxJSONItems:          positiveEnvInt("MAX_JSON_ITEMS", 100000),
-		MaxJSONDepth:          positiveEnvInt("MAX_JSON_DEPTH", 128),
-		LogLevel:              strings.ToUpper(*logLevel),
-		LogToFile:             env("LOG_TO_FILE", "1") != "0",
+		AllowPortFallback:      !explicitPort,
+		Host:                   *host,
+		Port:                   *port,
+		DataDir:                dd,
+		DBPath:                 dbp,
+		AdminToken:             *adminToken,
+		AdminCookieSecure:      boolEnv("ADMIN_COOKIE_SECURE", boolEnv("ALLOW_EXTERNAL_HOST", false)),
+		TrustedProxyCIDRs:      envOr("TRUSTED_PROXY_CIDRS", ""),
+		MaxRequestBytes:        int64(positiveEnvInt("MAX_REQUEST_BYTES", 16*1024*1024)),
+		ModelMemoryGuard:       boolEnv("MODEL_MEMORY_GUARD", true),
+		ModelBufferBudgetBytes: int64(positiveEnvInt("MODEL_BUFFER_BUDGET_BYTES", 224<<20)),
+		ModelMemoryHighBytes:   int64(positiveEnvInt("MODEL_MEMORY_HIGH_BYTES", 256<<20)),
+		MaxConcurrentRequests:  positiveEnvInt("MAX_CONCURRENT_REQUESTS", 13),
+		ModelQueueSize:         positiveEnvInt("MODEL_QUEUE_SIZE", 32),
+		ModelQueueWaitSeconds:  positiveEnvInt("MODEL_QUEUE_WAIT_SECONDS", 60),
+		ModelKeyQueueSize:      positiveEnvInt("MODEL_KEY_QUEUE_SIZE", 16),
+		ModelKeyLimits:         env("MODEL_KEY_CONCURRENCY_LIMITS", ""),
+		AdminConcurrency:       positiveEnvInt("ADMIN_CONCURRENCY", 8),
+		HeavyAdminConcurrency:  positiveEnvInt("HEAVY_ADMIN_CONCURRENCY", 2),
+		QueryConcurrency:       positiveEnvInt("QUERY_CONCURRENCY", 4),
+		BodyReadConcurrency:    positiveEnvInt("BODY_READ_CONCURRENCY", 4),
+		RequestBodyBudget:      int64(positiveEnvInt("REQUEST_BODY_BUDGET", 32<<20)),
+		MaxResponseBytes:       int64(positiveEnvInt("MAX_RESPONSE_BYTES", 8<<20)),
+		MaxJSONItems:           positiveEnvInt("MAX_JSON_ITEMS", 100000),
+		MaxJSONDepth:           positiveEnvInt("MAX_JSON_DEPTH", 128),
+		LogLevel:               strings.ToUpper(*logLevel),
+		LogToFile:              env("LOG_TO_FILE", "1") != "0",
 
 		PortalRegistrationMode:  strings.ToLower(strings.TrimSpace(envOr("PORTAL_REGISTRATION_MODE", envOr("PORTAL_INVITE_MODE", "invite")))),
 		PortalMaxTasksPerUser:   positiveEnvInt("PORTAL_MAX_TASKS_PER_USER", 3),
-		PortalUserConcurrency:   positiveEnvInt("PORTAL_USER_CONCURRENCY", 2),
-		PortalUserQueueSize:     positiveEnvInt("PORTAL_USER_QUEUE_SIZE", 4),
-		PortalSharedQueueSize:   positiveEnvInt("PORTAL_SHARED_QUEUE_SIZE", 6),
-		PortalSharedConcurrency: positiveEnvInt("PORTAL_SHARED_CONCURRENCY", 3),
-		PortalDailyRequests:     envInt("PORTAL_DAILY_REQUESTS", 0),
-		PortalDailyInputTokens:  envInt("PORTAL_DAILY_INPUT_TOKENS", 0),
-		PortalDailyOutputTokens: envInt("PORTAL_DAILY_OUTPUT_TOKENS", 0),
-		PortalKeyMaxPerUser:     positiveEnvInt("PORTAL_KEY_MAX_PER_USER", 2),
-		PortalEnabled:           boolEnv("PORTAL_ENABLED", true),
+		PortalUserConcurrency:   positiveEnvInt("PORTAL_USER_CONCURRENCY", 4),
+		PortalUserQueueSize:     positiveEnvInt("PORTAL_USER_QUEUE_SIZE", 6),
+		PortalSharedQueueSize:   positiveEnvInt("PORTAL_SHARED_QUEUE_SIZE", 28),
+		PortalSharedConcurrency: positiveEnvInt("PORTAL_SHARED_CONCURRENCY", 12),
+		// 单账号 UID 的真实名额保护；不改变服务器、共享池及用户硬上限。
+		WorkBuddyAccountConcurrency: positiveEnvInt("WORKBUDDY_ACCOUNT_CONCURRENCY", 4),
+		PortalDailyRequests:         envInt("PORTAL_DAILY_REQUESTS", 0),
+		PortalDailyInputTokens:      envInt("PORTAL_DAILY_INPUT_TOKENS", 0),
+		PortalDailyOutputTokens:     envInt("PORTAL_DAILY_OUTPUT_TOKENS", 0),
+		PortalKeyMaxPerUser:         positiveEnvInt("PORTAL_KEY_MAX_PER_USER", 2),
+		PortalEnabled:               boolEnv("PORTAL_ENABLED", true),
 
 		AllowExternalHost:  boolEnv("ALLOW_EXTERNAL_HOST", false),
 		Desensitize:        boolEnv("DESENSITIZE", true),
