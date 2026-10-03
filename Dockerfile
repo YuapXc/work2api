@@ -1,7 +1,7 @@
 # work2api 容器镜像：纯 Go（免 CGO），前端 dist 已 go:embed 进二进制，构建无需 Node。
 # 多阶段：builder 交叉编译静态单文件，runtime 用 alpine（带 ca-certificates 以便
 # 对上游发起 HTTPS）。以非 root 运行，数据落在 /data 卷。
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
