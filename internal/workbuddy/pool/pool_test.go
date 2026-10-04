@@ -2,6 +2,22 @@ package pool
 
 import "testing"
 
+func TestExhaustedAccountsNeverUseCooldownFallback(t *testing.T) {
+	zero := 0.0
+	p := &Pool{accounts: []*Account{{UID: "empty", Enabled: true, CreditsRemain: &zero}, {UID: "unknown", Enabled: true, CooldownUntil: nowSec() + 5}}}
+	if got := p.Pick(map[string]bool{"empty": true}, nil, 7); got != nil {
+		t.Fatal("exhausted account was revived", got)
+	}
+	if got := p.Pick(nil, nil, 7); got == nil || got.UID != "unknown" {
+		t.Fatal("unknown credits lost short cooldown fallback", got)
+	}
+	positive := 1.0
+	p.accounts[0].CreditsRemain = &positive
+	if got := p.Pick(map[string]bool{"empty": true}, nil, 7); got == nil {
+		t.Fatal("refreshed credits did not restore eligibility")
+	}
+}
+
 func uids(as []*Account) []string {
 	out := make([]string, len(as))
 	for i, a := range as {

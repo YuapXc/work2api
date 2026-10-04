@@ -2,6 +2,7 @@ package qoder
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +32,43 @@ func (r *Runtime) CheckinHistory(ctx context.Context, days int) (provider.Checki
 }
 
 const quotaTTL = 30 * time.Second
+
+type quotaFlight struct {
+	done     chan struct{}
+	identity [32]byte
+	quota    *account.QuotaInfo
+	err      error
+}
+
+// All manual, periodic and on-demand quota reads share the same in-flight
+// request only when account credentials and region still match.
+func (r *Runtime) queryQuota(ctx context.Context, id, region, token string) (*account.QuotaInfo, error) {
+	identity := sha256.Sum256([]byte(region + "\x00" + token))
+	r.quotaMu.Lock()
+	if flight := r.quotaFlights[id]; flight != nil && flight.identity == identity {
+		r.quotaMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-flight.done:
+			return flight.quota, flight.err
+		}
+	}
+	if r.quotaFlights == nil {
+		r.quotaFlights = map[string]*quotaFlight{}
+	}
+	flight := &quotaFlight{done: make(chan struct{}), identity: identity}
+	r.quotaFlights[id] = flight
+	r.quotaMu.Unlock()
+	flight.quota, flight.err = account.FetchQuotaContext(ctx, token, account.NormalizeRegion(region))
+	r.quotaMu.Lock()
+	if r.quotaFlights[id] == flight {
+		delete(r.quotaFlights, id)
+	}
+	close(flight.done)
+	r.quotaMu.Unlock()
+	return flight.quota, flight.err
+}
 
 // AdminData reports qoder's accounts (native ~/.qoder2api + locally-detected
 // desktop credentials), models and a status summary for the WebUI. Each account
@@ -100,6 +138,14 @@ func (r *Runtime) accountRow(id, label, region, source, authMode string, active 
 	row["checkin_total_credits"] = totalCredits
 	// quota (cached; background refresh on miss)
 	if q, ok := r.quotaFor(id, source, region); ok {
+		row["quota_stale"] = q.failed || time.Since(q.ts) >= quotaTTL
+		row["quota_refresh_failed"] = q.failed
+		if !q.ts.IsZero() {
+			row["quota_updated_at"] = q.ts.Unix()
+		}
+		if q.ts.IsZero() {
+			return row
+		}
 		row["credits_remaining"] = q.remaining
 		row["credits_total"] = q.total
 		row["plan"] = q.plan
@@ -135,9 +181,16 @@ func (r *Runtime) tokenFor(id, source, region string) string {
 // quotaFor returns a cached quota snapshot, kicking a background refresh on a
 // stale/absent entry so the next poll shows it without blocking this load.
 func (r *Runtime) quotaFor(id, source, region string) (quotaEntry, bool) {
+	token := r.tokenFor(id, source, region)
+	identity := sha256.Sum256([]byte(region + "\x00" + token))
 	r.quotaMu.Lock()
 	e, ok := r.quotaCache[id]
-	fresh := ok && time.Since(e.ts) < quotaTTL
+	if ok && e.identity != identity {
+		delete(r.quotaCache, id)
+		e = quotaEntry{}
+		ok = false
+	}
+	fresh := ok && time.Since(e.attempt) < quotaTTL
 	inflight := r.quotaInflight[id]
 	if !fresh && !inflight {
 		r.quotaInflight[id] = true
@@ -149,6 +202,10 @@ func (r *Runtime) quotaFor(id, source, region string) (quotaEntry, bool) {
 
 // refreshQuota fetches and caches one account's quota.
 func (r *Runtime) refreshQuota(id, source, region string) {
+	r.refreshQuotaContext(context.Background(), id, source, region)
+}
+
+func (r *Runtime) refreshQuotaContext(ctx context.Context, id, source, region string) {
 	defer func() {
 		r.quotaMu.Lock()
 		r.quotaInflight[id] = false
@@ -158,12 +215,22 @@ func (r *Runtime) refreshQuota(id, source, region string) {
 	if token == "" {
 		return
 	}
-	q, err := account.FetchQuota(token, account.NormalizeRegion(region))
-	if err != nil || q == nil {
+	q, err := r.queryQuota(ctx, id, region, token)
+	identity := sha256.Sum256([]byte(region + "\x00" + token))
+	if r.tokenFor(id, source, region) != token {
 		return
 	}
-	e := buildQuotaEntry(q)
 	r.quotaMu.Lock()
+	e := r.quotaCache[id]
+	if e.identity != identity {
+		e = quotaEntry{}
+	}
+	if err == nil && q != nil {
+		e = buildQuotaEntry(q)
+	}
+	e.failed = err != nil || q == nil
+	e.attempt = time.Now()
+	e.identity = identity
 	if !account.IsGatewayHidden(id) {
 		r.quotaCache[id] = e
 	}
@@ -293,18 +360,38 @@ func (r *Runtime) ExportCredentials() (map[string]any, error) {
 
 // AdminCheckin runs the campaigns checkin for every usable qoder credential.
 func (r *Runtime) AdminCheckin(ctx context.Context) (map[string]any, error) {
+	r.mu.Lock()
+	if flight := r.checkinFlight; flight != nil {
+		r.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-flight.done:
+			return flight.result, flight.err
+		}
+	}
+	flight := &checkinFlight{done: make(chan struct{})}
+	r.checkinFlight = flight
+	r.mu.Unlock()
+	defer func() { r.mu.Lock(); r.checkinFlight = nil; close(flight.done); r.mu.Unlock() }()
 	results := []map[string]any{}
 	if dataDirExists() {
-		for _, res := range checkin.CheckinAll() {
+		for _, res := range checkin.CheckinAllContext(ctx) {
 			results = append(results, checkinRow(res))
 		}
 	}
 	for _, c := range r.detectLocal() {
 		id := "qoder-local-" + c.Region
-		res := checkin.CheckinWithToken(id, "本地 Qoder（"+c.Region+"）", c.DeviceToken)
+		if account.NormalizeRegion(c.Region) != account.RegionCN {
+			results = append(results, map[string]any{"account_id": id, "account": "本地 Qoder（" + c.Region + "）", "ok": false, "status": "unsupported", "message": "暂不支持国际站签到"})
+			continue
+		}
+		res := checkin.CheckinWithTokenContext(ctx, id, "本地 Qoder（"+c.Region+"）", c.DeviceToken)
 		results = append(results, checkinRow(res))
 	}
-	return map[string]any{"ok": true, "results": results}, nil
+	flight.result = map[string]any{"ok": true, "results": results}
+	flight.err = ctx.Err()
+	return flight.result, flight.err
 }
 
 func checkinRow(res checkin.CheckinResult) map[string]any {
@@ -328,7 +415,25 @@ func (r *Runtime) AdminRefreshCredits(ctx context.Context) (map[string]any, erro
 		return map[string]any{"ok": false, "account_id": acct.ID, "unsupported": true,
 			"message": "该账号为 PAT，暂不支持额度查询（仅设备令牌账号支持）"}, nil
 	}
-	q, err := account.FetchQuotaContext(ctx, token, acct.Region)
+	q, err := r.queryQuota(ctx, acct.ID, string(acct.Region), token)
+	source := "native"
+	if strings.HasPrefix(acct.ID, "qoder-local-") {
+		source = "local"
+	}
+	if r.tokenFor(acct.ID, source, string(acct.Region)) == token && !account.IsGatewayHidden(acct.ID) {
+		identity := sha256.Sum256([]byte(string(acct.Region) + "\x00" + token))
+		r.quotaMu.Lock()
+		e := r.quotaCache[acct.ID]
+		if e.identity != identity {
+			e = quotaEntry{}
+		}
+		if err == nil && q != nil {
+			e = buildQuotaEntry(q)
+		}
+		e.identity, e.attempt, e.failed = identity, time.Now(), err != nil || q == nil
+		r.quotaCache[acct.ID] = e
+		r.quotaMu.Unlock()
+	}
 	if err != nil {
 		return nil, err
 	}

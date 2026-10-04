@@ -1,11 +1,13 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
+	"work2api/internal/streamwatch"
 
 	"work2api/internal/store"
 	"work2api/internal/tokenusage"
@@ -14,6 +16,7 @@ import (
 )
 
 type logArgs struct {
+	ctx             context.Context
 	protocol, model string
 	acc             *pool.Account
 	t0              time.Time
@@ -30,7 +33,11 @@ type logArgs struct {
 }
 
 func (o *Orchestrator) logUsage(a logArgs) {
-	if a.quota != nil && a.status == "ok" {
+	if a.ctx != nil {
+		streamwatch.Outcome(a.ctx, a.status)
+	}
+	completedTransport := a.status == "ok" || a.status == "incomplete"
+	if a.quota != nil && completedTransport {
 		a.quota.observe(a.usage)
 	}
 	if a.userID > 0 {
@@ -39,7 +46,7 @@ func (o *Orchestrator) logUsage(a logArgs) {
 		a.reasoning = ""
 	}
 	if a.acc != nil && a.updatePool {
-		if a.status == "ok" {
+		if completedTransport {
 			o.pool.OnSuccess(a.acc.UID)
 		} else {
 			cd := a.cooldown
@@ -174,22 +181,26 @@ func mergeUsageFromLine(line string, acc map[string]any) map[string]any {
 }
 
 // deltaParts extracts content + reasoning increments (with tool_call recompose).
-func deltaParts(line string) (string, string) {
+func deltaParts(line string) (string, string, string) {
 	if !strings.HasPrefix(line, "data:") {
-		return "", ""
+		return "", "", ""
 	}
 	data := strings.TrimSpace(line[5:])
 	if data == "[DONE]" || data == "" {
-		return "", ""
+		return "", "", ""
 	}
 	var chunk map[string]any
 	if json.Unmarshal([]byte(data), &chunk) != nil {
-		return "", ""
+		return "", "", ""
 	}
 	var content, reasoning strings.Builder
+	var finish string
 	choices, _ := chunk["choices"].([]any)
 	for _, ch := range choices {
 		choice, _ := ch.(map[string]any)
+		if f, ok := choice["finish_reason"].(string); ok && f != "" {
+			finish = f
+		}
 		delta, _ := choice["delta"].(map[string]any)
 		if delta == nil {
 			continue
@@ -221,7 +232,7 @@ func deltaParts(line string) (string, string) {
 			}
 		}
 	}
-	return content.String(), reasoning.String()
+	return content.String(), reasoning.String(), finish
 }
 
 // sanitizeChatSSE strips empty delta fields from a passthrough Chat SSE line.

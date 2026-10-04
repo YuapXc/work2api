@@ -7,7 +7,7 @@ package app
 // refresh. All timing is read from the DB settings on every tick, so changes
 // take effect without a restart.
 //
-// Deferred (per project decisions): weekly full backup, credit webhook alerts,
+// Deferred (per project decisions): credit webhook alerts,
 // and attachment archiving.
 
 import (
@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 
+	"work2api/internal/core/provider"
+	"work2api/internal/statebackup"
 	"work2api/internal/workbuddy/billing"
 	"work2api/internal/workbuddy/siterouting"
 )
@@ -33,9 +35,11 @@ const (
 
 // Scheduler owns the periodic background tasks over an Orchestrator.
 type Scheduler struct {
-	o    *Orchestrator
-	stop chan struct{}
-	done chan struct{}
+	ctx    context.Context
+	cancel context.CancelFunc
+	o      *Orchestrator
+	stop   chan struct{}
+	done   chan struct{}
 
 	lastCredit   float64
 	lastRowCheck float64
@@ -56,7 +60,9 @@ type Scheduler struct {
 
 // NewScheduler builds a scheduler bound to the orchestrator.
 func NewScheduler(o *Orchestrator) *Scheduler {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Scheduler{
+		ctx: ctx, cancel: cancel,
 		o:              o,
 		stop:           make(chan struct{}),
 		done:           make(chan struct{}),
@@ -71,6 +77,9 @@ func (s *Scheduler) Start() { go s.run() }
 // Stop signals the loop to exit and waits (bounded) for it to finish, so a hung
 // upstream call during a tick can never wedge process shutdown.
 func (s *Scheduler) Stop() {
+	if s.cancel != nil {
+		s.cancel()
+	}
 	select {
 	case <-s.stop:
 	default:
@@ -91,6 +100,13 @@ func (s *Scheduler) setting(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func (s *Scheduler) context() context.Context {
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return context.Background()
 }
 
 func parseHours(raw string) []int {
@@ -158,7 +174,7 @@ func (s *Scheduler) checkedInToday() map[string]bool {
 // refreshCredits fetches credits for every account and persists them; accounts
 // with remaining credit get their cooldown cleared (auto-thaw).
 func (s *Scheduler) refreshCredits() {
-	ctx := context.Background()
+	ctx := s.context()
 	for _, acc := range s.o.pool.Accounts() { // snapshot: admin may add/remove concurrently
 		s.o.refreshCreditsFor(ctx, acc)
 	}
@@ -167,7 +183,7 @@ func (s *Scheduler) refreshCredits() {
 // doCheckin runs daily checkin for accounts not already checked in today.
 // Returns the UIDs that genuinely failed (excludes "already checked in").
 func (s *Scheduler) doCheckin() []string {
-	ctx := context.Background()
+	ctx := s.context()
 	skip := s.checkedInToday()
 	t := today()
 	var failed []string
@@ -218,9 +234,12 @@ func (s *Scheduler) doKeepalive() {
 		if mgr == nil {
 			continue
 		}
-		if mgr.Keepalive() {
+		if mgr.KeepaliveContext(s.context()) {
 			delete(s.keepaliveFails, acc.UID)
 			continue
+		}
+		if s.context().Err() != nil {
+			return
 		}
 		s.keepaliveFails[acc.UID]++
 		if s.keepaliveFails[acc.UID] >= keepaliveFailLimit {
@@ -264,9 +283,10 @@ func (s *Scheduler) run() {
 		return
 	default:
 	}
+	leaveWarm := statebackup.Enter()
 	s.refreshCredits()
-	s.o.models.Refresh()
-	s.o.refreshRuntimeModels(context.Background())
+	s.o.models.RefreshContext(s.context())
+	s.o.refreshRuntimeModels(s.context())
 	// 同步 lastCredit：否则首个 tick 的周期判据（now-lastCredit >= interval）
 	// 因零值必然命中，刚预热完又对全部账号白刷一遍额度（Workbuddy2API #34 同款）。
 	s.lastCredit = float64(time.Now().Unix())
@@ -276,6 +296,7 @@ func (s *Scheduler) run() {
 		s.o.bench.Refresh()
 	}
 
+	leaveWarm()
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -285,6 +306,7 @@ func (s *Scheduler) run() {
 		default:
 		}
 		s.tick()
+		s.o.scheduledBackup(s.ctx)
 		select {
 		case <-s.stop:
 			return
@@ -294,7 +316,19 @@ func (s *Scheduler) run() {
 }
 
 func (s *Scheduler) tick() {
+	leave := statebackup.Enter()
+	defer leave()
 	now := time.Now()
+	settings, _ := s.o.db.GetSettings()
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for _, rt := range provider.Runtimes() {
+		if maintainer, ok := rt.(provider.BackgroundMaintainer); ok {
+			maintainer.Maintain(ctx, settings, now)
+		}
+	}
 	t := today()
 	hours := parseHours(s.setting("checkin_hours", "9,21"))
 
@@ -348,8 +382,8 @@ func (s *Scheduler) tick() {
 
 	// --- daily model refresh ---
 	if now.Hour() == parseHour(s.setting("model_refresh_hour", "6"), 6) && s.lastModelRefreshDate != t {
-		s.o.models.Refresh()
-		s.o.refreshRuntimeModels(context.Background())
+		s.o.models.RefreshContext(s.context())
+		s.o.refreshRuntimeModels(s.context())
 		s.lastModelRefreshDate = t
 	}
 

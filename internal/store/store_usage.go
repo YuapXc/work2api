@@ -226,7 +226,7 @@ func (d *DB) UsageSummary() (map[string]any, error) {
 	out["by_account"] = []map[string]any{}
 	rows, err := d.db.Query(`SELECT account_uid, COUNT(*), COALESCE(SUM(total_tokens),0),
 		COALESCE(SUM(credits),0), SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END),
-		SUM(CASE WHEN status='ok' AND credits IS NULL THEN 1 ELSE 0 END)
+		SUM(CASE WHEN status IN ('ok','incomplete') AND credits IS NULL THEN 1 ELSE 0 END)
 		FROM usage_logs GROUP BY account_uid ORDER BY 2 DESC`)
 	if err == nil {
 		defer rows.Close()
@@ -250,7 +250,7 @@ func (d *DB) UsageSummary() (map[string]any, error) {
 	_ = d.db.QueryRow(`SELECT COUNT(*),
 		COALESCE(SUM(cached_tokens),0),
 		COALESCE(SUM(CASE WHEN cached_tokens IS NOT NULL THEN input_tokens - cached_tokens ELSE 0 END),0)
-		FROM usage_logs WHERE cached_tokens IS NOT NULL AND cached_tokens >= 0 AND input_tokens >= cached_tokens AND status='ok'`).Scan(&knownRows, &cachedSum, &missSum)
+		FROM usage_logs WHERE cached_tokens IS NOT NULL AND cached_tokens >= 0 AND input_tokens >= cached_tokens AND status IN ('ok','incomplete')`).Scan(&knownRows, &cachedSum, &missSum)
 	out["cache"] = map[string]any{
 		"known_rows": knownRows, "cached_tokens": cachedSum, "uncached_tokens": missSum,
 		"hit_rate": func() any {

@@ -67,16 +67,18 @@ func newAccount(uid string, mgr Credential) *Account {
 
 // Healthy reports whether the account can serve a request now.
 func (a *Account) Healthy(now float64) bool {
-	if !a.Enabled {
+	if !a.Callable() {
 		return false
 	}
 	if a.CooldownUntil > now {
 		return false
 	}
-	if a.CreditsRemain != nil && *a.CreditsRemain <= 0 {
-		return false
-	}
 	return true
+}
+
+// Callable excludes hard unavailability; short cooldown grace never overrides it.
+func (a *Account) Callable() bool {
+	return a.Enabled && (a.CreditsRemain == nil || *a.CreditsRemain > 0)
 }
 
 func (a *Account) markFailure(cooldownSeconds float64) {
@@ -163,7 +165,7 @@ func (p *Pool) Pick(allowed map[string]bool, costByUID map[string]float64, expir
 		var best *Account
 		bestExpiry := math.Inf(1)
 		for _, a := range p.accounts {
-			if (allowed == nil || allowed[a.UID]) && a.Enabled && a.CooldownUntil < bestExpiry {
+			if (allowed == nil || allowed[a.UID]) && a.Callable() && a.CooldownUntil < bestExpiry {
 				best = a
 				bestExpiry = a.CooldownUntil
 			}

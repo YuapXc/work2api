@@ -65,6 +65,19 @@ func Created(u map[string]any) *int {
 	return cacheCount(u["cache_creation_input_tokens"], u["prompt_cache_write_tokens"])
 }
 
+// Reasoning preserves a valid observed output count; absent observations stay unknown.
+func Reasoning(u map[string]any) *int {
+	for _, v := range []any{detail(u, "completion_tokens_details", "reasoning_tokens"), detail(u, "output_tokens_details", "reasoning_tokens"), u["reasoning_tokens"]} {
+		if n := number(v); n != nil && *n >= 0 {
+			output := first(u, "completion_tokens", "output_tokens")
+			if output == nil || *n <= *output {
+				return n
+			}
+		}
+	}
+	return nil
+}
+
 // Totals returns inclusive input and output counts. Native Anthropic input is
 // exclusive of cache read/write; OpenAI prompt/input tokens are inclusive.
 func Totals(u map[string]any) (int, int) {
@@ -85,6 +98,12 @@ func Totals(u map[string]any) (int, int) {
 		}
 	}
 	return i, o
+}
+
+// KnownTotals distinguishes observed zero from malformed or absent counts.
+func KnownTotals(u map[string]any) (bool, bool) {
+	i, o := first(u, "prompt_tokens", "input_tokens"), first(u, "completion_tokens", "output_tokens")
+	return i != nil && *i >= 0, o != nil && *o >= 0
 }
 
 func nativeAnthropic(u map[string]any) bool {

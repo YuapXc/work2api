@@ -13,11 +13,13 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
+	"work2api/internal/tokenusage"
 
 	_ "embed"
 
@@ -37,12 +39,10 @@ const (
 	runtimePrefix = "qoder/"
 )
 
-// fallbackModelKeys mirrors qoder2api's static list used when the signed
-// model/list call is unavailable (see bridge.HandleListModels).
+// fallbackModelKeys is a conservative, unverified catalog used until discovery
+// succeeds. Actual account entitlements always come from the signed model list.
 var fallbackModelKeys = []string{
-	"auto", "qmodel_38max", "qfmodel", "qmodel_latest", "qmodel", "q37fmodel",
-	"dmodel", "dfmodel", "gmodel", "gfmodel", "gm51model", "kmodel_latest",
-	"kmodel", "mmodel",
+	"qmodel_38max", "qfmodel",
 }
 
 const fallbackContextWindow = 180000
@@ -51,13 +51,22 @@ const fallbackContextWindow = 180000
 // expensive to build (session bootstrap + jobToken exchange), so one is cached
 // per account id.
 type Runtime struct {
-	mu               sync.Mutex
-	bridges          map[string]*bridge.Bridge
-	bridgeKeys       map[string][32]byte
-	bridgeGeneration map[string]uint64
-	bridgeInflight   map[string]*bridgeInitialization
-	modelCache       []provider.CatalogModel
-	saltSet          bool
+	checkinFlight        *checkinFlight
+	maintenanceMu        sync.Mutex
+	autoWindow           string
+	autoAttempts         int
+	autoRetry            time.Time
+	lastQuotaMaintenance time.Time
+	mu                   sync.Mutex
+	bridges              map[string]*bridge.Bridge
+	bridgeKeys           map[string][32]byte
+	bridgeGeneration     map[string]uint64
+	bridgeInflight       map[string]*bridgeInitialization
+	modelCache           []provider.CatalogModel
+	modelCacheKey        [32]byte
+	modelCacheLoaded     bool
+	modelCacheStale      bool
+	saltSet              bool
 
 	localOnce  sync.Once
 	localCreds []localcred.Credential
@@ -66,6 +75,7 @@ type Runtime struct {
 	oauthStates map[string]*oauthState
 
 	quotaMu       sync.Mutex
+	quotaFlights  map[string]*quotaFlight
 	quotaCache    map[string]quotaEntry
 	quotaInflight map[string]bool
 }
@@ -89,6 +99,15 @@ type quotaEntry struct {
 	// WebUI 账号表可直接复用积分构成弹层）。
 	packages []map[string]any
 	ts       time.Time
+	identity [32]byte
+	attempt  time.Time
+	failed   bool
+}
+
+type checkinFlight struct {
+	done   chan struct{}
+	result map[string]any
+	err    error
 }
 
 // New constructs the qoder runtime. It applies the qoder2api install salt so
@@ -292,13 +311,25 @@ func (r *Runtime) bridgeFor(ctx context.Context, acct *account.Account, secret s
 	}
 }
 
-// Models returns the namespaced catalog. It queries the signed model/list
-// endpoint for the active account and falls back to the static key list.
+// Models returns the active account's cached catalog without network I/O.
+// Until discovery succeeds, it exposes a clearly marked conservative fallback.
 func (r *Runtime) Models(ctx context.Context) []provider.CatalogModel {
+	acct, secret, err := r.pickAccount()
+	if err != nil {
+		return nil
+	}
+	key := modelCatalogKey(acct, secret)
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(r.modelCache) > 0 {
-		return append([]provider.CatalogModel(nil), r.modelCache...)
+	if r.modelCacheLoaded && r.modelCacheKey == key {
+		out := make([]provider.CatalogModel, 0, len(r.modelCache))
+		for _, model := range r.modelCache {
+			model.Extra = cloneCatalogExtra(model.Extra)
+			model.Extra["catalog_source"] = "live"
+			model.Extra["catalog_stale"] = r.modelCacheStale
+			out = append(out, model)
+		}
+		return out
 	}
 	return r.fallbackModels()
 }
@@ -312,14 +343,17 @@ func (r *Runtime) RefreshModels(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	key := modelCatalogKey(acct, secret)
 	b, err := r.bridgeFor(ctx, acct, secret)
 	if err != nil {
+		r.markCatalogStale(key)
 		logger.Error("qoder: models bridge build failed: %v", err)
 		return err
 	}
 	models, err := b.ListAvailableModelsContext(ctx)
-	if err != nil || len(models) == 0 {
-		logger.Error("qoder: ListAvailableModels failed (%v), using fallback", err)
+	if err != nil {
+		r.markCatalogStale(key)
+		logger.Error("qoder: ListAvailableModels failed (%v), retaining last snapshot", err)
 		return fmt.Errorf("qoder model discovery failed: %v", err)
 	}
 	out := make([]provider.CatalogModel, 0, len(models))
@@ -350,10 +384,37 @@ func (r *Runtime) RefreshModels(ctx context.Context) error {
 			},
 		})
 	}
+	current, currentSecret, err := r.pickAccount()
+	if err != nil || modelCatalogKey(current, currentSecret) != key {
+		return fmt.Errorf("qoder account changed during model discovery")
+	}
 	r.mu.Lock()
 	r.modelCache = out
+	r.modelCacheKey = key
+	r.modelCacheLoaded = true
+	r.modelCacheStale = false
 	r.mu.Unlock()
 	return nil
+}
+
+func modelCatalogKey(acct *account.Account, secret string) [32]byte {
+	return sha256.Sum256([]byte(acct.ID + "\x00" + string(acct.Region) + "\x00" + secret))
+}
+
+func (r *Runtime) markCatalogStale(key [32]byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.modelCacheKey == key {
+		r.modelCacheStale = true
+	}
+}
+
+func cloneCatalogExtra(extra map[string]any) map[string]any {
+	out := make(map[string]any, len(extra)+2)
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
 }
 
 // modalityOf / modelModalities 把上游 is_vl 布尔翻译成统一目录的标准模态字段，
@@ -380,6 +441,7 @@ func (r *Runtime) fallbackModels() []provider.CatalogModel {
 			ID:      runtimePrefix + key,
 			Name:    key,
 			Context: fallbackContextWindow,
+			Extra:   map[string]any{"catalog_source": "fallback", "catalog_stale": true},
 		})
 	}
 	return out
@@ -430,6 +492,16 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 	report.OutputTokens = res.OutputTokens
 	report.Output = res.Output
 	report.Reasoning = res.Reasoning
+	report.CachedTokens, _ = tokenusage.ValidCache(res.Usage)
+	for _, key := range []string{"credit", "credits"} {
+		if value, ok := res.Usage[key].(float64); ok && value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0) {
+			report.Credits = &value
+			break
+		}
+	}
+	if res.FinishReason == "length" || res.FinishReason == "content_filter" {
+		report.Status = "incomplete"
+	}
 	if err != nil {
 		report.Status = "error"
 		report.Error = err.Error()

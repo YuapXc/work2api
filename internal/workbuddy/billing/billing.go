@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"strconv"
@@ -71,28 +73,36 @@ func billingHeaders(mgr Credential) (map[string]string, error) {
 }
 
 func postJSON(ctx context.Context, mgr Credential, url string, body map[string]any) (map[string]any, error) {
+	data, status, err := postJSONStatus(ctx, mgr, url, body)
+	if err == nil && (status < 200 || status >= 300) {
+		return nil, fmt.Errorf("billing HTTP %d", status)
+	}
+	return data, err
+}
+
+func postJSONStatus(ctx context.Context, mgr Credential, url string, body map[string]any) (map[string]any, int, error) {
 	headers, err := billingHeaders(mgr)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	payload, _ := json.Marshal(body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 	var data map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return map[string]any{}, nil
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&data); err != nil {
+		return map[string]any{}, resp.StatusCode, nil
 	}
-	return data, nil
+	return data, resp.StatusCode, nil
 }
 
 func extractAccounts(data map[string]any) []any {
@@ -369,9 +379,26 @@ func FetchCredits(ctx context.Context, mgr Credential) (*Credit, error) {
 // DailyCheckin performs the daily check-in.
 func DailyCheckin(ctx context.Context, mgr Credential) (CheckinResult, error) {
 	url := mgr.Endpoint() + "/v2/billing/meter/daily-checkin"
-	data, err := postJSON(ctx, mgr, url, map[string]any{})
-	if err != nil {
-		return CheckinResult{}, err
+	var data map[string]any
+	var status int
+	for attempt := 0; ; attempt++ {
+		var err error
+		data, status, err = postJSONStatus(ctx, mgr, url, map[string]any{})
+		if err != nil {
+			return CheckinResult{}, err
+		}
+		msg := strings.ToLower(str(data["msg"]) + " " + str(data["message"]))
+		processing := strings.Contains(msg, "请求处理中") || strings.Contains(msg, "request is being processed") || strings.Contains(msg, "request processing")
+		if status != http.StatusTooManyRequests || !processing || attempt >= 3 {
+			break
+		}
+		timer := time.NewTimer([]time.Duration{2 * time.Second, 5 * time.Second, 10 * time.Second}[attempt])
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return CheckinResult{}, ctx.Err()
+		case <-timer.C:
+		}
 	}
 	// 必须存在明确的 code 字段才判成功——否则非 JSON / 网关 404 / WAF 拦截等
 	// 会被 num(nil)==0 误判为「签到成功」（国际站无签到活动即属此类）。
@@ -386,14 +413,27 @@ func DailyCheckin(ctx context.Context, mgr Credential) (CheckinResult, error) {
 		}
 		return CheckinResult{OK: false, Message: msg}, nil
 	}
+	validCode := false
+	switch v := codeRaw.(type) {
+	case float64:
+		validCode = !math.IsNaN(v) && !math.IsInf(v, 0) && math.Trunc(v) == v
+	case string:
+		_, e := strconv.Atoi(v)
+		validCode = e == nil
+	case int:
+		validCode = true
+	}
 	code := num(codeRaw)
-	if code == 0 {
+	if validCode && code == 0 && status >= 200 && status < 300 {
 		return CheckinResult{OK: true, Message: "签到成功"}, nil
 	}
-	for _, k := range []string{"已签到", "already", "checkin"} {
-		if strings.Contains(msg, k) {
+	for _, k := range []string{"已签到", "already checked in", "already checked-in", "already signed in"} {
+		if strings.Contains(strings.ToLower(msg), k) {
 			return CheckinResult{OK: false, Message: msg, Already: true}, nil
 		}
+	}
+	if msg == "" {
+		msg = fmt.Sprintf("签到未完成（HTTP %d）", status)
 	}
 	return CheckinResult{OK: false, Message: msg}, nil
 }

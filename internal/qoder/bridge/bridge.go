@@ -14,6 +14,7 @@ import (
 
 	"work2api/internal/qoder/account"
 	"work2api/internal/qoder/logger"
+	"work2api/internal/streamwatch"
 )
 
 func qoderChatStreamURL(region account.Region) string {
@@ -205,11 +206,24 @@ func (b *Bridge) ListAvailableModelsContext(ctx context.Context) ([]QoderModel, 
 		keys = append(keys, k)
 	}
 	logger.Debug("model list response keys: %v (region=%s)", keys, b.region)
-	models := parseQoderModels(resp)
-	if len(models) == 0 {
-		return nil, fmt.Errorf("%s -> empty model list, keys=%v", modelListURL, keys)
+	models, err := decodeModelCatalog(resp)
+	if err != nil {
+		return nil, fmt.Errorf("%s -> %w", modelListURL, err)
 	}
 	return models, nil
+}
+
+func decodeModelCatalog(resp map[string]interface{}) ([]QoderModel, error) {
+	valid := false
+	for _, category := range []string{"assistant", "developer", "chat"} {
+		if _, ok := resp[category].([]interface{}); ok {
+			valid = true
+		}
+	}
+	if !valid {
+		return nil, fmt.Errorf("invalid model list")
+	}
+	return parseQoderModels(resp), nil
 }
 
 func parseQoderModels(resp map[string]interface{}) []QoderModel {
@@ -218,7 +232,7 @@ func parseQoderModels(resp map[string]interface{}) []QoderModel {
 	for _, cat := range categories {
 		rawList, _ := resp[cat].([]interface{})
 		out := extractModels(rawList)
-		if len(out) > 0 {
+		if len(rawList) > 0 {
 			return out
 		}
 	}
@@ -232,7 +246,13 @@ func extractModels(rawList []interface{}) []QoderModel {
 		if !ok {
 			continue
 		}
-		enable, _ := m["enable"].(bool)
+		enable := true
+		if v, present := m["enable"]; present {
+			enable, _ = v.(bool)
+		}
+		if !enable {
+			continue
+		}
 		model := QoderModel{
 			Key:            StrVal(m, "key"),
 			DisplayName:    StrVal(m, "display_name"),
@@ -478,6 +498,9 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 		}
 		streamErr := b.client.openStreamLines(ctx, qurl, body, extra,
 			deltaDispatcher(onDeltaWrapped, &upstreamErr))
+		if upstreamErr != nil {
+			streamwatch.AttemptResult(ctx, ErrorStatus(upstreamErr))
+		}
 		if upstreamErr == nil && streamErr == nil {
 			// 上游正常关流但未发出任何有效 delta/usage 帧：对齐 hub
 			// "empty upstream stream" 显式报错（不纳入重开闸门——

@@ -99,6 +99,18 @@ onUnmounted(() => timer && clearInterval(timer))
       </div>
     </WCard>
     <WSpinner v-if="loading" center label="加载中" />
+    <WCard v-if="ov?.call_metrics" class="mb-4" title="最近一小时调用">
+      <div class="flex flex-wrap gap-4 text-small">
+        <span>请求 {{ ov.call_metrics.requests }} · 失败 {{ ov.call_metrics.errors }} · 输出未完成 {{ ov.call_metrics.incomplete }}</span>
+        <span>上游尝试 {{ ov.call_metrics.attempts }} · 上游 429 {{ ov.call_metrics.upstream_429 }}</span>
+        <span>等待 P95 ≤ {{ ov.call_metrics.wait_p95_ms == null ? '—' : ov.call_metrics.wait_p95_ms + ' ms' }}</span>
+        <span>排队 / 账号等待 P95 ≤ {{ ov.call_metrics.queue_p95_ms ?? '—' }} / {{ ov.call_metrics.account_wait_p95_ms ?? '—' }} ms</span>
+        <span>执行阶段 P95 ≤ {{ ov.call_metrics.execution_p95_ms == null ? '—' : ov.call_metrics.execution_p95_ms + ' ms' }}</span>
+        <span>首响应 P95 ≤ {{ ov.call_metrics.first_byte_p95_ms == null ? '—' : ov.call_metrics.first_byte_p95_ms + ' ms' }}</span>
+        <span>总耗时 P95 ≤ {{ ov.call_metrics.total_p95_ms == null ? '—' : ov.call_metrics.total_p95_ms + ' ms' }}</span>
+      </div>
+      <p class="mt-2 text-micro text-faint">P95 为固定区间估算；首响应指首字节，包含等待与协议初始化，非模型首个 token。重启后重新统计。</p>
+    </WCard>
     <template v-else>
       <!-- 预警条 -->
       <div v-if="ov?.alerts?.length" class="mb-4 space-y-2">

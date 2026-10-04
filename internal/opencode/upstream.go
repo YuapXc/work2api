@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"work2api/internal/streamwatch"
 
 	"work2api/internal/core/protocol"
 	"work2api/internal/jsonutil"
@@ -192,6 +193,11 @@ func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies 
 			return nil, err, attempts
 		}
 		resp, err := node.proxy.client.Do(req)
+		attemptStatus := 0
+		if resp != nil {
+			attemptStatus = resp.StatusCode
+		}
+		streamwatch.AttemptResult(req.Context(), attemptStatus)
 		if ctx.Err() != nil {
 			lastResponse, lastErr = resp, err
 			if lastErr == nil && lastResponse == nil {
@@ -407,6 +413,11 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies map[Ti
 			break
 		}
 		resp, err := proxy.client.Do(req)
+		attemptStatus := 0
+		if resp != nil {
+			attemptStatus = resp.StatusCode
+		}
+		streamwatch.AttemptResult(req.Context(), attemptStatus)
 		if ctx.Err() != nil {
 			lastResponse, lastErr = resp, err
 			if lastErr == nil && lastResponse == nil {

@@ -618,6 +618,8 @@ async function saveConfig() {
             <div v-if="row.raw.failure_count" class="text-micro text-faint">失败 {{ row.raw.failure_count }} 次</div>
           </template>
           <template #cell-credits="{ row }">
+              <span v-if="row.raw.quota_refresh_failed" class="mr-1 text-micro text-warn" :title="row.raw.quota_updated_at ? '最后成功：' + dt(row.raw.quota_updated_at) : '尚未成功获取额度'">刷新失败</span>
+              <span v-else-if="row.raw.quota_stale" class="mr-1 text-micro text-faint">缓存过期</span>
             <template v-if="row.raw.credits_remaining != null">
               <span class="mono text-ink">{{ fmtCredits(row.raw.credits_remaining) }}</span>
               <span v-if="row.raw.credits_total != null" class="mono text-faint"> / {{ fmtCredits(row.raw.credits_total) }}</span>

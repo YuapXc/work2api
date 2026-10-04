@@ -91,6 +91,7 @@ type Orchestrator struct {
 	mcMu           sync.Mutex
 	modelCooldowns map[string]cdEntry
 	projectAuths   string
+	backup         backupState
 	sessions       *sessionRouter
 }
 
@@ -697,7 +698,7 @@ func (o *Orchestrator) pickAccountExcludingIn(model, sessionKey string, tried ma
 	if sessionKey != "" {
 		if uid := o.sessions.lookup(sessionKey); uid != "" && !tried[uid] {
 			if ready[uid] {
-				if a := o.pool.Get(uid); a != nil && a.Enabled && a.CooldownUntil-now <= sessionStickyMaxCooldown {
+				if a := o.pool.Get(uid); a != nil && a.Callable() && a.CooldownUntil-now <= sessionStickyMaxCooldown {
 					return a, nil
 				}
 			}
@@ -753,7 +754,7 @@ func (o *Orchestrator) pickInScope(model, sessionKey string, tried map[string]bo
 	if sessionKey != "" {
 		if uid := o.sessions.lookup(sessionKey); uid != "" {
 			if ready[uid] {
-				if a := o.pool.Get(uid); a != nil && a.Enabled && a.CooldownUntil-now <= sessionStickyMaxCooldown {
+				if a := o.pool.Get(uid); a != nil && a.Callable() && a.CooldownUntil-now <= sessionStickyMaxCooldown {
 					return a, nil
 				}
 			}
@@ -979,7 +980,13 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 			}
 		}
 		tried[acc.UID] = true
+		streamwatch.StartAttempt(ctx)
 		started, err := o.runOnce(ctx, acc, body, sink)
+		status := 200
+		if ue, ok := err.(*upstream.UpstreamError); ok {
+			status = ue.StatusCode
+		}
+		streamwatch.AttemptResult(ctx, status)
 		if err == nil {
 			return acc, nil
 		}
@@ -1061,7 +1068,7 @@ func (o *Orchestrator) accountSelector(model, preferred string, tried map[string
 		for _, candidate := range o.pool.Accounts() {
 			// Keep the original selected account's short account-cooldown grace;
 			// model cooldown remains a strict exclusion as in the original picker.
-			preferredGrace := candidate.UID == preferred && candidate.Enabled && candidate.CooldownUntil-now <= sessionStickyMaxCooldown
+			preferredGrace := candidate.UID == preferred && candidate.Callable() && candidate.CooldownUntil-now <= sessionStickyMaxCooldown
 			if !allowed[candidate.UID] || (!candidate.Healthy(now) && !preferredGrace) || o.modelCooldownUntil(candidate.UID, model) > now {
 				continue
 			}

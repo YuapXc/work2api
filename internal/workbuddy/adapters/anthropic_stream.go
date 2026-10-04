@@ -375,6 +375,8 @@ func (c *AnthropicStreamConverter) Reasoning() string { return c.thinkingContent
 // Usage returns the merged usage map (may be nil).
 func (c *AnthropicStreamConverter) Usage() map[string]any { return c.usage }
 
+func (c *AnthropicStreamConverter) CompletionStatus() string { return completionStatus(c.finishReason) }
+
 func mapStopReason(sr string) string {
 	switch sr {
 	case "stop":

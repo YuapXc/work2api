@@ -4,6 +4,7 @@ package credentials
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -195,6 +196,10 @@ func (m *Manager) Endpoint() string {
 
 // refresh fetches a new token and writes it back atomically. Caller holds mu.
 func (m *Manager) refresh() error {
+	return m.refreshContext(context.Background())
+}
+
+func (m *Manager) refreshContext(ctx context.Context) error {
 	if m.retired {
 		return errors.New("账号已移除")
 	}
@@ -210,7 +215,7 @@ func (m *Manager) refresh() error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader([]byte("{}")))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return err
 	}
@@ -320,9 +325,13 @@ func (m *Manager) CatalogHeaders() (map[string]string, error) {
 
 // Keepalive forces a token refresh. Returns true on success.
 func (m *Manager) Keepalive() bool {
+	return m.KeepaliveContext(context.Background())
+}
+
+func (m *Manager) KeepaliveContext(ctx context.Context) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.refresh() == nil
+	return m.refreshContext(ctx) == nil
 }
 
 // RawSession returns the full auth file content.

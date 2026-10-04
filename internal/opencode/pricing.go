@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"work2api/internal/jsonutil"
+	"work2api/internal/statebackup"
 )
 
 const (
@@ -363,6 +364,8 @@ func metadataDeprecated(model map[string]any) bool {
 }
 
 func saveMetadataCache(path string, cache modelMetadataCache) error {
+	leave := statebackup.Enter()
+	defer leave()
 	data, err := json.MarshalIndent(cache, "", "  ")
 	if err != nil {
 		return err

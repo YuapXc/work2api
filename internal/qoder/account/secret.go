@@ -74,10 +74,8 @@ func GetSecret(accountID string) (string, error) {
 	if s == "" {
 		return "", fmt.Errorf("empty secret for %s", accountID)
 	}
-	// 若读到 keyring 编码，写回明文，方便服务器长期使用
-	if strings.HasPrefix(strings.TrimSpace(string(data)), keyringPrefix) {
-		_ = os.WriteFile(path, []byte(s), 0600)
-	}
+	// Compatibility decoding is read-only: never overwrite a concurrently rotated
+	// credential from a quota/catalog read or during a coordinated backup.
 	return s, nil
 }
 

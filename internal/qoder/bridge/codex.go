@@ -3,14 +3,9 @@ package bridge
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
-	"strings"
-	"time"
-
-	"work2api/internal/qoder/cosy"
-	"work2api/internal/qoder/logger"
+	"work2api/internal/workbuddy/adapters"
 )
 
 func (b *Bridge) HandleCodexResponses(w http.ResponseWriter, r *http.Request) {
@@ -34,259 +29,101 @@ func (b *Bridge) HandleCodexResponses(w http.ResponseWriter, r *http.Request) {
 // ServeCodex runs the Codex/Responses conversion + streaming against an
 // already-parsed client body, writing the client response to w.
 func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[string]interface{}) (ServeResult, error) {
-	startTime := time.Now()
 	var result ServeResult
-
-	reqID := cosy.NewUUID()[:8]
-
 	stream, _ := req["stream"].(bool)
 	model := StrValDefault(req, "model", "auto")
 	instructions, _ := req["instructions"].(string)
 	tools := ConvertResponsesToolsToOpenAI(req["tools"])
-	toolsEnabled := tools != nil
-
-	// Convert input to messages
-	incomingMsgs := CodexInputToMessages(req["input"], instructions)
-	prompt := ExtractLatestUserPrompt(incomingMsgs)
-	messages := BuildQoderMessages(b.templateMessages(), incomingMsgs, prompt, toolsEnabled)
-
-	logger.Info("[Codex][%s] model=%s stream=%v tools=%v msgs=%d", reqID, model, stream, toolsEnabled, len(incomingMsgs))
-
-	respId := "resp_" + cosy.NewRequestID()
-
-	if stream {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.WriteHeader(200)
-		flusher, _ := w.(http.Flusher)
-
-		writeEvent := func(eventType string, data interface{}) {
-			d, _ := json.Marshal(data)
-			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, string(d))
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}
-
-		writeEvent("response.created", map[string]interface{}{
-			"type": "response.created",
-			"response": map[string]interface{}{
-				"id": respId, "model": model, "status": "in_progress",
-				"output": []interface{}{},
-			},
-		})
-
-		outputItemId := "msg_" + cosy.NewRequestID()
-		writeEvent("response.output_item.added", map[string]interface{}{
-			"type":         "response.output_item.added",
-			"output_index": 0,
-			"item": map[string]interface{}{
-				"id": outputItemId, "type": "message", "role": "assistant",
-				"status": "in_progress", "content": []interface{}{},
-			},
-		})
-
-		contentPartId := "cp_" + cosy.NewRequestID()
-		writeEvent("response.content_part.added", map[string]interface{}{
-			"type":          "response.content_part.added",
-			"item_id":       outputItemId,
-			"output_index":  0,
-			"content_index": 0,
-			"part": map[string]interface{}{
-				"type": "output_text", "text": "",
-			},
-		})
-		_ = contentPartId
-
-		toolCallMerged := map[int]map[string]interface{}{}
-		var totalInputTokens, totalOutputTokens int
-		var streamFull strings.Builder
-		var streamReasoning strings.Builder
-
-		err := b.CallQoderWithOpts(ctx, "codex", messages, model, tools, requestCallOpts(req), func(d Delta) {
-			result.updateUsage(d, &totalInputTokens, &totalOutputTokens)
-			if d.Reasoning != "" {
-				streamReasoning.WriteString(d.Reasoning)
-				writeEvent("response.reasoning_text.delta", map[string]interface{}{
-					"type":          "response.reasoning_text.delta",
-					"item_id":       outputItemId,
-					"output_index":  0,
-					"content_index": 0,
-					"delta":         d.Reasoning,
-				})
-			}
-			if d.Content != "" {
-				streamFull.WriteString(d.Content)
-				writeEvent("response.output_text.delta", map[string]interface{}{
-					"type":          "response.output_text.delta",
-					"item_id":       outputItemId,
-					"output_index":  0,
-					"content_index": 0,
-					"delta":         d.Content,
-				})
-			}
-			if d.ToolCalls != nil {
-				MergeToolCallChunks(toolCallMerged, d.ToolCalls)
-			}
-		})
-		result.InputTokens = totalInputTokens
-		result.OutputTokens = totalOutputTokens
-		result.Output = streamFull.String()
-		result.Reasoning = streamReasoning.String()
-		if err != nil {
-			logger.Error("[Codex][%s] stream 请求失败: %v (耗时 %dms)", reqID, err, time.Since(startTime).Milliseconds())
-			errMsg, _ := FriendlyError(err)
-			writeEvent("error", map[string]interface{}{
-				"type":    "error",
-				"message": errMsg,
-			})
-			return result, err
-		}
-
-		writeEvent("response.output_text.done", map[string]interface{}{
-			"type":          "response.output_text.done",
-			"item_id":       outputItemId,
-			"output_index":  0,
-			"content_index": 0,
-			"text":          streamFull.String(),
-		})
-		messageItem := map[string]interface{}{"id": outputItemId, "type": "message", "role": "assistant", "status": "completed", "content": []interface{}{map[string]interface{}{"type": "output_text", "text": streamFull.String(), "annotations": []interface{}{}}}}
-		output := []interface{}{messageItem}
-		writeEvent("response.content_part.done", map[string]interface{}{"type": "response.content_part.done", "item_id": outputItemId, "output_index": 0, "content_index": 0, "part": messageItem["content"].([]interface{})[0]})
-		writeEvent("response.output_item.done", map[string]interface{}{"type": "response.output_item.done", "output_index": 0, "item": messageItem})
-
-		// Emit tool calls as function_call items if any
-		for i, tcMap := range SortedToolCalls(toolCallMerged) {
-			if tcMap == nil {
-				continue
-			}
-			fn, _ := tcMap["function"].(map[string]interface{})
-			callId, _ := tcMap["id"].(string)
-			if callId == "" {
-				callId = "call_" + cosy.NewRequestID()
-			}
-			name, _ := fn["name"].(string)
-			args, _ := fn["arguments"].(string)
-
-			fcItemId := "fc_" + cosy.NewRequestID()
-			writeEvent("response.output_item.added", map[string]interface{}{
-				"type":         "response.output_item.added",
-				"output_index": i + 1,
-				"item": map[string]interface{}{
-					"id": fcItemId, "type": "function_call",
-					"call_id": callId, "name": name, "arguments": "",
-					"status": "in_progress",
-				},
-			})
-			writeEvent("response.function_call_arguments.delta", map[string]interface{}{
-				"type":         "response.function_call_arguments.delta",
-				"item_id":      fcItemId,
-				"output_index": i + 1,
-				"delta":        args,
-			})
-			writeEvent("response.function_call_arguments.done", map[string]interface{}{
-				"type":         "response.function_call_arguments.done",
-				"item_id":      fcItemId,
-				"output_index": i + 1,
-				"arguments":    args,
-			})
-			item := map[string]interface{}{"id": fcItemId, "type": "function_call", "call_id": callId, "name": name, "arguments": args, "status": "completed"}
-			output = append(output, item)
-			writeEvent("response.output_item.done", map[string]interface{}{"type": "response.output_item.done", "output_index": i + 1, "item": item})
-		}
-		if streamReasoning.Len() > 0 {
-			output = append(output, map[string]interface{}{"type": "reasoning", "id": "rs_" + cosy.NewRequestID(), "summary": []interface{}{map[string]interface{}{"type": "summary_text", "text": streamReasoning.String()}}})
-		}
-
-		status := "completed"
-		writeEvent("response.completed", map[string]interface{}{
-			"type": "response.completed",
-			"response": map[string]interface{}{
-				"id": respId, "model": model, "status": status,
-				"output": output,
-				"usage": map[string]interface{}{
-					"input_tokens": totalInputTokens, "output_tokens": totalOutputTokens, "total_tokens": totalInputTokens + totalOutputTokens,
-				},
-			},
-		})
-		logger.Info("[Codex][%s] stream 完成 tool_calls=%d 耗时=%dms", reqID, len(toolCallMerged), time.Since(startTime).Milliseconds())
-		return result, nil
-	} else {
-		var full strings.Builder
-		var reasoning strings.Builder
-		toolCallMerged := map[int]map[string]interface{}{}
-		var totalInputTokens, totalOutputTokens int
-		err := b.CallQoderWithOpts(ctx, "codex", messages, model, tools, requestCallOpts(req), func(d Delta) {
-			result.updateUsage(d, &totalInputTokens, &totalOutputTokens)
-			if d.Reasoning != "" {
-				reasoning.WriteString(d.Reasoning)
-			}
-			if d.Content != "" {
-				full.WriteString(d.Content)
-			}
-			if d.ToolCalls != nil {
-				MergeToolCallChunks(toolCallMerged, d.ToolCalls)
-			}
-		})
-		result.InputTokens = totalInputTokens
-		result.OutputTokens = totalOutputTokens
-		result.Output = full.String()
-		result.Reasoning = reasoning.String()
-		if err != nil {
-			logger.Error("[Codex][%s] 请求失败: %v (耗时 %dms)", reqID, err, time.Since(startTime).Milliseconds())
-			WriteCodexErr(w, err)
-			return result, err
-		}
-
-		output := []interface{}{}
-		if reasoning.Len() > 0 {
-			output = append(output, map[string]interface{}{
-				"type": "reasoning", "id": "rs_" + cosy.NewRequestID(),
-				"summary": []interface{}{
-					map[string]interface{}{"type": "summary_text", "text": reasoning.String()},
-				},
-			})
-		}
-		if full.Len() > 0 {
-			output = append(output, map[string]interface{}{
-				"type": "message", "role": "assistant",
-				"content": []interface{}{
-					map[string]interface{}{"type": "output_text", "text": full.String()},
-				},
-			})
-		}
-		for _, tcMap := range SortedToolCalls(toolCallMerged) {
-			if tcMap == nil {
-				continue
-			}
-			fn, _ := tcMap["function"].(map[string]interface{})
-			callId, _ := tcMap["id"].(string)
-			if callId == "" {
-				callId = "call_" + cosy.NewRequestID()
-			}
-			name, _ := fn["name"].(string)
-			args, _ := fn["arguments"].(string)
-			output = append(output, map[string]interface{}{
-				"type": "function_call", "call_id": callId,
-				"name": name, "arguments": args,
-			})
-		}
-
-		resp := map[string]interface{}{
-			"id": respId, "model": model, "status": "completed",
-			"output": output,
-			"usage": map[string]interface{}{
-				"input_tokens": totalInputTokens, "output_tokens": totalOutputTokens, "total_tokens": totalInputTokens + totalOutputTokens,
-			},
-		}
-		logger.Info("[Codex][%s] 完成 content_len=%d tool_calls=%d 耗时=%dms", reqID, full.Len(), len(toolCallMerged), time.Since(startTime).Milliseconds())
-		logger.Debug("[Codex][%s] 响应体: %s", reqID, func() string { d, _ := json.Marshal(resp); return string(d) }())
-		WriteJSON(w, resp)
-		return result, nil
+	incoming := CodexInputToMessages(req["input"], instructions)
+	messages := BuildQoderMessages(b.templateMessages(), incoming, ExtractLatestUserPrompt(incoming), tools != nil)
+	conv := adapters.NewResponsesStreamConverter(model)
+	if !stream {
+		conv.SetNonstream()
 	}
+	var opened bool
+	var writeErr error
+	send := func(text string) {
+		if text == "" || writeErr != nil {
+			return
+		}
+		if !opened {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(200)
+			opened = true
+		}
+		_, writeErr = io.WriteString(w, text)
+		if writeErr == nil {
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	}
+	callCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	toolsSeen := false
+	var input, output int
+	err := b.CallQoderWithOpts(callCtx, "codex", messages, model, tools, requestCallOpts(req), func(d Delta) {
+		result.updateUsage(d, &input, &output)
+		delta := map[string]any{}
+		if d.Content != "" {
+			delta["content"] = d.Content
+		}
+		if d.Reasoning != "" {
+			delta["reasoning_content"] = d.Reasoning
+		}
+		if len(d.ToolCalls) > 0 {
+			delta["tool_calls"] = d.ToolCalls
+			toolsSeen = true
+		}
+		chunk := map[string]any{"choices": []any{map[string]any{"delta": delta, "finish_reason": d.FinishReason}}}
+		if d.Usage != nil {
+			chunk["usage"] = d.Usage
+		}
+		raw, _ := json.Marshal(chunk)
+		send(conv.FeedLine("data: " + string(raw)))
+		if writeErr != nil {
+			cancel()
+		}
+	})
+	result.InputTokens, result.OutputTokens = input, output
+	result.Output, result.Reasoning = conv.TextContent(), conv.Reasoning()
+	if writeErr != nil {
+		return result, writeErr
+	}
+	if err != nil {
+		if opened {
+			message, _ := FriendlyError(err)
+			send(conv.Fail(message, ErrorStatus(err)))
+		} else {
+			WriteCodexErr(w, err)
+		}
+		return result, err
+	}
+	// Qoder may close a successful envelope without a finish_reason. Preserve that
+	// established transport contract while honoring every explicit upstream reason.
+	if result.FinishReason == "" {
+		result.FinishReason = "stop"
+		if toolsSeen {
+			result.FinishReason = "tool_calls"
+		}
+		raw, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"finish_reason": result.FinishReason}}})
+		send(conv.FeedLine("data: " + string(raw)))
+	}
+	if stream {
+		err = conv.FinishEvents(func(event map[string]any) error {
+			raw, err := json.Marshal(event)
+			if err != nil {
+				return err
+			}
+			send("data: " + string(raw) + "\n\n")
+			return writeErr
+		})
+	} else {
+		WriteJSON(w, conv.GetNonstreamResponse())
+	}
+	return result, err
 }
-
 func CodexInputToMessages(input interface{}, instructions string) []interface{} {
 	var msgs []interface{}
 

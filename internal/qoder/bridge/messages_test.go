@@ -1,6 +1,158 @@
 package bridge
 
-import "testing"
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"work2api/internal/qoder/cosy"
+)
+
+func TestQoderResponsesKeepStableItemsAndIncompleteUsage(t *testing.T) {
+	frames := []string{
+		`{"choices":[{"delta":{"reasoning_content":"think"}}]}`,
+		`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"lookup","arguments":"{}"}}]}}]}`,
+		`{"choices":[{"delta":{"content":"answer"},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":8},"completion_tokens_details":{"reasoning_tokens":3}}}`,
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, frame := range frames {
+			outer, _ := json.Marshal(map[string]any{"body": frame, "statusCodeValue": 200})
+			_, _ = w.Write([]byte("data: " + string(outer) + "\n\n"))
+		}
+	}))
+	defer srv.Close()
+	sess, err := cosy.NewSession(cosy.AuthIdentity{Uid: "fixture", UserType: "personal_standard"}, "fixture", "fixture", "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &Bridge{sess: sess, client: NewBearerClient(sess), templateBase: map[string]any{}, chatStreamURL: srv.URL}
+	for _, streaming := range []bool{false, true} {
+		w := httptest.NewRecorder()
+		res, err := b.ServeCodex(context.Background(), w, map[string]any{"model": "qfmodel", "input": "hello", "stream": streaming})
+		if err != nil || res.FinishReason != "length" || !res.UsageKnown {
+			t.Fatal(res, err)
+		}
+		var response map[string]any
+		if streaming {
+			sequence := -1
+			ids := map[string]string{}
+			for _, line := range strings.Split(w.Body.String(), "\n") {
+				if !strings.HasPrefix(line, "data: ") {
+					continue
+				}
+				var event map[string]any
+				if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
+					t.Fatal(err)
+				}
+				seq := int(event["sequence_number"].(float64))
+				if seq != sequence+1 {
+					t.Fatal("event sequence", sequence, seq)
+				}
+				sequence = seq
+				if item, ok := event["item"].(map[string]any); ok {
+					kind := item["type"].(string)
+					id := item["id"].(string)
+					if prev := ids[kind]; prev != "" && prev != id {
+						t.Fatal("item identity changed", kind)
+					}
+					ids[kind] = id
+				}
+				if event["type"] == "response.incomplete" {
+					response = event["response"].(map[string]any)
+				}
+			}
+		} else if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response["status"] != "incomplete" {
+			t.Fatal(response)
+		}
+		items := response["output"].([]any)
+		if len(items) != 3 {
+			t.Fatal(items)
+		}
+		if items[0].(map[string]any)["type"] != "reasoning" || items[1].(map[string]any)["type"] != "function_call" || items[2].(map[string]any)["type"] != "message" {
+			t.Fatal("arrival order lost", items)
+		}
+		if items[1].(map[string]any)["call_id"] == "" {
+			t.Fatal("missing generated tool call ID")
+		}
+		usage := response["usage"].(map[string]any)
+		if usage["input_tokens"] != float64(10) || usage["output_tokens"] != float64(5) {
+			t.Fatal(usage)
+		}
+	}
+	for _, protocol := range []string{"chat", "anthropic"} {
+		w := httptest.NewRecorder()
+		req := map[string]any{"model": "qfmodel", "messages": []any{map[string]any{"role": "user", "content": "hello"}}}
+		var result ServeResult
+		if protocol == "chat" {
+			result, err = b.ServeChat(context.Background(), w, req)
+		} else {
+			result, err = b.ServeClaude(context.Background(), w, req)
+		}
+		if err != nil || !result.UsageKnown || result.FinishReason != "length" {
+			t.Fatal(protocol, result, err)
+		}
+		var response map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+			t.Fatal(protocol, err)
+		}
+		usage := response["usage"].(map[string]any)
+		if protocol == "chat" {
+			choice := response["choices"].([]any)[0].(map[string]any)
+			if choice["finish_reason"] != "length" || usage["prompt_tokens"] != float64(10) || usage["prompt_tokens_details"].(map[string]any)["cached_tokens"] != float64(8) {
+				t.Fatal(response)
+			}
+		} else if response["stop_reason"] != "max_tokens" || usage["input_tokens"] != float64(2) || usage["cache_read_input_tokens"] != float64(8) {
+			t.Fatal(response)
+		}
+	}
+}
+
+func TestDeltaKeepsUsageAndCompletionSemantics(t *testing.T) {
+	inner := `{"choices":[{"delta":{"reasoning_content":"think","content":"answer"},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":8},"completion_tokens_details":{"reasoning_tokens":3}}}`
+	outer, _ := json.Marshal(map[string]any{"body": inner, "statusCodeValue": 200})
+	d := ExtractDelta(string(outer))
+	var res ServeResult
+	var input, output int
+	res.updateUsage(d, &input, &output)
+	res.InputTokens, res.OutputTokens = input, output
+	if !res.UsageKnown || res.anthropicStop("end_turn") != "max_tokens" || d.Reasoning != "think" || d.Content != "answer" {
+		t.Fatal(d, res)
+	}
+	usage := res.anthropicUsage()
+	if usage["input_tokens"] != 2 || usage["cache_read_input_tokens"] != 8 || usage["output_tokens"] != 5 {
+		t.Fatal(usage)
+	}
+	outer, _ = json.Marshal(map[string]any{"body": `{"usage":{"prompt_tokens":null,"completion_tokens":"bad"}}`})
+	d = ExtractDelta(string(outer))
+	if d.HasInputTokens || d.HasOutputTokens {
+		t.Fatal("malformed usage became observed zero", d)
+	}
+}
+
+func TestDisabledModelCatalogDoesNotFallThrough(t *testing.T) {
+	if _, err := decodeModelCatalog(map[string]interface{}{"error": "invalid"}); err == nil {
+		t.Fatal("malformed response treated as authoritative empty catalog")
+	}
+	if models, err := decodeModelCatalog(map[string]interface{}{"assistant": []interface{}{}}); err != nil || len(models) != 0 {
+		t.Fatal("valid empty catalog treated as failure", models, err)
+	}
+	models := parseQoderModels(map[string]interface{}{
+		"assistant": []interface{}{map[string]interface{}{"key": "disabled", "enable": false}},
+		"developer": []interface{}{map[string]interface{}{"key": "stale", "enable": true}},
+	})
+	if len(models) != 0 {
+		t.Fatal("disabled assistant catalog revived from alternate category", models)
+	}
+	models = extractModels([]interface{}{map[string]interface{}{"key": "disabled", "enable": false}, map[string]interface{}{"key": "legacy"}, map[string]interface{}{"key": "enabled", "enable": true}})
+	if len(models) != 2 || models[0].Key != "legacy" || models[1].Key != "enabled" {
+		t.Fatal("explicit disabled filtering or absent-field compatibility failed", models)
+	}
+}
 
 // imageContentParts：三种入站图片格式都归一成上游 image_url 形式
 func TestImageContentParts(t *testing.T) {

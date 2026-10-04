@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"work2api/internal/core/protocol"
+	"work2api/internal/statebackup"
 )
 
 const modelCatalogCacheSchemaVersion = 3
@@ -61,6 +62,8 @@ func (c *Catalog) LoadCache(path string) error {
 
 // SaveCache snapshots only public model capability data.
 func (c *Catalog) SaveCache() error {
+	leave := statebackup.Enter()
+	defer leave()
 	c.mu.RLock()
 	path := c.cachePath
 	cache := modelCatalogCache{

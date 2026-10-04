@@ -228,6 +228,7 @@ export interface UsageRecord {
 }
 
 export interface Overview {
+  call_metrics?: { requests: number; errors: number; incomplete: number; attempts: number; upstream_429: number; wait_p95_ms: number | null; queue_p95_ms: number | null; account_wait_p95_ms: number | null; execution_p95_ms: number | null; first_byte_p95_ms: number | null; total_p95_ms: number | null }
   admission?: { memory_pressure?: boolean; buffer_reserved_bytes?: number; buffer_budget_bytes?: number; shared_running?: number; shared_capacity?: number; account_running?: Record<string,number>; account_capacity?: number; running: number; queued: number; capacity: number; queue_capacity: number; oldest_wait_ms: number; wait_limit_ms: number; rejected: Record<string,number> }
   request_body_bytes?: number
   accounts: AccountInfo[]

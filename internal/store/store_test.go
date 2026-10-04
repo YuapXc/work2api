@@ -1,9 +1,38 @@
 package store
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 )
+
+func TestOnlineSnapshotIsIndependent(t *testing.T) {
+	dir := t.TempDir()
+	db, err := New(filepath.Join(dir, "live.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.SaveSettings(map[string]string{"keepalive_hour": "21"}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "snapshot.db")
+	if err := db.Snapshot(context.Background(), path); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SaveSettings(map[string]string{"keepalive_hour": "22"}); err != nil {
+		t.Fatal(err)
+	}
+	copy, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer copy.Close()
+	settings, err := copy.GetSettings()
+	if err != nil || settings["keepalive_hour"] != "21" {
+		t.Fatal(settings, err)
+	}
+}
 
 func TestStoreRoundTrip(t *testing.T) {
 	dir := t.TempDir()

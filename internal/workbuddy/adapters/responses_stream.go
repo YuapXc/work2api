@@ -28,12 +28,21 @@ type ResponsesStreamConverter struct {
 	toolOrder []int
 
 	// thinking 追踪：上游 reasoning_content 增量 → Responses reasoning 项，
-	// 排在 message 项之前（summary text 形态，无服务端 id，不参与上游回放校验）。
-	reasoning strings.Builder
+	// 按首次出现顺序分配稳定 ID/索引，以 summary text 形态输出。
+	reasoning                strings.Builder
+	reasoningID              string
+	reasoningIdx, messageIdx int
+	items                    []responseOutputItem
+	sequence                 int
 
 	finishReason string
 	usage        map[string]any
 	errObj       map[string]any
+}
+
+type responseOutputItem struct {
+	kind string
+	tool int
 }
 
 type respToolCall struct {
@@ -51,11 +60,12 @@ func NewResponsesStreamConverter(model string) *ResponsesStreamConverter {
 		model = "unknown"
 	}
 	return &ResponsesStreamConverter{
-		respID:    randID("resp_"),
-		msgID:     randID("msg_"),
-		model:     model,
-		createdAt: time.Now().Unix(),
-		toolCalls: map[int]*respToolCall{},
+		respID:      randID("resp_"),
+		msgID:       randID("msg_"),
+		model:       model,
+		createdAt:   time.Now().Unix(),
+		toolCalls:   map[int]*respToolCall{},
+		reasoningID: randID("rs_"), reasoningIdx: -1, messageIdx: -1,
 	}
 }
 
@@ -76,7 +86,7 @@ func (c *ResponsesStreamConverter) FeedLine(line string) string {
 	return c.processChunk(chunk)
 }
 
-// Finish emits closing events (done + completed).
+// Finish emits closing events (done + completed/incomplete).
 func (c *ResponsesStreamConverter) Finish() string {
 	var events strings.Builder
 	_ = c.FinishEvents(func(event map[string]any) error {
@@ -92,40 +102,46 @@ func (c *ResponsesStreamConverter) Finish() string {
 // FinishEvents emits each full protocol event separately. Production callers
 // encode directly to their writer, avoiding one large concatenated SSE string.
 func (c *ResponsesStreamConverter) FinishEvents(send func(map[string]any) error) error {
+	status := c.CompletionStatus()
 	var err error
 	emit := func(kind string, data map[string]any) {
 		if err != nil {
 			return
 		}
-		data["type"] = kind
+		c.eventPayload(kind, data)
 		err = send(data)
+	}
+	if c.reasoningIdx >= 0 {
+		emit("response.reasoning_summary_text.done", map[string]any{"item_id": c.reasoningID, "output_index": c.reasoningIdx, "summary_index": 0, "text": c.reasoning.String()})
+		emit("response.reasoning_summary_part.done", map[string]any{"item_id": c.reasoningID, "output_index": c.reasoningIdx, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": c.reasoning.String()}})
+		emit("response.output_item.done", map[string]any{"output_index": c.reasoningIdx, "item": c.reasoningItem(status, false)})
 	}
 	if c.emittedContentPart {
 		emit("response.output_text.done", map[string]any{
-			"output_index": 0, "content_index": 0, "text": c.content.String(),
+			"item_id": c.msgID, "output_index": c.messageIdx, "content_index": 0, "text": c.content.String(),
 		})
 		emit("response.content_part.done", map[string]any{
-			"output_index": 0, "content_index": 0,
+			"item_id": c.msgID, "output_index": c.messageIdx, "content_index": 0,
 			"part": map[string]any{"type": "output_text", "text": c.content.String(), "annotations": []any{}},
 		})
 	}
 	if c.emittedMsgItem {
 		emit("response.output_item.done", map[string]any{
-			"output_index": 0, "item": c.msgItem("completed", false),
+			"output_index": c.messageIdx, "item": c.msgItem(status, false),
 		})
 	}
 	for _, idx := range sortedKeys(c.toolOrder) {
 		tc := c.toolCalls[idx]
 		if tc.emitted {
 			emit("response.function_call_arguments.done", map[string]any{
-				"output_index": tc.outputIdx, "arguments": tc.args.String(),
+				"item_id": tc.fcID, "output_index": tc.outputIdx, "arguments": tc.args.String(),
 			})
 			emit("response.output_item.done", map[string]any{
-				"output_index": tc.outputIdx, "item": c.fcItem(tc, "completed"),
+				"output_index": tc.outputIdx, "item": c.fcItem(tc, status),
 			})
 		}
 	}
-	emit("response.completed", map[string]any{"response": c.responseObj("completed")})
+	emit("response."+status, map[string]any{"response": c.responseObj(status)})
 	return err
 }
 
@@ -134,8 +150,17 @@ func (c *ResponsesStreamConverter) SetNonstream() { c.nonstream = true }
 
 // GetNonstreamResponse returns the full non-streaming Response object.
 func (c *ResponsesStreamConverter) GetNonstreamResponse() map[string]any {
-	return c.responseObj("completed")
+	return c.responseObj(c.CompletionStatus())
 }
+
+func completionStatus(reason string) string {
+	if reason == "length" || reason == "content_filter" {
+		return "incomplete"
+	}
+	return "completed"
+}
+
+func (c *ResponsesStreamConverter) CompletionStatus() string { return completionStatus(c.finishReason) }
 
 // Fail ends the stream as failed per the Responses protocol.
 func (c *ResponsesStreamConverter) Fail(message string, code int) string {
@@ -170,28 +195,36 @@ func (c *ResponsesStreamConverter) processChunk(chunk map[string]any) string {
 
 		if delta != nil {
 			if reasoning, ok := delta["reasoning_content"].(string); ok && reasoning != "" {
+				if c.reasoningIdx < 0 {
+					c.reasoningIdx = len(c.items)
+					c.items = append(c.items, responseOutputItem{kind: "reasoning"})
+					events.WriteString(c.evt("response.output_item.added", map[string]any{"output_index": c.reasoningIdx, "item": c.reasoningItem("in_progress", true)}))
+					events.WriteString(c.evt("response.reasoning_summary_part.added", map[string]any{"item_id": c.reasoningID, "output_index": c.reasoningIdx, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": ""}}))
+				}
 				c.reasoning.WriteString(reasoning)
-				events.WriteString(c.evt("response.reasoning_text.delta", map[string]any{
-					"output_index": 0, "content_index": 0, "delta": reasoning,
+				events.WriteString(c.evt("response.reasoning_summary_text.delta", map[string]any{
+					"item_id": c.reasoningID, "output_index": c.reasoningIdx, "summary_index": 0, "delta": reasoning,
 				}))
 			}
 			if content, ok := delta["content"].(string); ok && content != "" {
 				if !c.emittedMsgItem {
+					c.messageIdx = len(c.items)
+					c.items = append(c.items, responseOutputItem{kind: "message"})
 					events.WriteString(c.evt("response.output_item.added", map[string]any{
-						"output_index": 0, "item": c.msgItem("in_progress", true),
+						"output_index": c.messageIdx, "item": c.msgItem("in_progress", true),
 					}))
 					c.emittedMsgItem = true
 				}
 				if !c.emittedContentPart {
 					events.WriteString(c.evt("response.content_part.added", map[string]any{
-						"output_index": 0, "content_index": 0,
+						"item_id": c.msgID, "output_index": c.messageIdx, "content_index": 0,
 						"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
 					}))
 					c.emittedContentPart = true
 				}
 				c.content.WriteString(content)
 				events.WriteString(c.evt("response.output_text.delta", map[string]any{
-					"output_index": 0, "content_index": 0, "delta": content,
+					"item_id": c.msgID, "output_index": c.messageIdx, "content_index": 0, "delta": content,
 				}))
 			}
 			tcs, _ := delta["tool_calls"].([]any)
@@ -206,15 +239,12 @@ func (c *ResponsesStreamConverter) processChunk(chunk map[string]any) string {
 				}
 				slot, exists := c.toolCalls[idx]
 				if !exists {
-					base := 0
-					if c.emittedMsgItem || c.content.Len() > 0 {
-						base = 1
-					}
-					slot = &respToolCall{fcID: randID("fc_"), outputIdx: base + len(c.toolCalls)}
+					slot = &respToolCall{fcID: randID("fc_"), id: randID("call_"), outputIdx: len(c.items)}
+					c.items = append(c.items, responseOutputItem{kind: "function_call", tool: idx})
 					c.toolCalls[idx] = slot
 					c.toolOrder = append(c.toolOrder, idx)
 				}
-				if id, ok := tc["id"].(string); ok && id != "" {
+				if id, ok := tc["id"].(string); ok && id != "" && !slot.emitted {
 					slot.id = id
 				}
 				fn, _ := tc["function"].(map[string]any)
@@ -233,7 +263,7 @@ func (c *ResponsesStreamConverter) processChunk(chunk map[string]any) string {
 					if args, ok := fn["arguments"].(string); ok && args != "" {
 						slot.args.WriteString(args)
 						events.WriteString(c.evt("response.function_call_arguments.delta", map[string]any{
-							"output_index": slot.outputIdx, "delta": args,
+							"item_id": slot.fcID, "output_index": slot.outputIdx, "delta": args,
 						}))
 					}
 				}
@@ -250,12 +280,23 @@ func (c *ResponsesStreamConverter) evt(eventType string, data map[string]any) st
 	if c.nonstream {
 		return ""
 	}
-	payload := map[string]any{"type": eventType}
-	for k, v := range data {
-		payload[k] = v
-	}
-	b, _ := json.Marshal(payload)
+	c.eventPayload(eventType, data)
+	b, _ := json.Marshal(data)
 	return "data: " + string(b) + "\n\n"
+}
+
+func (c *ResponsesStreamConverter) eventPayload(kind string, data map[string]any) {
+	data["type"] = kind
+	data["sequence_number"] = c.sequence
+	c.sequence++
+}
+
+func (c *ResponsesStreamConverter) reasoningItem(status string, empty bool) map[string]any {
+	summary := []any{}
+	if !empty {
+		summary = append(summary, map[string]any{"type": "summary_text", "text": c.reasoning.String()})
+	}
+	return map[string]any{"type": "reasoning", "id": c.reasoningID, "summary": summary, "status": status}
 }
 
 func (c *ResponsesStreamConverter) msgItem(status string, empty bool) map[string]any {
@@ -286,28 +327,26 @@ func (c *ResponsesStreamConverter) fcItem(tc *respToolCall, status string) map[s
 }
 
 func (c *ResponsesStreamConverter) responseObj(status string) map[string]any {
-	var output []any
-	if c.reasoning.Len() > 0 {
-		output = append(output, map[string]any{
-			"type":    "reasoning",
-			"id":      randID("rs_"),
-			"summary": []any{map[string]any{"type": "summary_text", "text": c.reasoning.String()}},
-		})
-	}
-	if c.emittedMsgItem || c.content.Len() > 0 {
-		output = append(output, c.msgItem(status, false))
-	}
-	for _, idx := range sortedKeys(c.toolOrder) {
-		tc := c.toolCalls[idx]
-		if tc.emitted {
-			output = append(output, c.fcItem(tc, status))
+	output := []any{}
+	for _, item := range c.items {
+		switch item.kind {
+		case "reasoning":
+			output = append(output, c.reasoningItem(status, false))
+		case "message":
+			output = append(output, c.msgItem(status, false))
+		case "function_call":
+			output = append(output, c.fcItem(c.toolCalls[item.tool], status))
 		}
 	}
 	var usage any
 	if c.usage != nil {
 		// cached_tokens 用上游真实值（未上报则省略该字段）——硬编码 0 会让
 		// 客户端把每次请求都当成全量 miss。
-		details := map[string]any{"reasoning_tokens": 0}
+		details := map[string]any{}
+		outputDetails := map[string]any{}
+		if reasoning := tokenusage.Reasoning(c.usage); reasoning != nil {
+			outputDetails["reasoning_tokens"] = *reasoning
+		}
 		cached := upstreamCachedTokens(c.usage)
 		if cached != nil {
 			details["cached_tokens"] = *cached
@@ -317,7 +356,7 @@ func (c *ResponsesStreamConverter) responseObj(status string) map[string]any {
 			"input_tokens":          inputTokens,
 			"input_tokens_details":  details,
 			"output_tokens":         outputTokens,
-			"output_tokens_details": map[string]any{"reasoning_tokens": 0},
+			"output_tokens_details": outputDetails,
 			"total_tokens":          inputTokens + outputTokens,
 		}
 		if cached != nil {
@@ -337,6 +376,13 @@ func (c *ResponsesStreamConverter) responseObj(status string) map[string]any {
 	}
 	if c.errObj != nil {
 		response["error"] = c.errObj
+	}
+	if status == "incomplete" {
+		reason := "max_output_tokens"
+		if c.finishReason == "content_filter" {
+			reason = "content_filter"
+		}
+		response["incomplete_details"] = map[string]any{"reason": reason}
 	}
 	return response
 }

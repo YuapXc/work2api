@@ -121,6 +121,83 @@ func TestResponsesStreamReasoning(t *testing.T) {
 	}
 }
 
+func TestResponsesOutputIdentityOrderAndIncompleteStatus(t *testing.T) {
+	for _, finish := range []string{"stop", "length", "content_filter"} {
+		for _, reasoningFirst := range []bool{true, false} {
+			c := NewResponsesStreamConverter("m")
+			var stream strings.Builder
+			tool := map[string]any{"tool_calls": []any{map[string]any{"index": 3, "id": "call-3", "function": map[string]any{"name": "run", "arguments": "{\"x\":"}}}}
+			if reasoningFirst {
+				stream.WriteString(c.FeedLine(chatChunk(map[string]any{"reasoning_content": "think"})))
+			} else {
+				stream.WriteString(c.FeedLine(chatChunk(tool)))
+			}
+			stream.WriteString(c.FeedLine(chatChunk(map[string]any{"content": "answer"})))
+			if reasoningFirst {
+				stream.WriteString(c.FeedLine(chatChunk(tool)))
+			} else {
+				stream.WriteString(c.FeedLine(chatChunk(map[string]any{"reasoning_content": "think"})))
+			}
+			stream.WriteString(c.FeedLine(`data: {"choices":[{"delta":{},"finish_reason":"` + finish + `"}],"usage":{"prompt_tokens":10,"completion_tokens":7,"completion_tokens_details":{"reasoning_tokens":3}}}`))
+			stream.WriteString(c.Finish())
+			response := c.GetNonstreamResponse()
+			output := response["output"].([]any)
+			seq := 0
+			added := map[string]bool{}
+			for _, line := range strings.Split(stream.String(), "\n") {
+				if !strings.HasPrefix(line, "data: ") {
+					continue
+				}
+				var event map[string]any
+				if err := json.Unmarshal([]byte(line[6:]), &event); err != nil {
+					t.Fatal(err)
+				}
+				if event["sequence_number"] != float64(seq) {
+					t.Fatal("non-monotonic event sequence", event)
+				}
+				seq++
+				if index, ok := event["output_index"].(float64); ok {
+					item := output[int(index)].(map[string]any)
+					if id, ok := event["item_id"].(string); ok && (id != item["id"] || !added[id]) {
+						t.Fatal("delta does not reference announced final item", event, item)
+					}
+					if announced, ok := event["item"].(map[string]any); ok {
+						if announced["id"] != item["id"] {
+							t.Fatal("item ID/index changed", event, item)
+						}
+						if event["type"] == "response.output_item.added" {
+							added[announced["id"].(string)] = true
+						}
+					}
+				}
+			}
+			status := "completed"
+			if finish != "stop" {
+				status = "incomplete"
+				reason := "max_output_tokens"
+				if finish == "content_filter" {
+					reason = finish
+				}
+				if response["incomplete_details"].(map[string]any)["reason"] != reason {
+					t.Fatal(response)
+				}
+			}
+			if response["status"] != status || !strings.Contains(stream.String(), `"type":"response.`+status+`"`) {
+				t.Fatal("incorrect terminal status", response)
+			}
+			usage := response["usage"].(map[string]any)
+			if usage["output_tokens_details"].(map[string]any)["reasoning_tokens"] != 3 {
+				t.Fatal("reasoning usage lost", usage)
+			}
+		}
+	}
+	c := NewResponsesStreamConverter("m")
+	c.FeedLine(`data: {"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	if _, known := c.GetNonstreamResponse()["usage"].(map[string]any)["output_tokens_details"].(map[string]any)["reasoning_tokens"]; known {
+		t.Fatal("unknown reasoning tokens invented")
+	}
+}
+
 // TestAnthropicRequestBudgetToEffort locks the thinking.budget_tokens →
 // reasoning_effort ladder and the output_config.effort precedence.
 func TestAnthropicRequestBudgetToEffort(t *testing.T) {
@@ -190,7 +267,9 @@ func TestResponsesFinishEventsPreserveCompletePayloadAndOrder(t *testing.T) {
 	c := NewResponsesStreamConverter("m")
 	c.FeedLine(chatChunk(map[string]any{"content": "完整文本<>&"}))
 	c.FeedLine(chatChunk(map[string]any{"tool_calls": []any{map[string]any{"index": 0, "id": "call-1", "function": map[string]any{"name": "tool", "arguments": `{"value":"完整参数"}`}}}}))
+	startSequence := c.sequence
 	legacy := c.Finish()
+	c.sequence = startSequence // Compare two encoders at the same point in the stream.
 	var want []map[string]any
 	for _, line := range strings.Split(legacy, "\n") {
 		if strings.HasPrefix(line, "data: ") {

@@ -18,6 +18,7 @@ package provider
 import (
 	"context"
 	"net/http"
+	"time"
 )
 
 // Protocol is the client-facing wire protocol of an inference request.
@@ -47,13 +48,14 @@ type UsageReport struct {
 	AccountUID   string
 	InputTokens  int
 	OutputTokens int
-	Status       string // "ok" | "error"
+	Status       string // "ok" | "incomplete" | "error"
 	Error        string
 	Input        string
 	Output       string
 	Reasoning    string
 	Effort       string
 	Credits      *float64
+	CachedTokens *int
 }
 
 // ServeRequest carries a single inference call to a Runtime.
@@ -86,6 +88,11 @@ type Runtime interface {
 // ModelRefresher discovers models on explicit or scheduled refresh. Ordinary
 // Models calls remain read-only snapshots for management/catalog polling.
 type ModelRefresher interface{ RefreshModels(context.Context) error }
+
+// BackgroundMaintainer participates in the shared cancellable scheduler.
+type BackgroundMaintainer interface {
+	Maintain(context.Context, map[string]string, time.Time)
+}
 
 type CheckinCalendar struct {
 	History    map[string][]string `json:"history"`

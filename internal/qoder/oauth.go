@@ -2,6 +2,7 @@ package qoder
 
 import (
 	"fmt"
+	"work2api/internal/statebackup"
 
 	"work2api/internal/core/provider"
 	"work2api/internal/qoder/account"
@@ -53,6 +54,8 @@ func (r *Runtime) OAuthBegin(opts map[string]any) (map[string]any, error) {
 	}
 	r.setOAuth(sess.LoginID, &oauthState{status: "pending"})
 	go func(loginID string) {
+		leave := statebackup.Enter()
+		defer leave()
 		acct, err := account.WaitLogin(loginID)
 		if err != nil {
 			r.setOAuth(loginID, &oauthState{status: "error", message: err.Error()})

@@ -11,6 +11,8 @@ import (
 
 	"work2api/internal/qoder/cosy"
 	"work2api/internal/qoder/logger"
+	"work2api/internal/tokenusage"
+	"work2api/internal/workbuddy/upstream"
 )
 
 // ServeResult carries the aggregated outcome of a single Serve* call so the
@@ -24,13 +26,64 @@ type ServeResult struct {
 	OutputTokens      int
 	Output            string
 	Reasoning         string
+	Usage             map[string]any
+	FinishReason      string
 }
 
 func (r *ServeResult) updateUsage(d Delta, input, output *int) {
+	r.Usage = upstream.MergeUsage(r.Usage, d.Usage)
+	if d.FinishReason != "" {
+		r.FinishReason = d.FinishReason
+	}
 	d.UpdateUsage(input, output)
 	r.inputTokensKnown = r.inputTokensKnown || d.HasInputTokens || d.InputTokens > 0
 	r.outputTokensKnown = r.outputTokensKnown || d.HasOutputTokens || d.OutputTokens > 0
 	r.UsageKnown = r.inputTokensKnown && r.outputTokensKnown
+}
+
+func (r *ServeResult) completionReason(fallback string) string {
+	if r.FinishReason != "" {
+		return r.FinishReason
+	}
+	return fallback
+}
+
+func (r *ServeResult) anthropicStop(fallback string) string {
+	switch r.FinishReason {
+	case "length":
+		return "max_tokens"
+	case "content_filter":
+		return "refusal"
+	case "tool_calls", "function_call":
+		return "tool_use"
+	case "stop":
+		return "end_turn"
+	}
+	return fallback
+}
+
+func (r *ServeResult) anthropicUsage() map[string]any {
+	out := map[string]any{}
+	if r.inputTokensKnown {
+		out["input_tokens"] = r.InputTokens
+	}
+	if r.outputTokensKnown {
+		out["output_tokens"] = r.OutputTokens
+	}
+	read, write := tokenusage.ValidCache(r.Usage)
+	fresh := r.InputTokens
+	if read != nil {
+		out["cache_read_input_tokens"] = *read
+		fresh -= *read
+	}
+	if write != nil {
+		out["cache_creation_input_tokens"] = *write
+		fresh -= *write
+	}
+	if r.inputTokensKnown {
+		out["input_tokens"] = fresh
+	}
+	return out
 }
 
 func (b *Bridge) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -138,17 +191,14 @@ func (b *Bridge) ServeChat(ctx context.Context, w http.ResponseWriter, req map[s
 		if len(toolCallBuf) > 0 {
 			finishReason = "tool_calls"
 		}
+		finishReason = result.completionReason(finishReason)
 		done := MakeChatChunk(reqId, created, model)
 		choices := done["choices"].([]interface{})
 		ch := choices[0].(map[string]interface{})
 		ch["finish_reason"] = finishReason
 		ch["delta"] = map[string]interface{}{}
-		if totalInputTokens > 0 || totalOutputTokens > 0 {
-			done["usage"] = map[string]interface{}{
-				"prompt_tokens":     totalInputTokens,
-				"completion_tokens": totalOutputTokens,
-				"total_tokens":      totalInputTokens + totalOutputTokens,
-			}
+		if result.Usage != nil {
+			done["usage"] = result.Usage
 		}
 		data, _ := json.Marshal(done)
 		fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", string(data))
@@ -211,9 +261,9 @@ func (b *Bridge) ServeChat(ctx context.Context, w http.ResponseWriter, req map[s
 			"id": reqId, "object": "chat.completion",
 			"created": created, "model": model,
 			"choices": []interface{}{
-				map[string]interface{}{"index": 0, "message": msg, "finish_reason": finishReason},
+				map[string]interface{}{"index": 0, "message": msg, "finish_reason": result.completionReason(finishReason)},
 			},
-			"usage": map[string]interface{}{"prompt_tokens": totalInputTokens, "completion_tokens": totalOutputTokens, "total_tokens": totalInputTokens + totalOutputTokens},
+			"usage": result.Usage,
 		}
 		logger.Info("[Chat][%s] 完成 finish=%s content_len=%d tool_calls=%d 耗时=%dms", reqID, finishReason, full.Len(), len(toolCallBuf), time.Since(startTime).Milliseconds())
 		logger.Debug("[Chat][%s] 响应体: %s", reqID, func() string { d, _ := json.Marshal(resp); return string(d) }())

@@ -7,6 +7,7 @@ import (
 
 	"work2api/internal/core/provider"
 	"work2api/internal/store"
+	"work2api/internal/streamwatch"
 )
 
 // dispatchRuntime routes a request whose (alias-resolved) model belongs to a
@@ -48,6 +49,7 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 		AppName:  principal.AppName,
 	})
 	s.o.logRuntimeUsage(report, string(proto), resolved, t0, principal.AppName, principal.UserID, principal.AppID)
+	streamwatch.Outcome(r.Context(), report.Status)
 	return true
 }
 
@@ -79,6 +81,7 @@ func (o *Orchestrator) logRuntimeUsage(rep provider.UsageReport, protocol, model
 		InputTokens:      rep.InputTokens,
 		TokensKnown:      rep.TokensKnown,
 		OutputTokens:     rep.OutputTokens,
+		CachedTokens:     rep.CachedTokens,
 		LatencyMs:        float64(time.Since(t0).Milliseconds()),
 		Status:           status,
 		Error:            rep.Error,

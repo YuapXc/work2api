@@ -85,8 +85,9 @@ async function refreshAA() {
 async function refresh() {
   refreshing.value = true
   try {
-    await api.modelsRefresh()
-    toast.success('已刷新模型目录')
+    const result = await api.modelsRefresh()
+    if (result.warnings?.length) toast.info('部分渠道刷新失败，暂时保留缓存或待验证目录')
+    else toast.success('已刷新模型目录')
     await load()
   } finally {
     refreshing.value = false

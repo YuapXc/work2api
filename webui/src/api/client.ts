@@ -151,7 +151,7 @@ export const api = {
   models: () => http.get<unknown, { models: ModelInfo[]; source?: 'dynamic' | 'static' }>('/admin/models'),
   modelCatalog: () => http.get<unknown, { models: ModelInfo[] }>('/admin/models/catalog'),
   modelsRefresh: () =>
-    http.post<unknown, { ok: boolean; models: ModelInfo[]; source?: 'dynamic' | 'static' }>('/admin/models/refresh'),
+    http.post<unknown, { ok: boolean; models: ModelInfo[]; source?: 'dynamic' | 'static'; warnings?: string[] }>('/admin/models/refresh'),
   // AA（Artificial Analysis）评测：按带命名空间的模型 id 返回智能/编码/数学指数
   benchmarks: () =>
     http.get<unknown, { configured: boolean; models: Record<string, AABenchmark> }>('/admin/models/benchmarks'),
@@ -206,6 +206,8 @@ export const api = {
 
   // 自动签到 / 额度刷新 设置
   getSettings: () => http.get<unknown, Settings>('/admin/settings'),
+  backupStatus: () => http.get<unknown, { status: string; last_success: number | null }>('/admin/backups'),
+  createBackup: () => http.post<unknown, { status: string; last_success: number | null }>('/admin/backups', {}, { timeout: 150000 }),
   saveSettings: (data: Partial<Settings>) => http.post<unknown, Settings & { ok: boolean }>('/admin/settings', data),
 
   // 上传 auth 文件（后端接收 multipart 的 file 字段）

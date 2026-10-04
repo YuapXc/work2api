@@ -12,11 +12,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"work2api/internal/statebackup"
 )
 
 // Server is the HTTP surface over an Orchestrator.
 type Server struct {
-	o *Orchestrator
+	calls callMonitor
+	o     *Orchestrator
 	// adminSessions + loginLimiter back the WebUI login (HttpOnly cookie
 	// sessions). In-memory only: restart signs everyone out.
 	sessions                                                    *adminSessionManager
@@ -87,7 +89,17 @@ func (s *Server) Handler() http.Handler {
 	s.mountAdmin(mux)
 	s.mountPortal(mux)
 	s.mountWebUI(mux)
-	return s.hostGuard(s.adminGuard(s.portalGuard(s.requestGuard(mux))))
+	return s.hostGuard(s.stateGuard(s.observeCalls(s.adminGuard(s.portalGuard(s.requestGuard(mux))))))
+}
+
+func (s *Server) stateGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/admin/backups" {
+			leave := statebackup.Enter()
+			defer leave()
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Bound admission and finish reading bodies before opening a long-lived SSE
@@ -345,7 +357,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	accounts := s.o.pool.Accounts()
 	healthy := 0
 	for _, a := range accounts {
-		if a.Enabled && a.CooldownUntil <= float64(time.Now().UnixNano())/1e9 {
+		if a.Healthy(float64(time.Now().UnixNano()) / 1e9) {
 			healthy++
 		}
 	}

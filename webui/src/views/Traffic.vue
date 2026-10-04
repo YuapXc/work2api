@@ -301,7 +301,7 @@ onMounted(() => {
           <template #cell-status="{ row }">
             <span class="inline-flex items-center gap-1.5">
               <WLed :tone="row.status === 'ok' ? 'live' : row.status === 'error' ? 'fault' : 'muted'" />
-              <span class="text-small">{{ row.status }}</span>
+              <span class="text-small">{{ row.status === 'incomplete' ? '输出未完成' : row.status }}</span>
             </span>
           </template>
           <template #cell-actions="{ row }">

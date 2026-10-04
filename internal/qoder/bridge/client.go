@@ -227,7 +227,13 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
+		streamwatch.StartAttempt(ctx)
 		resp, err := client.Do(req)
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		streamwatch.AttemptResult(ctx, status)
 		if err != nil {
 			lastErr = err
 			if ctx.Err() != nil {

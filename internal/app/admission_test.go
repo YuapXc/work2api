@@ -588,6 +588,16 @@ func TestAccountSelectorUsesSameSiteAccountsAndLiveAuthorizedReadiness(t *testin
 	o.pool = pool.New(map[string]pool.Credential{"one": catalogOffline{original.Mgr}, "two": catalogOffline{original.Mgr}}, "")
 	o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: catalogTransport{}})
 	o.models.Refresh()
+	zero := 0.0
+	o.pool.SetCredits("one", &zero, nil, nil, nil)
+	exhausted, e := o.accountSelector("test-model", "one", nil, map[string]bool{"one": true, "two": true})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if acc, e := exhausted(nil); e != nil || acc == nil || acc.UID != "two" {
+		t.Fatal("preferred cooldown grace revived exhausted account", acc, e)
+	}
+	o.pool.SetCredits("one", nil, nil, nil, nil)
 	selector, err := o.accountSelector("test-model", "one", nil, map[string]bool{"one": true, "two": true})
 	if err != nil {
 		t.Fatal(err)

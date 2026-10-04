@@ -6,9 +6,8 @@ import (
 	"strconv"
 	"strings"
 
-	"work2api/internal/qoder/cosy"
-
 	"work2api/internal/qoder/logger"
+	"work2api/internal/tokenusage"
 )
 
 type Delta struct {
@@ -20,11 +19,13 @@ type Delta struct {
 	OutputTokens    int
 	HasInputTokens  bool
 	HasOutputTokens bool
+	Usage           map[string]any
+	FinishReason    string
 	Err             error // 上游返回业务错误时非 nil
 }
 
 func (d Delta) isEmpty() bool {
-	return d.Role == "" && d.Content == "" && d.Reasoning == "" && d.ToolCalls == nil && d.InputTokens == 0 && d.OutputTokens == 0 && !d.HasInputTokens && !d.HasOutputTokens && d.Err == nil
+	return d.Role == "" && d.Content == "" && d.Reasoning == "" && d.ToolCalls == nil && d.InputTokens == 0 && d.OutputTokens == 0 && !d.HasInputTokens && !d.HasOutputTokens && d.Usage == nil && d.FinishReason == "" && d.Err == nil
 }
 
 // UpdateUsage applies cumulative snapshots, including explicit zero values,
@@ -71,17 +72,20 @@ func ExtractDelta(dataLine string) Delta {
 	// 不提前 return：同帧若还带 choices 内容，合并进同一个 Delta，避免内容丢失
 	var usageIn, usageOut int
 	var hasIn, hasOut bool
-	if usage, ok := innerJSON["usage"].(map[string]interface{}); ok {
-		_, hasIn = usage["prompt_tokens"]
-		_, hasOut = usage["completion_tokens"]
-		usageIn = int(cosy.FloatVal(usage, "prompt_tokens"))
-		usageOut = int(cosy.FloatVal(usage, "completion_tokens"))
+	usage, _ := innerJSON["usage"].(map[string]interface{})
+	if usage != nil {
+		hasIn, hasOut = tokenusage.KnownTotals(usage)
+		usageIn, usageOut = tokenusage.Totals(usage)
 	}
 	choices, _ := innerJSON["choices"].([]interface{})
 	for _, ch := range choices {
 		chMap, _ := ch.(map[string]interface{})
+		finish, _ := chMap["finish_reason"].(string)
 		delta, _ := chMap["delta"].(map[string]interface{})
 		if delta == nil {
+			if finish != "" {
+				return Delta{Usage: usage, FinishReason: finish, InputTokens: usageIn, OutputTokens: usageOut, HasInputTokens: hasIn, HasOutputTokens: hasOut}
+			}
 			continue
 		}
 		role, _ := delta["role"].(string)
@@ -91,9 +95,9 @@ func ExtractDelta(dataLine string) Delta {
 		if tc, ok := delta["tool_calls"].([]interface{}); ok && len(tc) > 0 {
 			toolCalls = tc
 		}
-		if role != "" || content != "" || reasoning != "" || toolCalls != nil {
+		if role != "" || content != "" || reasoning != "" || toolCalls != nil || finish != "" {
 			return Delta{Role: role, Content: content, Reasoning: reasoning, ToolCalls: toolCalls,
-				InputTokens: usageIn, OutputTokens: usageOut, HasInputTokens: hasIn, HasOutputTokens: hasOut}
+				InputTokens: usageIn, OutputTokens: usageOut, HasInputTokens: hasIn, HasOutputTokens: hasOut, Usage: usage, FinishReason: finish}
 		}
 	}
 	// 上游业务错误：{"code":"115","message":"..."}
@@ -106,8 +110,8 @@ func ExtractDelta(dataLine string) Delta {
 		return Delta{Err: err}
 	}
 	// choices 与业务 code 均未命中且 usage > 0：维持返回 usage-only Delta（行为同修复前）
-	if hasIn || hasOut {
-		return Delta{InputTokens: usageIn, OutputTokens: usageOut, HasInputTokens: hasIn, HasOutputTokens: hasOut}
+	if usage != nil {
+		return Delta{InputTokens: usageIn, OutputTokens: usageOut, HasInputTokens: hasIn, HasOutputTokens: hasOut, Usage: usage}
 	}
 	logger.Debug("[delta] no valid choices found, inner=%s", inner)
 	return Delta{}

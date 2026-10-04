@@ -28,6 +28,16 @@ const s = reactive<Record<string, string>>({
   qoder_machine_salt: '',
 })
 const keepalive = ref(true)
+const qoderAutoCheckin = ref(false)
+const qoderAutoQuota = ref(false)
+const backupEnabled = ref(false)
+const backingUp = ref(false)
+const backup = ref<{ status: string; last_success: number | null }>({ status: '', last_success: null })
+async function createBackup() {
+  backingUp.value = true
+  try { backup.value = await api.createBackup(); toast.success('完整备份已保存到服务器数据目录') }
+  finally { backingUp.value = false }
+}
 const costAware = ref(true)
 const alertOn = ref(false)
 const aaKeyInput = ref('')
@@ -41,6 +51,10 @@ async function load() {
     const data = (await api.getSettings()) as Settings & Record<string, string>
     for (const k of Object.keys(s)) if (data[k] != null) s[k] = String(data[k])
     keepalive.value = String(data.keepalive_enabled ?? '1') === '1'
+    qoderAutoCheckin.value = String(data.qoder_auto_checkin ?? '0') === '1'
+    qoderAutoQuota.value = String(data.qoder_auto_quota ?? '0') === '1'
+    backupEnabled.value = String(data.backup_enabled ?? '0') === '1'
+    backup.value = await api.backupStatus()
     costAware.value = String(data.cost_aware_routing ?? '1') === '1'
     alertOn.value = String(data.alert_enabled ?? '0') === '1'
     aaEnabled.value = !!data.aa_enabled
@@ -56,6 +70,9 @@ async function save() {
     const payload: Record<string, unknown> = {
       ...s,
       keepalive_enabled: keepalive.value ? '1' : '0',
+      qoder_auto_checkin: qoderAutoCheckin.value ? '1' : '0',
+      qoder_auto_quota: qoderAutoQuota.value ? '1' : '0',
+      backup_enabled: backupEnabled.value ? '1' : '0',
       cost_aware_routing: costAware.value ? '1' : '0',
       alert_enabled: alertOn.value ? '1' : '0',
     }
@@ -119,6 +136,14 @@ onMounted(load)
             <label class="text-small text-muted">额度刷新间隔（分）</label>
             <WInput v-model="s.credit_refresh_min" placeholder="30" />
           </div>
+            <div class="grid grid-cols-[1fr_9rem] items-center gap-3">
+              <label class="text-small text-muted" title="仅中国站，按活动窗口补领，失败最多重试三次；默认关闭">Qoder 中国站自动签到</label>
+              <WToggle v-model="qoderAutoCheckin" />
+            </div>
+            <div class="grid grid-cols-[1fr_9rem] items-center gap-3">
+              <label class="text-small text-muted" title="沿用上方额度刷新间隔；默认关闭">Qoder 定期刷新额度</label>
+              <WToggle v-model="qoderAutoQuota" />
+            </div>
           <div class="grid grid-cols-[1fr_9rem] items-center gap-3">
             <label class="text-small text-muted">模型目录刷新（时）</label>
             <WInput v-model="s.model_refresh_hour" placeholder="6" />
@@ -131,6 +156,18 @@ onMounted(load)
             <label class="text-small text-muted">AA 评测刷新（时）</label>
             <WInput v-model="s.aa_refresh_hour" placeholder="7" />
           </div>
+        </div>
+      </WCard>
+
+      <WCard title="完整备份" sub="保存在服务器 DATA_DIR/backups，含密钥和凭据；请保护并另存副本。">
+        <div class="space-y-3.5">
+          <div class="flex items-center justify-between">
+            <label class="text-small text-muted">每日自动备份（保留最近 7 份）</label>
+            <WToggle v-model="backupEnabled" />
+          </div>
+          <p class="text-micro text-faint">开关在保存设置后生效。有调用或数据操作时稍后重试；捕获快照期间短暂协调数据访问。服务器反代、证书等额外文件需通过 BACKUP_EXTRA_PATHS 配置。</p>
+          <p class="text-micro text-muted">最近成功：{{ backup.last_success ? new Date(backup.last_success * 1000).toLocaleString() : '暂无' }} · {{ ({ running: '备份中', failed: '失败，请查看服务日志', complete: '完成' } as Record<string, string>)[backup.status] || '未执行' }}</p>
+          <WButton :loading="backingUp" @click="createBackup">立即备份</WButton>
         </div>
       </WCard>
 

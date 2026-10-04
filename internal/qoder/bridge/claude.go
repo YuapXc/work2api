@@ -233,8 +233,8 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 
 		writeSse("message_delta", map[string]interface{}{
 			"type":  "message_delta",
-			"delta": map[string]interface{}{"stop_reason": stopReason, "stop_sequence": nil},
-			"usage": map[string]interface{}{"input_tokens": totalInputTokens, "output_tokens": totalOutputTokens},
+			"delta": map[string]interface{}{"stop_reason": result.anthropicStop(stopReason), "stop_sequence": nil},
+			"usage": result.anthropicUsage(),
 		})
 		writeSse("message_stop", map[string]interface{}{"type": "message_stop"})
 		logger.Info("[Claude][%s] stream 完成 stop=%s content_len=%d tool_calls=%d 耗时=%dms", reqID, stopReason, streamContentLen, len(mergedTools), time.Since(startTime).Milliseconds())
@@ -304,9 +304,9 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 
 		resp := map[string]interface{}{
 			"id": msgId, "type": "message", "role": "assistant", "model": model,
-			"stop_reason": stopReason, "stop_sequence": nil,
+			"stop_reason": result.anthropicStop(stopReason), "stop_sequence": nil,
 			"content": content,
-			"usage":   map[string]interface{}{"input_tokens": totalInputTokens, "output_tokens": totalOutputTokens},
+			"usage":   result.anthropicUsage(),
 		}
 		logger.Info("[Claude][%s] 完成 stop=%s content_len=%d tool_calls=%d 耗时=%dms", reqID, stopReason, full.Len(), len(toolCallMerged), time.Since(startTime).Milliseconds())
 		logger.Debug("[Claude][%s] 响应体: %s", reqID, func() string { d, _ := json.Marshal(resp); return string(d) }())

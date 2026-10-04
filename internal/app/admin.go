@@ -34,6 +34,8 @@ func (s *Server) mountAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/login", s.handleAdminLogin)
 	mux.HandleFunc("POST /admin/logout", s.handleAdminLogout)
 	mux.HandleFunc("GET /admin/overview", s.adminOverview)
+	mux.HandleFunc("GET /admin/backups", s.adminBackups)
+	mux.HandleFunc("POST /admin/backups", s.adminBackups)
 	mux.HandleFunc("GET /admin/accounts", s.adminAccounts)
 	mux.HandleFunc("POST /admin/accounts/upload", s.adminUpload)
 	mux.HandleFunc("GET /admin/oauth/sites", s.adminOAuthSites)
@@ -182,6 +184,8 @@ func (s *Server) adminOverview(w http.ResponseWriter, r *http.Request) {
 	summary, _ := s.o.db.UsageSummary()
 	writeJSON(w, 200, map[string]any{
 		"admission":          s.modelsAdmission.snapshot(),
+		"call_metrics":       s.calls.snapshot(),
+		"backup":             s.o.backupStatus(),
 		"request_body_bytes": s.bodies.usage(),
 		"accounts":           accounts,
 		"alerts":             s.creditAlerts(accounts),
@@ -719,6 +723,10 @@ func (s *Server) adminModelCatalog(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) adminHealth(w http.ResponseWriter, r *http.Request) {
 	healthy := s.o.pool.HealthyCount(nil)
+	providers := []map[string]any{{"name": "workbuddy", "ready": healthy > 0, "callable_accounts": healthy, "model_count": len(s.o.models.ListCached()), "model_source": s.o.models.Source()}}
+	if healthy == 0 {
+		providers[0]["reason"] = "没有启用且有额度的非冷却账号"
+	}
 	available := 0
 	if healthy > 0 {
 		available++
@@ -726,11 +734,17 @@ func (s *Server) adminHealth(w http.ResponseWriter, r *http.Request) {
 	total := 1
 	for _, rt := range provider.Runtimes() {
 		total++
-		if rt.Ready() {
+		ready := rt.Ready()
+		row := map[string]any{"name": rt.Name(), "ready": ready}
+		if !ready {
+			row["reason"] = "未配置可用凭据或渠道未启用"
+		}
+		providers = append(providers, row)
+		if ready {
 			available++
 		}
 	}
-	writeJSON(w, 200, map[string]any{"status": "ok", "available_providers": available, "total_providers": total})
+	writeJSON(w, 200, map[string]any{"status": "ok", "available_providers": available, "total_providers": total, "providers": providers, "upstream_probe": "not_performed"})
 }
 
 // attachModelAccounts enriches each model entry with an "accounts" array: the
@@ -823,7 +837,7 @@ func (s *Server) attachModelAccounts(entries []map[string]any) {
 }
 
 func (s *Server) adminRefreshModels(w http.ResponseWriter, r *http.Request) {
-	models := s.o.models.Refresh()
+	models := s.o.models.RefreshContext(r.Context())
 	warnings := s.o.refreshRuntimeModels(r.Context())
 	writeJSON(w, 200, map[string]any{"ok": true, "models": models, "source": s.o.models.Source(), "count": len(models), "warnings": warnings})
 }

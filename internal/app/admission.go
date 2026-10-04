@@ -401,6 +401,7 @@ func (a *modelAdmission) releaseModelLocked(model string) {
 
 func (l *modelLease) await(ctx context.Context) error {
 	start := time.Now()
+	defer func() { streamwatch.QueueWait(ctx, time.Since(start), false) }()
 	timer := time.NewTimer(l.remaining)
 	defer timer.Stop()
 	// Wake memory-pressure waiters even when no model request finishes.
@@ -487,6 +488,7 @@ func (l *modelLease) throttle(ctx context.Context, wait func(context.Context) er
 	waitCtx, cancel := context.WithTimeout(ctx, l.remaining)
 	defer cancel()
 	err := wait(waitCtx)
+	streamwatch.QueueWait(ctx, time.Since(start), true)
 	cancel()
 	l.remaining -= time.Since(start)
 	if err != nil {

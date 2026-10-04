@@ -159,9 +159,13 @@ func (r *Registry) CreditsByRegion(model string) map[string]float64 {
 
 // Refresh force-refreshes the model cache.
 func (r *Registry) Refresh() []map[string]any {
+	return r.RefreshContext(context.Background())
+}
+
+func (r *Registry) RefreshContext(ctx context.Context) []map[string]any {
 	r.refreshMu.Lock()
 	defer r.refreshMu.Unlock()
-	fetched := r.fetchFromUpstream()
+	fetched := r.fetchFromUpstreamContext(ctx)
 	if fetched == nil {
 		r.mu.Lock()
 		r.lastFail = nowSec()
@@ -281,6 +285,10 @@ type fetchedModel struct {
 }
 
 func (r *Registry) fetchFromUpstream() []fetchedModel {
+	return r.fetchFromUpstreamContext(context.Background())
+}
+
+func (r *Registry) fetchFromUpstreamContext(ctx context.Context) []fetchedModel {
 	var accounts []*pool.Account
 	for _, a := range r.pool.Accounts() {
 		if a.Enabled {
@@ -305,7 +313,10 @@ func (r *Registry) fetchFromUpstream() []fetchedModel {
 	creditsByRegion := map[string]map[string]float64{}
 	anyOK := false
 	for _, account := range accounts {
-		got := r.fetchOne(account)
+		if ctx.Err() != nil {
+			return nil
+		}
+		got := r.fetchOneContext(ctx, account)
 		if got == nil {
 			continue
 		}
