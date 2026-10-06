@@ -2,6 +2,7 @@ package projection
 
 import (
 	"encoding/json"
+	"sort"
 	"strings"
 )
 
@@ -144,12 +145,17 @@ func shrinkJSONValue(value any, depth int, key string) any {
 	case map[string]any:
 		out := make(map[string]any, len(v))
 		idx := 0
-		for k, item := range v {
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
 			if idx >= jsonShrinkMaxKeys {
 				out["_omitted_keys"] = len(v) - idx
 				break
 			}
-			out[k] = shrinkJSONValue(item, depth+1, k)
+			out[k] = shrinkJSONValue(v[k], depth+1, k)
 			idx++
 		}
 		return out

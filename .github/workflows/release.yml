@@ -25,7 +25,11 @@ jobs:
     outputs:
       release_tag: ${{ steps.metadata.outputs.release_tag }}
       image_name: ${{ steps.metadata.outputs.image_name }}
+      source_sha: ${{ steps.metadata.outputs.source_sha }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Resolve release metadata
         id: metadata
         shell: bash
@@ -41,15 +45,25 @@ jobs:
             echo "Release tag must be a semantic version such as v1.0.0 or v1.0.0-rc.1" >&2
             exit 1
           fi
+          if git rev-parse --verify "refs/tags/$release_tag^{commit}" >/dev/null 2>&1; then
+            source_sha="$(git rev-parse "refs/tags/$release_tag^{commit}")"
+          else
+            # A new manual release is explicitly anchored to this workflow commit.
+            source_sha="$GITHUB_SHA"
+          fi
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
           echo "image_name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
   verify:
     name: Verify source
+    needs: prepare
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
@@ -91,6 +105,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
@@ -147,6 +163,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
@@ -168,6 +186,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.release_tag }},enable=${{ !contains(needs.prepare.outputs.release_tag, '-') }}
             type=semver,pattern={{major}},value=${{ needs.prepare.outputs.release_tag }},enable=${{ !contains(needs.prepare.outputs.release_tag, '-') }}
           labels: |
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.source_sha }}
             org.opencontainers.image.title=work2api
             org.opencontainers.image.description=统一 Go 网关：WorkBuddy/CodeBuddy、Qoder、OpenCode 三协议兼容 API
       - name: Build and push image
@@ -203,6 +222,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.source_sha }}
         run: |
           release_type=()
           if [[ "$RELEASE_TAG" == *-* ]]; then
@@ -213,5 +233,5 @@ jobs:
             # tag 被删重建时旧 release 会失去 tag 引用变成 draft，这里显式转正
             gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$RELEASE_TAG" release-files/* "${release_type[@]}" --generate-notes --title "$RELEASE_TAG" --target "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
+            gh release create "$RELEASE_TAG" release-files/* "${release_type[@]}" --generate-notes --title "$RELEASE_TAG" --target "$RELEASE_SHA" --repo "$GITHUB_REPOSITORY"
           fi

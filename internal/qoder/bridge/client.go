@@ -247,8 +247,11 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 			return WrapTransportError(err)
 		}
 		if resp.StatusCode != 200 {
-			body, _ := io.ReadAll(resp.Body)
+			body, readErr := streamwatch.ReadBody(ctx, resp.Body, 1<<20)
 			resp.Body.Close()
+			if readErr != nil {
+				return readErr
+			}
 			detail := string(body)
 			if IsTransientUpstream(resp.StatusCode, detail) && attempt < TransientMaxRetries {
 				logger.Info("transient upstream HTTP %d opening stream %s (try %d/%d) - retry in %ds",
@@ -294,9 +297,9 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 			case <-ctx.Done():
 				return ctx.Err()
 			case err := <-errCh:
-				if watch.Err != nil {
-					logger.Error("[streamwatch] %v", watch.Err)
-					return watch.Err
+				if watch.Err() != nil {
+					logger.Error("[streamwatch] %v", watch.Err())
+					return watch.Err()
 				}
 				logger.Debug("stream read complete")
 				return err

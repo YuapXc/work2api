@@ -482,7 +482,11 @@ func (s *Server) adminCreateApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := s.o.genAPIKey()
-	enc, _ := s.o.crypto.Encrypt(key)
+	enc, err := s.o.crypto.Encrypt(key)
+	if err != nil {
+		writeAPIErr(w, errBody(500, "密钥加密失败，请稍后重试", "server_error"))
+		return
+	}
 	id, err := s.o.db.CreateApp(name, s.o.hashKey(key), key[:min(10, len(key))]+"…", note, enc, allowed, 0)
 	if err != nil {
 		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
@@ -670,6 +674,10 @@ func (s *Server) adminUsageTimeseries(w http.ResponseWriter, r *http.Request) {
 	points, _ := strconv.Atoi(r.URL.Query().Get("points"))
 	if points <= 0 {
 		points = 24
+	}
+	if points > 1000 {
+		writeAPIErr(w, errBody(400, "时间序列最多查询 1000 个点", "invalid_request_error"))
+		return
 	}
 	ts, _ := s.o.db.UsageTimeseries(gran, points, r.URL.Query().Get("model"))
 	writeJSON(w, 200, map[string]any{"granularity": gran, "points": points, "data": ts})

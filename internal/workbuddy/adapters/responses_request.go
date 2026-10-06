@@ -38,12 +38,46 @@ func ResponsesRequestToChat(body map[string]any) (map[string]any, error) {
 	}
 	if tc, ok := body["tool_choice"]; ok {
 		chat["tool_choice"] = tc
+		if choice, ok := tc.(map[string]any); ok && choice["type"] == "function" {
+			if name, ok := choice["name"].(string); ok && name != "" {
+				chat["tool_choice"] = map[string]any{"type": "function", "function": map[string]any{"name": name}}
+			}
+		}
 	}
 	for _, key := range []string{"temperature", "top_p", "stop", "seed",
 		"presence_penalty", "frequency_penalty", "response_format", "reasoning_effort"} {
 		if v, ok := body[key]; ok {
 			chat[key] = v
 		}
+	}
+	if reasoning, ok := body["reasoning"].(map[string]any); ok {
+		if effort, ok := reasoning["effort"]; ok {
+			chat["reasoning_effort"] = effort
+		}
+		if summary, ok := reasoning["summary"]; ok {
+			chat["reasoning_summary"] = summary
+		}
+	}
+	if text, ok := body["text"].(map[string]any); ok {
+		if format, ok := text["format"].(map[string]any); ok {
+			if format["type"] == "json_schema" {
+				schema := map[string]any{}
+				for _, key := range []string{"name", "description", "schema", "strict"} {
+					if value, ok := format[key]; ok {
+						schema[key] = value
+					}
+				}
+				chat["response_format"] = map[string]any{"type": "json_schema", "json_schema": schema}
+			} else {
+				chat["response_format"] = format
+			}
+		}
+		if verbosity, ok := text["verbosity"]; ok {
+			chat["verbosity"] = verbosity
+		}
+	}
+	if parallel, ok := body["parallel_tool_calls"]; ok {
+		chat["parallel_tool_calls"] = parallel
 	}
 	if v, ok := body["max_output_tokens"]; ok {
 		chat["max_tokens"] = v

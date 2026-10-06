@@ -20,7 +20,6 @@ def main():
     root = pathlib.Path("/opt/work2api/backups")
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     destination = root / ("full-" + stamp)
-    destination.mkdir(mode=0o700)
     current = pathlib.Path("/opt/work2api/current").resolve()
     paths = [
         "/var/lib/work2api", "/etc/work2api", "/etc/systemd/system/work2api.service",
@@ -30,6 +29,20 @@ def main():
         "/etc/nginx/ssl/cloudflare-origin.pem", "/etc/nginx/ssl/cloudflare-origin.key",
         str(current),
     ]
+    required = paths[:3] + [str(current)]
+    missing = [name for name in required if not pathlib.Path(name).exists()]
+    if missing:
+        raise SystemExit("Missing required backup inputs: " + ", ".join(missing))
+    destination.mkdir(mode=0o700)
+    optional_missing = [name for name in paths if not pathlib.Path(name).exists()]
+    # Application-managed online archives are independent backups, not state.
+    # Including them here recursively multiplies archive size on each run.
+    def state_filter(member):
+        prefix = "var/lib/work2api/backups"
+        if member.name == prefix or member.name.startswith(prefix + "/"):
+            return None
+        return member
+
     active = subprocess.run(["systemctl", "is-active", "--quiet", "work2api"]).returncode == 0
     partial = destination / "state-config.tar.gz.partial"
     final = destination / "state-config.tar.gz"
@@ -41,7 +54,7 @@ def main():
             for name in paths:
                 path = pathlib.Path(name)
                 if path.exists():
-                    archive.add(path, arcname=str(path).lstrip("/"))
+                    archive.add(path, arcname=str(path).lstrip("/"), filter=state_filter)
         partial.rename(final)
     finally:
         if active:
@@ -50,6 +63,7 @@ def main():
         digest = hashlib.file_digest(handle, "sha256").hexdigest()
     (destination / "state-config.tar.gz.sha256").write_text(digest + "  state-config.tar.gz\n")
     (destination / "version.txt").write_text(str(current) + "\n")
+    (destination / "optional-missing.txt").write_text("\n".join(optional_missing) + "\n")
     print("Backup complete:", final)
     print("Restore requires maintenance isolation and matching application/schema versions.")
 

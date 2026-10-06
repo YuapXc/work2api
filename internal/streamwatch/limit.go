@@ -25,6 +25,24 @@ func LimitReader(ctx context.Context, r io.Reader) io.Reader {
 	return &responseReader{r: r, left: ResponseLimit(ctx)}
 }
 
+// ReadBody applies the same idle/duration and byte bounds to JSON and error
+// bodies as to SSE. A smaller diagnostic limit may be supplied by callers.
+func ReadBody(ctx context.Context, body io.ReadCloser, limit int64) ([]byte, error) {
+	if limit > 0 && limit < ResponseLimit(ctx) {
+		ctx = WithResponseLimit(ctx, limit)
+	}
+	watch := NewWatch(body, ctx, 0, 0)
+	defer watch.Close()
+	data, err := io.ReadAll(watch.Reader(body))
+	if breach := watch.Err(); breach != nil {
+		return nil, breach
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return data, err
+}
+
 type responseReader struct {
 	r    io.Reader
 	left int64

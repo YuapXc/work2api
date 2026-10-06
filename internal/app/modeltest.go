@@ -149,6 +149,12 @@ func (s *Server) adminModelTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	choices, validChoices := payload["choices"].([]any)
+	if !parseOK || !validChoices || len(choices) == 0 {
+		resp["error"] = "上游未返回有效的模型响应"
+		writeJSON(w, 200, resp)
+		return
+	}
 	content := ""
 	finish := ""
 	var usage map[string]any

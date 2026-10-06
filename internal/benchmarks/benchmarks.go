@@ -70,6 +70,7 @@ type Store struct {
 	settings SettingsSource
 
 	mu        sync.Mutex
+	refreshMu sync.Mutex
 	rows      []aaModel
 	fetchedAt time.Time
 	lastFail  time.Time
@@ -145,6 +146,8 @@ func (s *Store) fetch() []aaModel {
 // ensure returns cached rows if fresh; otherwise refreshes (respecting the
 // failure cooldown). Falls back to stale rows on fetch failure.
 func (s *Store) ensure() []aaModel {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
 	now := time.Now()
 	s.mu.Lock()
 	if len(s.rows) > 0 && now.Sub(s.fetchedAt) < cacheTTL {
@@ -176,6 +179,10 @@ func (s *Store) ensure() []aaModel {
 // Refresh forces a fetch (for the scheduler / manual WebUI refresh). Keeps the
 // existing cache on failure.
 func (s *Store) Refresh() {
+	if !s.refreshMu.TryLock() {
+		return
+	}
+	defer s.refreshMu.Unlock()
 	rows := s.fetch()
 	if rows == nil {
 		s.mu.Lock()
@@ -299,11 +306,11 @@ func (s *Store) match(rows []aaModel, providerName, id, name string) *aaModel {
 	return nil
 }
 
-// Lookup returns the raw AA row for a provider's model, or nil. Triggers a fetch
-// only if the cache is empty (never on the request path via Map, which is
-// read-only against ensure()).
+// lookup is a read-only snapshot; scheduled/explicit Refresh owns network IO.
 func (s *Store) lookup(providerName, id, name string) *aaModel {
-	rows := s.ensure()
+	s.mu.Lock()
+	rows := s.rows
+	s.mu.Unlock()
 	if len(rows) == 0 {
 		return nil
 	}

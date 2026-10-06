@@ -339,3 +339,22 @@ func BenchmarkResponsesFinishCopies(b *testing.B) {
 		}
 	})
 }
+
+func TestResponsesNativeOptionsAdaptToChat(t *testing.T) {
+	body := map[string]any{"input": "hello", "reasoning": map[string]any{"effort": "high"}, "text": map[string]any{"format": map[string]any{"type": "json_schema", "name": "answer", "strict": true, "schema": map[string]any{"type": "object"}}}, "tool_choice": map[string]any{"type": "function", "name": "lookup"}, "parallel_tool_calls": false}
+	chat, err := ResponsesRequestToChat(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chat["reasoning_effort"] != "high" || chat["parallel_tool_calls"] != false {
+		t.Fatal("native options lost", chat)
+	}
+	choice := chat["tool_choice"].(map[string]any)
+	if choice["function"].(map[string]any)["name"] != "lookup" {
+		t.Fatal("tool choice lost")
+	}
+	schema := chat["response_format"].(map[string]any)["json_schema"].(map[string]any)
+	if schema["name"] != "answer" || schema["strict"] != true || schema["schema"] == nil {
+		t.Fatal("structured output schema lost", schema)
+	}
+}

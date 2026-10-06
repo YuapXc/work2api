@@ -1,7 +1,6 @@
 package opencode
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -106,12 +105,16 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provid
 		watch := streamwatch.NewWatch(resp.Body, ctx, 0, 0)
 		defer watch.Close()
 		var usage protocol.Usage
+		var known bool
 		if external == upstreamRoute.Protocol {
-			usage, _, err = protocol.ForwardStream(ctx, w, watch.Reader(resp.Body), upstreamRoute.Protocol, model)
+			usage, known, err = protocol.ForwardStream(ctx, w, watch.Reader(resp.Body), upstreamRoute.Protocol, model)
 		} else {
-			usage, _, err = protocol.TranscodeStream(ctx, w, watch.Reader(resp.Body), upstreamRoute.Protocol, external, model)
+			usage, known, err = protocol.TranscodeStream(ctx, w, watch.Reader(resp.Body), upstreamRoute.Protocol, external, model)
 		}
-		report := usageReport(usage)
+		report := usageReport(usage, known)
+		if protocol.ClientCanceled(ctx, err) {
+			report.Status, report.Error = "incomplete", "client canceled"
+		}
 		if err != nil && !protocol.ClientCanceled(ctx, err) {
 			rt.logger.Warn("downstream stream ended with an error", "component", "opencode.stream", "request_id", ids.Request, "model", model, "error", err)
 			report.Status = "error"
@@ -120,23 +123,28 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provid
 		return report, nil
 	}
 
-	responseBody, err := io.ReadAll(streamwatch.LimitReader(ctx, resp.Body))
-	if err != nil {
-		protocol.WriteError(w, external, http.StatusBadGateway, "failed to read upstream response", "upstream_error", ids.Request)
-		return provider.UsageReport{Status: "error", Error: "read upstream failed"}, nil
-	}
+	var responseBody []byte
+	var usage protocol.Usage
+	var known bool
 	// Free models (and the anonymous lane) are force-streamed upstream even when
 	// the client asked for a single JSON document; collapse the SSE back.
 	if upstreamRoute.Anonymous || rt.catalog.IsFreeModel(upstreamRoute.ID) {
-		collapsed, err := protocol.CollapseStream(bytes.NewReader(responseBody), upstreamRoute.Protocol, model)
+		watch := streamwatch.NewWatch(resp.Body, ctx, 0, 0)
+		defer watch.Close()
+		responseBody, usage, known, err = protocol.CollapseStreamWithUsage(watch.Reader(resp.Body), upstreamRoute.Protocol, model)
 		if err != nil {
 			rt.logger.Warn("stream collapse failed", "component", "opencode.conversion", "request_id", ids.Request, "model", model, "error", err)
 			protocol.WriteError(w, external, http.StatusBadGateway, "unsupported upstream response", "upstream_error", ids.Request)
 			return provider.UsageReport{Status: "error", Error: "collapse failed"}, nil
 		}
-		responseBody = collapsed
+	} else {
+		responseBody, err = streamwatch.ReadBody(ctx, resp.Body, 0)
+		if err != nil {
+			protocol.WriteError(w, external, http.StatusBadGateway, "failed to read upstream response", "upstream_error", ids.Request)
+			return provider.UsageReport{Status: "error", Error: "read upstream failed"}, nil
+		}
+		usage, known = protocol.ResponseUsage(upstreamRoute.Protocol, responseBody)
 	}
-	usage, _ := protocol.ResponseUsage(upstreamRoute.Protocol, responseBody)
 	if external != upstreamRoute.Protocol {
 		responseBody, err = protocol.ConvertResponse(upstreamRoute.Protocol, external, responseBody)
 		if err != nil {
@@ -148,7 +156,7 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provid
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(responseBody)
-	return usageReport(usage), nil
+	return usageReport(usage, known), nil
 }
 
 // serveSystemOne relays a System One decision payload verbatim to every tier.
@@ -184,19 +192,27 @@ func (rt *Runtime) serveSystemOne(ctx context.Context, w http.ResponseWriter, ex
 		w.Header().Set("Content-Type", ct)
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
-		return provider.UsageReport{Status: "ok"}, nil
+		watch := streamwatch.NewWatch(resp.Body, ctx, 0, 0)
+		defer watch.Close()
+		_, err = io.Copy(w, watch.Reader(resp.Body))
+		report := usageReport(protocol.Usage{}, false)
+		if protocol.ClientCanceled(ctx, err) {
+			report.Status, report.Error = "incomplete", "client canceled"
+		} else if err != nil {
+			report.Status, report.Error = "error", err.Error()
+		}
+		return report, nil
 	}
-	responseBody, err := io.ReadAll(streamwatch.LimitReader(ctx, resp.Body))
+	responseBody, err := streamwatch.ReadBody(ctx, resp.Body, 0)
 	if err != nil {
 		protocol.WriteError(w, protocol.SystemOne, http.StatusBadGateway, "failed to read upstream response", "upstream_error", ids.Request)
 		return provider.UsageReport{Status: "error", Error: "read upstream failed"}, nil
 	}
-	usage, _ := protocol.ResponseUsage(upstreamRoute.Protocol, responseBody)
+	usage, known := protocol.ResponseUsage(upstreamRoute.Protocol, responseBody)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(responseBody)
-	return usageReport(usage), nil
+	return usageReport(usage, known), nil
 }
 
 func (rt *Runtime) prepareRouteBodies(from protocol.Protocol, route Route, input map[string]any) (map[Tier][]byte, error) {
@@ -258,8 +274,15 @@ func copyErrorResponse(w http.ResponseWriter, proto protocol.Protocol, resp *htt
 	return message
 }
 
-func usageReport(usage protocol.Usage) provider.UsageReport {
+func usageReport(usage protocol.Usage, known bool) provider.UsageReport {
+	var cached *int
+	if usage.CachedKnown {
+		n := usage.Cached
+		cached = &n
+	}
 	return provider.UsageReport{
+		TokensKnown:  &known,
+		CachedTokens: cached,
 		InputTokens:  usage.Input,
 		OutputTokens: usage.Output,
 		Status:       "ok",

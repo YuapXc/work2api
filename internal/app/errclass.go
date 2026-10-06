@@ -62,7 +62,7 @@ const (
 
 var (
 	rateMarkers           = []string{"rate limit", "rate-limiting", "rate-limited", "frequency limit", "too many requests", "usage limit", "请求过于频繁", "使用频率", "限流"}
-	sessionDeadMarkers    = []string{"Offline user session not found", "12153"}
+	sessionDeadMarkers    = []string{"Offline user session not found"}
 	accountFaultMarkers   = []string{"request illegal", "trial not activated", "trial version is not yet activated"}
 	promptTooLongMarkers  = []string{`"code":11115`, `"code":"11115"`, "prompt is too long"}
 	contentBlockedMarkers = []string{"blocked by security policy", "unapproved channel", "illegal api invocation"}
@@ -155,6 +155,23 @@ func isModelBlocked(status int, text, lower string) bool {
 
 func hasBusinessEnvelope(text string) bool {
 	return strings.Contains(text, `"code":`) || strings.Contains(text, `"msg":`)
+}
+
+// Only explicit business-code fields may invalidate a credential.
+func businessCode(text, want string) bool {
+	root := jsonRoot(text)
+	nodes := []map[string]any{root}
+	if inner, ok := root["error"].(map[string]any); ok {
+		nodes = append(nodes, inner)
+	}
+	for _, node := range nodes {
+		for _, key := range []string{"code", "errCode", "error_code"} {
+			if strings.TrimSpace(toStr(node[key])) == want {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isWAFBlocked(status int, text string) bool {
@@ -251,7 +268,7 @@ func classifyUpstream(status int, raw []byte, _ http.Header) ErrKind {
 		return errModelBlocked
 	case status == 402:
 		return errHardCredit
-	case hitFold(text, lower, sessionDeadMarkers):
+	case status >= 400 && (businessCode(text, "12153") || hitFold(text, lower, sessionDeadMarkers)):
 		return errSessionDead
 	case hitFold(text, lower, accountFaultMarkers):
 		return errAccountFault

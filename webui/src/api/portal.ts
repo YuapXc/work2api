@@ -10,6 +10,6 @@ export interface PortalContribution { id: number; user_id: number; account_uid: 
 export interface PortalOverview {
   users: PortalUser[]; invites: PortalInvite[]; groups: PortalGroup[]; accounts?: PortalAccount[]
   contributions?: PortalContribution[]; registration_mode: string
-  user_concurrency?: number; user_concurrency_overrides?: Record<string, number>
+  user_concurrency?: number; user_concurrency_max?: number; user_concurrency_overrides?: Record<string, number>
   default_group_id?: number; default_auto_grant?: boolean
 }

@@ -25,7 +25,7 @@ var version = "dev"
 func main() {
 	cfg := config.Load(os.Args[1:])
 
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		log.Fatalf("create data dir: %v", err)
 	}
 

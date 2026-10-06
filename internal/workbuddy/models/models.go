@@ -304,6 +304,11 @@ func (r *Registry) fetchFromUpstreamContext(ctx context.Context) []fetchedModel 
 		return nil
 	}
 	merged := map[string]fetchedModel{}
+	// Preserve only previously confirmed UID mappings on a failed refresh.
+	// Never infer access from another account's site/profile.
+	r.mu.Lock()
+	previous := cloneAll(r.models)
+	r.mu.Unlock()
 	var order []string
 	modelProfiles := map[string][]string{}
 	modelAccounts := map[string][]string{}
@@ -312,27 +317,55 @@ func (r *Registry) fetchFromUpstreamContext(ctx context.Context) []fetchedModel 
 	// 也供成本优先选号用。nil（该站点没给值）不记，绝不当 0。
 	creditsByRegion := map[string]map[string]float64{}
 	anyOK := false
+	fresh := map[string]bool{}
+	freshCredits := map[string]bool{}
 	for _, account := range accounts {
 		if ctx.Err() != nil {
 			return nil
 		}
 		got := r.fetchOneContext(ctx, account)
+		observed := got != nil
 		if got == nil {
-			continue
+			for _, old := range previous {
+				uids, _ := old["account_uids"].([]string)
+				if !contains(uids, account.UID) || str(old["id"]) == "auto" {
+					continue
+				}
+				old = cloneMap(old)
+				region := siterouting.ProfileSite(account.Profile)
+				delete(old, "credits")
+				if costs, ok := old["credits_by_region"].(map[string]float64); ok {
+					if cost, exists := costs[region]; exists {
+						old["credits"] = cost
+					}
+				}
+				reasoning, _ := old["reasoning"].(map[string]any)
+				got = append(got, fetchedModel{id: str(old["id"]), entry: old, reasoning: reasoning})
+			}
+		} else {
+			anyOK = true
 		}
-		anyOK = true
 		region := siterouting.ProfileSite(account.Profile)
 		for _, fm := range got {
 			if _, exists := merged[fm.id]; !exists {
 				merged[fm.id] = fm
 				order = append(order, fm.id)
+			} else if observed && !fresh[fm.id] {
+				merged[fm.id] = fm
+			}
+			if observed {
+				fresh[fm.id] = true
 			}
 			if c, ok := fm.entry["credits"].(float64); ok {
 				if creditsByRegion[fm.id] == nil {
 					creditsByRegion[fm.id] = map[string]float64{}
 				}
-				if _, seen := creditsByRegion[fm.id][region]; !seen {
+				costKey := fm.id + "\x00" + region
+				if _, seen := creditsByRegion[fm.id][region]; !seen || observed && !freshCredits[costKey] {
 					creditsByRegion[fm.id][region] = c
+				}
+				if observed {
+					freshCredits[costKey] = true
 				}
 			}
 			if !contains(modelProfiles[fm.id], account.Profile) {
@@ -343,10 +376,10 @@ func (r *Registry) fetchFromUpstreamContext(ctx context.Context) []fetchedModel 
 			}
 		}
 	}
-	if !anyOK || len(order) == 0 {
+	if !anyOK {
 		return nil
 	}
-	var out []fetchedModel
+	out := []fetchedModel{}
 	for _, id := range order {
 		fm := merged[id]
 		fm.entry["profiles"] = modelProfiles[id]
@@ -396,7 +429,7 @@ func (r *Registry) RefreshAccount(ctx context.Context, uid string) bool {
 		return false
 	}
 	got := r.fetchOneContext(ctx, account)
-	if len(got) == 0 {
+	if got == nil {
 		return false
 	}
 	if account.Provider == "workbuddy" {
@@ -517,13 +550,14 @@ func (r *Registry) fetchOneContext(ctx context.Context, account *pool.Account) [
 	modelsRaw, _ := d["models"].([]any)
 	agents, _ := d["agents"].([]any)
 	var cliIDs []any
+	cliFound := false
 	for _, ag := range agents {
 		if a, ok := ag.(map[string]any); ok && a["name"] == "cli" {
-			cliIDs, _ = a["models"].([]any)
+			cliIDs, cliFound = a["models"].([]any)
 			break
 		}
 	}
-	if len(cliIDs) == 0 {
+	if !cliFound {
 		return nil
 	}
 	dyn := map[string]map[string]any{}
@@ -534,7 +568,7 @@ func (r *Registry) fetchOneContext(ctx context.Context, account *pool.Account) [
 			}
 		}
 	}
-	var out []fetchedModel
+	out := []fetchedModel{}
 	for _, midAny := range cliIDs {
 		mid := str(midAny)
 		m := dyn[mid]
@@ -552,9 +586,6 @@ func (r *Registry) fetchOneContext(ctx context.Context, account *pool.Account) [
 		}
 		e["profile"] = account.Profile
 		out = append(out, fetchedModel{id: mid, entry: e, reasoning: reasoning})
-	}
-	if len(out) == 0 {
-		return nil
 	}
 	return out
 }

@@ -42,12 +42,18 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	writer := &cancelWriter{ResponseWriter: w, cancel: cancel}
-	report, _ := rt.Serve(ctx, provider.ServeRequest{
+	report, err := rt.Serve(ctx, provider.ServeRequest{
 		Protocol: proto,
 		Payload:  payload,
 		Writer:   writer,
 		AppName:  principal.AppName,
 	})
+	if err != nil {
+		report.Status, report.Error = "error", err.Error()
+		if !writer.committed && r.Context().Err() == nil {
+			writeAPIErr(writer, errBody(502, "供应商未完成请求，请检查渠道配置后重试", "upstream_error"))
+		}
+	}
 	s.o.logRuntimeUsage(report, string(proto), resolved, t0, principal.AppName, principal.UserID, principal.AppID)
 	streamwatch.Outcome(r.Context(), report.Status)
 	return true
@@ -171,11 +177,19 @@ func (o *Orchestrator) benchTargets(ctx context.Context) []benchTarget {
 // A downstream write failure cancels every provider's upstream context.
 type cancelWriter struct {
 	http.ResponseWriter
-	cancel context.CancelFunc
+	cancel    context.CancelFunc
+	committed bool
 }
 
 func (w *cancelWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+func (w *cancelWriter) WriteHeader(status int) {
+	if status >= 200 {
+		w.committed = true
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
 func (w *cancelWriter) Write(p []byte) (int, error) {
+	w.committed = true
 	_ = http.NewResponseController(w.ResponseWriter).SetWriteDeadline(time.Now().Add(30 * time.Second))
 	n, err := w.ResponseWriter.Write(p)
 	if err != nil {
@@ -184,6 +198,7 @@ func (w *cancelWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 func (w *cancelWriter) Flush() {
+	w.committed = true
 	controller := http.NewResponseController(w.ResponseWriter)
 	_ = controller.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	if err := controller.Flush(); err != nil {

@@ -936,3 +936,98 @@ func TestAdaptiveProtocolCapacity(t *testing.T) {
 		}
 	}
 }
+
+func TestPublicBodySaturationPreservesProtectedIntake(t *testing.T) {
+	s := NewServer(&Orchestrator{cfg: &config.Config{BodyReadConcurrency: 1}})
+	for i := 0; i < cap(s.publicBodySlots); i++ {
+		s.publicBodySlots <- struct{}{}
+	}
+	for i := 0; i < cap(s.publicBodyWaiting); i++ {
+		s.publicBodyWaiting <- struct{}{}
+	}
+	if !s.publicBodies.reserve(s.publicBodies.limit) {
+		t.Fatal("failed to saturate public budget")
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /portal/api/auth/login", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) })
+	mux.HandleFunc("POST /protected", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) })
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) })
+	h := s.requestGuard(mux)
+	public := httptest.NewRecorder()
+	h.ServeHTTP(public, httptest.NewRequest("POST", "/portal/api/auth/login", strings.NewReader(`{}`)))
+	if public.Code != 429 {
+		t.Fatal("public intake was not bounded", public.Code)
+	}
+	protected := httptest.NewRecorder()
+	h.ServeHTTP(protected, httptest.NewRequest("POST", "/protected", strings.NewReader(`{}`)))
+	if protected.Code != 204 || s.bodies.usage() != 0 || len(s.bodySlots) != 0 {
+		t.Fatal("public traffic exhausted protected intake", protected.Code)
+	}
+	for _, tc := range []struct {
+		method, path string
+		code         int
+	}{{"POST", "/missing", 404}, {"POST", "//protected", 307}, {"POST", "/./protected", 307}, {"POST", "//portal/api/auth/login", 307}, {"POST", "/health", 405}, {"GET", "/health", 204}, {"HEAD", "/health", 204}} {
+		body := &unreadAdmissionBody{t: t}
+		r := httptest.NewRequest(tc.method, tc.path, nil)
+		r.Body = body
+		r.ContentLength = -1
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != tc.code {
+			t.Fatalf("%s %s: %d", tc.method, tc.path, w.Code)
+		}
+		if tc.code == 405 && w.Header().Get("Allow") == "" {
+			t.Fatal("method allowance lost")
+		}
+	}
+}
+
+type unreadAdmissionBody struct{ t *testing.T }
+
+func (b *unreadAdmissionBody) Read([]byte) (int, error) {
+	b.t.Error("unused body was read")
+	return 0, io.EOF
+}
+func (*unreadAdmissionBody) Close() error { return nil }
+
+type refreshCatalogTransport struct{ stage, calls int }
+
+func (tr *refreshCatalogTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	tr.calls++
+	if tr.stage == 1 && tr.calls == 1 {
+		return nil, errors.New("catalog temporarily unavailable")
+	}
+	body := `{"data":{"models":[{"id":"test-model","name":"Fresh"}],"agents":[{"name":"cli","models":["test-model"]}]}}`
+	if tr.stage == 0 {
+		body = strings.ReplaceAll(body, "Fresh", "Old")
+	}
+	if tr.stage == 2 {
+		body = `{"data":{"models":[],"agents":[{"name":"cli","models":[]}]}}`
+	}
+	return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+}
+func TestCatalogPartialFailurePreservesOnlyConfirmedMappings(t *testing.T) {
+	o, original := newDNSFailoverOrch(t, &failingUpstream{})
+	o.pool = pool.New(map[string]pool.Credential{"one": catalogOffline{original.Mgr}, "two": catalogOffline{original.Mgr}}, "")
+	tr := &refreshCatalogTransport{}
+	o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: tr})
+	o.models.Refresh()
+	tr.stage, tr.calls = 1, 0
+	o.models.Refresh()
+	var found map[string]any
+	for _, model := range o.models.ListCached() {
+		if model["id"] == "test-model" {
+			found = model
+		}
+	}
+	if found == nil || found["name"] != "Fresh" || len(found["account_uids"].([]string)) != 2 {
+		t.Fatal("partial refresh lost verified account mapping or fresh metadata", found)
+	}
+	tr.stage, tr.calls = 2, 0
+	o.models.Refresh()
+	for _, model := range o.models.ListCached() {
+		if model["id"] == "test-model" {
+			t.Fatal("valid empty catalog retained revoked model", model)
+		}
+	}
+}

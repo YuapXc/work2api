@@ -34,6 +34,22 @@ jobs:
       - name: Test
         run: go test ./...
 
+  frontend:
+    name: Frontend and embedded assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+      - working-directory: webui
+        run: |
+          npm ci
+          npm run build
+          npm run check:embed
+
   format:
     name: gofmt
     runs-on: ubuntu-latest

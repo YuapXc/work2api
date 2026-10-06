@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -67,14 +68,37 @@ var DefaultSettings = map[string]string{
 	"qoder_machine_salt":      "",
 	// 用户门户（阶段 A）：管理员可配置的共享模型禁用列表（JSON 数组），从共享
 	// 权限集中扣除。注册方式等部署级开关走环境变量，不进 settings。
-	"portal_disabled_models":    "",
-	"portal_public_url":         "",
-	"portal_default_group":      "0",
-	"portal_default_auto_grant": "0",
+	"portal_disabled_models":         "",
+	"portal_public_url":              "",
+	"portal_default_group":           "0",
+	"portal_default_auto_grant":      "0",
+	"portal_user_concurrency_limits": "{}",
 }
 
 // New opens (creating if needed) the SQLite database at path.
 func New(path string) (*DB, error) {
+	// Create ordinary filesystem databases privately before SQLite initializes
+	// them (its WAL/SHM inherit the database mode). URI/in-memory DSNs retain
+	// SQLite semantics; Windows access control still requires host ACLs.
+	if path != ":memory:" && !strings.HasPrefix(path, "file:") {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			return nil, err
+		}
+		err = file.Chmod(0o600)
+		closeErr := file.Close()
+		if err != nil {
+			return nil, err
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		for _, suffix := range []string{"-wal", "-shm"} {
+			if err := os.Chmod(path+suffix, 0o600); err != nil && !os.IsNotExist(err) {
+				return nil, err
+			}
+		}
+	}
 	// MaxOpenConns(1): serialize like the Python single-connection + lock model,
 	// and guarantee the PRAGMA ordering below (auto_vacuum must precede WAL and
 	// table creation, or it is silently ignored).

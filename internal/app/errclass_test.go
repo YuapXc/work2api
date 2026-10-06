@@ -16,6 +16,9 @@ func TestClassifyUpstream(t *testing.T) {
 	}{
 		{"11102 model blocked", 400, `{"code":11102,"msg":"service info not found"}`, errModelBlocked},
 		{"402 hard credit", 402, ``, errHardCredit},
+		{"number in ordinary error is not session dead", 400, `{"msg":"request 12153 invalid"}`, errClient},
+		{"nested session code", 401, `{"error":{"code":"12153"}}`, errSessionDead},
+		{"successful model output is not session dead", 200, `{"content":"12153"}`, errNone},
 		{"401 session dead 12153", 401, `{"code":12153,"msg":"Offline user session not found"}`, errSessionDead},
 		{"403 request illegal account fault", 403, `{"code":11140,"msg":"request illegal"}`, errAccountFault},
 		{"429 + 14018 hard credit", 429, `{"code":14018,"msg":"credit"}`, errHardCredit},

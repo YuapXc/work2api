@@ -101,10 +101,12 @@ async function onLogin() {
 
 async function logout() {
   try {
-    await fetch('/admin/logout', { method: 'POST' })
-  } catch { /* 忽略 */ }
-  authOk.value = false
-  toast.success('已退出登录')
+    const response = await fetch('/admin/logout', { method: 'POST' })
+    if (!response.ok) throw new Error('退出登录失败，请重试')
+    localStorage.removeItem('workbuddy_admin_token')
+    authOk.value = false
+    toast.success('已退出登录')
+  } catch (e: any) { toast.error(e?.message || '退出登录失败，请检查连接') }
 }
 
 // ---------- 网关健康（30s 轮询） ----------

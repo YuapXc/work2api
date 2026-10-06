@@ -142,7 +142,7 @@ func CodexInputToMessages(input interface{}, instructions string) []interface{} 
 			}
 			itemType, _ := itemMap["type"].(string)
 			switch itemType {
-			case "message":
+			case "message", "":
 				role, _ := itemMap["role"].(string)
 				content := itemMap["content"]
 				if contentStr, ok := content.(string); ok {

@@ -4,10 +4,6 @@
 # 新功能"构建了却没生效"。）
 set -e
 cd "$(dirname "$0")"
-npm run build
-rm -rf ../internal/app/webui/assets ../internal/app/webui/index.html
-cp -r dist/assets ../internal/app/webui/assets
-cp dist/index.html ../internal/app/webui/index.html
-[ -f dist/logo.svg ] && cp dist/logo.svg ../internal/app/webui/logo.svg
+npm run build:embed
 echo "synced to internal/app/webui:"
 grep -oE 'assets/index-[^"]+\.js' ../internal/app/webui/index.html

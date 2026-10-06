@@ -74,7 +74,7 @@ async function load() {
     defaultAuto.value = !!data.value.default_auto_grant
     for (const a of data.value.accounts || []) sharingDrafts.value[a.uid] = { mode: a.sharing_mode || 'private', groups: data.value.groups.filter(g => accountsOf(g).includes(a.uid)).map(g => g.id) }
     for (const g of data.value.groups) groupDrafts.value[g.id] = parseModels(g.allowed_models).filter(isPublicModel)
-    for (const u of data.value.users) concurrencyDrafts.value[u.id] = String(data.value.user_concurrency_overrides?.[String(u.id)] || 0)
+    for (const u of data.value.users) concurrencyDrafts.value[u.id] = String(Math.min(data.value.user_concurrency_overrides?.[String(u.id)] || 0, data.value.user_concurrency_max || 4))
     loaded.value = true
   } catch (e: any) { error.value = e?.response?.data?.error?.message || e?.message || '加载失败' }
   finally { loading.value = false }
@@ -195,9 +195,9 @@ async function copyInvite(invite: PortalInvite, link = false) {
       <WInput v-model="bootstrapName" placeholder="管理员用户名" /><WInput v-model="bootstrapPass" type="password" placeholder="8–72 字节密码" /><WButton variant="primary" :loading="busy" @click="bootstrap">初始化</WButton>
     </div>
     <section class="glass rounded-xl p-5 space-y-3">
-      <h2 class="font-semibold">用户与密码恢复</h2><p class="text-micro text-faint">默认每用户同时执行 {{ data.user_concurrency || 2 }} 个请求；所有 Key 合并计算。可信用户可提高到 3，共享和全局上限仍生效。调整适用于后续请求。</p><p v-if="!data.users.length" class="text-small text-faint">暂无用户。</p>
+      <h2 class="font-semibold">用户与密码恢复</h2><p class="text-micro text-faint">默认每用户同时执行 {{ data.user_concurrency || 4 }} 个请求；所有 Key 合并计算。可按用户调整，最多 {{ data.user_concurrency_max || 4 }}；共享、账号和全局上限仍生效。调整适用于后续请求。</p><p v-if="!data.users.length" class="text-small text-faint">暂无用户。</p>
       <div v-for="u in data.users" :key="u.id" class="rounded-lg border border-line p-3 space-y-2">
-        <div class="flex items-center gap-2 text-small"><label :for="`concurrency-${u.id}`">执行并发</label><select :id="`concurrency-${u.id}`" v-model="concurrencyDrafts[u.id]" :disabled="busy" class="rounded-lg border border-line bg-bg p-2"><option value="0">默认</option><option value="1">1</option><option value="2">2</option><option value="3">3（可信用户）</option></select><WButton size="sm" :disabled="busy" @click="mutate(() => api.portalWrite(`users/${u.id}/concurrency`, { limit: Number(concurrencyDrafts[u.id]) }), '并发上限已更新')">保存并发</WButton></div>
+        <div class="flex items-center gap-2 text-small"><label :for="`concurrency-${u.id}`">执行并发</label><select :id="`concurrency-${u.id}`" v-model="concurrencyDrafts[u.id]" :disabled="busy" class="rounded-lg border border-line bg-bg p-2"><option value="0">默认</option><option v-for="n in (data.user_concurrency_max || 4)" :key="n" :value="String(n)">{{ n }}</option></select><WButton size="sm" :disabled="busy" @click="mutate(() => api.portalWrite(`users/${u.id}/concurrency`, { limit: Number(concurrencyDrafts[u.id]) }), '并发上限已更新')">保存并发</WButton></div>
         <div class="flex flex-wrap items-center gap-3"><span>{{ u.username }} <span class="text-micro text-faint">#{{ u.id }} · {{ u.role }} · {{ u.status }}</span></span><WButton size="sm" :disabled="busy" @click="mutate(() => api.portalWrite(`users/${u.id}/status`, { status: u.status === 'active' ? 'disabled' : 'active' }), '用户状态已更新')">{{ u.status === 'active' ? '停用' : '启用' }}</WButton></div>
         <div class="flex gap-2"><WInput v-model="passwords[u.id]" type="password" placeholder="新密码（8–72 字节）" /><WButton size="sm" :disabled="busy" @click="resetPassword(u)">重置密码并退出设备</WButton></div>
       </div>

@@ -227,7 +227,7 @@ onMounted(load)
       </template>
       <template v-else>
         <div class="mb-2 flex items-center gap-2 text-small text-live"><WIcon name="check" :size="16" /> 密钥已生成，请立即复制保存</div>
-        <p class="mb-3 text-micro text-faint">出于安全，完整密钥只显示这一次。关闭后将无法再次查看明文。</p>
+        <p class="mb-3 text-micro text-faint">请复制并妥善保存。授权管理员可以再次查看完整密钥，请勿分享管理权限。</p>
         <div class="flex items-center gap-2 rounded-lg border border-line bg-bg/50 p-3">
           <code class="mono flex-1 break-all text-small text-brand">{{ newKey }}</code>
           <WButton size="sm" variant="ghost" @click="copy(newKey)"><WIcon name="copy" :size="15" /> 复制</WButton>

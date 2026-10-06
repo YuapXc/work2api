@@ -29,7 +29,8 @@ var passthroughBodyKeys = map[string]struct{}{
 	"stream_options": {}, "stop": {}, "presence_penalty": {}, "frequency_penalty": {},
 	"n": {}, "response_format": {}, "seed": {}, "user": {}, "reasoning_effort": {},
 	"verbosity": {}, "reasoning_summary": {},
-	"thinking": {}, // DeepSeek thinking switch
+	"thinking":            {}, // DeepSeek thinking switch
+	"parallel_tool_calls": {},
 }
 
 // UpstreamError carries a non-200 upstream status and its raw body.
@@ -152,7 +153,10 @@ func (c *Client) StreamUpstream(ctx context.Context, headers map[string]string, 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		raw := readAll(resp.Body)
+		raw, err := streamwatch.ReadBody(ctx, resp.Body, 1<<20)
+		if err != nil {
+			return err
+		}
 		return &UpstreamError{StatusCode: resp.StatusCode, Raw: raw, Header: resp.Header}
 	}
 
@@ -167,7 +171,10 @@ func (c *Client) StreamUpstream(ctx context.Context, headers map[string]string, 
 // handleJSONResponse deals with a non-streaming JSON body returned for a stream
 // request, normalizing it into two SSE lines.
 func (c *Client) handleJSONResponse(resp *http.Response, yield LineFunc) error {
-	raw := readAll(resp.Body)
+	raw, err := streamwatch.ReadBody(resp.Request.Context(), resp.Body, 0)
+	if err != nil {
+		return err
+	}
 	var chunk map[string]any
 	if err := json.Unmarshal(stripBOM(raw), &chunk); err != nil {
 		return invalidStream("上游返回了无效 JSON，无法读取模型响应")
@@ -293,8 +300,8 @@ func streamSSE(resp *http.Response, yield LineFunc) error {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		if watch.Err != nil {
-			return watch.Err
+		if watch.Err() != nil {
+			return watch.Err()
 		}
 		return err
 	}
@@ -469,21 +476,6 @@ func codeOK(v any) bool {
 	default:
 		return false
 	}
-}
-
-func readAll(r interface{ Read([]byte) (int, error) }) []byte {
-	buf := make([]byte, 0, 4096)
-	tmp := make([]byte, 4096)
-	for {
-		n, err := r.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-		}
-		if err != nil {
-			break
-		}
-	}
-	return buf
 }
 
 func stripBOM(b []byte) []byte {

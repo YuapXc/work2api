@@ -9,6 +9,7 @@ package app
 // 单账号场景键照常提取，行为不变。
 
 import (
+	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
 	"strconv"
@@ -88,18 +89,20 @@ func extractSessionKey(body map[string]any) string {
 type sessionEntry struct {
 	uid     string
 	expires float64
+	order   *list.Element
 }
 
 // sessionRouter 是 会话键 → 账号 uid 的粘性映射（TTL + 惰性 GC，纯内存）。
 type sessionRouter struct {
-	mu  sync.Mutex
-	ttl float64
-	max int
-	m   map[string]sessionEntry
+	mu    sync.Mutex
+	ttl   float64
+	max   int
+	m     map[string]sessionEntry
+	order *list.List
 }
 
 func newSessionRouter() *sessionRouter {
-	return &sessionRouter{ttl: 1800, max: 2000, m: map[string]sessionEntry{}}
+	return &sessionRouter{ttl: 1800, max: 2000, m: map[string]sessionEntry{}, order: list.New()}
 }
 
 func (r *sessionRouter) removeAccount(uid string) {
@@ -107,7 +110,7 @@ func (r *sessionRouter) removeAccount(uid string) {
 	defer r.mu.Unlock()
 	for key, entry := range r.m {
 		if entry.uid == uid {
-			delete(r.m, key)
+			r.removeLocked(key)
 		}
 	}
 }
@@ -119,13 +122,24 @@ func (r *sessionRouter) bind(key, uid string) {
 	now := nowSec()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.m[key] = sessionEntry{uid: uid, expires: now + r.ttl}
-	if len(r.m) > r.max {
-		for k, e := range r.m {
-			if e.expires <= now {
-				delete(r.m, k)
-			}
-		}
+	if entry, ok := r.m[key]; ok {
+		entry.uid, entry.expires = uid, now+r.ttl
+		r.order.MoveToBack(entry.order)
+		r.m[key] = entry
+		return
+	}
+	for len(r.m) >= r.max && r.order.Len() > 0 {
+		r.removeLocked(r.order.Front().Value.(string))
+	}
+	r.m[key] = sessionEntry{uid: uid, expires: now + r.ttl, order: r.order.PushBack(key)}
+}
+
+// Evict oldest bindings under pressure; ordinary lookup does not renew TTL
+// or alter account selection. Every auxiliary entry has the same hard cap.
+func (r *sessionRouter) removeLocked(key string) {
+	if entry, ok := r.m[key]; ok {
+		r.order.Remove(entry.order)
+		delete(r.m, key)
 	}
 }
 
@@ -134,7 +148,7 @@ func (r *sessionRouter) unbind(key string) {
 		return
 	}
 	r.mu.Lock()
-	delete(r.m, key)
+	r.removeLocked(key)
 	r.mu.Unlock()
 }
 
@@ -151,7 +165,7 @@ func (r *sessionRouter) lookup(key string) string {
 		return ""
 	}
 	if e.expires <= now {
-		delete(r.m, key)
+		r.removeLocked(key)
 		return ""
 	}
 	return e.uid

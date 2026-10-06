@@ -97,6 +97,21 @@ func Body(body map[string]any) (map[string]any, Stats) {
 	rawTools, _ := body["tools"].([]any)
 	messages := cloneMsgs(rawMsgs)
 	tools := cloneMsgs(rawTools)
+	// The upstream projection intentionally summarizes text history. It has
+	// no faithful representation for image/file blocks, so preserve those
+	// requests rather than silently changing a vision task into text-only.
+	for _, message := range messages {
+		if blocks, ok := message["content"].([]any); ok {
+			for _, raw := range blocks {
+				if block, ok := raw.(map[string]any); ok {
+					typeName, _ := block["type"].(string)
+					if typeName != "text" && typeName != "input_text" && typeName != "output_text" {
+						return projected, Stats{Mode: "multimodal-preserved", OriginalMessages: len(messages), ProjectedMessages: len(messages), OriginalTools: len(tools), ProjectedTools: len(tools)}
+					}
+				}
+			}
+		}
+	}
 
 	projectedTools, toolStats := projectTools(tools)
 	projected["tools"] = projectedTools

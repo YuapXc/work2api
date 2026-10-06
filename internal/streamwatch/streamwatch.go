@@ -14,6 +14,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,8 +31,8 @@ const (
 // read the returned io.ReadCloser normally, and the underlying body is closed
 // for you on first deadline breach or when the watcher's own Close is called.
 type Watch struct {
-	// Err is non-nil once the watchdog fired (Idle/Total breach).
-	Err error
+	err       atomic.Pointer[BreachError]
+	closeOnce sync.Once
 
 	ctx        context.Context
 	underlying ioCloser
@@ -90,11 +92,15 @@ func (w *Watch) Touch() {
 // Close stops the watchdog (does NOT close the underlying body — the owner's
 // defer does that).
 func (w *Watch) Close() {
-	select {
-	case <-w.done:
-	default:
-		close(w.done)
+	w.closeOnce.Do(func() { close(w.done) })
+}
+
+// Err safely publishes a watchdog failure to the reader goroutine.
+func (w *Watch) Err() error {
+	if err := w.err.Load(); err != nil {
+		return err
 	}
+	return nil
 }
 
 func (w *Watch) loop(ctx context.Context) {
@@ -104,7 +110,7 @@ func (w *Watch) loop(ctx context.Context) {
 	defer totalTimer.Stop()
 
 	abort := func(kind string, age time.Duration) {
-		w.Err = &BreachError{Kind: kind, Age: age}
+		w.err.Store(&BreachError{Kind: kind, Age: age})
 		_ = w.underlying.Close() // unblocks the pending Read at the call site
 	}
 	for {
@@ -112,7 +118,8 @@ func (w *Watch) loop(ctx context.Context) {
 		case <-w.done:
 			return
 		case <-ctx.Done():
-			return // request canceled; body owner's ctx handling closes the body
+			_ = w.underlying.Close()
+			return
 		case <-idleTimer.C:
 			abort("idle", w.idle)
 			return

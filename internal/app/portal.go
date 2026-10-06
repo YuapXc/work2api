@@ -1218,7 +1218,7 @@ func (s *Server) adminPortalOverview(w http.ResponseWriter, r *http.Request) {
 		writeAPIErr(w, errBody(503, "默认共享池查询失败", "server_error"))
 		return
 	}
-	writeJSON(w, 200, map[string]any{"users": users, "invites": invites, "groups": groups, "contributions": contributions, "accounts": accounts, "account_count": len(accounts), "registration_mode": s.o.cfg.PortalRegistrationMode, "user_concurrency": s.portalUserLimit(0), "user_concurrency_overrides": portalConcurrencyOverrides(settings), "default_group_id": intOf(settings["portal_default_group"]), "default_auto_grant": settings["portal_default_auto_grant"] == "1"})
+	writeJSON(w, 200, map[string]any{"users": users, "invites": invites, "groups": groups, "contributions": contributions, "accounts": accounts, "account_count": len(accounts), "registration_mode": s.o.cfg.PortalRegistrationMode, "user_concurrency": s.portalUserLimit(0), "user_concurrency_max": s.modelsAdmission.sharedCapacity, "user_concurrency_overrides": portalConcurrencyOverrides(settings), "default_group_id": intOf(settings["portal_default_group"]), "default_auto_grant": settings["portal_default_auto_grant"] == "1"})
 }
 
 func (s *Server) adminPortalDefaultGroup(w http.ResponseWriter, r *http.Request) {
@@ -1281,6 +1281,39 @@ func (s *Server) portalGroupViews() ([]map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	settings, err := s.o.db.GetSettings()
+	if err != nil {
+		return nil, err
+	}
+	disabled := map[string]bool{}
+	for _, id := range parseJSONStringArray(settings["portal_disabled_models"]) {
+		disabled[id] = true
+	}
+	catalog := s.o.models.ListCached()
+	users, err := s.o.db.ListUsers()
+	if err != nil {
+		return nil, err
+	}
+	eligibleByGroup := map[int64]int{}
+	for _, u := range users {
+		if u.Status != "active" {
+			continue
+		}
+		active, err := s.o.db.ActiveContributionUIDs(u.ID)
+		if err != nil {
+			return nil, err
+		}
+		if len(active) == 0 {
+			continue
+		}
+		granted, err := s.o.db.GrantedGroups(u.ID)
+		if err != nil {
+			return nil, err
+		}
+		for _, group := range granted {
+			eligibleByGroup[group.ID]++
+		}
+	}
 	out := []map[string]any{}
 	for _, g := range groups {
 		accounts, err := s.o.db.GroupAccountUIDs(g.ID)
@@ -1306,15 +1339,7 @@ func (s *Server) portalGroupViews() ([]map[string]any, error) {
 			}
 		}
 		usable := map[string]bool{}
-		settings, err := s.o.db.GetSettings()
-		if err != nil {
-			return nil, err
-		}
-		disabled := map[string]bool{}
-		for _, id := range parseJSONStringArray(settings["portal_disabled_models"]) {
-			disabled[id] = true
-		}
-		for _, model := range s.o.models.ListCached() {
+		for _, model := range catalog {
 			id := str2(model["id"])
 			if disabled[id] || id == "auto" || !slices.Contains(models, id) {
 				continue
@@ -1327,33 +1352,8 @@ func (s *Server) portalGroupViews() ([]map[string]any, error) {
 			}
 		}
 		eligibleUsers := 0
-		users, err := s.o.db.ListUsers()
-		if err != nil {
-			return nil, err
-		}
 		if g.Enabled && len(usable) > 0 {
-			for _, u := range users {
-				if u.Status != "active" {
-					continue
-				}
-				active, err := s.o.db.ActiveContributionUIDs(u.ID)
-				if err != nil {
-					return nil, err
-				}
-				if len(active) == 0 {
-					continue
-				}
-				groups, err := s.o.db.GrantedGroups(u.ID)
-				if err != nil {
-					return nil, err
-				}
-				for _, granted := range groups {
-					if granted.ID == g.ID {
-						eligibleUsers++
-						break
-					}
-				}
-			}
+			eligibleUsers = eligibleByGroup[g.ID]
 		}
 		out = append(out, map[string]any{"id": g.ID, "name": g.Name, "provider": g.Provider, "enabled": g.Enabled, "allowed_models": models, "accounts": accounts, "grants": grants, "created_at": g.CreatedAt, "ready_accounts": len(ready), "usable_models": len(usable), "eligible_users": eligibleUsers})
 	}

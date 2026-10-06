@@ -8,6 +8,7 @@ import (
 
 	"work2api/internal/identity"
 	"work2api/internal/jsonutil"
+	"work2api/internal/tokenusage"
 )
 
 func ConvertResponse(from, to Protocol, body []byte) ([]byte, error) {
@@ -237,12 +238,10 @@ func encodeBridgeResponse(protocol Protocol, response bridgeResponse) map[string
 			"error":              nil,
 			"incomplete_details": incomplete,
 			"usage": map[string]any{
-				"input_tokens":  response.Usage.Input,
-				"output_tokens": response.Usage.Output,
-				"total_tokens":  response.Usage.Total,
-				"input_tokens_details": map[string]any{
-					"cached_tokens": response.Usage.Cached,
-				},
+				"input_tokens":         response.Usage.Input,
+				"output_tokens":        response.Usage.Output,
+				"total_tokens":         response.Usage.Total,
+				"input_tokens_details": cacheDetails(response.Usage),
 				"output_tokens_details": map[string]any{
 					"reasoning_tokens": response.Usage.Reasoning,
 				},
@@ -291,7 +290,10 @@ func decodeOpenAIUsage(usage map[string]any) Usage {
 		jsonutil.IntAt(usage, "input_tokens_details", "cache_creation_input_tokens"),
 	)
 	reasoning := jsonutil.FirstNonZero(jsonutil.IntAt(usage, "completion_tokens_details", "reasoning_tokens"), jsonutil.IntAt(usage, "output_tokens_details", "reasoning_tokens"))
-	return Usage{Input: input, Output: output, Total: total, Cached: cached, CacheCreation: cacheCreation, Reasoning: reasoning}
+	if observed := tokenusage.Cached(usage); observed != nil {
+		cached = *observed
+	}
+	return Usage{Input: input, Output: output, Total: total, Cached: cached, CachedKnown: tokenusage.Cached(usage) != nil, CacheCreation: cacheCreation, Reasoning: reasoning}
 }
 
 func decodeAnthropicUsage(usage map[string]any) Usage {
@@ -305,31 +307,41 @@ func decodeAnthropicUsage(usage map[string]any) Usage {
 		Output:        output,
 		Total:         input + output,
 		Cached:        cached,
+		CachedKnown:   tokenusage.Cached(usage) != nil,
 		CacheCreation: cacheCreation,
 	}
 }
 
 func openAIUsage(usage Usage) map[string]any {
 	return map[string]any{
-		"prompt_tokens":     usage.Input,
-		"completion_tokens": usage.Output,
-		"total_tokens":      usage.Total,
-		"prompt_tokens_details": map[string]any{
-			"cached_tokens": usage.Cached,
-		},
+		"prompt_tokens":         usage.Input,
+		"completion_tokens":     usage.Output,
+		"total_tokens":          usage.Total,
+		"prompt_tokens_details": cacheDetails(usage),
 		"completion_tokens_details": map[string]any{
 			"reasoning_tokens": usage.Reasoning,
 		},
 	}
 }
 
+func cacheDetails(usage Usage) map[string]any {
+	out := map[string]any{}
+	if usage.CachedKnown || usage.Cached != 0 {
+		out["cached_tokens"] = usage.Cached
+	}
+	return out
+}
+
 func anthropicUsage(usage Usage) map[string]any {
-	return map[string]any{
+	out := map[string]any{
 		"input_tokens":                max(usage.Input-usage.Cached-usage.CacheCreation, 0),
 		"output_tokens":               usage.Output,
 		"cache_creation_input_tokens": usage.CacheCreation,
-		"cache_read_input_tokens":     usage.Cached,
 	}
+	if usage.CachedKnown || usage.Cached != 0 {
+		out["cache_read_input_tokens"] = usage.Cached
+	}
+	return out
 }
 
 func chatStop(stop string) string {

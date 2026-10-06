@@ -46,12 +46,12 @@ func TestIdleAbortUnblocksRead(t *testing.T) {
 	select {
 	case err := <-done:
 		// Read 被解除阻塞后返回 EOF（body 已关）；watchdog 应记录 breach
-		if w.Err == nil {
+		if w.Err() == nil {
 			t.Fatal("watchdog 应记录 idle breach")
 		}
 		var be *BreachError
-		if !errors.As(w.Err, &be) || be.Kind != "idle" {
-			t.Fatalf("应为 idle breach，got %v", w.Err)
+		if !errors.As(w.Err(), &be) || be.Kind != "idle" {
+			t.Fatalf("应为 idle breach，got %v", w.Err())
 		}
 		if err != io.EOF {
 			t.Fatalf("Read 应以 EOF 结束，got %v", err)
@@ -72,8 +72,8 @@ func TestTouchKeepsAlive(t *testing.T) {
 		w.Touch()
 		time.Sleep(20 * time.Millisecond)
 	}
-	if w.Err != nil {
-		t.Fatalf("持续活动不应触发看门狗: %v", w.Err)
+	if w.Err() != nil {
+		t.Fatalf("持续活动不应触发看门狗: %v", w.Err())
 	}
 }
 
@@ -96,8 +96,8 @@ func TestTotalCap(t *testing.T) {
 	}()
 	time.Sleep(200 * time.Millisecond)
 	var be *BreachError
-	if w.Err == nil || !errors.As(w.Err, &be) || be.Kind != "total" {
-		t.Fatalf("总时长上限应触发 total breach，got %v", w.Err)
+	if w.Err() == nil || !errors.As(w.Err(), &be) || be.Kind != "total" {
+		t.Fatalf("总时长上限应触发 total breach，got %v", w.Err())
 	}
 }
 
@@ -109,8 +109,8 @@ func TestCtxCancel(t *testing.T) {
 	defer w.Close()
 	cancel()
 	time.Sleep(120 * time.Millisecond)
-	if w.Err != nil {
-		t.Fatalf("ctx 取消不应触发 breach: %v", w.Err)
+	if w.Err() != nil {
+		t.Fatalf("ctx 取消不应触发 breach: %v", w.Err())
 	}
 }
 
@@ -122,5 +122,22 @@ func TestReaderPassthrough(t *testing.T) {
 	data, err := io.ReadAll(w.Reader(body))
 	if err != nil || string(data) != "hello stream" {
 		t.Fatalf("passthrough 失败: %q %v", data, err)
+	}
+}
+
+func TestReadBodyCancellationUnblocksAndReturnsContext(t *testing.T) {
+	body := newFakeBody()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { _, err := ReadBody(ctx, body, 0); result <- err }()
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal("cancellation reported as successful EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancellation left body read blocked")
 	}
 }

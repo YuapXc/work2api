@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 )
 
@@ -15,6 +16,13 @@ import (
 // gateway forces stream:true on the wire and collapses the events back so
 // downstream clients that asked for a plain JSON reply keep working.
 func CollapseStream(reader io.Reader, protocol Protocol, model string) ([]byte, error) {
+	body, _, _, err := CollapseStreamWithUsage(reader, protocol, model)
+	return body, err
+}
+
+// CollapseStreamWithUsage retains whether the upstream actually supplied usage;
+// synthesized zero counters in the encoded response are not an observation.
+func CollapseStreamWithUsage(reader io.Reader, protocol Protocol, model string) ([]byte, Usage, bool, error) {
 	parser := &bridgeStreamParser{
 		protocol:          protocol,
 		tools:             map[string]bool{},
@@ -50,23 +58,43 @@ func CollapseStream(reader io.Reader, protocol Protocol, model string) ([]byte, 
 	})
 	if readErr != nil && readErr != errStreamNormalTermination {
 		if streamErr != nil {
-			return nil, streamErr
+			return nil, Usage{}, false, streamErr
 		}
-		return nil, readErr
+		return nil, Usage{}, false, readErr
 	}
 	if !terminated {
 		if streamErr != nil {
-			return nil, streamErr
+			return nil, Usage{}, false, streamErr
 		}
-		return nil, errSSEUnexpectedEOF
+		return nil, Usage{}, false, errSSEUnexpectedEOF
 	}
-	return json.Marshal(encodeBridgeResponse(protocol, acc.response))
+	acc.response.Text = acc.text.String()
+	for index, builder := range acc.arguments {
+		acc.response.Tools[index].ArgumentsJSON = builder.String()
+	}
+	for index, builder := range acc.reasonText {
+		acc.response.Reasoning[index].Text = builder.String()
+	}
+	for index, builder := range acc.reasonSignatures {
+		acc.response.Reasoning[index].Signature = builder.String()
+	}
+	doc := encodeBridgeResponse(protocol, acc.response)
+	if !acc.reported {
+		delete(doc, "usage")
+	}
+	body, err := json.Marshal(doc)
+	return body, acc.response.Usage, acc.reported, err
 }
 
 type collapseAccumulator struct {
-	response bridgeResponse
-	tools    map[string]int
-	reason   *bridgeBlock
+	response         bridgeResponse
+	tools            map[string]int
+	reason           *bridgeBlock
+	text             strings.Builder
+	arguments        map[int]*strings.Builder
+	reported         bool
+	reasonText       map[int]*strings.Builder
+	reasonSignatures map[int]*strings.Builder
 }
 
 func (acc *collapseAccumulator) apply(event bridgeStreamEvent) {
@@ -79,26 +107,36 @@ func (acc *collapseAccumulator) apply(event bridgeStreamEvent) {
 			acc.response.Model = event.Model
 		}
 	case "text":
-		acc.response.Text += event.Text
+		acc.text.WriteString(event.Text)
 	case "reasoning":
 		if event.Text == "" && event.Encrypted == "" && event.Signature == "" {
 			break
 		}
-		acc.reasoningBlock().Text += event.Text
+		acc.reasoningBlock()
+		appendReasoningDelta(&acc.reasonText, len(acc.response.Reasoning)-1, event.Text)
 		if event.Encrypted != "" {
 			acc.splitReasoning()
 			acc.reasoningBlock().Encrypted += event.Encrypted
 			acc.reason = nil
 		}
 	case "reasoning_signature":
-		acc.reasoningBlock().Signature += event.Signature
+		acc.reasoningBlock()
+		appendReasoningDelta(&acc.reasonSignatures, len(acc.response.Reasoning)-1, event.Signature)
 	case "tool_start":
 		acc.toolBlock(event.ToolKey, event.ToolID, event.ToolName)
 	case "tool_delta":
-		block := acc.toolBlock(event.ToolKey, event.ToolID, event.ToolName)
-		block.ArgumentsJSON += event.Text
+		acc.toolBlock(event.ToolKey, event.ToolID, event.ToolName)
+		index := acc.tools[event.ToolKey]
+		if acc.arguments == nil {
+			acc.arguments = map[int]*strings.Builder{}
+		}
+		if acc.arguments[index] == nil {
+			acc.arguments[index] = &strings.Builder{}
+		}
+		acc.arguments[index].WriteString(event.Text)
 	case "usage":
 		if event.Usage != nil {
+			acc.reported = true
 			mergeBridgeUsage(&acc.response.Usage, *event.Usage)
 		}
 	case "finish":
@@ -144,4 +182,17 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func appendReasoningDelta(builders *map[int]*strings.Builder, index int, delta string) {
+	if delta == "" {
+		return
+	}
+	if *builders == nil {
+		*builders = map[int]*strings.Builder{}
+	}
+	if (*builders)[index] == nil {
+		(*builders)[index] = &strings.Builder{}
+	}
+	(*builders)[index].WriteString(delta)
 }

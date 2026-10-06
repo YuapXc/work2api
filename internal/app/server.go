@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,8 @@ type Server struct {
 	adminSlots, heavySlots, querySlots, bodySlots, refreshSlots chan struct{}
 	bodyWaiting                                                 chan struct{}
 	bodies                                                      *bodyBudget
+	publicBodySlots, publicBodyWaiting                          chan struct{}
+	publicBodies                                                *bodyBudget
 	refreshMu                                                   sync.Mutex
 	refreshes                                                   map[string]*refreshFlight
 	// 用户门户状态（HANDOFF §8）：扫码任务表（内存，带 TTL）与每用户轮询限频。
@@ -74,6 +77,7 @@ type principalContextKey struct{}
 func NewServer(o *Orchestrator) *Server {
 	return &Server{o: o, sessions: newAdminSessionManager(), loginLimiter: newLoginRateLimiter(), portalLoginLimiter: newLoginRateLimiter(), portalSlots: make(chan struct{}, 8),
 		portalTasks: map[string]*portalContributionTask{}, portalPollLimiter: map[int64]*pollLimiter{},
+		publicBodySlots: make(chan struct{}, 2), publicBodyWaiting: make(chan struct{}, 2), publicBodies: &bodyBudget{limit: 64 << 10},
 		bodyWaiting: make(chan struct{}, positiveOr(o.cfg.ModelQueueSize, 32)), modelsAdmission: newModelAdmission(o.cfg), adminSlots: make(chan struct{}, positiveOr(o.cfg.AdminConcurrency, 8)), heavySlots: make(chan struct{}, positiveOr(o.cfg.HeavyAdminConcurrency, 2)), querySlots: make(chan struct{}, positiveOr(o.cfg.QueryConcurrency, 4)), bodySlots: make(chan struct{}, positiveOr(o.cfg.BodyReadConcurrency, 4)), bodies: &bodyBudget{limit: int64(positiveOr(int(o.cfg.RequestBodyBudget), 32<<20))}, refreshSlots: make(chan struct{}, 8), refreshes: map[string]*refreshFlight{}}
 }
 
@@ -116,6 +120,22 @@ func (s *Server) requestGuard(next http.Handler) http.Handler {
 			}
 			r = r.WithContext(context.WithValue(r.Context(), principalContextKey{}, principal))
 		}
+		// Let ServeMux preserve its 404/405/redirect semantics without reading
+		// bodies for unmatched routes. GET (including static catch-all) and HEAD
+		// never need a body; their normal query admission remains below.
+		if mux, ok := next.(*http.ServeMux); ok {
+			escaped := r.URL.EscapedPath()
+			clean := path.Clean(escaped)
+			if strings.HasSuffix(escaped, "/") && clean != "/" {
+				clean += "/"
+			}
+			// ServeMux returns a nonempty pattern even for canonical redirects.
+			// Their unnormalized paths have not passed route authentication.
+			if _, pattern := mux.Handler(r); pattern == "" || r.Method != http.MethodConnect && clean != escaped {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
 		slots := s.adminSlots
 		model := isModelRoute(r)
 		heavy := isHeavyAdmin(r)
@@ -148,7 +168,11 @@ func (s *Server) requestGuard(next http.Handler) http.Handler {
 				return
 			}
 		}
-		if r.Body != nil && r.Body != http.NoBody {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Body != nil && r.Body != http.NoBody {
+			bodySlots, bodyWaiting, bodies := s.bodySlots, s.bodyWaiting, s.bodies
+			if r.URL.Path == "/admin/login" || r.URL.Path == "/admin/logout" || strings.HasPrefix(r.URL.Path, "/portal/api/auth/") {
+				bodySlots, bodyWaiting, bodies = s.publicBodySlots, s.publicBodyWaiting, s.publicBodies
+			}
 			limit := s.o.cfg.MaxRequestBytes
 			if limit <= 0 {
 				limit = 16 * 1024 * 1024
@@ -161,41 +185,41 @@ func (s *Server) requestGuard(next http.Handler) http.Handler {
 				return
 			}
 			select {
-			case s.bodySlots <- struct{}{}:
+			case bodySlots <- struct{}{}:
 			default:
 				// A short bounded wait absorbs Agent fan-out before body parsing;
 				// readers and raw-byte allocations retain their existing limits.
 				select {
-				case s.bodyWaiting <- struct{}{}:
+				case bodyWaiting <- struct{}{}:
 				default:
 					s.writeOverload(w, "body_read_capacity")
 					return
 				}
 				timer := time.NewTimer(5 * time.Second)
 				select {
-				case s.bodySlots <- struct{}{}:
+				case bodySlots <- struct{}{}:
 					timer.Stop()
-					<-s.bodyWaiting
+					<-bodyWaiting
 				case <-r.Context().Done():
 					timer.Stop()
-					<-s.bodyWaiting
+					<-bodyWaiting
 					return
 				case <-timer.C:
-					<-s.bodyWaiting
+					<-bodyWaiting
 					s.writeOverload(w, "body_read_capacity")
 					return
 				}
 			}
 
 			body, reserved, err := func() ([]byte, int64, error) {
-				defer func() { <-s.bodySlots }()
+				defer func() { <-bodySlots }()
 				defer r.Body.Close()
 				controller := http.NewResponseController(w)
 				_ = controller.SetReadDeadline(time.Now().Add(30 * time.Second))
 				defer controller.SetReadDeadline(time.Time{})
-				return s.bodies.read(http.MaxBytesReader(w, r.Body, limit), r.ContentLength)
+				return bodies.read(http.MaxBytesReader(w, r.Body, limit), r.ContentLength)
 			}()
-			defer s.bodies.release(reserved)
+			defer bodies.release(reserved)
 			if err != nil {
 				var overload *apiError
 				if errors.As(err, &overload) {

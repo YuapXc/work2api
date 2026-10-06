@@ -302,3 +302,15 @@ func TestMinimalBodies(t *testing.T) {
 		t.Fatalf("最小 body 不应被改，got %d", len(msgs))
 	}
 }
+
+func TestProjectionPreservesMultimodalHistory(t *testing.T) {
+	body := agenticBody()
+	messages := body["messages"].([]any)
+	messages[1].(map[string]any)["content"] = []any{map[string]any{"type": "text", "text": "inspect this"}, map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://example.test/image.png"}}}
+	before, _ := json.Marshal(body)
+	projected, stats := Body(body)
+	after, _ := json.Marshal(projected)
+	if string(before) != string(after) || stats.Mode != "multimodal-preserved" {
+		t.Fatal("multimodal history was projected into text", stats)
+	}
+}

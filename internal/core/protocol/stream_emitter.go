@@ -61,12 +61,13 @@ type bridgeStreamEmitter struct {
 
 func newBridgeStreamEmitter(writer io.Writer, flusher http.Flusher, target Protocol, model string) *bridgeStreamEmitter {
 	return &bridgeStreamEmitter{
-		w:       writer,
-		flush:   flusher,
-		target:  target,
-		model:   model,
-		created: time.Now().Unix(),
-		tools:   map[string]*bridgeStreamTool{},
+		w:              writer,
+		flush:          flusher,
+		target:         target,
+		model:          model,
+		created:        time.Now().Unix(),
+		tools:          map[string]*bridgeStreamTool{},
+		responseOutput: []any{},
 	}
 }
 
@@ -390,6 +391,7 @@ func (emitter *bridgeStreamEmitter) finishReasoning() error {
 		if emitter.reasoningEncrypted != "" {
 			item["encrypted_content"] = emitter.reasoningEncrypted
 		}
+		emitter.recordResponseItem(emitter.reasoningOutput, item)
 		return emitter.sse("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": emitter.reasoningOutput, "item": item, "sequence_number": emitter.nextSequence()})
 	}
 	return nil
@@ -546,22 +548,14 @@ func (emitter *bridgeStreamEmitter) Finish() error {
 			return err
 		}
 		response := bridgeResponse{
-			ID:        emitter.id,
-			Model:     emitter.model,
-			Text:      emitter.text.String(),
-			Reasoning: []bridgeBlock{{Kind: "reasoning", ID: emitter.reasoningItemID, Text: emitter.reasoning.String(), Signature: emitter.reasoningSignature.String()}},
-			Stop:      emitter.stop,
-			Usage:     emitter.usage,
-			Created:   emitter.created,
-		}
-		if emitter.reasoning.Len() == 0 && emitter.reasoningSignature.Len() == 0 {
-			response.Reasoning = nil
-		}
-		for _, key := range emitter.order {
-			tool := emitter.tools[key]
-			response.Tools = append(response.Tools, bridgeBlock{Kind: "tool_call", ID: tool.ID, Name: tool.Name, ArgumentsJSON: tool.Arguments.String()})
+			ID:      emitter.id,
+			Model:   emitter.model,
+			Stop:    emitter.stop,
+			Usage:   emitter.usage,
+			Created: emitter.created,
 		}
 		completed := encodeBridgeResponse(Responses, response)
+		completed["output"] = emitter.responseOutput
 		terminal := "response." + fmt.Sprint(completed["status"])
 		return emitter.sse(terminal, map[string]any{"type": terminal, "response": completed, "sequence_number": emitter.nextSequence()})
 	}
@@ -579,6 +573,7 @@ func (emitter *bridgeStreamEmitter) finishResponsesItems() error {
 			return err
 		}
 		item := map[string]any{"id": emitter.textItemID, "type": "message", "status": "completed", "role": "assistant", "content": []any{part}}
+		emitter.recordResponseItem(emitter.textOutput, item)
 		if err := emitter.sse("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": emitter.textOutput, "item": item, "sequence_number": emitter.nextSequence()}); err != nil {
 			return err
 		}
@@ -599,11 +594,19 @@ func (emitter *bridgeStreamEmitter) finishResponsesItems() error {
 			return err
 		}
 		item := map[string]any{"id": tool.ItemID, "type": "function_call", "status": "completed", "arguments": arguments, "call_id": tool.ID, "name": tool.Name}
+		emitter.recordResponseItem(tool.Index, item)
 		if err := emitter.sse("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": tool.Index, "item": item, "sequence_number": emitter.nextSequence()}); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (emitter *bridgeStreamEmitter) recordResponseItem(index int, item map[string]any) {
+	for len(emitter.responseOutput) <= index {
+		emitter.responseOutput = append(emitter.responseOutput, nil)
+	}
+	emitter.responseOutput[index] = item
 }
 
 func (emitter *bridgeStreamEmitter) chatChunk(delta map[string]any, finish any) error {
@@ -669,9 +672,10 @@ func mergeBridgeUsage(destination *Usage, source Usage) {
 	if source.Total != 0 {
 		destination.Total = max(destination.Total, source.Total)
 	}
-	if source.Cached != 0 {
+	if source.CachedKnown || source.Cached != 0 {
 		destination.Cached = source.Cached
 	}
+	destination.CachedKnown = destination.CachedKnown || source.CachedKnown
 	if source.CacheCreation != 0 {
 		destination.CacheCreation = source.CacheCreation
 	}

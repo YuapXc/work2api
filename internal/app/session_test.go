@@ -87,3 +87,39 @@ func TestSessionRouter(t *testing.T) {
 		t.Error("empty key must not bind")
 	}
 }
+
+func TestSessionRouterHardCapAndIndexCleanup(t *testing.T) {
+	r := newSessionRouter()
+	r.max = 2
+	r.bind("first", "a")
+	r.bind("second", "b")
+	expires := r.m["first"].expires
+	r.lookup("first")
+	if r.m["first"].expires != expires {
+		t.Fatal("lookup renewed affinity TTL")
+	}
+	r.bind("third", "c")
+	if r.lookup("first") != "" || r.lookup("second") != "b" {
+		t.Fatal("oldest binding was not evicted")
+	}
+	r.bind("second", "b")
+	r.bind("fourth", "d")
+	if r.lookup("third") != "" {
+		t.Fatal("rebinding did not update eviction order")
+	}
+	if len(r.m) != 2 || r.order.Len() != 2 {
+		t.Fatal("affinity cap or index mismatch")
+	}
+	r.removeAccount("b")
+	r.unbind("fourth")
+	if len(r.m) != 0 || r.order.Len() != 0 {
+		t.Fatal("affinity indexes leaked on removal")
+	}
+	r.bind("expired", "e")
+	entry := r.m["expired"]
+	entry.expires = nowSec() - 1
+	r.m["expired"] = entry
+	if r.lookup("expired") != "" || r.order.Len() != 0 {
+		t.Fatal("expired affinity index leaked")
+	}
+}

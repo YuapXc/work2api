@@ -111,7 +111,7 @@ onUnmounted(() => timer && clearInterval(timer))
       </div>
       <p class="mt-2 text-micro text-faint">P95 为固定区间估算；首响应指首字节，包含等待与协议初始化，非模型首个 token。重启后重新统计。</p>
     </WCard>
-    <template v-else>
+    <template v-if="ov">
       <!-- 预警条 -->
       <div v-if="ov?.alerts?.length" class="mb-4 space-y-2">
         <div

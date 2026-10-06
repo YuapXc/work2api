@@ -91,6 +91,7 @@ type Usage struct {
 	Output        int
 	Total         int
 	Cached        int
+	CachedKnown   bool
 	CacheCreation int
 	Reasoning     int
 }
