@@ -154,6 +154,21 @@ func TestDisabledModelCatalogDoesNotFallThrough(t *testing.T) {
 	}
 }
 
+// 退役模型从目录摘除（buddy-proxy #119 对齐）：gm51model/kmodel/mmodel 上游已下线，
+// 展示但点名可调的语义由 retiredModelKeys 承载，其余模型不受影响。
+func TestRetiredModelCatalogHidden(t *testing.T) {
+	models := dropRetiredModels([]QoderModel{
+		{Key: "qmodel_38max", DisplayName: "Qwen3.8-Max", Enable: true},
+		{Key: "gm51model", DisplayName: "GLM-5.2", Enable: true},
+		{Key: "kmodel", DisplayName: "Kimi-K2.8-Preview", Enable: true},
+		{Key: "mmodel", DisplayName: "MiniMax-M2.7", Enable: true},
+		{Key: "kmodel_latest", DisplayName: "Kimi-K3", Enable: true},
+	})
+	if len(models) != 2 || models[0].Key != "qmodel_38max" || models[1].Key != "kmodel_latest" {
+		t.Fatal("retired models not hidden or live models dropped", models)
+	}
+}
+
 // imageContentParts：三种入站图片格式都归一成上游 image_url 形式
 func TestImageContentParts(t *testing.T) {
 	// OpenAI: image_url {url}

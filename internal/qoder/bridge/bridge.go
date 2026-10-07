@@ -188,6 +188,16 @@ func NewBridgeContext(ctx context.Context, pat string, region account.Region, te
 	}, nil
 }
 
+// retiredModelKeys 上游仍返回、但官方已标记过时的模型 key（buddy-proxy #119 实测
+// 2026-10-07：GLM-5.2 / Kimi-K2.8-Preview / MiniMax-M2.7 被上游收回又恢复后已不在
+// 官方客户端下拉中）。隐藏 ≠ 停用：客户端点名仍可调用，只是模型列表不再展示，
+// 避免用户选中大概率报错的过时模型。上游若恢复展示，从集合中删除对应 key 即可。
+var retiredModelKeys = map[string]bool{
+	"gm51model": true, // GLM-5.2
+	"kmodel":    true, // Kimi-K2.8-Preview
+	"mmodel":    true, // MiniMax-M2.7
+}
+
 // ListAvailableModels 通过 cosy 签名调用 /algo/api/v2/model/list 拉取上游模型清单。
 // 返回顶层 assistant 数组中 enable=true 的模型，按 is_default desc + display_name asc 排序。
 func (b *Bridge) ListAvailableModels() ([]QoderModel, error) {
@@ -210,7 +220,19 @@ func (b *Bridge) ListAvailableModelsContext(ctx context.Context) ([]QoderModel, 
 	if err != nil {
 		return nil, fmt.Errorf("%s -> %w", modelListURL, err)
 	}
-	return models, nil
+	return dropRetiredModels(models), nil
+}
+
+// dropRetiredModels 摘除上游已下线的过时模型（见 retiredModelKeys）。
+// 复用入参底层数组（调用方持有的是本函数专属的解析结果，无别名共享）。
+func dropRetiredModels(models []QoderModel) []QoderModel {
+	filtered := models[:0]
+	for _, m := range models {
+		if !retiredModelKeys[m.Key] {
+			filtered = append(filtered, m)
+		}
+	}
+	return filtered
 }
 
 func decodeModelCatalog(resp map[string]interface{}) ([]QoderModel, error) {

@@ -291,6 +291,8 @@ func (r *Registry) fetchFromUpstream() []fetchedModel {
 func (r *Registry) fetchFromUpstreamContext(ctx context.Context) []fetchedModel {
 	var accounts []*pool.Account
 	for _, a := range r.pool.Accounts() {
+		// 手动停用（含共享池「贡献验证中」）的账号不参与目录拉取：
+		// 对齐上游 0.6.3，停用账号不应被一次目录请求唤醒/触发风控。
 		if a.Enabled {
 			accounts = append(accounts, a)
 		}
