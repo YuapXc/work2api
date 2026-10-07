@@ -126,10 +126,10 @@ func TestPickPrefersLargerExpiringPile(t *testing.T) {
 			bigHits++
 		}
 	}
-	// With a ~40x larger expiring pile the bias should land the big account well
-	// above an even split; assert a clear majority (soft bias still lets small win
-	// occasionally, so we don't demand 100%).
-	if bigHits < 280 {
+	// 期望命中率约 74%（big 权重 3.0 vs small 约 1.05，400 次期望 ~296 次、
+	// σ≈8.8）。阈值 250 留出 ~5σ 裕度，避免统计性偶发失败；仍断言明显多数
+	// （软偏置允许 small 偶尔胜出，不要求 100%）。
+	if bigHits < 250 {
 		t.Fatalf("larger expiring pile should dominate, big won %d/400", bigHits)
 	}
 }
