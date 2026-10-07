@@ -861,12 +861,24 @@ func (o *Orchestrator) enhanceBody(body map[string]any) map[string]any {
 		}
 	}
 	body = reasoning.Sanitize(body, dyn)
-	if o.cfg.Desensitize {
-		// CompactHarness 必须开：CC 2.x 的长 harness 模板会被上游渠道审核整块
-		// 拒绝，逐词零宽空格救不了，只有整体压缩成行为摘要才行（buddy-proxy #45）
-		body = desensitize.Body(body, desensitize.Options{Roles: []string{"system", "developer"}, CompactHarness: true})
-	}
 	return body
+}
+
+// applyDesensitize applies anti-content-review desensitization ONLY for
+// domestic accounts, at call time — it must not run inside enhanceBody: the
+// chosen account is unknown that early, and the international site has no
+// content review, so injecting zero-width spaces there only degrades system
+// prompt fidelity (upstream workbuddy_one gateway/inference.apply_desensitize).
+func (o *Orchestrator) applyDesensitize(acc *pool.Account, body map[string]any) map[string]any {
+	if !o.cfg.Desensitize {
+		return body
+	}
+	if siterouting.ProfileSite(acc.Profile) == siterouting.International {
+		return body
+	}
+	// CompactHarness 必须开：CC 2.x 的长 harness 模板会被上游渠道审核整块
+	// 拒绝，逐词零宽空格救不了，只有整体压缩成行为摘要才行（buddy-proxy #45）
+	return desensitize.Body(body, desensitize.Options{Roles: []string{"system", "developer"}, CompactHarness: true})
 }
 
 func (o *Orchestrator) getHeaders(acc *pool.Account) (map[string]string, *apiError) {
@@ -874,7 +886,7 @@ func (o *Orchestrator) getHeaders(acc *pool.Account) (map[string]string, *apiErr
 	if mgr == nil {
 		return nil, errBody(503, "账号凭据不可用", "auth_error")
 	}
-	h, err := mgr.GetHeaders()
+	h, err := mgr.GetChatHeaders()
 	if err != nil {
 		o.pool.OnFailure(acc.UID, cooldownHard)
 		return nil, errBody(503, "账号 token 刷新失败，请到 WebUI 重新扫码登录", "auth_error")
@@ -953,6 +965,7 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 	}()
 	const maxFailoverAttempts = 5
 	tried := map[string]bool{}
+	desensitized := "" // apply anti-review desensitization once per attempt's region
 	for attempt := 0; ; attempt++ {
 		if lease, ok := ctx.Value(modelLeaseKey{}).(*modelLease); ok {
 			choose, chooseErr := o.accountSelector(model, acc.UID, tried, scope)
@@ -980,6 +993,13 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 			}
 		}
 		tried[acc.UID] = true
+		// 反审核脱敏按本次实际选中的账号区域决定，只在选定账号后施加一次：
+		// 换号重试不重复注入零宽字符（上游 workbuddy_one open_upstream 同款）。
+		site := siterouting.ProfileSite(acc.Profile)
+		if site != desensitized {
+			body = o.applyDesensitize(acc, body)
+			desensitized = site
+		}
 		streamwatch.StartAttempt(ctx)
 		started, err := o.runOnce(ctx, acc, body, sink)
 		status := 200

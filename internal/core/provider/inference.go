@@ -64,6 +64,10 @@ type ServeRequest struct {
 	Payload  map[string]any // parsed client body; Payload["model"] is still namespaced
 	Writer   http.ResponseWriter
 	AppName  string
+	// Headers carries the client's original request headers. Runtimes that
+	// derive session affinity from header signals (opencode's x-session-id
+	// family) read them here; it is nil for callers without a real request.
+	Headers http.Header
 }
 
 // Runtime is the inference contract each non-default provider implements so the
@@ -214,6 +218,18 @@ type AccountManager interface {
 	RenameAccount(id, name string) error
 	// DeleteAccount removes the account.
 	DeleteAccount(id string) error
+}
+
+// AccountImporter is an optional capability: a runtime that can add an account
+// from a pasted personal access token (no browser/scan flow needed — the
+// headless-server path). qoder implements it by exchanging the PAT for a job
+// token (cosy.ExchangeJobToken) exactly like upstream qoder2api's
+// AddAccountByPAT. The method validates the token against the upstream, saves
+// the account + secret, makes it active, and returns a summary row.
+type AccountImporter interface {
+	// AddAccountByToken validates token (per its own scheme), persists the
+	// account and returns {id, label, region?} or an error.
+	AddAccountByToken(ctx context.Context, token string, opts map[string]any) (map[string]any, error)
 }
 
 // ConfigRuntime is an optional capability: a runtime whose credentials/settings

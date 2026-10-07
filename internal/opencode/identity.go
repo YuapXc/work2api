@@ -20,18 +20,37 @@ type RequestIDs struct {
 	ParentSession string
 }
 
-// deriveRequestIDs builds the correlation IDs from the client payload alone.
+// deriveRequestIDs builds the correlation IDs from the client's session
+// affinity signals, headers first (upstream opencode2api identity/request.go
+// priority), then in-body signals, then the first user turn so a growing
+// conversation stays stable.
 //
-// Deviation from opencode2api: the shared Runtime contract hands us the parsed
-// payload but not the raw *http.Request, so the x-opencode-*/x-session-* header
-// signals are unavailable. Session affinity therefore derives from in-body
-// signals (conversation_id, metadata.session_id, previous_response_id) and, as
-// upstream does, the first user turn so a growing conversation stays stable.
-func deriveRequestIDs(body map[string]any) RequestIDs {
-	signal := jsonutil.FirstString(
-		jsonutil.StringAt(body, "conversation_id"),
-		jsonutil.StringAt(body, "metadata", "session_id"),
-	)
+// Header priority (1:1 with upstream): x-opencode-session, x-session-affinity,
+// X-Session-Id, x-session-id, conversation-id. These let a client explicitly
+// separate independent conversations (e.g. Zen free tier needs a canonical
+// ses_ id per conversation); body-only signals can't express "same user, new
+// conversation".
+func deriveRequestIDs(body map[string]any, headers ...Header) RequestIDs {
+	var h Header
+	if len(headers) > 0 {
+		h = headers[0]
+	}
+	signal := ""
+	if h != nil {
+		signal = firstNonEmpty(
+			h.Get("x-opencode-session"),
+			h.Get("x-session-affinity"),
+			h.Get("X-Session-Id"),
+			h.Get("x-session-id"),
+			h.Get("conversation-id"),
+		)
+	}
+	if signal == "" {
+		signal = jsonutil.FirstString(
+			jsonutil.StringAt(body, "conversation_id"),
+			jsonutil.StringAt(body, "metadata", "session_id"),
+		)
+	}
 	if signal == "" {
 		signal = conversationSeed(body)
 	}
@@ -69,6 +88,19 @@ func conversationSeed(body map[string]any) string {
 			if len(encoded) > 0 && string(encoded) != "null" {
 				return string(encoded)
 			}
+		}
+	}
+	return ""
+}
+
+// Header is the minimal header view deriveRequestIDs needs (satisfied by
+// http.Header; kept as an interface so tests can inject a plain map).
+type Header interface{ Get(string) string }
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
 		}
 	}
 	return ""

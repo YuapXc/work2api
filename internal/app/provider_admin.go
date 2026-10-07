@@ -20,6 +20,7 @@ func (s *Server) mountProviderAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/providers/{name}/oauth/poll", s.adminProviderOAuthPoll)
 	mux.HandleFunc("POST /admin/providers/{name}/accounts/{id}/activate", s.adminProviderActivate)
 	mux.HandleFunc("POST /admin/providers/{name}/accounts/{id}/rename", s.adminProviderRename)
+	mux.HandleFunc("POST /admin/providers/{name}/accounts/import", s.adminProviderImportAccount)
 	mux.HandleFunc("DELETE /admin/providers/{name}/accounts/{id}", s.adminProviderDeleteAccount)
 	mux.HandleFunc("GET /admin/providers/{name}/config", s.adminProviderGetConfig)
 	mux.HandleFunc("POST /admin/providers/{name}/config", s.adminProviderSaveConfig)
@@ -126,6 +127,35 @@ func (s *Server) adminProviderDeleteAccount(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// adminProviderImportAccount adds an account from a pasted personal access
+// token (the headless-server path; qoder PAT). The token is validated against
+// the upstream before anything is persisted.
+func (s *Server) adminProviderImportAccount(w http.ResponseWriter, r *http.Request) {
+	rt, ok := provider.RuntimeByName(r.PathValue("name"))
+	if !ok {
+		writeJSON(w, 404, errBody(404, "未知供应商："+r.PathValue("name"), "invalid_request_error").body)
+		return
+	}
+	imp, ok := rt.(provider.AccountImporter)
+	if !ok {
+		writeJSON(w, 400, errBody(400, r.PathValue("name")+" 不支持凭 token 添加账号", "invalid_request_error").body)
+		return
+	}
+	body, _ := readJSON(r)
+	token, _ := body["token"].(string)
+	if token == "" {
+		writeJSON(w, 400, errBody(400, "token 不能为空", "invalid_request_error").body)
+		return
+	}
+	delete(body, "token")
+	acct, err := imp.AddAccountByToken(r.Context(), token, body)
+	if err != nil {
+		writeJSON(w, 502, errBody(502, err.Error(), "upstream_error").body)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "account": acct})
 }
 
 // oauthRuntime resolves a provider name to its OAuthRuntime, or writes an error.

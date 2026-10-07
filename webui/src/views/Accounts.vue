@@ -375,7 +375,7 @@ async function refreshCreditsAll() {
 // ---------- 添加账号 ----------
 const addOpen = ref(false)
 const addProvider = ref('')
-const addMethod = ref<'upload' | 'oauth'>('oauth')
+const addMethod = ref<'upload' | 'oauth' | 'token'>('oauth')
 const oauthSites = ref<string[]>([])
 const oauthOptions = ref<OAuthOption[]>([])
 const oauthChoice = ref<Record<string, string>>({})
@@ -406,7 +406,7 @@ async function onAddProviderChange() {
   oauthUrl.value = ''
   oauthChoice.value = {}
   const c = caps(addProvider.value)
-  addMethod.value = c.includes('oauth') ? 'oauth' : c.includes('upload') ? 'upload' : 'oauth'
+  addMethod.value = c.includes('oauth') ? 'oauth' : c.includes('upload') ? 'upload' : c.includes('add_account') ? 'token' : 'oauth'
   if (name === 'workbuddy') {
     const res = await api.oauthSites()
     if (generation !== pollGeneration) return
@@ -499,6 +499,26 @@ async function onUpload(e: Event) {
     await load()
   } finally {
     if (uploadEl.value) uploadEl.value.value = ''
+  }
+}
+
+const patToken = ref('')
+const patSaving = ref(false)
+async function onAddByToken() {
+  const token = patToken.value.trim()
+  if (!token || patSaving.value) return
+  patSaving.value = true
+  oauthMessage.value = ''
+  try {
+    await api.providerImportAccount(addProvider.value, token, { ...oauthChoice.value })
+    toast.success('已添加账号')
+    patToken.value = ''
+    addOpen.value = false
+    await load()
+  } catch (err: any) {
+    oauthMessage.value = err?.response?.data?.error?.message || '添加失败，请检查 PAT 后重试'
+  } finally {
+    patSaving.value = false
   }
 }
 
@@ -738,10 +758,11 @@ async function saveConfig() {
       <label class="mb-1.5 block text-small text-muted">供应商</label>
       <WSelect v-model="addProvider" :options="addProviderOptions" class="mb-4" @update:model-value="onAddProviderChange" />
 
-      <!-- 方式切换（仅 workbuddy 同时支持上传与扫码） -->
-      <div v-if="caps(addProvider).includes('upload') && caps(addProvider).includes('oauth')" class="mb-4 flex gap-2">
-        <WButton size="sm" :variant="addMethod === 'oauth' ? 'primary' : 'subtle'" @click="addMethod = 'oauth'">扫码登录</WButton>
-        <WButton size="sm" :variant="addMethod === 'upload' ? 'primary' : 'subtle'" @click="addMethod = 'upload'">上传凭据</WButton>
+      <!-- 方式切换（供应商支持多种添加方式时展示） -->
+      <div v-if="[caps(addProvider).includes('oauth'), caps(addProvider).includes('upload'), caps(addProvider).includes('add_account')].filter(Boolean).length > 1" class="mb-4 flex gap-2">
+        <WButton v-if="caps(addProvider).includes('oauth')" size="sm" :variant="addMethod === 'oauth' ? 'primary' : 'subtle'" @click="addMethod = 'oauth'">扫码登录</WButton>
+        <WButton v-if="caps(addProvider).includes('upload')" size="sm" :variant="addMethod === 'upload' ? 'primary' : 'subtle'" @click="addMethod = 'upload'">上传凭据</WButton>
+        <WButton v-if="caps(addProvider).includes('add_account')" size="sm" :variant="addMethod === 'token' ? 'primary' : 'subtle'" @click="addMethod = 'token'">PAT 添加</WButton>
       </div>
 
       <!-- 扫码登录 -->
@@ -772,6 +793,17 @@ async function saveConfig() {
         </button>
       </template>
 
+      <!-- PAT 添加（qoder：无浏览器/扫码的服务器路径） -->
+      <template v-else-if="addMethod === 'token'">
+        <div v-for="o in oauthOptions" :key="o.key" class="mb-3">
+          <label class="mb-1.5 block text-small text-muted">{{ o.label }}</label>
+          <WSelect v-model="oauthChoice[o.key]" :options="o.values" />
+        </div>
+        <label class="mb-1.5 block text-small text-muted">Personal Access Token</label>
+        <WTextarea v-model="patToken" :rows="3" placeholder="在 Qoder 控制台生成的 PAT" />
+        <p class="mt-2 text-micro text-faint">PAT 会先向上游验证再落库，验证失败不保存。</p>
+      </template>
+
       <p v-if="oauthMessage" class="mt-3 text-small text-muted">{{ oauthMessage }}</p>
       <template #footer>
         <WButton variant="subtle" @click="addOpen = false">关闭</WButton>
@@ -782,6 +814,15 @@ async function saveConfig() {
           @click="beginOAuth"
         >
           {{ oauthPolling ? '等待授权…' : '开始扫码登录' }}
+        </WButton>
+        <WButton
+          v-if="addMethod === 'token'"
+          variant="primary"
+          :loading="patSaving"
+          :disabled="!patToken.trim()"
+          @click="onAddByToken"
+        >
+          {{ patSaving ? '验证中…' : '验证并添加' }}
         </WButton>
       </template>
     </WModal>

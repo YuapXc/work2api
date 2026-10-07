@@ -198,27 +198,8 @@ func (r *Registry) RefreshContext(ctx context.Context) []map[string]any {
 // ReasoningEfforts returns supported effort levels for a model (nil if unknown).
 func (r *Registry) ReasoningEfforts(model string) []string {
 	r.mu.Lock()
-	cfg := r.reasoning[model]
-	r.mu.Unlock()
-	if cfg == nil {
-		return nil
-	}
-	var efforts []string
-	if se, ok := cfg["supportedEfforts"].([]string); ok {
-		efforts = append(efforts, se...)
-	}
-	if len(efforts) == 0 {
-		if de, ok := cfg["defaultEffort"].(string); ok && de != "" {
-			efforts = []string{de}
-		}
-	}
-	if canDisable, _ := cfg["canDisableThinking"].(bool); canDisable && !contains(efforts, "off") {
-		efforts = append(efforts, "off")
-	}
-	if len(efforts) == 0 {
-		return nil
-	}
-	return efforts
+	defer r.mu.Unlock()
+	return r.reasoningEffortsLocked(model)
 }
 
 // EffortsTable returns the dynamic per-model effort table for reasoning
@@ -249,7 +230,20 @@ func (r *Registry) reasoningEffortsLocked(model string) []string {
 			efforts = []string{de}
 		}
 	}
-	if canDisable, _ := cfg["canDisableThinking"].(bool); canDisable && !contains(efforts, "off") {
+	// `effort`（国内版用它代替 defaultEffort）语义同样是「默认跑在哪档」，
+	// 不是「只支持这一档」——实测给报 effort=high 的 auto 发 low 照样 200。
+	// 只用它**标注默认档**，不当支持集裁剪（上游 workbuddy_one 同款约定）。
+	if len(efforts) == 0 {
+		if e, ok := cfg["effort"].(string); ok && e != "" {
+			efforts = []string{e}
+		}
+	}
+	// onlyReasoning models cannot disable thinking: never offer off even if the
+	// catalog also claims canDisableThinking — the catalog field ranks below the
+	// stronger onlyReasoning semantic constraint (measured on glm-5.2: both
+	// regions accept "off" yet still emit reasoning, so the catalog's
+	// onlyReasoning:false is not honored by the model server).
+	if canDisable, _ := cfg["canDisableThinking"].(bool); canDisable && !boolOf(cfg["onlyReasoning"]) && !contains(efforts, "off") {
 		efforts = append(efforts, "off")
 	}
 	if len(efforts) == 0 {
@@ -349,6 +343,23 @@ func (r *Registry) fetchFromUpstreamContext(ctx context.Context) []fetchedModel 
 		}
 		region := siterouting.ProfileSite(account.Profile)
 		for _, fm := range got {
+			// onlyReasoning merges conservatively (OR): it is a capability LIMIT
+			// ("thinking cannot be disabled"), so if ANY region says the model
+			// cannot disable thinking we believe it — the opposite direction
+			// ("more informative wins") measured wrong on glm-5.2, whose intl
+			// catalog claims onlyReasoning:false yet the model still reasons on
+			// reasoning_effort=off in both regions.
+			if boolOf(fm.reasoning["onlyReasoning"]) {
+				fm.entry["reasoning"].(map[string]any)["onlyReasoning"] = true
+				if prev, exists := merged[fm.id]; exists {
+					if pr, ok := prev.entry["reasoning"].(map[string]any); ok {
+						pr["onlyReasoning"] = true
+					}
+					if prev.reasoning != nil {
+						prev.reasoning["onlyReasoning"] = true
+					}
+				}
+			}
 			if _, exists := merged[fm.id]; !exists {
 				merged[fm.id] = fm
 				order = append(order, fm.id)
@@ -647,6 +658,17 @@ func extractReasoning(m map[string]any) map[string]any {
 				list = append(list, str(x))
 			}
 			cfg["supportedEfforts"] = list
+		}
+		// `effort`: the domestic catalog uses it instead of defaultEffort
+		// (measured across both regions, 18 models carry it; it never co-occurs
+		// with supportedEfforts). It records the DEFAULT rung the model runs at,
+		// NOT the supported set — upstream does not validate reasoning_effort
+		// values, so this is recorded for display/merge ranking only and must
+		// never feed effort clamping.
+		if _, hasDefault := cfg["defaultEffort"]; !hasDefault {
+			if e, ok := r["effort"].(string); ok && e != "" {
+				cfg["effort"] = e
+			}
 		}
 	}
 	return cfg

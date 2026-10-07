@@ -184,6 +184,10 @@ export const api = {
   providerDeleteAccount: (name: string, id: string) =>
     http.delete<unknown, { ok: boolean }>(
       `/admin/providers/${encodeURIComponent(name)}/accounts/${encodeURIComponent(id)}`),
+  // 凭 token 添加账号（qoder PAT；无浏览器/扫码的服务器路径）
+  providerImportAccount: (name: string, token: string, opts: Record<string, unknown>) =>
+    http.post<unknown, { ok: boolean; account: Record<string, unknown> }>(
+      `/admin/providers/${encodeURIComponent(name)}/accounts/import`, { token, ...opts }),
 
   // ---------- 供应商扫码登录（OAuth）：options / begin / poll ----------
   // 登录可选项（如 qoder 的区域 cn / global），驱动弹窗里的选择项

@@ -47,6 +47,7 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 		Payload:  payload,
 		Writer:   writer,
 		AppName:  principal.AppName,
+		Headers:  r.Header,
 	})
 	if err != nil {
 		report.Status, report.Error = "error", err.Error()

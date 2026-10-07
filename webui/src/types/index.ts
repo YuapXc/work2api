@@ -285,7 +285,7 @@ export interface ProviderSummary {
   display_name: string
   ready: boolean
   default?: boolean
-  /** 能力标记，驱动动作按钮/列的显隐：accounts/models/checkin/credits/oauth/upload/config/local_detect */
+  /** 能力标记，驱动动作按钮/列的显隐：accounts/models/checkin/credits/oauth/upload/config/local_detect/add_account */
   capabilities: string[]
   /** 概览卡片用的摘要数字（各供应商形状不同） */
   status: Record<string, unknown>

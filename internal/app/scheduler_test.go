@@ -20,3 +20,17 @@ func TestWarmupUpdatesLastCredit(t *testing.T) {
 		t.Fatal("首个 tick 不应再次刷新额度：预热未同步 lastCredit 会导致启动双刷")
 	}
 }
+
+// A7 回归：lastRowCheck 与 lastCredit 同形状——零值会让首个 tick 立即对
+// usage_logs 跑行数检查（MIN/MAX + 可能截断）。预热必须一并同步。
+func TestWarmupUpdatesLastRowCheck(t *testing.T) {
+	s := &Scheduler{}
+	s.lastCredit = float64(time.Now().Unix())
+	s.lastRowCheck = s.lastCredit // 与 scheduler.go run() 预热保持一致
+
+	checkEvery := 30 // 默认 USAGE_CHECK_INTERVAL_MIN
+	now := time.Now().Add(time.Second)
+	if float64(now.Unix())-s.lastRowCheck >= float64(checkEvery)*60 {
+		t.Fatal("首个 tick 不应触发 usage 行数检查：预热未同步 lastRowCheck")
+	}
+}

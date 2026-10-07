@@ -80,7 +80,7 @@ func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 	d := provider.AdminData{
 		DisplayName:  "Qoder",
 		Ready:        r.Ready(),
-		Capabilities: []string{"accounts", "models", "checkin", "credits", "oauth", "local_detect"},
+		Capabilities: []string{"accounts", "models", "checkin", "credits", "oauth", "local_detect", "add_account"},
 	}
 	accts := []map[string]any{}
 	if dataDirExists() {
@@ -118,7 +118,7 @@ func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 		"account_count": len(accts), "model_count": len(models), "region": region,
 	}
 	if !d.Ready {
-		d.Notes = "未探测到 Qoder 桌面登录，也没有 ~/.qoder2api 账号；请在本机登录 Qoder 桌面端，或导入账号"
+		d.Notes = "未探测到 Qoder 桌面登录，也没有 ~/.qoder2api 账号；请在本机登录 Qoder 桌面端、扫码登录，或粘贴 PAT 添加账号"
 	}
 	return d
 }

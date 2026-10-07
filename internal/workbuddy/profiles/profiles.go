@@ -8,6 +8,9 @@
 package profiles
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+
 	"work2api/internal/workbuddy/siterouting"
 )
 
@@ -34,6 +37,39 @@ var sdkHeaders = map[string]string{
 	"X-Agent-Type":                "main",
 	"X-Private-Data":              "false",
 	"X-CodeBuddy-Request":         "1",
+}
+
+// newRequestID returns a 32-hex request id, same format as the official CLI's
+// X-Request-ID (crypto/rand, not math — ids are also used for reconciliation).
+func newRequestID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// ChatHeaders adds per-request identity ids for the chat path.
+//
+// Measured against the real upstream (workbuddy_one identity.py): the three id
+// headers deliberately share ONE value — upstream echoes X-Request-ID as the
+// response header, X-Conversation-Message-ID becomes the SSE message id, and
+// X-Conversation-Request-ID is what the console's「请求」column shows (absent
+// → upstream fabricates crb-<uuid1>). Sharing one id lets a single value join
+// console record ↔ response header ↔ SSE message when reconciling. Measured
+// to have ZERO impact on prompt cache hit rate (cache is account+prompt-prefix
+// keyed, not request-id keyed).
+//
+// X-Conversation-ID / X-Session-ID are deliberately NOT sent: likely the
+// upstream conversation/prompt-cache ownership key; sending a fresh random
+// value per request risks shattering cache ownership for no measured benefit.
+func ChatHeaders(auth siterouting.Auth, account Account) map[string]string {
+	headers := CredentialHeaders(auth, account)
+	rid := newRequestID()
+	headers["X-Request-ID"] = rid
+	headers["X-Conversation-Message-ID"] = rid
+	headers["X-Conversation-Request-ID"] = rid
+	return headers
 }
 
 // Account is the credential's account blob (subset used for headers).

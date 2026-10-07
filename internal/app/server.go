@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"work2api/internal/statebackup"
 )
 
@@ -467,6 +468,7 @@ func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	textLen := 0
+	cjkLen := 0
 	nMsg := 0
 	if msgs, ok := body["messages"].([]any); ok {
 		for _, m := range msgs {
@@ -475,19 +477,39 @@ func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 			switch c := mm["content"].(type) {
 			case string:
 				textLen += len(c)
+				cjkLen += cjkRunes(c)
 			case []any:
 				for _, p := range c {
 					if pm, ok := p.(map[string]any); ok {
 						if t, ok := pm["text"].(string); ok {
 							textLen += len(t)
+							cjkLen += cjkRunes(t)
 						}
 					}
 				}
 			}
 		}
 	}
-	est := textLen/4 + nMsg*4 + 4
+	// CJK 约 1.5 字符/token，其余按 4 字节/token：英文经验公式 len/4 对中文
+	// 严重低估（1 字 3 字节≈1 token），分权估算（Workbuddy2API #20 同款修法）。
+	est := int(float64(cjkLen)/1.5) + (textLen-3*cjkLen)/4 + nMsg*4 + 4
+	if est < 1 {
+		est = 1
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"input_tokens": est})
+}
+
+// cjkRunes counts CJK runes (han, CJK punctuation, fullwidth forms) in s.
+func cjkRunes(s string) int {
+	n := 0
+	for _, r := range s {
+		if unicode.Is(unicode.Han, r) ||
+			(r >= 0x3000 && r <= 0x303F) ||
+			(r >= 0xFF00 && r <= 0xFFEF) {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *Server) auth(r *http.Request) (*Principal, *apiError) {

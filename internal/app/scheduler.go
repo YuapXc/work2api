@@ -290,6 +290,8 @@ func (s *Scheduler) run() {
 	// 同步 lastCredit：否则首个 tick 的周期判据（now-lastCredit >= interval）
 	// 因零值必然命中，刚预热完又对全部账号白刷一遍额度（Workbuddy2API #34 同款）。
 	s.lastCredit = float64(time.Now().Unix())
+	// lastRowCheck 同形：零值会让首个 tick 立即对 usage_logs 跑行数检查。
+	s.lastRowCheck = s.lastCredit
 	// AA benchmarks: warm once at startup so the Models page has data without
 	// waiting for the daily window (skipped cheaply when no key is configured).
 	if s.o.bench.Configured() {

@@ -312,6 +312,27 @@ func (m *Manager) GetHeaders() (map[string]string, error) {
 	return profiles.CredentialHeaders(s.Auth, profiles.Account(s.Account)), nil
 }
 
+// GetChatHeaders returns chat-path headers: credential identity plus the
+// per-request X-Request-ID / X-Conversation-Message-ID /
+// X-Conversation-Request-ID triple (shared value, see profiles.ChatHeaders).
+func (m *Manager) GetChatHeaders() (map[string]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s, err := m.session(); err == nil && encryptedToken(s.Auth) {
+		return nil, errors.New("该账号 token 被 CodeBuddy 加密存储（$wbEncrypted），无法直接读取；请在 WebUI 重新扫码登录导入该账号")
+	}
+	if m.isExpired() {
+		if err := m.refresh(); err != nil {
+			return nil, err
+		}
+	}
+	s, err := m.session()
+	if err != nil {
+		return nil, err
+	}
+	return profiles.ChatHeaders(s.Auth, profiles.Account(s.Account)), nil
+}
+
 // CatalogHeaders returns model-catalog request headers.
 func (m *Manager) CatalogHeaders() (map[string]string, error) {
 	m.mu.Lock()

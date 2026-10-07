@@ -10,9 +10,10 @@ import (
 	"strings"
 )
 
-// effortRank orders effort levels low→high.
+// effortRank orders effort levels low→high. `none` is an alias of `off`
+// (OpenAI-style clients say none, Anthropic-style say off), both rank 0.
 var effortRank = map[string]int{
-	"off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6,
+	"off": 0, "none": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6,
 }
 
 // KnownEfforts is the cold-start fallback of per-model reasoning support.
@@ -38,6 +39,16 @@ type Body = map[string]any
 
 // NormalizeReasoningEffort downgrades reasoning_effort to the model's supported
 // levels (snake/camel field compatible).
+//
+// ⚠️ `off`/`none` is the "no thinking" SWITCH, not the lowest rung — it must be
+// picked separately from thinking levels (Workbuddy2API #24). The naive
+// "highest level ≤ requested" loop always matches off (rank 0), so a client
+// asking for low/medium on a model whose lowest thinking rung is high gets
+// off — thinking silently disabled, worse than no downgrade at all. Semantics:
+//  1. request off/none → give off when supported, else lift to the lowest thinking level;
+//  2. request a thinking level → pick the highest thinking level ≤ request
+//     (off excluded); when all exceed the request, take the lowest thinking level;
+//  3. model offers only off (no thinking at all) → only off.
 func NormalizeReasoningEffort(body Body, efforts map[string][]string) Body {
 	if efforts == nil {
 		efforts = KnownEfforts
@@ -68,32 +79,76 @@ func NormalizeReasoningEffort(body Body, efforts map[string][]string) Body {
 	if !ok {
 		return body
 	}
-	best, bestIdx := "", -1
+	rank := func(s string) (int, bool) {
+		i, ok := effortRank[strings.ToLower(strings.TrimSpace(s))]
+		return i, ok
+	}
+	var thinking, offLike []string
 	for _, s := range supported {
-		idx, ok := effortRank[strings.ToLower(strings.TrimSpace(s))]
-		if ok && idx <= reqIdx && idx > bestIdx {
-			best, bestIdx = s, idx
+		idx, ok := rank(s)
+		if !ok {
+			continue
+		}
+		if idx == 0 {
+			offLike = append(offLike, s)
+		} else {
+			thinking = append(thinking, s)
 		}
 	}
-	if best != "" {
-		if strings.ToLower(best) != req {
-			log.Printf("reasoning_effort 降级 model=%s %s -> %s", model, req, best)
-			body[key] = best
+	lowest := func(levels []string) string {
+		best, bestIdx := "", 1<<30
+		for _, s := range levels {
+			idx, _ := rank(s)
+			if idx < bestIdx {
+				best, bestIdx = s, idx
+			}
 		}
+		return best
+	}
+	chosen := ""
+	if reqIdx == 0 {
+		if len(offLike) > 0 {
+			// Client explicitly wants no thinking and the model supports it.
+			chosen = offLike[0]
+		} else if len(thinking) > 0 {
+			// Model lists no "off" rung (onlyReasoning): measured against the real
+			// upstream (2026-10-07, deepseek-v4-pro, catalog onlyReasoning) bare
+			// "off" is rejected with 400 code=11150, while "off" +
+			// thinking:{type:disabled} succeeds with no reasoning. Rewrite "off"
+			// into the form the upstream actually accepts for "no thinking":
+			// lift to the lowest thinking rung + drop the thinking switch.
+			// InjectThinking (DeepSeek) then leaves the explicit disabled state
+			// alone and strips the rewritten effort, so "off" truly means off
+			// instead of silently forcing thinking on. Clients that sent their
+			// own thinking object keep it untouched.
+			if _, stated := body["thinking"]; !stated {
+				body["thinking"] = map[string]any{"type": "disabled"}
+			}
+			chosen = lowest(thinking)
+		}
+	} else if len(thinking) > 0 {
+		// Thinking levels only: highest level ≤ request, else the lowest one.
+		bestIdx := -1
+		for _, s := range thinking {
+			idx, _ := rank(s)
+			if idx <= reqIdx && idx > bestIdx {
+				chosen, bestIdx = s, idx
+			}
+		}
+		if chosen == "" {
+			chosen = lowest(thinking)
+		}
+	} else if len(offLike) > 0 {
+		// Model offers only off (no thinking capability).
+		chosen = offLike[0]
+	}
+	if chosen == "" {
 		return body
 	}
-	// all supported levels exceed the request: pick the lowest
-	lowest, lowestIdx := "", 1<<30
-	for _, s := range supported {
-		idx, ok := effortRank[strings.ToLower(strings.TrimSpace(s))]
-		if !ok {
-			idx = 1 << 30
-		}
-		if idx < lowestIdx {
-			lowest, lowestIdx = s, idx
-		}
+	if strings.ToLower(strings.TrimSpace(chosen)) != req {
+		log.Printf("reasoning_effort 降级 model=%s %s -> %s", model, req, chosen)
 	}
-	body[key] = lowest
+	body[key] = chosen
 	return body
 }
 
@@ -146,20 +201,21 @@ func Sanitize(body Body, efforts map[string][]string) Body {
 	body = NormalizeToolChoice(body)
 	body = NormalizeReasoningEffort(body, efforts)
 	body = NormalizeRoles(body)
+	body = EnsureLeadingSystem(body)
 	body = RepairToolSequence(body)
 	body = InjectThinking(body)
 	body = BackfillReasoningContent(body)
 	return body
 }
 
-// NormalizeRoles rewrites developer→system and ensures the first message is a
-// system message (international site returns 400 code=11128 otherwise).
+// NormalizeRoles rewrites developer→system (upstream role whitelist rejects
+// "developer" with 400 code=11128; developer is OpenAI's alias of system).
+// Only this one value is rewritten — no merging, reordering or deletion.
 func NormalizeRoles(body Body) Body {
 	msgs, ok := body["messages"].([]any)
-	if !ok || len(msgs) == 0 {
+	if !ok {
 		return body
 	}
-	hasSystem := false
 	for _, m := range msgs {
 		mm, ok := m.(map[string]any)
 		if !ok {
@@ -168,14 +224,25 @@ func NormalizeRoles(body Body) Body {
 		if mm["role"] == "developer" {
 			mm["role"] = "system"
 		}
-		if mm["role"] == "system" {
-			hasSystem = true
-		}
 	}
-	if !hasSystem {
-		sys := map[string]any{"role": "system", "content": "You are a helpful assistant."}
-		body["messages"] = append([]any{sys}, msgs...)
+	return body
+}
+
+// EnsureLeadingSystem prepends an EMPTY system message when the first message
+// is not a system one. Upstream 11128 checks messages[0].role, not "any system
+// exists": a client sending [user, system] still 400s unless the first message
+// is system (upstream workbuddy_one.ensure_leading_system; an empty system is
+// harmless on the domestic site and required on the international one).
+func EnsureLeadingSystem(body Body) Body {
+	msgs, ok := body["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return body
 	}
+	if first, ok := msgs[0].(map[string]any); ok && first["role"] == "system" {
+		return body
+	}
+	sys := map[string]any{"role": "system", "content": ""}
+	body["messages"] = append([]any{sys}, msgs...)
 	return body
 }
 

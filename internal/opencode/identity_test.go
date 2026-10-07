@@ -2,9 +2,35 @@ package opencode
 
 import (
 	"hash/fnv"
+	"net/http"
 	"testing"
 	"time"
 )
+
+// E2 回归：会话亲和信号按上游优先级取请求头，回落 body 信号。
+func TestDeriveRequestIDsHeaderSignals(t *testing.T) {
+	// x-session-id 头优先于 body 信号（客户端显式分离会话）
+	h := http.Header{"X-Session-Id": []string{"ses_0123456789abABCDEFGHIJKLMN"}}
+	ids := deriveRequestIDs(map[string]any{"conversation_id": "other"}, h)
+	if ids.Session != "ses_0123456789abABCDEFGHIJKLMN" {
+		t.Fatalf("header 信号应优先, got %q", ids.Session)
+	}
+	// 上游头优先级：x-opencode-session > x-session-affinity > X-Session-Id > x-session-id > conversation-id
+	h = http.Header{
+		"Conversation-Id":    []string{"low"},
+		"X-Session-Id":       []string{"mid"},
+		"X-Opencode-Session": []string{"high"},
+	}
+	ids = deriveRequestIDs(map[string]any{}, h)
+	if got := CanonicalSessionID("high"); ids.Session != got {
+		t.Fatalf("x-opencode-session 应最优先, got %q want %q", ids.Session, got)
+	}
+	// 无头时回落 body 信号（原有行为不变）
+	ids = deriveRequestIDs(map[string]any{"metadata": map[string]any{"session_id": "body-sig"}}, nil)
+	if got := CanonicalSessionID("body-sig"); ids.Session != got {
+		t.Fatalf("body 信号回落失败, got %q want %q", ids.Session, got)
+	}
+}
 
 func TestCanonicalSessionIDPassesValidIDUnchanged(t *testing.T) {
 	valid := "ses_0123456789ab" + "ABCDEFGHIJKLMN" // ses_ + 12 hex + 14 base62
