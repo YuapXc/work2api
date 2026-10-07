@@ -143,7 +143,11 @@ func (s *Server) adminProviderImportAccount(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, 400, errBody(400, r.PathValue("name")+" 不支持凭 token 添加账号", "invalid_request_error").body)
 		return
 	}
-	body, _ := readJSON(r)
+	body, err := readJSON(r)
+	if err != nil {
+		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").body)
+		return
+	}
 	token, _ := body["token"].(string)
 	if token == "" {
 		writeJSON(w, 400, errBody(400, "token 不能为空", "invalid_request_error").body)

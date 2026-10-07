@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -214,6 +215,8 @@ func SaveSettings(s *Settings) error {
 // 用途：使每个部署的指纹派生空间独立，防止 uid 派生模式被上游全局识别。
 // 生成后保持不变——变更 salt 即所有账号指纹整体漂移（等价于换设备）。
 func EnsureMachineSalt() (string, error) {
+	mu.Lock()
+	defer mu.Unlock()
 	st, err := LoadSettings()
 	if err != nil || st == nil {
 		st = &Settings{Port: 8963, LogLevel: "info"}
@@ -230,4 +233,114 @@ func EnsureMachineSalt() (string, error) {
 		return "", err
 	}
 	return st.MachineSalt, nil
+}
+
+// ImportAndActivate updates the credential and account as one serialized
+// operation. Recover the exact previous bytes on failure, including activation
+// and the hidden marker; never delete a pre-existing credential as rollback.
+func ImportAndActivate(a *Account, secret string) (err error) {
+	mu.Lock()
+	defer mu.Unlock()
+	d, err := dir()
+	if err != nil {
+		return err
+	}
+	tokenPath, err := secretPath(a.ID)
+	if err != nil {
+		return err
+	}
+	accounts, err := listUnlocked(d)
+	if err != nil {
+		return err
+	}
+	found := false
+	for i := range accounts {
+		if accounts[i].ID == a.ID {
+			previous := accounts[i]
+			previous.Region, previous.AuthMode = a.Region, a.AuthMode
+			previous.Email, previous.UserType = a.Email, a.UserType
+			if previous.Name == "" {
+				previous.Name = a.Name
+			}
+			*a = previous
+			accounts[i] = *a
+			found = true
+		}
+	}
+	if !found {
+		accounts = append(accounts, *a)
+	}
+	type snapshot struct {
+		path    string
+		data    []byte
+		existed bool
+	}
+	var saved []snapshot
+	paths := []string{tokenPath, gatewayHiddenPath(a.ID)}
+	for _, entry := range accounts {
+		paths = append(paths, filepath.Join(d, entry.ID+".json"))
+	}
+	for _, path := range paths {
+		data, readErr := os.ReadFile(path)
+		if readErr != nil && !os.IsNotExist(readErr) {
+			return readErr
+		}
+		saved = append(saved, snapshot{path, data, readErr == nil})
+	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		var rollbackErrors []error
+		for _, prev := range saved {
+			if prev.existed {
+				if e := writeAtomic(prev.path, prev.data); e != nil {
+					rollbackErrors = append(rollbackErrors, e)
+				}
+			} else if e := os.Remove(prev.path); e != nil && !os.IsNotExist(e) {
+				rollbackErrors = append(rollbackErrors, e)
+			}
+		}
+		err = errors.Join(append([]error{err}, rollbackErrors...)...)
+	}()
+	if err = writeAtomic(tokenPath, []byte(normalizeSecret(secret))); err != nil {
+		return err
+	}
+	for i := range accounts {
+		accounts[i].Active = accounts[i].ID == a.ID
+		data, e := json.MarshalIndent(&accounts[i], "", "  ")
+		if e != nil {
+			return e
+		}
+		if err = writeAtomic(filepath.Join(d, accounts[i].ID+".json"), data); err != nil {
+			return err
+		}
+	}
+	if err = SetGatewayHidden(a.ID, false); err != nil {
+		return err
+	}
+	a.Active = true
+	return nil
+}
+func writeAtomic(path string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".work2api-import-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if err = f.Chmod(0600); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err = f.Write(data); err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Rename(f.Name(), path)
 }

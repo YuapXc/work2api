@@ -185,3 +185,96 @@ func TestFetchOneRejectsBusinessErrorCode(t *testing.T) {
 		}
 	}
 }
+
+type isolatedCatalogTransport func(*http.Request) (*http.Response, error)
+
+func (f isolatedCatalogTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type isolatedCatalogCredential struct {
+	catalogTestCredential
+	uid string
+}
+
+func (c isolatedCatalogCredential) CatalogHeaders() (map[string]string, error) {
+	return map[string]string{"X-Test-UID": c.uid}, nil
+}
+func catalogResponse(r *http.Request, status int, b string) *http.Response {
+	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(b)), Request: r}
+}
+func TestFreshSourceOverridesFailedSourceSnapshot(t *testing.T) {
+	phase := 0
+	tr := &dualTransport{respond: func(path string) (int, string) {
+		if phase == 1 && path == "/v3/config" {
+			return 503, `{}`
+		}
+		name := "Old"
+		if phase == 1 {
+			name = "New"
+		}
+		return 200, strings.Replace(catalogBody("shared"), `"name":"shared"`, `"name":"`+name+`"`, 1)
+	}}
+	p := pool.New(map[string]pool.Credential{"uid": catalogTestCredential{profile: "cn-cli"}}, "")
+	r := NewWithCatalogClient(p, nil, &http.Client{Transport: tr})
+	r.fetchOneContext(context.Background(), p.Accounts()[0])
+	phase = 1
+	got := r.fetchOneContext(context.Background(), p.Accounts()[0])
+	if len(got) != 1 || got[0].entry["name"] != "New" || !got[0].fresh {
+		t.Fatalf("fresh metadata masked: %#v", got)
+	}
+}
+func TestCanceledCatalogDoesNotPenalizeAccount(t *testing.T) {
+	p := pool.New(map[string]pool.Credential{"uid": catalogTestCredential{profile: "cn-cli"}}, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := NewWithCatalogClient(p, nil, &http.Client{Transport: isolatedCatalogTransport(func(req *http.Request) (*http.Response, error) { return nil, req.Context().Err() })})
+	r.fetchOneContext(ctx, p.Accounts()[0])
+	r.RefreshContext(ctx)
+	if r.lastFail != 0 {
+		t.Fatal("canceled refresh started failure backoff")
+	}
+	if a := p.Get("uid"); a.FailureCount != 0 || a.CooldownUntil != 0 {
+		t.Fatal("cancellation punished account")
+	}
+}
+func TestRefreshPreservesPublishedSnapshotAndSourceRestrictions(t *testing.T) {
+	phase := 0
+	p := pool.New(map[string]pool.Credential{"a": isolatedCatalogCredential{catalogTestCredential{profile: "cn-cli"}, "a"}, "b": isolatedCatalogCredential{catalogTestCredential{profile: "cn-cli"}, "b"}}, "")
+	first := p.Accounts()[0].UID
+	tr := isolatedCatalogTransport(func(req *http.Request) (*http.Response, error) {
+		uid := req.Header.Get("X-Test-UID")
+		if req.URL.Path != "/v3/config" || phase == 0 && uid != first {
+			return catalogResponse(req, 200, catalogBody()), nil
+		}
+		if phase == 1 && uid == first {
+			return catalogResponse(req, 503, `{}`), nil
+		}
+		flag := "false"
+		if phase == 1 {
+			flag = "true"
+		}
+		return catalogResponse(req, 200, `{"data":{"models":[{"id":"shared","name":"shared","supportsReasoning":true,"onlyReasoning":`+flag+`}],"agents":[{"name":"cli","models":["shared"]}]}}`), nil
+	})
+	r := NewWithCatalogClient(p, nil, &http.Client{Transport: tr})
+	old := r.Refresh()
+	var cfg map[string]any
+	for _, m := range old {
+		if m["id"] == "shared" {
+			cfg = m["reasoning"].(map[string]any)
+		}
+	}
+	phase = 1
+	r.Refresh()
+	if cfg["onlyReasoning"] != false {
+		t.Fatal("refresh mutated old snapshot")
+	}
+	for _, m := range r.ListCached() {
+		if m["id"] == "shared" && !boolOf(m["reasoning"].(map[string]any)["onlyReasoning"]) {
+			t.Fatal("merged restriction lost")
+		}
+	}
+	cfg["onlyReasoning"] = true
+	sources, _ := catalogSources("cn-cli")
+	if boolOf(r.catalogCache[[3]string{"cn-cli", first, sources[0]}][0].reasoning["onlyReasoning"]) {
+		t.Fatal("source snapshot polluted")
+	}
+}

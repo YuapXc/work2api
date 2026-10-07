@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
+	"work2api/internal/streamwatch"
 )
 
 // ExchangeJobToken 将 PAT 或 refresh token 转换为 job token
@@ -76,11 +76,16 @@ func ExchangeJobTokenContext(ctx context.Context, token, machineId, machineToken
 		return nil, err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	data, err := streamwatch.ReadBody(ctx, resp.Body, 1<<20)
+	if err != nil {
+		return nil, err
+	}
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP %d at jobToken body=%s", resp.StatusCode, string(data))
+		return nil, fmt.Errorf("HTTP %d at jobToken", resp.StatusCode)
 	}
 	var result map[string]interface{}
-	err = json.Unmarshal(data, &result)
-	return result, err
+	if err = json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("invalid jobToken response")
+	}
+	return result, nil
 }

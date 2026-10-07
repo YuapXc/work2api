@@ -148,3 +148,16 @@ func TestSanitizeRolesAndLeadingSystem(t *testing.T) {
 		t.Fatal("不应再注入自定义兜底文案")
 	}
 }
+
+func TestExplicitOffWithUnknownSupportDisablesDeepseekThinking(t *testing.T) {
+	for _, value := range []string{"off", "none"} {
+		body := Body{"model": "deepseek-future", "reasoning_effort": value}
+		out := Sanitize(body, map[string][]string{"deepseek-future": {}})
+		if out["thinking"].(map[string]any)["type"] != "disabled" {
+			t.Fatal("explicit off lost")
+		}
+		if _, present := out["reasoning_effort"]; present {
+			t.Fatal("disabled effort not removed")
+		}
+	}
+}

@@ -31,7 +31,7 @@ func TestExtractReasoningKeepsEffort(t *testing.T) {
 // A4 回归：onlyReasoning 模型即使目录写了 canDisableThinking:true 也不放开 off。
 func TestReasoningEffortsOnlyReasoningNeverOffersOff(t *testing.T) {
 	r := &Registry{reasoning: map[string]map[string]any{
-		"locked": {"supportedEfforts": []string{"high", "xhigh"}, "canDisableThinking": true, "onlyReasoning": true},
+		"locked": {"supportedEfforts": []string{"off", "none", "high", "xhigh"}, "canDisableThinking": true, "onlyReasoning": true},
 		"free":   {"supportedEfforts": []string{"high"}, "canDisableThinking": true},
 	}}
 	if eff := r.ReasoningEfforts("locked"); contains(eff, "off") {
@@ -42,14 +42,25 @@ func TestReasoningEffortsOnlyReasoningNeverOffersOff(t *testing.T) {
 	}
 }
 
-// effort（国内版代替 defaultEffort 的「默认档」标注）可作最低档来源，
-// 使 onlyReasoning 模型的 bare off 能抬到该档 + thinking:disabled（11150 规避）。
-func TestReasoningEffortsEffortAsDefaultRung(t *testing.T) {
+// Defaults may repair an explicit off request, but never clamp thinking levels.
+func TestReasoningDefaultsOnlyApplyToOffCompatibility(t *testing.T) {
 	r := &Registry{reasoning: map[string]map[string]any{
 		"deepseek-v4-pro": {"effort": "high", "onlyReasoning": true, "supportsReasoning": true},
+		"known":           {"defaultEffort": "high", "supportedEfforts": []string{"low", "high"}},
 	}}
-	eff := r.ReasoningEfforts("deepseek-v4-pro")
-	if len(eff) != 1 || eff[0] != "high" {
-		t.Fatalf("effort 应作为唯一档位返回, got %v", eff)
+	if r.ReasoningEfforts("deepseek-v4-pro") != nil {
+		t.Fatal("default is not support")
+	}
+	for _, level := range []string{"low", "max"} {
+		levels := r.RequestEfforts("deepseek-v4-pro", level)
+		if levels == nil || len(levels) != 0 {
+			t.Fatalf("thinking should pass through: %v", levels)
+		}
+	}
+	if got := r.RequestEfforts("deepseek-v4-pro", "off"); len(got) != 1 || got[0] != "high" {
+		t.Fatal("off workaround lost", got)
+	}
+	if got := r.RequestEfforts("known", "low"); len(got) != 2 {
+		t.Fatal("explicit support lost", got)
 	}
 }

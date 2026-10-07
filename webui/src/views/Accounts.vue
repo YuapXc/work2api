@@ -400,6 +400,8 @@ async function openAdd() {
 }
 
 async function onAddProviderChange() {
+  patToken.value = ''
+  oauthMessage.value = ''
   stopPoll()
   const generation = pollGeneration
   const name = addProvider.value
@@ -504,19 +506,22 @@ async function onUpload(e: Event) {
 
 const patToken = ref('')
 const patSaving = ref(false)
+watch(addOpen, (open) => { if (!open) { patToken.value = ''; oauthMessage.value = ''; stopPoll() } })
 async function onAddByToken() {
   const token = patToken.value.trim()
   if (!token || patSaving.value) return
+  const generation = pollGeneration
   patSaving.value = true
   oauthMessage.value = ''
   try {
     await api.providerImportAccount(addProvider.value, token, { ...oauthChoice.value })
+    if (generation !== pollGeneration) { await load(); return }
     toast.success('已添加账号')
     patToken.value = ''
     addOpen.value = false
     await load()
   } catch (err: any) {
-    oauthMessage.value = err?.response?.data?.error?.message || '添加失败，请检查 PAT 后重试'
+    if (generation === pollGeneration) oauthMessage.value = err?.response?.data?.error?.message || '添加失败，请检查 PAT 后重试'
   } finally {
     patSaving.value = false
   }
@@ -756,13 +761,13 @@ async function saveConfig() {
     <!-- 添加账号 -->
     <WModal v-model:open="addOpen" title="添加账号" @update:open="(v) => !v && stopPoll()">
       <label class="mb-1.5 block text-small text-muted">供应商</label>
-      <WSelect v-model="addProvider" :options="addProviderOptions" class="mb-4" @update:model-value="onAddProviderChange" />
+      <WSelect v-model="addProvider" :options="addProviderOptions" :disabled="patSaving" class="mb-4" @update:model-value="onAddProviderChange" />
 
       <!-- 方式切换（供应商支持多种添加方式时展示） -->
       <div v-if="[caps(addProvider).includes('oauth'), caps(addProvider).includes('upload'), caps(addProvider).includes('add_account')].filter(Boolean).length > 1" class="mb-4 flex gap-2">
-        <WButton v-if="caps(addProvider).includes('oauth')" size="sm" :variant="addMethod === 'oauth' ? 'primary' : 'subtle'" @click="addMethod = 'oauth'">扫码登录</WButton>
-        <WButton v-if="caps(addProvider).includes('upload')" size="sm" :variant="addMethod === 'upload' ? 'primary' : 'subtle'" @click="addMethod = 'upload'">上传凭据</WButton>
-        <WButton v-if="caps(addProvider).includes('add_account')" size="sm" :variant="addMethod === 'token' ? 'primary' : 'subtle'" @click="addMethod = 'token'">PAT 添加</WButton>
+        <WButton v-if="caps(addProvider).includes('oauth')" size="sm" :disabled="patSaving" :variant="addMethod === 'oauth' ? 'primary' : 'subtle'" @click="addMethod = 'oauth'">扫码登录</WButton>
+        <WButton v-if="caps(addProvider).includes('upload')" size="sm" :disabled="patSaving" :variant="addMethod === 'upload' ? 'primary' : 'subtle'" @click="addMethod = 'upload'">上传凭据</WButton>
+        <WButton v-if="caps(addProvider).includes('add_account')" size="sm" :disabled="patSaving" :variant="addMethod === 'token' ? 'primary' : 'subtle'" @click="addMethod = 'token'">PAT 添加</WButton>
       </div>
 
       <!-- 扫码登录 -->
@@ -773,7 +778,7 @@ async function saveConfig() {
         </div>
         <div v-for="o in oauthOptions" :key="o.key" class="mb-3">
           <label class="mb-1.5 block text-small text-muted">{{ o.label }}</label>
-          <WSelect v-model="oauthChoice[o.key]" :options="o.values" />
+          <WSelect v-model="oauthChoice[o.key]" :options="o.values" :disabled="patSaving" />
         </div>
         <div v-if="oauthUrl" class="rounded-lg border border-line bg-bg/40 p-3 text-small text-muted">
           已在新标签打开授权页，请完成登录后等待自动确认。
@@ -797,7 +802,7 @@ async function saveConfig() {
       <template v-else-if="addMethod === 'token'">
         <div v-for="o in oauthOptions" :key="o.key" class="mb-3">
           <label class="mb-1.5 block text-small text-muted">{{ o.label }}</label>
-          <WSelect v-model="oauthChoice[o.key]" :options="o.values" />
+          <WSelect v-model="oauthChoice[o.key]" :options="o.values" :disabled="patSaving" />
         </div>
         <label class="mb-1.5 block text-small text-muted">Personal Access Token</label>
         <WTextarea v-model="patToken" :rows="3" placeholder="在 Qoder 控制台生成的 PAT" />

@@ -13,7 +13,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 	"work2api/internal/statebackup"
 )
 
@@ -467,49 +466,57 @@ func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").body)
 		return
 	}
-	textLen := 0
-	cjkLen := 0
+	// Compatibility estimate, not a provider tokenizer or quota settlement.
+	writeJSON(w, http.StatusOK, map[string]any{"input_tokens": estimateInputTokens(body)})
+}
+
+func estimateInputTokens(body map[string]any) int {
+	textBytes := estimateContentBytes(body["system"])
 	nMsg := 0
-	if msgs, ok := body["messages"].([]any); ok {
-		for _, m := range msgs {
+	if messages, ok := body["messages"].([]any); ok {
+		for _, raw := range messages {
+			msg, _ := raw.(map[string]any)
 			nMsg++
-			mm, _ := m.(map[string]any)
-			switch c := mm["content"].(type) {
-			case string:
-				textLen += len(c)
-				cjkLen += cjkRunes(c)
-			case []any:
-				for _, p := range c {
-					if pm, ok := p.(map[string]any); ok {
-						if t, ok := pm["text"].(string); ok {
-							textLen += len(t)
-							cjkLen += cjkRunes(t)
-						}
-					}
-				}
+			textBytes += estimateContentBytes(msg["content"])
+			if calls := msg["tool_calls"]; calls != nil {
+				textBytes += estimateJSONBytes(calls)
 			}
 		}
 	}
-	// CJK 约 1.5 字符/token，其余按 4 字节/token：英文经验公式 len/4 对中文
-	// 严重低估（1 字 3 字节≈1 token），分权估算（Workbuddy2API #20 同款修法）。
-	est := int(float64(cjkLen)/1.5) + (textLen-3*cjkLen)/4 + nMsg*4 + 4
-	if est < 1 {
-		est = 1
+	if tools := body["tools"]; tools != nil {
+		textBytes += estimateJSONBytes(tools)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"input_tokens": est})
+	// Restore the old byte/4 baseline rather than reducing CJK estimates using
+	// an uncalibrated coefficient. Images/audio require a model-specific counter.
+	return textBytes/4 + nMsg*4 + 4
 }
-
-// cjkRunes counts CJK runes (han, CJK punctuation, fullwidth forms) in s.
-func cjkRunes(s string) int {
-	n := 0
-	for _, r := range s {
-		if unicode.Is(unicode.Han, r) ||
-			(r >= 0x3000 && r <= 0x303F) ||
-			(r >= 0xFF00 && r <= 0xFFEF) {
-			n++
+func estimateJSONBytes(v any) int { b, _ := json.Marshal(v); return len(b) }
+func estimateContentBytes(v any) int {
+	switch x := v.(type) {
+	case string:
+		return len(x)
+	case []any:
+		n := 0
+		for _, item := range x {
+			n += estimateContentBytes(item)
 		}
+		return n
+	case map[string]any:
+		switch x["type"] {
+		case "image", "image_url", "input_image", "audio", "input_audio":
+			return 0
+		case "tool_use":
+			return len(toStrLoose(x["name"])) + estimateJSONBytes(x["input"])
+		case "tool_result":
+			return estimateContentBytes(x["content"])
+		case "thinking":
+			return estimateContentBytes(x["thinking"])
+		default:
+			return estimateContentBytes(x["text"]) + estimateContentBytes(x["content"])
+		}
+	default:
+		return 0
 	}
-	return n
 }
 
 func (s *Server) auth(r *http.Request) (*Principal, *apiError) {

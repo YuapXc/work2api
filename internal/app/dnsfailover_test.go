@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 	"work2api/internal/config"
@@ -96,5 +98,44 @@ func TestOpenUpstreamFailureAccounting(t *testing.T) {
 				t.Fatalf("unexpected account penalty: cooldown=%v failures=%d", got.CooldownUntil, got.FailureCount)
 			}
 		})
+	}
+}
+
+type regionRetryUpstream struct{ bodies []map[string]any }
+
+func (f *regionRetryUpstream) StreamUpstream(ctx context.Context, h map[string]string, b map[string]any, target string, yield upstream.LineFunc) error {
+	f.bodies = append(f.bodies, b)
+	if len(f.bodies) == 1 {
+		return &upstream.UpstreamError{StatusCode: 503, Raw: []byte(`{"error":{"message":"temporary failure"}}`)}
+	}
+	return nil
+}
+func TestRegionFailoverUsesOriginalInternationalPrompt(t *testing.T) {
+	o, first := newDNSFailoverOrch(t, &failingUpstream{})
+	mgr := o.managers[first.UID]
+	o.pool = pool.New(map[string]pool.Credential{first.UID: mgr, "alternate": mgr}, "")
+	first = o.pool.Get(first.UID)
+	first.Profile = "cn-cli"
+	o.pool.Get("alternate").Profile = "intl-cli"
+	o.managers["alternate"] = mgr
+	o.cfg.Desensitize = true
+	o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: catalogTransport{}})
+	o.models.Refresh()
+	client := &regionRetryUpstream{}
+	o.upstreamClient = client
+	original := "security review and Claude Code"
+	body := map[string]any{"model": "test-model", "messages": []any{map[string]any{"role": "system", "content": original}, map[string]any{"role": "user", "content": "hi"}}}
+	if _, err := o.openUpstream(context.Background(), first, body, "test-model", "", func(string) error { return nil }, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.bodies) != 2 {
+		t.Fatal("failover did not run", len(client.bodies))
+	}
+	content := func(b map[string]any) string { return b["messages"].([]any)[0].(map[string]any)["content"].(string) }
+	if !strings.Contains(content(client.bodies[0]), "\u200b") {
+		t.Fatal("domestic processing absent")
+	}
+	if content(client.bodies[1]) != original || content(body) != original {
+		t.Fatal("international retry or original prompt was mutated")
 	}
 }

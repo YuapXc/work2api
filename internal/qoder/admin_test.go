@@ -2,7 +2,13 @@ package qoder
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 	"work2api/internal/core/provider"
 	"work2api/internal/qoder/account"
 	"work2api/internal/qoder/checkin"
@@ -91,5 +97,72 @@ func TestQuotaEntryIncludesEveryCreditBucket(t *testing.T) {
 	}
 	if empty := buildQuotaEntry(&account.QuotaInfo{}); len(empty.packages) != 0 || empty.remaining != 0 {
 		t.Fatal("absent buckets created phantom credits")
+	}
+}
+
+type patExchangeTransport struct {
+	body   string
+	status int
+}
+
+func (f patExchangeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: f.status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(f.body)), Request: r}, nil
+}
+func TestPATRejectsInvalidExchangeWithoutChangingActiveAccount(t *testing.T) {
+	root := account.DataRoot()
+	account.SetDataRoot(t.TempDir())
+	defer account.SetDataRoot(root)
+	a := &account.Account{ID: "old", Name: "old", Active: true}
+	if err := account.Save(a); err != nil {
+		t.Fatal(err)
+	}
+	account.SaveSecret(a.ID, "original")
+	transport := http.DefaultTransport
+	defer func() { http.DefaultTransport = transport }()
+	for _, body := range []string{`{}`, `{"id":"new"}`, `{"securityOauthToken":"session"}`, `{"code":401,"id":"new","securityOauthToken":"session"}`} {
+		http.DefaultTransport = patExchangeTransport{body, 200}
+		if _, err := New("error").AddAccountByToken(context.Background(), "fake-pat", map[string]any{"region": "cn"}); err == nil {
+			t.Fatal("invalid exchange accepted", body)
+		}
+		list, _ := account.List()
+		if len(list) != 1 || !list[0].Active || list[0].ID != "old" {
+			t.Fatal("invalid import changed active state")
+		}
+	}
+}
+func TestPATReimportPreservesMetadataAndFailurePreservesSecret(t *testing.T) {
+	root := account.DataRoot()
+	account.SetDataRoot(t.TempDir())
+	defer account.SetDataRoot(root)
+	created := time.Now().Add(-time.Hour).UTC()
+	a := &account.Account{ID: "123User", Name: "Alias", Region: account.RegionCN, AuthMode: "pat", APIMode: "anthropic", Tags: []string{"tag"}, SortOrder: 4, CreatedAt: created}
+	if err := account.Save(a); err != nil {
+		t.Fatal(err)
+	}
+	account.SaveSecret(a.ID, "old-pat")
+	transport := http.DefaultTransport
+	http.DefaultTransport = patExchangeTransport{`{"id":"123","name":"User","securityOauthToken":"session"}`, 200}
+	defer func() { http.DefaultTransport = transport }()
+	if _, err := New("error").AddAccountByToken(context.Background(), "new-pat", map[string]any{"region": "cn"}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := account.Get(a.ID)
+	if got.Name != "Alias" || got.APIMode != "anthropic" || got.SortOrder != 4 || !got.CreatedAt.Equal(created) || len(got.Tags) != 1 || !got.Active {
+		t.Fatal("reimport erased metadata", got)
+	}
+	// Prevent saving the account before any credential is overwritten.
+	path := filepath.Join(account.DataRoot(), "accounts", a.ID+".json")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New("error").AddAccountByToken(context.Background(), "bad-replacement", map[string]any{"region": "cn"}); err == nil {
+		t.Fatal("filesystem failure ignored")
+	}
+	secret, _ := account.GetSecret(a.ID)
+	if secret != "new-pat" {
+		t.Fatal("failed reimport destroyed previous credential")
 	}
 }

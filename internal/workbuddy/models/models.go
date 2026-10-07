@@ -196,6 +196,9 @@ func (r *Registry) RefreshContext(ctx context.Context) []map[string]any {
 	r.refreshMu.Lock()
 	defer r.refreshMu.Unlock()
 	fetched := r.fetchFromUpstreamContext(ctx)
+	if ctx.Err() != nil {
+		return withStandardAll(r.fallback())
+	}
 	if fetched == nil {
 		r.mu.Lock()
 		r.lastFail = nowSec()
@@ -255,18 +258,20 @@ func (r *Registry) reasoningEffortsLocked(model string) []string {
 	if se, ok := cfg["supportedEfforts"].([]string); ok {
 		efforts = append(efforts, se...)
 	}
-	if len(efforts) == 0 {
-		if de, ok := cfg["defaultEffort"].(string); ok && de != "" {
-			efforts = []string{de}
+	if boolOf(cfg["onlyReasoning"]) {
+		filtered := efforts[:0]
+		for _, level := range efforts {
+			normalized := strings.ToLower(strings.TrimSpace(level))
+			if normalized != "off" && normalized != "none" {
+				filtered = append(filtered, level)
+			}
 		}
+		efforts = filtered
 	}
-	// `effort`（国内版用它代替 defaultEffort）语义同样是「默认跑在哪档」，
-	// 不是「只支持这一档」——实测给报 effort=high 的 auto 发 low 照样 200。
-	// 只用它**标注默认档**，不当支持集裁剪（上游 workbuddy_one 同款约定）。
+	// A default rung is not a supported set. Unknown thinking levels must pass
+	// through; off compatibility is handled separately for each request.
 	if len(efforts) == 0 {
-		if e, ok := cfg["effort"].(string); ok && e != "" {
-			efforts = []string{e}
-		}
+		return nil
 	}
 	// onlyReasoning models cannot disable thinking: never offer off even if the
 	// catalog also claims canDisableThinking — the catalog field ranks below the
@@ -280,6 +285,30 @@ func (r *Registry) reasoningEffortsLocked(model string) []string {
 		return nil
 	}
 	return efforts
+}
+
+// RequestEfforts separates explicit support from default-rung off compatibility.
+// A known catalog with unknown support returns a non-nil empty table so callers
+// do not silently substitute the cold-start support table.
+func (r *Registry) RequestEfforts(model, requested string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cfg, known := r.reasoning[model]
+	if !known {
+		return nil
+	}
+	if levels := r.reasoningEffortsLocked(model); levels != nil {
+		return levels
+	}
+	requested = strings.ToLower(strings.TrimSpace(requested))
+	if (requested == "off" || requested == "none") && boolOf(cfg["onlyReasoning"]) {
+		for _, key := range []string{"defaultEffort", "effort"} {
+			if level := str(cfg[key]); level != "" {
+				return []string{level}
+			}
+		}
+	}
+	return []string{}
 }
 
 // MaxOutputTokens returns a model's max output token limit (0 if unknown).
@@ -360,7 +389,7 @@ func (r *Registry) fetchFromUpstreamContext(ctx context.Context) []fetchedModel 
 				if !contains(uids, account.UID) || str(old["id"]) == "auto" {
 					continue
 				}
-				old = cloneMap(old)
+				old = cloneModelEntry(old)
 				region := siterouting.ProfileSite(account.Profile)
 				delete(old, "credits")
 				if costs, ok := old["credits_by_region"].(map[string]float64); ok {
@@ -376,28 +405,19 @@ func (r *Registry) fetchFromUpstreamContext(ctx context.Context) []fetchedModel 
 		}
 		region := siterouting.ProfileSite(account.Profile)
 		for _, fm := range got {
-			// onlyReasoning merges conservatively (OR): it is a capability LIMIT
-			// ("thinking cannot be disabled"), so if ANY region says the model
-			// cannot disable thinking we believe it — the opposite direction
-			// ("more informative wins") measured wrong on glm-5.2, whose intl
-			// catalog claims onlyReasoning:false yet the model still reasons on
-			// reasoning_effort=off in both regions.
-			if boolOf(fm.reasoning["onlyReasoning"]) {
-				fm.entry["reasoning"].(map[string]any)["onlyReasoning"] = true
-				if prev, exists := merged[fm.id]; exists {
-					if pr, ok := prev.entry["reasoning"].(map[string]any); ok {
-						pr["onlyReasoning"] = true
-					}
-					if prev.reasoning != nil {
-						prev.reasoning["onlyReasoning"] = true
-					}
-				}
-			}
-			if _, exists := merged[fm.id]; !exists {
+			// Combine capability restrictions after selecting fresh metadata.
+			previous, exists := merged[fm.id]
+			locked := boolOf(fm.reasoning["onlyReasoning"]) || boolOf(previous.reasoning["onlyReasoning"])
+			if !exists {
 				merged[fm.id] = fm
 				order = append(order, fm.id)
 			} else if observed && fm.fresh && !fresh[fm.id] {
 				merged[fm.id] = fm
+			}
+			chosen := merged[fm.id]
+			if locked {
+				chosen.reasoning["onlyReasoning"] = true
+				chosen.entry["reasoning"] = chosen.reasoning
 			}
 			if observed && fm.fresh {
 				fresh[fm.id] = true
@@ -590,16 +610,25 @@ func (r *Registry) fetchOneContext(ctx context.Context, account *pool.Account) [
 			freshAny = true
 		}
 		for _, fm := range entries {
+			fm.entry = cloneModelEntry(fm.entry)
+			fm.reasoning, _ = fm.entry["reasoning"].(map[string]any)
 			fm.fresh = fetched != nil
-			if _, exists := merged[fm.id]; !exists {
+			previous, exists := merged[fm.id]
+			if !exists {
 				merged[fm.id] = fm
 				order = append(order, fm.id)
+			} else if fm.fresh && !previous.fresh {
+				merged[fm.id] = fm
 			}
 		}
 	}
-	if !freshAny {
-		// 全部来源失败不能伪装成一次成功刷新：冷却账号、交给失败退避。
-		r.pool.OnFailure(account.UID, 60)
+	if ctx.Err() != nil {
+		return nil
+	}
+	if !freshAny { // 全部来源失败不能伪装成一次成功刷新：冷却账号、交给失败退避。
+		if ctx.Err() == nil {
+			r.pool.OnFailure(account.UID, 60)
+		}
 		return nil
 	}
 	out := make([]fetchedModel, 0, len(order))
@@ -637,9 +666,12 @@ func (r *Registry) fetchCatalogURL(ctx context.Context, url string, headers map[
 				return nil
 			}
 		case string:
-			if c != "0" && c != "" {
+			if c != "0" {
 				return nil
 			}
+		case nil:
+		default:
+			return nil
 		}
 	}
 	d, _ := data["data"].(map[string]any)
@@ -881,7 +913,39 @@ func cloneMap(m map[string]any) map[string]any {
 func cloneAll(models []map[string]any) []map[string]any {
 	out := make([]map[string]any, 0, len(models))
 	for _, m := range models {
-		out = append(out, cloneMap(m))
+		out = append(out, cloneModelEntry(m))
 	}
 	return out
+}
+
+// Entries cross refresh/publication boundaries; all mutable nested containers
+// are copied, including capability metadata and per-region costs.
+func cloneModelEntry(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = cloneCatalogValue(v)
+	}
+	return out
+}
+func cloneCatalogValue(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		return cloneModelEntry(x)
+	case map[string]float64:
+		out := make(map[string]float64, len(x))
+		for k, v := range x {
+			out[k] = v
+		}
+		return out
+	case []string:
+		return append([]string(nil), x...)
+	case []any:
+		out := make([]any, len(x))
+		for i, v := range x {
+			out[i] = cloneCatalogValue(v)
+		}
+		return out
+	default:
+		return v
+	}
 }

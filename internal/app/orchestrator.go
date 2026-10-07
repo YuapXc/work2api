@@ -856,7 +856,11 @@ func (o *Orchestrator) enhanceBody(body map[string]any) map[string]any {
 	}
 	var dyn map[string][]string
 	if modelID != "" {
-		if eff := o.models.ReasoningEfforts(modelID); eff != nil {
+		requested := toStrLoose(body["reasoning_effort"])
+		if requested == "" {
+			requested = toStrLoose(body["reasoningEffort"])
+		}
+		if eff := o.models.RequestEfforts(modelID, requested); eff != nil {
 			dyn = map[string][]string{modelID: eff}
 		}
 	}
@@ -965,7 +969,8 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 	}()
 	const maxFailoverAttempts = 5
 	tried := map[string]bool{}
-	desensitized := "" // apply anti-review desensitization once per attempt's region
+	originalBody := body
+	domesticBody := map[string]any(nil) // derive from the original, never a prior attempt
 	for attempt := 0; ; attempt++ {
 		if lease, ok := ctx.Value(modelLeaseKey{}).(*modelLease); ok {
 			choose, chooseErr := o.accountSelector(model, acc.UID, tried, scope)
@@ -995,10 +1000,12 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 		tried[acc.UID] = true
 		// 反审核脱敏按本次实际选中的账号区域决定，只在选定账号后施加一次：
 		// 换号重试不重复注入零宽字符（上游 workbuddy_one open_upstream 同款）。
-		site := siterouting.ProfileSite(acc.Profile)
-		if site != desensitized {
-			body = o.applyDesensitize(acc, body)
-			desensitized = site
+		body = originalBody
+		if siterouting.ProfileSite(acc.Profile) != siterouting.International && o.cfg.Desensitize {
+			if domesticBody == nil {
+				domesticBody = o.applyDesensitize(acc, originalBody)
+			}
+			body = domesticBody
 		}
 		streamwatch.StartAttempt(ctx)
 		started, err := o.runOnce(ctx, acc, body, sink)

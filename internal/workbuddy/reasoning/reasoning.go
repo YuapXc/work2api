@@ -371,6 +371,16 @@ func InjectThinking(body Body) Body {
 	if !isDeepseek(body["model"]) {
 		return body
 	}
+	// Explicit off remains meaningful even when the catalog has no support set.
+	if _, has := body["thinking"]; !has {
+		effort := strings.ToLower(strings.TrimSpace(toStr(body["reasoning_effort"])))
+		if effort == "" {
+			effort = strings.ToLower(strings.TrimSpace(toStr(body["reasoningEffort"])))
+		}
+		if effort == "off" || effort == "none" {
+			body["thinking"] = map[string]any{"type": "disabled"}
+		}
+	}
 	if _, has := body["thinking"]; !has {
 		var mt any = body["max_completion_tokens"]
 		if mt == nil {
