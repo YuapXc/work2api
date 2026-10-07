@@ -994,8 +994,17 @@ type refreshCatalogTransport struct{ stage, calls int }
 
 func (tr *refreshCatalogTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	tr.calls++
+	// 双路目录（/v3/config + 插件目录）共享同一传输：stage 1 只让先拉的
+	// /v3/config 失败一次，插件目录仍成功——这才构成「单路失败」语义；
+	// 否则两路同失败会触发整路失败退避，不再保留旧映射。
 	if tr.stage == 1 && tr.calls == 1 {
 		return nil, errors.New("catalog temporarily unavailable")
+	}
+	if tr.stage == 1 && r.URL.Path != "/v3/config" {
+		// 插件目录成功且不含 test-model：v3 失败回落旧快照 → Fresh 保留
+		return &http.Response{StatusCode: 200, Header: make(http.Header),
+			Body:    io.NopCloser(strings.NewReader(`{"data":{"models":[],"agents":[{"name":"cli","models":[]}]}}`)),
+			Request: r}, nil
 	}
 	body := `{"data":{"models":[{"id":"test-model","name":"Fresh"}],"agents":[{"name":"cli","models":["test-model"]}]}}`
 	if tr.stage == 0 {
@@ -1024,6 +1033,11 @@ func TestCatalogPartialFailurePreservesOnlyConfirmedMappings(t *testing.T) {
 		t.Fatal("partial refresh lost verified account mapping or fresh metadata", found)
 	}
 	tr.stage, tr.calls = 2, 0
+	o.models.Refresh()
+	// 双路语义下的「模型被撤销」判定：空目录是合法响应、覆盖成功快照，但单路
+	// 失败会让另一来源的快照继续供应该模型——只有两路同时给空目录才算撤销。
+	// 逐个账号清快照再刷新，等价于「两路从此都返回空」。
+	o.models.ClearCatalogSnapshots()
 	o.models.Refresh()
 	for _, model := range o.models.ListCached() {
 		if model["id"] == "test-model" {

@@ -1,6 +1,7 @@
 package models
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"strings"
@@ -53,7 +54,134 @@ func TestFetchFromUpstreamSkipsDisabledAccounts(t *testing.T) {
 			}
 		}
 	}
-	if calls := transport.calls.Load(); calls != 1 {
+	if calls := transport.calls.Load(); calls != 2 {
 		t.Fatal("disabled account was fetched", calls)
+	}
+}
+
+// B1：双路目录合并——/v3/config 先拉（同 ID 元数据优先）、插件目录补专属模型；
+// 单路失败保留该来源成功快照；全部失败触发失败退避。
+type dualTransport struct {
+	respond func(path string) (int, string)
+	paths   []string
+}
+
+func (t *dualTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	t.paths = append(t.paths, r.URL.Path)
+	status, body := t.respond(r.URL.Path)
+	return &http.Response{
+		StatusCode: status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    r,
+	}, nil
+}
+
+func catalogBody(ids ...string) string {
+	var models, idsJSON []string
+	for _, id := range ids {
+		models = append(models, `{"id":"`+id+`","name":"`+id+`"}`)
+		idsJSON = append(idsJSON, `"`+id+`"`)
+	}
+	return `{"data":{"models":[` + strings.Join(models, ",") + `],"agents":[{"name":"cli","models":[` + strings.Join(idsJSON, ",") + `]}]}}`
+}
+
+func modelIDs(got []fetchedModel) (map[string]bool, int) {
+	ids := map[string]bool{}
+	fresh := 0
+	for _, fm := range got {
+		ids[fm.id] = true
+		if fm.fresh {
+			fresh++
+		}
+	}
+	return ids, fresh
+}
+
+func TestFetchOneMergesDualCatalogSources(t *testing.T) {
+	tr := &dualTransport{respond: func(path string) (int, string) {
+		if path == "/v3/config" {
+			return 200, catalogBody("shared-model", "client-only")
+		}
+		return 200, catalogBody("shared-model", "legacy-only")
+	}}
+	p := pool.New(map[string]pool.Credential{"uid1": catalogTestCredential{profile: "cn-cli"}}, "")
+	r := NewWithCatalogClient(p, nil, &http.Client{Transport: tr})
+	got := r.fetchOneContext(context.Background(), p.Accounts()[0])
+	if got == nil {
+		t.Fatal("fetch failed")
+	}
+	ids, fresh := modelIDs(got)
+	for _, want := range []string{"shared-model", "client-only", "legacy-only"} {
+		if !ids[want] {
+			t.Fatalf("缺少 %s: %v", want, ids)
+		}
+	}
+	if fresh != 3 {
+		t.Fatalf("两路成功时全部条目应为真实观测, fresh=%d", fresh)
+	}
+	if len(tr.paths) != 2 || tr.paths[0] != "/v3/config" {
+		t.Fatalf("/v3/config 应先拉: %v", tr.paths)
+	}
+}
+
+func TestFetchOneSingleSourceFailureKeepsSnapshot(t *testing.T) {
+	failLegacy := atomic.Bool{}
+	tr := &dualTransport{respond: func(path string) (int, string) {
+		if path == "/v3/config" {
+			return 200, catalogBody("client-only")
+		}
+		if failLegacy.Load() {
+			return 503, `{}`
+		}
+		return 200, catalogBody("legacy-only")
+	}}
+	p := pool.New(map[string]pool.Credential{"uid1": catalogTestCredential{profile: "cn-cli"}}, "")
+	r := NewWithCatalogClient(p, nil, &http.Client{Transport: tr})
+	acc := p.Accounts()[0]
+	if got := r.fetchOneContext(context.Background(), acc); got == nil {
+		t.Fatal("首次拉取失败")
+	}
+	failLegacy.Store(true)
+	got := r.fetchOneContext(context.Background(), acc)
+	if got == nil {
+		t.Fatal("单路失败不应整路失败")
+	}
+	ids, fresh := modelIDs(got)
+	if !ids["legacy-only"] {
+		t.Fatal("插件目录单路失败应保留其成功快照的专属模型")
+	}
+	if !ids["client-only"] || fresh != 1 {
+		t.Fatalf("只有 /v3/config 条目应为真实观测: ids=%v fresh=%d", ids, fresh)
+	}
+}
+
+func TestFetchOneAllSourcesFailedPenalizes(t *testing.T) {
+	tr := &dualTransport{respond: func(path string) (int, string) { return 503, `{}` }}
+	p := pool.New(map[string]pool.Credential{"uid1": catalogTestCredential{profile: "cn-cli"}}, "")
+	r := NewWithCatalogClient(p, nil, &http.Client{Transport: tr})
+	acc := p.Accounts()[0]
+	if got := r.fetchOneContext(context.Background(), acc); got != nil {
+		t.Fatal("全部来源失败必须返回 nil（失败退避），不得伪装成功")
+	}
+	if len(tr.paths) != 2 {
+		t.Fatalf("两路都应尝试过: %v", tr.paths)
+	}
+}
+
+func TestFetchOneRejectsBusinessErrorCode(t *testing.T) {
+	tr := &dualTransport{respond: func(path string) (int, string) {
+		if path == "/v3/config" {
+			return 200, `{"code":999,"data":{"models":[{"id":"bad-model","name":"bad"}],"agents":[{"name":"cli","models":["bad-model"]}]}}`
+		}
+		return 200, catalogBody("legacy-only")
+	}}
+	p := pool.New(map[string]pool.Credential{"uid1": catalogTestCredential{profile: "cn-cli"}}, "")
+	r := NewWithCatalogClient(p, nil, &http.Client{Transport: tr})
+	got := r.fetchOneContext(context.Background(), p.Accounts()[0])
+	for _, fm := range got {
+		if fm.id == "bad-model" {
+			t.Fatal("业务错误码响应中的模型不得入库")
+		}
 	}
 }

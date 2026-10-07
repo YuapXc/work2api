@@ -292,3 +292,18 @@ func CatalogURLForProfile(profile string) (string, error) {
 	}
 	return ep + "/v3/config", nil
 }
+
+// LegacyCatalogURLForProfile returns the region-specific plugin catalog URL
+// (上游 region.catalog_path：国际版 /v2/enterprises/personal/models，国内版
+// /console/enterprises/personal/models；intl-work 与 intl-cli 同路径)。
+// 0.6.3 起与 /v3/config 双路合并：/v3/config 元数据优先，插件专属模型保留。
+func LegacyCatalogURLForProfile(profile string) (string, error) {
+	ep, err := EndpointForProfile(profile)
+	if err != nil {
+		return "", err
+	}
+	if strings.HasPrefix(profile, "cn-") {
+		return ep + "/console/enterprises/personal/models", nil
+	}
+	return ep + "/v2/enterprises/personal/models", nil
+}

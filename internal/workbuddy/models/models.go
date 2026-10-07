@@ -47,6 +47,23 @@ type catalogClient interface {
 	CatalogHeaders() (map[string]string, error)
 }
 
+// catalogSource enumerates the per-profile catalog endpoints, richest first.
+// 0.6.3 起上游双路拉取：官方客户端 /v3/config（国际版 CLI 白名单含
+// deepseek-v4.1-flash 等，插件目录会漏）+ 区域插件目录。两路共享解析与
+// 禁用标志，同 ID 先到先得（/v3/config 元数据优先），插件专属模型保留。
+func catalogSources(profile string) ([]string, error) {
+	ep, err := siterouting.EndpointForProfile(profile)
+	if err != nil {
+		return nil, err
+	}
+	v3 := ep + "/v3/config"
+	legacy, err := siterouting.LegacyCatalogURLForProfile(profile)
+	if err != nil || legacy == v3 {
+		return []string{v3}, nil
+	}
+	return []string{v3, legacy}, nil
+}
+
 // Registry is the thread-safe dynamic model catalog.
 type Registry struct {
 	pool   *pool.Pool
@@ -60,6 +77,9 @@ type Registry struct {
 	fetchedAt float64
 	lastFail  float64
 	source    string
+	// catalogCache 按 (profile, uid, url) 保存各来源的成功快照：单一路失败
+	// 不砍掉另一来源的专属模型（上游 0.6.3 _catalog_cache 同款）。
+	catalogCache map[[3]string][]fetchedModel
 }
 
 // New builds a Registry over an account pool.
@@ -73,11 +93,12 @@ func NewWithCatalogClient(p *pool.Pool, db Settings, client *http.Client) *Regis
 		client = httpclient.New(20 * time.Second)
 	}
 	return &Registry{
-		pool:      p,
-		db:        db,
-		client:    client,
-		reasoning: map[string]map[string]any{},
-		source:    "static",
+		pool:         p,
+		db:           db,
+		client:       client,
+		reasoning:    map[string]map[string]any{},
+		catalogCache: map[[3]string][]fetchedModel{},
+		source:       "static",
 	}
 }
 
@@ -117,6 +138,15 @@ func (r *Registry) ListCached() []map[string]any {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return withStandardAll(r.models)
+}
+
+// ClearCatalogSnapshots drops every per-source success snapshot (tests and
+// administrative resets only): the next refresh republishes from live sources
+// alone, without any fallback history.
+func (r *Registry) ClearCatalogSnapshots() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.catalogCache = map[[3]string][]fetchedModel{}
 }
 
 // IDs returns the current model ids.
@@ -276,6 +306,9 @@ type fetchedModel struct {
 	id        string
 	entry     map[string]any
 	reasoning map[string]any
+	// fresh 标记本路是否为本次真实观测（false = 成功快照回落）：
+	// 合并时真实观测优先于快照，与跨账号的「真实观测可覆盖失败回落」同口径。
+	fresh bool
 }
 
 func (r *Registry) fetchFromUpstream() []fetchedModel {
@@ -363,10 +396,10 @@ func (r *Registry) fetchFromUpstreamContext(ctx context.Context) []fetchedModel 
 			if _, exists := merged[fm.id]; !exists {
 				merged[fm.id] = fm
 				order = append(order, fm.id)
-			} else if observed && !fresh[fm.id] {
+			} else if observed && fm.fresh && !fresh[fm.id] {
 				merged[fm.id] = fm
 			}
-			if observed {
+			if observed && fm.fresh {
 				fresh[fm.id] = true
 			}
 			if c, ok := fm.entry["credits"].(float64); ok {
@@ -374,10 +407,10 @@ func (r *Registry) fetchFromUpstreamContext(ctx context.Context) []fetchedModel 
 					creditsByRegion[fm.id] = map[string]float64{}
 				}
 				costKey := fm.id + "\x00" + region
-				if _, seen := creditsByRegion[fm.id][region]; !seen || observed && !freshCredits[costKey] {
+				if _, seen := creditsByRegion[fm.id][region]; !seen || observed && fm.fresh && !freshCredits[costKey] {
 					creditsByRegion[fm.id][region] = c
 				}
-				if observed {
+				if observed && fm.fresh {
 					freshCredits[costKey] = true
 				}
 			}
@@ -531,30 +564,83 @@ func (r *Registry) fetchOneContext(ctx context.Context, account *pool.Account) [
 	if err != nil {
 		return nil
 	}
-	url, err := siterouting.CatalogURLForProfile(account.Profile)
+	sources, err := catalogSources(account.Profile)
 	if err != nil {
 		return nil
 	}
+	merged := map[string]fetchedModel{}
+	var order []string
+	freshAny := false
+	for _, url := range sources {
+		fetched := r.fetchCatalogURL(ctx, url, headers, account)
+		key := [3]string{account.Profile, account.UID, url}
+		r.mu.Lock()
+		if fetched != nil {
+			r.catalogCache[key] = fetched
+		}
+		entries := fetched
+		if entries == nil {
+			// 单路失败回落成功快照。注意空目录（cli 白名单为空）是合法响应：
+			// 它表示「该来源一个模型都不给」，必须覆盖旧快照（含清空），
+			// 否则上游下架的模型会借快照永远留存（REVOKED 语义）。
+			entries = r.catalogCache[key]
+		}
+		r.mu.Unlock()
+		if fetched != nil {
+			freshAny = true
+		}
+		for _, fm := range entries {
+			fm.fresh = fetched != nil
+			if _, exists := merged[fm.id]; !exists {
+				merged[fm.id] = fm
+				order = append(order, fm.id)
+			}
+		}
+	}
+	if !freshAny {
+		// 全部来源失败不能伪装成一次成功刷新：冷却账号、交给失败退避。
+		r.pool.OnFailure(account.UID, 60)
+		return nil
+	}
+	out := make([]fetchedModel, 0, len(order))
+	for _, id := range order {
+		out = append(out, merged[id])
+	}
+	return out
+}
+
+// fetchCatalogURL 拉取单路目录并共享 CLI 白名单/禁用标志/元数据解析。
+// 失败返回 nil（HTTP 错误、业务错误码、畸形响应、无 cli 白名单均算失败）。
+func (r *Registry) fetchCatalogURL(ctx context.Context, url string, headers map[string]string, account *pool.Account) []fetchedModel {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 	resp, err := r.client.Do(req)
-	if err != nil {
-		if ctx.Err() == nil {
-			r.pool.OnFailure(account.UID, 60)
-		}
+	if err != nil || resp == nil {
 		return nil
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		log.Printf("models api status %d (%s)", resp.StatusCode, account.Profile)
-		r.pool.OnFailure(account.UID, 60)
 		return nil
 	}
 	var data map[string]any
 	if json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&data) != nil {
 		return nil
+	}
+	// 业务错误码（上游按 code 字段报错时 HTTP 仍是 200）：不信任其中的模型清单。
+	if code, hasCode := data["code"]; hasCode {
+		switch c := code.(type) {
+		case float64:
+			if c != 0 {
+				return nil
+			}
+		case string:
+			if c != "0" && c != "" {
+				return nil
+			}
+		}
 	}
 	d, _ := data["data"].(map[string]any)
 	if d == nil {
@@ -600,6 +686,9 @@ func (r *Registry) fetchOneContext(ctx context.Context, account *pool.Account) [
 		e["profile"] = account.Profile
 		out = append(out, fetchedModel{id: mid, entry: e, reasoning: reasoning})
 	}
+	// 空目录（cli 白名单存在但为空 / 全部被 disabled 过滤）是合法响应：
+	// 「该来源一个模型都不给」，必须作为成功结果覆盖成功快照（含清空），
+	// 与失败 nil 严格区分——否则上游下架的模型会借快照永远留存。
 	return out
 }
 
