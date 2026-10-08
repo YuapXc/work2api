@@ -31,7 +31,8 @@ import (
 // contributions, resource_groups, group_accounts, user_group_grants) and
 // rebuilds apps to drop the global-unique name constraint (per-user naming).
 // v16 adds stable usage app IDs and independent daily execution quotas.
-const SchemaVersion = 17
+// v18 adds bounded, content-free request diagnostics to usage records.
+const SchemaVersion = 18
 
 // DB wraps the SQLite connection.
 type DB struct {
@@ -205,6 +206,9 @@ CREATE INDEX IF NOT EXISTS idx_usage_protocol ON usage_logs(protocol);
 	// v13-era: LogUsage writes tokens_known; older DBs lack the column.
 	if _, err := tx.Exec("ALTER TABLE usage_logs ADD COLUMN tokens_known INTEGER"); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 		return fmt.Errorf("migrate usage_logs.tokens_known: %w", err)
+	}
+	if _, err := tx.Exec("ALTER TABLE usage_logs ADD COLUMN diagnostics TEXT"); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("migrate usage_logs.diagnostics: %w", err)
 	}
 	// Legacy apps migration runs once and commits atomically with the rest
 	// of the schema. The old table remains authoritative after an interrupted

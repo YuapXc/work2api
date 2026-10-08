@@ -40,6 +40,7 @@ const columns = [
  { key: 'state', label: '状态' }, { key: 'credits', label: '已观测积分', align: 'right' as const },
  { key: 'last', label: '最近调用' }, { key: 'action', label: '' },
 ]
+function compatibilityLabel(value: string) { return ({ identity: '固定身份兼容', client_metadata: '客户端身份与归因精简' } as Record<string, string>)[value] || '' }
 function sourceLabel(source: string) { return ({ sid: '显式会话标识', pck: '缓存分组标识（弱识别）', cid: '显式对话标识', user: '用户字段（弱识别）', fb: '首条消息推断' } as Record<string, string>)[source] || '会话标识' }
 function accountLabel(row: SessionRow) { return row.account_label || (row.session.account_uid ? row.session.account_uid.slice(0, 8) : '尚未绑定') }
 function stateLabel(row: SessionRow) { const s = row.session; return [s.running ? `执行中 ${s.running}` : '', s.waiting ? `排队中 ${s.waiting}` : ''].filter(Boolean).join(' / ') || '等待下一次调用' }
@@ -132,6 +133,7 @@ onUnmounted(() => { alive = false; clearTimeout(timer); document.removeEventList
      <div v-if="selected" class="flex-1 space-y-5 overflow-y-auto p-5">
       <div><div class="text-ink">{{ selected.session.app || '未命名应用' }} / {{ selected.session.model }}</div><div class="mono mt-1 text-micro text-faint">{{ selected.session.id.slice(0,12) }}</div><p class="mt-2 text-micro text-faint">{{ sourceLabel(selected.session.source) }}{{ isWeak(selected.session.source) ? '：可能合并独立任务或拆分连续请求；建议客户端发送 X-Session-ID。' : '；同一对话的不同模型分别绑定。' }}</p><p v-if="selected.session.agent_requests" class="mt-1 text-micro text-faint">其中子 Agent 请求 {{ selected.session.agent_requests }} 次</p><p v-if="selected.last_success_label" class="mt-1 text-micro text-faint">最后成功：{{ selected.last_success_label }}</p><p v-if="selected.last_attempt_label" class="mt-1 text-micro text-faint">最后尝试：{{ selected.last_attempt_label }}</p></div>
       <div class="border-y border-line py-3 text-small"><div>当前账号：<span class="text-ink">{{ accountLabel(selected) }}</span></div><div class="mt-1">{{ stateLabel(selected) }}</div><div class="mt-1 text-micro text-faint">自 {{ dt(selected.session.started_at) }} 开始观测 · {{ selected.session.requests }} 次请求</div></div>
+      <p v-if="compatibilityLabel(selected.session.compatibility || '')" class="text-micro text-faint">当前账号兼容方式：{{ compatibilityLabel(selected.session.compatibility || '') }}；技能、工具和权限指令保留。</p>
       <div v-if="selected.session.route_message" role="status" class="rounded-lg border border-line px-3 py-2 text-small" :class="selected.session.route_status === 'failed' ? 'text-warn' : 'text-route'">{{ selected.session.route_message }}<div v-if="selected.session.pending_action === 'switch'" class="mt-1">目标：{{ selected.target_label || selected.session.target_uid.slice(0,8) }}</div><WButton v-if="selected.session.pending_action" size="sm" variant="subtle" class="mt-2" :loading="saving" @click="apply('cancel')">取消待切换</WButton></div>
       <div><div class="mb-2 flex items-center justify-between"><h3 class="text-small font-semibold text-ink">可选账号</h3><WButton size="sm" variant="subtle" :loading="optionsLoading" :disabled="saving" @click="loadOptions().catch(() => {})">刷新账号</WButton></div>
        <p class="mb-2 text-micro text-faint">仅允许同成本或更低成本账号。显示成本系数，非本次积分账单；余额为最近一次获取值。</p>

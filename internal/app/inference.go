@@ -76,6 +76,7 @@ func (o *Orchestrator) logUsage(a logArgs) {
 		effort = "default"
 	}
 	_ = o.db.LogUsage(store.UsageParams{
+		Diagnostics:      usageDiagnostics(a.ctx),
 		Model:            a.model,
 		Protocol:         a.protocol,
 		AccountUID:       uid,

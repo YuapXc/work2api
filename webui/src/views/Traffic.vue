@@ -147,6 +147,19 @@ const logCols: Column[] = [
 
 // 详情
 const detailOpen = ref(false)
+function completionLabel(row: { status?: string; diagnostics?: UsageRecord['diagnostics'] }): string {
+  if (row.status !== 'incomplete') return row.status || '未知'
+  const reason = row.diagnostics?.finish_reason
+  if (reason === 'length') return '达到输出或上下文上限'
+  if (reason === 'content_filter') return '上游内容过滤'
+  return '输出未完成（原因未记录）'
+}
+function budgetLabel(limits?: Record<string, number>): string {
+  return limits && Object.keys(limits).length ? Object.entries(limits).map(([k, v]) => `${k}: ${v}`).join(' · ') : '未显式指定'
+}
+function compatibilityLabel(value?: string): string {
+  return ({ original: '原文', identity: '固定身份兼容', client_metadata: '客户端身份与归因精简' } as Record<string, string>)[value ?? ''] ?? '未记录'
+}
 const detail = ref<UsageRecord | null>(null)
 const detailLoading = ref(false)
 async function openDetail(id: number) {
@@ -306,7 +319,7 @@ onMounted(() => loadTab(tab.value))
           <template #cell-status="{ row }">
             <span class="inline-flex items-center gap-1.5">
               <WLed :tone="row.status === 'ok' ? 'live' : row.status === 'error' ? 'fault' : 'muted'" />
-              <span class="text-small">{{ row.status === 'incomplete' ? '输出未完成' : row.status }}</span>
+              <span class="text-small">{{ completionLabel(row) }}</span>
             </span>
           </template>
           <template #cell-actions="{ row }">
@@ -353,6 +366,14 @@ onMounted(() => loadTab(tab.value))
           </div>
           <div v-if="detail.reasoning_effort"><div class="text-micro text-faint">推理强度</div><div class="text-small text-ink">{{ detail.reasoning_effort }}</div></div>
           <div><div class="text-micro text-faint">时间</div><div class="mono text-small text-ink">{{ dt(detail.ts, 'MM-DD HH:mm:ss') }}</div></div>
+        </div>
+        <div v-if="detail.diagnostics" class="rounded-lg border border-line p-3 text-small space-y-1">
+          <div>结束原因：{{ detail.diagnostics.finish_reason || '未收到结束原因' }}</div>
+          <div>客户端输出预算：{{ budgetLabel(detail.diagnostics.requested_output_limits) }}</div>
+          <div>实际发送预算：{{ budgetLabel(detail.diagnostics.effective_output_limits) }}</div>
+          <div>输入处理：{{ compatibilityLabel(detail.diagnostics.compatibility) }}</div>
+          <div v-if="detail.diagnostics.error_kind">故障分类：{{ detail.diagnostics.error_kind }}</div>
+          <div v-if="detail.status === 'incomplete'" class="text-warn">{{ completionLabel(detail) }}</div>
         </div>
         <div v-if="detail.error" class="rounded-lg border border-fault/40 bg-fault/5 p-3">
           <div class="mb-1 text-micro font-medium text-fault">错误</div>

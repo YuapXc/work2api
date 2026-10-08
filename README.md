@@ -164,7 +164,8 @@ docker run -d --name work2api -p 8787:8787 \
 | — | `MAX_JSON_ITEMS` / `MAX_JSON_DEPTH` | `100000` / `128` | 解码前限制 JSON 结构符号数量与嵌套深度，防止对象数量放大内存 |
 | — | `MAX_RESPONSE_BYTES` | `8388608` | 每次上游响应上限，SSE 含封装，防止输出聚合无界增长 |
 | — | `DESENSITIZE` | 已停用 | 旧配置忽略；完整保留技能、工具和项目指令，不再摘要替换或插入零宽字符 |
-| — | `CHANNEL_IDENTITY_COMPAT` | `true` | 国内明确渠道拒绝且未开始输出时，对已验证的首行 Claude Code 固定身份声明最多兼容重试一次；完整保留后续指令，计入总计 5 次尝试，失败继续按原规则换号 |
+| — | `CHANNEL_IDENTITY_COMPAT` | `true` | 国内明确渠道拒绝且未开始输出时，兼容已验证的 Claude Code CLI/SDK 固定身份声明；保留技能、工具、权限和任务内容；关闭后同时关闭归因精简 |
+| — | `CHANNEL_METADATA_COMPAT` | `true` | 身份兼容仍被拒绝时，再移除已验证的 CC billing 归因行；两级兼容合计最多 2 次，连同授权范围内换号共最多 5 次。成功方式仅在当前会话、账号及系统/工具模板一致时复用；重启失效 |
 | — | `RATELIMIT` / `RATELIMIT_INTERVAL` | `true` / `1.5` | 每账号限速 |
 | — | `CHECKIN_HOURS` | `9,21` | 每日自动签到小时 |
 | — | `CREDIT_REFRESH_MIN` | `30` | 额度刷新周期（分钟） |

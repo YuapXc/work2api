@@ -203,7 +203,17 @@ export interface UsagePoint {
   tokens: number
 }
 
+export interface UsageDiagnostics {
+  finish_reason?: string
+  requested_output_limits?: Record<string, number>
+  effective_output_limits?: Record<string, number>
+  compatibility?: 'original' | 'identity' | 'client_metadata'
+  error_kind?: string
+  upstream_started: boolean
+}
+
 export interface UsageRecord {
+  diagnostics?: UsageDiagnostics | null
   id: number
   ts: number
   protocol: string
@@ -327,7 +337,7 @@ export interface ActiveSession {
  id: string; model: string; app: string; user_id: number; source: string; version: number
  started_at: number; last_at: number; expires_at: number; requests: number; running: number; waiting: number
  credits: number; credits_known: number; credits_unknown: number; account_uid: string
- pending_action: string; target_uid: string; route_status: string; route_message: string
+ pending_action: string; target_uid: string; route_status: string; route_message: string; compatibility?: string
  last_success_uid?: string; last_attempt_uid?: string; agent_requests?: number
 }
 export interface SessionRow { id: string; session: ActiveSession; account_label: string; target_label: string; last_success_label?: string; last_attempt_label?: string }

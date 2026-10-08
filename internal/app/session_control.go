@@ -10,31 +10,34 @@ import (
 // Observations and controls share the affinity map's bounded, in-memory lifetime.
 // No conversation text, raw session identifier or credential is retained.
 type sessionState struct {
-	ID            string  `json:"id"`
-	Model         string  `json:"model"`
-	App           string  `json:"app"`
-	UserID        int64   `json:"user_id"`
-	Source        string  `json:"source"`
-	Version       uint64  `json:"version"`
-	Started       float64 `json:"started_at"`
-	Last          float64 `json:"last_at"`
-	Requests      int     `json:"requests"`
-	Running       int     `json:"running"`
-	Waiting       int     `json:"waiting"`
-	Credits       float64 `json:"credits"`
-	Known         int     `json:"credits_known"`
-	Unknown       int     `json:"credits_unknown"`
-	Pending       string  `json:"pending_action"`
-	Target        string  `json:"target_uid"`
-	RouteStatus   string  `json:"route_status"`
-	RouteMessage  string  `json:"route_message"`
-	LastSuccess   string  `json:"last_success_uid"`
-	LastAttempt   string  `json:"last_attempt_uid"`
-	ManualUID     string  `json:"-"`
-	ControlEpoch  uint64  `json:"-"`
-	AgentRequests int     `json:"agent_requests"`
-	LastUID       string  `json:"-"`
-	scope         map[string]bool
+	ID                           string  `json:"id"`
+	Model                        string  `json:"model"`
+	App                          string  `json:"app"`
+	UserID                       int64   `json:"user_id"`
+	Source                       string  `json:"source"`
+	Version                      uint64  `json:"version"`
+	Started                      float64 `json:"started_at"`
+	Last                         float64 `json:"last_at"`
+	Requests                     int     `json:"requests"`
+	Running                      int     `json:"running"`
+	Waiting                      int     `json:"waiting"`
+	Credits                      float64 `json:"credits"`
+	Known                        int     `json:"credits_known"`
+	Unknown                      int     `json:"credits_unknown"`
+	Pending                      string  `json:"pending_action"`
+	Target                       string  `json:"target_uid"`
+	RouteStatus                  string  `json:"route_status"`
+	RouteMessage                 string  `json:"route_message"`
+	LastSuccess                  string  `json:"last_success_uid"`
+	LastAttempt                  string  `json:"last_attempt_uid"`
+	ManualUID                    string  `json:"-"`
+	ControlEpoch                 uint64  `json:"-"`
+	AgentRequests                int     `json:"agent_requests"`
+	LastUID                      string  `json:"-"`
+	Compatibility                string  `json:"compatibility"`
+	compatUID, compatFingerprint string
+	compatLevel                  int
+	scope                        map[string]bool
 }
 type sessionView struct {
 	sessionState
@@ -250,6 +253,9 @@ func (r *sessionRouter) commit(selection *sessionSelection, uid string) bool {
 	}
 	if e.info.Version != selection.version {
 		return false
+	}
+	if e.uid != uid {
+		clearCompatibility(e.info)
 	}
 	changed := e.uid != uid || e.info.Pending != ""
 	if e.info.Pending != "" {

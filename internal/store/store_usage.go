@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"strings"
 	"time"
 )
@@ -83,6 +84,7 @@ func (d *DB) SaveSettings(kv map[string]string) error {
 
 // UsageParams are the fields for a usage log entry.
 type UsageParams struct {
+	Diagnostics  *UsageDiagnostics
 	TokensKnown  *bool
 	Model        string
 	Protocol     string
@@ -106,6 +108,16 @@ type UsageParams struct {
 	AppID  int64
 }
 
+// UsageDiagnostics contains protocol facts only, never prompts or credentials.
+type UsageDiagnostics struct {
+	FinishReason    string         `json:"finish_reason,omitempty"`
+	RequestedLimits map[string]int `json:"requested_output_limits,omitempty"`
+	EffectiveLimits map[string]int `json:"effective_output_limits,omitempty"`
+	Compatibility   string         `json:"compatibility,omitempty"`
+	ErrorKind       string         `json:"error_kind,omitempty"`
+	Started         bool           `json:"upstream_started"`
+}
+
 // LogUsage inserts one usage record.
 func (d *DB) LogUsage(p UsageParams) error {
 	if p.Status == "" {
@@ -125,6 +137,14 @@ func (d *DB) LogUsage(p UsageParams) error {
 		cached = *p.CachedTokens
 	}
 	var userID any
+	var diagnostics any
+	if p.Diagnostics != nil {
+		raw, err := json.Marshal(p.Diagnostics)
+		if err != nil {
+			return err
+		}
+		diagnostics = string(raw)
+	}
 	if p.UserID != 0 {
 		userID = p.UserID
 	}
@@ -133,11 +153,11 @@ func (d *DB) LogUsage(p UsageParams) error {
 	_, err := d.db.Exec(
 		`INSERT INTO usage_logs (ts, model, protocol, account_uid, input_tokens, output_tokens,
 		   total_tokens, latency_ms, status, error, input_content, output_content,
-		   reasoning_content, credits, app_name, user_id, reasoning_effort, tokens_known, cached_tokens, app_id)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		   reasoning_content, credits, app_name, user_id, reasoning_effort, tokens_known, cached_tokens, app_id, diagnostics)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		float64(time.Now().UnixNano())/1e9, p.Model, p.Protocol, p.AccountUID,
 		p.InputTokens, p.OutputTokens, total, p.LatencyMs, p.Status, p.Error,
-		p.InputContent, p.OutputContent, p.ReasoningContent, credits, p.AppName, userID, effort, p.TokensKnown, cached, nullableID(p.AppID))
+		p.InputContent, p.OutputContent, p.ReasoningContent, credits, p.AppName, userID, effort, p.TokensKnown, cached, nullableID(p.AppID), diagnostics)
 	return err
 }
 
@@ -317,7 +337,7 @@ func usageWhere(protocol, model string, appName *string, status, search string) 
 	return "WHERE " + strings.Join(clauses, " AND "), params
 }
 
-const usageLightCols = "id, ts, model, protocol, account_uid, input_tokens, output_tokens, total_tokens, latency_ms, status, error, credits, app_name, user_id, reasoning_effort, tokens_known, cached_tokens"
+const usageLightCols = "id, ts, model, protocol, account_uid, input_tokens, output_tokens, total_tokens, latency_ms, status, error, credits, app_name, user_id, reasoning_effort, tokens_known, cached_tokens, diagnostics"
 
 // UsageRecent returns recent usage records with optional filters.
 func (d *DB) UsageRecent(limit int, protocol, model string, appName *string, status string, light bool, offset int, search string) ([]map[string]any, error) {
@@ -339,6 +359,7 @@ func (d *DB) UsageRecent(limit int, protocol, model string, appName *string, sta
 		return nil, err
 	}
 	for _, r := range list {
+		decodeUsageDiagnostics(r)
 		_, known := r["credits"]
 		r["credit_known"] = known && r["credits"] != nil
 	}
@@ -369,9 +390,21 @@ func (d *DB) GetUsage(id int) (map[string]any, error) {
 		return nil, err
 	}
 	r := list[0]
+	decodeUsageDiagnostics(r)
 	_, known := r["credits"]
 	r["credit_known"] = known && r["credits"] != nil
 	return r, nil
+}
+
+func decodeUsageDiagnostics(row map[string]any) {
+	if raw, ok := row["diagnostics"].(string); ok {
+		var value UsageDiagnostics
+		if len(raw) <= 4096 && json.Unmarshal([]byte(raw), &value) == nil {
+			row["diagnostics"] = value
+		} else {
+			row["diagnostics"] = nil
+		}
+	}
 }
 
 // UsageFilters returns distinct filter values.

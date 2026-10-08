@@ -65,6 +65,7 @@ type Config struct {
 	// workbuddy provider knobs (ported from workbuddy_one/config.py)
 	AllowExternalHost     bool
 	ChannelIdentityCompat bool
+	ChannelMetadataCompat bool
 	OptimizeContext       bool
 	Ratelimit             bool
 	RatelimitInterval     float64
@@ -174,6 +175,7 @@ func Load(args []string) *Config {
 
 		AllowExternalHost:     boolEnv("ALLOW_EXTERNAL_HOST", false),
 		ChannelIdentityCompat: boolEnv("CHANNEL_IDENTITY_COMPAT", true),
+		ChannelMetadataCompat: boolEnv("CHANNEL_METADATA_COMPAT", true),
 		OptimizeContext:       boolEnv("OPTIMIZE_CONTEXT", false),
 		Ratelimit:             boolEnv("RATELIMIT", true),
 		RatelimitInterval:     floatEnv("RATELIMIT_INTERVAL", 1.5),

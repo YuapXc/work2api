@@ -34,6 +34,7 @@ func TestClassifyUpstream(t *testing.T) {
 		{"403 no envelope waf", 403, `<html>blocked</html>`, errWAFBlock},
 		{"11101 bad params", 400, `{"code":11101,"msg":"Unmarshal chat params failed"}`, errBadParams},
 		{"channel denied", 400, `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`, errChannelDenied},
+		{"channel policy display envelope", 400, `{"code":11128,"msg":"Illegal API invocation from an unapproved channel","displayMsg":{"en":"The request was blocked by security policy. Please retry later or contact support."},"actions":["SUBMIT_FEEDBACK","COPY_ERROR","EDIT_INPUT"]}`, errChannelDenied},
 		{"nested channel denied", 403, `{"error":{"code":"11128","message":"Illegal API invocation from an unapproved channel"}}`, errChannelDenied},
 		{"11128 role validation is not channel denial", 400, `{"code":11128,"msg":"first message is not system prompt"}`, errClient},
 		{"11128 alone is not channel denial", 400, `{"code":11128}`, errClient},
@@ -59,7 +60,7 @@ func TestActionFor(t *testing.T) {
 			t.Errorf("%s should be fail-fast/no-rotate/no-cooldown, got %+v", k, a)
 		}
 	}
-	if a := actionFor(errChannelDenied, nil, nil, now); !a.Rotate || a.FailFast || a.Disable || !a.ModelScoped || a.Cooldown != softCooldownSec {
+	if a := actionFor(errChannelDenied, nil, nil, now); !a.Rotate || a.FailFast || a.Disable || a.ModelScoped || a.Cooldown != 0 {
 		t.Fatal("channel denial action", a)
 	}
 	// session dead / account-ban：禁用

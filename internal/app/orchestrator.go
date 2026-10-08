@@ -918,6 +918,7 @@ func (o *Orchestrator) runOnce(ctx context.Context, acc *pool.Account, body map[
 			return streamwatch.ErrResponseTooLarge
 		}
 		started = true
+		diagnostic(ctx).observe(line)
 		return sink(line)
 	}
 	client := o.upstreamClient
@@ -929,86 +930,13 @@ func (o *Orchestrator) runOnce(ctx context.Context, acc *pool.Account, body map[
 	return started, err
 }
 
-// channelIdentityCompatBody removes only a verified fixed identity banner from
-// the leading system message. Everything following it, including skills,
-// project instructions and tool metadata, remains byte-for-byte unchanged.
-// It is used only after an explicit domestic channel rejection, never eagerly.
+// channelIdentityCompatBody retains the legacy helper's identity-only contract.
 func channelIdentityCompatBody(body map[string]any) (map[string]any, bool) {
-	const banner = "You are Claude Code, Anthropic's official CLI for Claude."
-	rewrite := func(text string) (string, bool) {
-		if !strings.HasPrefix(text, banner) {
-			return text, false
-		}
-		tail := text[len(banner):]
-		if tail != "" && !strings.HasPrefix(tail, "\n") && !strings.HasPrefix(tail, "\r\n") {
-			return text, false
-		}
-		return "You are a coding assistant." + tail, true
-	}
-	msgs, ok := body["messages"].([]any)
-	if !ok || len(msgs) == 0 {
-		return body, false
-	}
-	first, ok := msgs[0].(map[string]any)
-	if !ok || first["role"] != "system" {
-		return body, false
-	}
-	var content any
-	switch value := first["content"].(type) {
-	case string:
-		text, matched := rewrite(value)
-		if !matched {
-			return body, false
-		}
-		content = text
-	case []any:
-		if len(value) == 0 {
-			return body, false
-		}
-		block, ok := value[0].(map[string]any)
-		if !ok || block["type"] != "text" {
-			return body, false
-		}
-		text, _ := block["text"].(string)
-		replaced, matched := rewrite(text)
-		if !matched {
-			return body, false
-		}
-		copyBlock := make(map[string]any, len(block))
-		for k, v := range block {
-			copyBlock[k] = v
-		}
-		copyBlock["text"] = replaced
-		blocks := append([]any(nil), value...)
-		blocks[0] = copyBlock
-		content = blocks
-	default:
-		return body, false
-	}
-	copyMessage := make(map[string]any, len(first))
-	for k, v := range first {
-		copyMessage[k] = v
-	}
-	copyMessage["content"] = content
-	messages := append([]any(nil), msgs...)
-	messages[0] = copyMessage
-	result := make(map[string]any, len(body))
-	for k, v := range body {
-		result[k] = v
-	}
-	result["messages"] = messages
-	return result, true
+	return channelCompatibilityBody(body, 1)
 }
 
-// openUpstream runs the request against acc, and on a retryable pre-stream
-// failure rotates to fresh accounts (except for the one identity compatibility
-// retry) until it succeeds or the candidate set is exhausted — capped at
-// maxFailoverAttempts total tries, including at most one fixed identity-banner
-// compatibility retry on a rejected domestic account, so an upstream outage can't turn one
-// client request into an unbounded sequential sweep of a large pool. A failure
-// after bytes have been streamed is never retried (can't un-send). A non-nil
-// scope confines every rotation pick to those UIDs (portal pool isolation —
-// retries must not widen permissions).
+// Retries are bounded to five total upstream attempts, including compatibility
+// retries. No replay is allowed after output; every account stays in scope.
 func (o *Orchestrator) openUpstream(ctx context.Context, acc *pool.Account, body map[string]any, model, sessionKey string, sink func(string) error, onRetryFail func(*pool.Account, *upstream.UpstreamError)) (*pool.Account, error) {
 	return o.openUpstreamScoped(ctx, acc, body, model, sessionKey, sink, onRetryFail, nil)
 }
@@ -1025,9 +953,10 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 	}()
 	const maxFailoverAttempts = 5
 	tried := map[string]bool{}
-	compatUsed := false
+	compatTries := 0
 	compatUID := ""
-	var compatBody map[string]any
+	compatLevel := 0
+	fingerprint := compatibilityFingerprint(body)
 	for attempt := 0; ; attempt++ {
 
 		sessionPhase(ctx, false)
@@ -1115,11 +1044,43 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 		// Region failover must not rewrite the conversation or its identifiers.
 		streamwatch.StartAttempt(ctx)
 		attemptBody := body
-		if acc.UID == compatUID && siterouting.ProfileSite(acc.Profile) == siterouting.Domestic {
-			attemptBody = compatBody
+		level := 0
+		if o.cfg.ChannelIdentityCompat && siterouting.ProfileSite(acc.Profile) == siterouting.Domestic {
+			level = o.sessions.compatibility(sessionKey, acc.UID, fingerprint)
+			if !o.cfg.ChannelMetadataCompat && level > 1 {
+				level = 0
+			}
+			if acc.UID == compatUID {
+				level = compatLevel
+			}
+			if level > 0 {
+				var matched bool
+				attemptBody, matched = channelCompatibilityBody(body, level)
+				if !matched {
+					level = 0
+					attemptBody = body
+				}
+			}
 		}
-		compatUID, compatBody = "", nil
+		compatUID, compatLevel = "", 0
+		if d := diagnostic(ctx); d != nil {
+			d.FinishReason, d.ErrorKind, d.Started = "", "", false
+			d.EffectiveLimits = outputLimits(attemptBody)
+			d.Compatibility = compatibilityName(level)
+		}
 		started, err := o.runOnce(ctx, acc, attemptBody, sink)
+		if d := diagnostic(ctx); d != nil {
+			d.ErrorKind = diagnosticErrorKind(ctx, err)
+		}
+		if err == nil {
+			o.sessions.rememberCompatibility(sessionKey, acc.UID, fingerprint, level)
+		}
+		ue, upstreamErr := err.(*upstream.UpstreamError)
+		denied := upstreamErr && isChannelDenied(ue.StatusCode, string(ue.Raw))
+		if denied && started {
+			o.sessions.unbindMatching(sessionKey, acc.UID)
+		}
+
 		o.sessions.outcome(ctx, acc.UID, err)
 		status := 200
 		if ue, ok := err.(*upstream.UpstreamError); ok {
@@ -1139,12 +1100,14 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 			return acc, err
 		}
 		if started {
+			if denied {
+				return acc, err
+			}
 			// 流已开始又中断：软冷却（可能是上游中途掉线），不重试已开始的流。
 			o.pool.OnFailure(acc.UID, cooldownSoft)
 			return acc, err
 		}
-		ue, ok := err.(*upstream.UpstreamError)
-		if !ok {
+		if !upstreamErr {
 			// 本机 DNS 解析失败是机器级故障（对所有上游同时生效、通常秒级自愈），
 			// 不是这个账号的毛病。打冷却会把一次抖动放大成整模型不可用、且期间
 			// 连「再探一次」的机会都没有。当前请求快速失败且不处罚账号，
@@ -1154,24 +1117,27 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 			}
 			return acc, err
 		}
-		if isChannelDenied(ue.StatusCode, string(ue.Raw)) {
-			_, matched := channelIdentityCompatBody(body)
-			source := "none"
-			if identity, ok := ctx.Value(requestSessionIdentityKey{}).(requestSessionIdentity); ok {
-				source = strings.SplitN(identity.key, ":", 2)[0]
-			}
-			log.Printf("渠道拒绝诊断: profile=%s fixed_identity_match=%t compat_enabled=%t compat_used=%t session_source=%s", acc.Profile, matched, o.cfg.ChannelIdentityCompat, compatUsed, source)
+		if denied {
+			log.Printf("渠道拒绝诊断: profile=%s model=%s compatibility=%s compat_enabled=%t started=%t attempt=%d", acc.Profile, model, compatibilityName(level), o.cfg.ChannelIdentityCompat, started, attempt+1)
 		}
-		if o.cfg.ChannelIdentityCompat && !compatUsed && attempt+1 < maxFailoverAttempts &&
-			siterouting.ProfileSite(acc.Profile) == siterouting.Domestic && isChannelDenied(ue.StatusCode, string(ue.Raw)) {
-			if compatible, matched := channelIdentityCompatBody(body); matched {
-				compatUsed, compatUID, compatBody = true, acc.UID, compatible
-				delete(tried, acc.UID)
-				// Re-enter admission and authorization checks before the retry;
-				// do not penalize a usable account for a fixed banner mismatch.
+		if denied && o.cfg.ChannelIdentityCompat && compatTries < 2 && attempt+1 < maxFailoverAttempts && siterouting.ProfileSite(acc.Profile) == siterouting.Domestic {
+			maxLevel := 1
+			if o.cfg.ChannelMetadataCompat {
+				maxLevel = 2
+			}
+			for next := level + 1; next <= maxLevel; next++ {
+				if _, matched := channelCompatibilityBody(body, next); matched {
+					compatUID, compatLevel = acc.UID, next
+					compatTries++
+					delete(tried, acc.UID)
+					break
+				}
+			}
+			if compatUID != "" {
 				continue
 			}
 		}
+
 		// 分类并对该账号施加处罚（禁用/负缓存/冷却/不罚），返回是否应换号。
 		act := o.penalizeAccount(acc, model, ue)
 		if act.FailFast || !act.Rotate {

@@ -97,6 +97,52 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 }
 
+func TestUsageDiagnosticsMigrationAndRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "diagnostics.db")
+	db, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = db.LogUsage(UsageParams{Model: "old", Status: "incomplete"}); err != nil {
+		t.Fatal(err)
+	}
+	// Reconstruct the previous schema to exercise an actual additive migration.
+	if _, err = db.db.Exec("ALTER TABLE usage_logs DROP COLUMN diagnostics; PRAGMA user_version=17"); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	db, err = New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	facts := &UsageDiagnostics{FinishReason: "length", RequestedLimits: map[string]int{"max_tokens": 1200}, EffectiveLimits: map[string]int{"max_tokens": 1000}, Compatibility: "identity", Started: true}
+	if err = db.LogUsage(UsageParams{Model: "new", Status: "incomplete", Diagnostics: facts}); err != nil {
+		t.Fatal(err)
+	}
+	for _, light := range []bool{true, false} {
+		rows, err := db.UsageRecent(10, "", "", nil, "", light, 0, "")
+		if err != nil || len(rows) != 2 {
+			t.Fatal(rows, err)
+		}
+		value, ok := rows[0]["diagnostics"].(UsageDiagnostics)
+		if !ok || value.FinishReason != "length" || value.EffectiveLimits["max_tokens"] != 1000 || rows[1]["diagnostics"] != nil {
+			t.Fatal(rows)
+		}
+	}
+	row, err := db.GetUsage(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row["diagnostics"].(UsageDiagnostics).RequestedLimits["max_tokens"] != 1200 {
+		t.Fatal(row)
+	}
+	var version int
+	if err = db.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != SchemaVersion {
+		t.Fatal(version, err)
+	}
+}
+
 // TestSettingsCacheInvalidation: GetSettings is memoized, but SaveSettings must
 // invalidate the cache so a later read reflects the write (and returned maps are
 // independent copies the caller can mutate without corrupting the cache).

@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"work2api/internal/store"
 )
 
 // Keep account affinity isolated between users and models; retain only a bounded hash.
@@ -46,6 +47,7 @@ type requestSessionIdentityKey struct{}
 
 // Resolve once from the original request, before conversion or queueing.
 func withRequestSessionIdentity(r *http.Request, body map[string]any) *http.Request {
+	r = r.WithContext(context.WithValue(r.Context(), requestDiagnosticsKey{}, &requestDiagnostics{UsageDiagnostics: store.UsageDiagnostics{RequestedLimits: outputLimits(body)}}))
 	identity := requestSessionIdentity{}
 	for _, name := range []string{"X-Claude-Code-Session-Id", "X-Session-Id", "Session-Id", "X-Conversation-Id", "Conversation-Id"} {
 		if value := boundedSessionID(r.Header.Get(name)); value != "" {
@@ -250,6 +252,7 @@ func (r *sessionRouter) unbindMatching(key, failedUID string) {
 	if entry, ok := r.m[key]; ok && entry.info != nil {
 		entry.uid = ""
 		entry.info.ManualUID = ""
+		clearCompatibility(entry.info)
 		r.sequence++
 		entry.info.Version = r.sequence
 		r.m[key] = entry

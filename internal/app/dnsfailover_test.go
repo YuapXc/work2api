@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -164,17 +165,18 @@ func TestRegionFailoverPreservesClientCapabilities(t *testing.T) {
 }
 
 type channelRetryUpstream struct {
-	calls   int
-	partial bool
-	body    string
-	always  bool
-	bodies  []map[string]any
+	calls     int
+	denyCalls int
+	partial   bool
+	body      string
+	always    bool
+	bodies    []map[string]any
 }
 
 func (f *channelRetryUpstream) StreamUpstream(_ context.Context, _ map[string]string, request map[string]any, _ string, yield upstream.LineFunc) error {
 	f.calls++
 	f.bodies = append(f.bodies, request)
-	if f.calls == 1 || f.always {
+	if f.calls == 1 || f.calls <= f.denyCalls || f.always {
 		if f.partial {
 			if e := yield(`data: {"choices":[{"delta":{"content":"partial"}}]}`); e != nil {
 				return e
@@ -309,13 +311,129 @@ func TestChannelIdentityBannerMatchingIsExactAndNonMutating(t *testing.T) {
 			t.Fatal("input mutated")
 		}
 	}
-	for _, text := range []string{"\n" + banner, banner + " Do not edit files.", "Quote: " + banner, "You are Claude Code."} {
+	for _, text := range []string{banner + " Do not edit files.", "Quote: " + banner, "You are Claude Code."} {
 		if _, ok := channelIdentityCompatBody(map[string]any{"messages": []any{map[string]any{"role": "system", "content": text}}}); ok {
 			t.Fatal("unknown template modified", text)
 		}
 	}
 	if _, ok := channelIdentityCompatBody(map[string]any{"messages": []any{map[string]any{"role": "user", "content": banner}}}); ok {
 		t.Fatal("user role rewritten")
+	}
+}
+
+func TestChannelCompatibilityProgressionAndSessionMemory(t *testing.T) {
+	const denial = `{"code":11128,"msg":"Illegal API invocation from an unapproved channel","displayMsg":{"en":"The request was blocked by security policy. Please retry later or contact support."}}`
+	const banner = "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."
+	const tail = "\nAvailable skills: example\nDo not edit files without permission."
+	makeBody := func(billing string) map[string]any {
+		return map[string]any{"model": "test-model", "max_tokens": 50, "messages": []any{
+			map[string]any{"role": "system", "content": []any{map[string]any{"type": "text", "text": billing}, map[string]any{"type": "text", "text": banner + tail, "cache_control": map[string]any{"type": "ephemeral"}}}},
+			map[string]any{"role": "user", "content": "<system-reminder>Available skills: example</system-reminder>"},
+		}, "tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": "Skill"}}}}
+	}
+	for _, metadata := range []bool{false, true} {
+		t.Run(fmt.Sprintf("metadata=%t", metadata), func(t *testing.T) {
+			client := &channelRetryUpstream{body: denial, denyCalls: 2}
+			o, first := newDNSFailoverOrch(t, &failingUpstream{})
+			o.upstreamClient = client
+			first.Profile = "cn-cli"
+			o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: catalogTransport{}})
+			o.models.Refresh()
+			o.cfg.ChannelIdentityCompat = true
+			o.cfg.ChannelMetadataCompat = metadata
+			body := makeBody("x-anthropic-billing-header: cc_version=2.1.0; cch=aaa;")
+			before, _ := json.Marshal(body)
+			ctx, finish := o.sessions.begin(context.Background(), "memory", "test-model", nil, body)
+			defer finish()
+			o.sessions.bind("memory", first.UID)
+			_, err := o.openUpstreamScoped(ctx, first, body, "test-model", "memory", func(string) error { return nil }, nil, map[string]bool{first.UID: true})
+			if !metadata {
+				if err == nil || client.calls != 2 || o.sessions.lookup("memory") != "" {
+					t.Fatal("disabled metadata retry or failed binding", client.calls, err)
+				}
+				return
+			}
+			if err != nil || client.calls != 3 {
+				t.Fatal("progressive compatibility failed", client.calls, err)
+			}
+			transformed := client.bodies[2]["messages"].([]any)[0].(map[string]any)["content"].([]any)
+			if transformed[0].(map[string]any)["text"] != "" || transformed[1].(map[string]any)["text"] != "You are a coding assistant."+tail {
+				t.Fatal("capabilities lost", transformed)
+			}
+			after, _ := json.Marshal(body)
+			if string(before) != string(after) {
+				t.Fatal("original mutated")
+			}
+			body = makeBody("x-anthropic-billing-header: cc_version=2.1.0; cch=bbb;")
+			fingerprint := compatibilityFingerprint(body)
+			if o.sessions.compatibility("memory", first.UID, fingerprint) != 2 {
+				t.Fatal("memory missed changing attribution")
+			}
+			_, err = o.openUpstreamScoped(ctx, first, body, "test-model", "memory", func(string) error { return nil }, nil, map[string]bool{first.UID: true})
+			if err != nil || client.calls != 4 || client.bodies[3]["messages"].([]any)[0].(map[string]any)["content"].([]any)[0].(map[string]any)["text"] != "" {
+				t.Fatal("successful compatibility not reused", err)
+			}
+			body["tools"] = []any{map[string]any{"type": "function", "function": map[string]any{"name": "Other"}}}
+			if o.sessions.compatibility("memory", first.UID, compatibilityFingerprint(body)) != 0 || o.sessions.compatibility("other", first.UID, fingerprint) != 0 || o.sessions.compatibility("memory", "other", fingerprint) != 0 {
+				t.Fatal("memory scope too broad")
+			}
+			o.sessions.unbindMatching("memory", first.UID)
+			if o.sessions.compatibility("memory", first.UID, fingerprint) != 0 {
+				t.Fatal("failed binding kept compatibility")
+			}
+		})
+	}
+}
+
+func TestUsageDiagnosticsPreservesRequestAndUpstreamFacts(t *testing.T) {
+	req := withRequestSessionIdentity(httptest.NewRequest("POST", "/v1/messages", nil), map[string]any{"max_tokens": 1200})
+	d := diagnostic(req.Context())
+	d.EffectiveLimits = outputLimits(map[string]any{"max_tokens": 1000})
+	d.observe(`data: {"choices":[{"finish_reason":"length"}]}`)
+	d.observe(`data: {"choices":[{"finish_reason":null}],"usage":{"completion_tokens":1000}}`)
+	facts := usageDiagnostics(req.Context())
+	if facts.RequestedLimits["max_tokens"] != 1200 || facts.EffectiveLimits["max_tokens"] != 1000 || facts.FinishReason != "length" || !facts.Started {
+		t.Fatal(facts)
+	}
+}
+
+func TestChannelCompatibilityAfterAnthropicConversion(t *testing.T) {
+	const billing = "x-anthropic-billing-header: cc_version=2.1.0; cch=abc;"
+	const rules = "\nAvailable skills: example\nUse MCP only with permission."
+	for _, identity := range []string{
+		"You are Claude Code, Anthropic's official CLI for Claude.",
+		"You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
+		"You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+		"You are an agent for Claude Code, Anthropic's official CLI for Claude. Given the user's message, use the permitted tools.",
+	} {
+		original := map[string]any{"model": "test-model", "max_tokens": 50, "system": []any{map[string]any{"type": "text", "text": billing}, map[string]any{"type": "text", "text": identity + rules}}, "messages": []any{map[string]any{"role": "user", "content": "<system-reminder>Available skills: example</system-reminder>"}}, "tools": []any{map[string]any{"name": "Skill", "description": "Invoke example", "input_schema": map[string]any{"type": "object"}}}}
+		chat, err := adapters.AnthropicRequestToChat(original)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before, _ := json.Marshal(chat)
+		first, ok := channelCompatibilityBody(chat, 1)
+		if !ok {
+			t.Fatal("native identity missed", identity)
+		}
+		text := first["messages"].([]any)[0].(map[string]any)["content"].(string)
+		if !strings.HasPrefix(text, billing+"\nYou are a coding assistant.") || !strings.HasSuffix(text, rules) {
+			t.Fatal("native capabilities changed", text)
+		}
+		if strings.Contains(identity, "Given the user's message,") && !strings.Contains(text, "Given the user's message, use the permitted tools.") {
+			t.Fatal("subagent instruction lost")
+		}
+		second, ok := channelCompatibilityBody(chat, 2)
+		if !ok {
+			t.Fatal("native attribution missed")
+		}
+		if second["messages"].([]any)[0].(map[string]any)["content"] != strings.TrimPrefix(text, billing+"\n") {
+			t.Fatal("unexpected metadata transformation")
+		}
+		after, _ := json.Marshal(chat)
+		if string(before) != string(after) {
+			t.Fatal("native request mutated")
+		}
 	}
 }
 func TestChannelDenialRotatesWithinScopeAndDoesNotReplayOutput(t *testing.T) {
@@ -355,14 +473,14 @@ func TestChannelDenialRotatesWithinScopeAndDoesNotReplayOutput(t *testing.T) {
 				t.Fatal("fallback did not bind alternate", served.UID)
 			}
 			if !tc.partial && !tc.content {
-				if o.modelCooldownUntil(first.UID, "test-model") <= nowSec() || o.modelCooldownUntil(first.UID, "other-model") > nowSec() {
+				if o.modelCooldownUntil(first.UID, "test-model") > nowSec() || o.modelCooldownUntil(first.UID, "other-model") > nowSec() {
 					t.Fatal("cooldown scope incorrect")
 				}
 				if !o.pool.Get(first.UID).Enabled || o.pool.Get(first.UID).CooldownUntil > nowSec() {
 					t.Fatal("account unnecessarily disabled/cooled")
 				}
 			}
-			if tc.exhausted && o.sessions.lookup("sticky") != "" {
+			if (tc.exhausted || tc.partial) && o.sessions.lookup("sticky") != "" {
 				t.Fatal("failed sticky binding survived exhausted scope")
 			}
 			if tc.content && o.modelCooldownUntil(first.UID, "test-model") > nowSec() {
