@@ -63,16 +63,16 @@ type Config struct {
 	PortalEnabled               bool
 
 	// workbuddy provider knobs (ported from workbuddy_one/config.py)
-	AllowExternalHost  bool
-	Desensitize        bool
-	OptimizeContext    bool
-	Ratelimit          bool
-	RatelimitInterval  float64
-	CheckinHours       []int
-	CreditRefreshMin   int
-	ModelRefreshHour   int
-	KeepaliveHour      int
-	UsageRetentionDays int
+	AllowExternalHost     bool
+	ChannelIdentityCompat bool
+	OptimizeContext       bool
+	Ratelimit             bool
+	RatelimitInterval     float64
+	CheckinHours          []int
+	CreditRefreshMin      int
+	ModelRefreshHour      int
+	KeepaliveHour         int
+	UsageRetentionDays    int
 	// UsageMaxRows caps total usage_logs rows (0 = unlimited). Guards against a
 	// burst of high-frequency calls bloating the DB within the retention window.
 	UsageMaxRows int
@@ -172,16 +172,16 @@ func Load(args []string) *Config {
 		PortalKeyMaxPerUser:         positiveEnvInt("PORTAL_KEY_MAX_PER_USER", 2),
 		PortalEnabled:               boolEnv("PORTAL_ENABLED", true),
 
-		AllowExternalHost:  boolEnv("ALLOW_EXTERNAL_HOST", false),
-		Desensitize:        boolEnv("DESENSITIZE", true),
-		OptimizeContext:    boolEnv("OPTIMIZE_CONTEXT", false),
-		Ratelimit:          boolEnv("RATELIMIT", true),
-		RatelimitInterval:  floatEnv("RATELIMIT_INTERVAL", 1.5),
-		CheckinHours:       intListEnv("CHECKIN_HOURS", []int{9, 21}),
-		CreditRefreshMin:   envInt("CREDIT_REFRESH_MIN", 30),
-		ModelRefreshHour:   envInt("MODEL_REFRESH_HOUR", 6),
-		KeepaliveHour:      envInt("KEEPALIVE_HOUR", 22),
-		UsageRetentionDays: envInt("USAGE_RETENTION_DAYS", 90),
+		AllowExternalHost:     boolEnv("ALLOW_EXTERNAL_HOST", false),
+		ChannelIdentityCompat: boolEnv("CHANNEL_IDENTITY_COMPAT", true),
+		OptimizeContext:       boolEnv("OPTIMIZE_CONTEXT", false),
+		Ratelimit:             boolEnv("RATELIMIT", true),
+		RatelimitInterval:     floatEnv("RATELIMIT_INTERVAL", 1.5),
+		CheckinHours:          intListEnv("CHECKIN_HOURS", []int{9, 21}),
+		CreditRefreshMin:      envInt("CREDIT_REFRESH_MIN", 30),
+		ModelRefreshHour:      envInt("MODEL_REFRESH_HOUR", 6),
+		KeepaliveHour:         envInt("KEEPALIVE_HOUR", 22),
+		UsageRetentionDays:    envInt("USAGE_RETENTION_DAYS", 90),
 		// 行数上限默认 10 万条（0=不限）：多数个人用量到不了，却能兜住失控增长。
 		UsageMaxRows:          envInt("USAGE_MAX_ROWS", 100000),
 		UsageCheckIntervalMin: envInt("USAGE_CHECK_INTERVAL_MIN", 30),

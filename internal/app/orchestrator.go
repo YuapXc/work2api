@@ -24,7 +24,6 @@ import (
 	"work2api/internal/streamwatch"
 	"work2api/internal/workbuddy/billing"
 	"work2api/internal/workbuddy/credentials"
-	"work2api/internal/workbuddy/desensitize"
 	"work2api/internal/workbuddy/models"
 	"work2api/internal/workbuddy/pool"
 	"work2api/internal/workbuddy/ratelimit"
@@ -869,23 +868,6 @@ func (o *Orchestrator) enhanceBody(body map[string]any) map[string]any {
 	return body
 }
 
-// applyDesensitize applies anti-content-review desensitization ONLY for
-// domestic accounts, at call time — it must not run inside enhanceBody: the
-// chosen account is unknown that early, and the international site has no
-// content review, so injecting zero-width spaces there only degrades system
-// prompt fidelity (upstream workbuddy_one gateway/inference.apply_desensitize).
-func (o *Orchestrator) applyDesensitize(acc *pool.Account, body map[string]any) map[string]any {
-	if !o.cfg.Desensitize {
-		return body
-	}
-	if siterouting.ProfileSite(acc.Profile) == siterouting.International {
-		return body
-	}
-	// CompactHarness 必须开：CC 2.x 的长 harness 模板会被上游渠道审核整块
-	// 拒绝，逐词零宽空格救不了，只有整体压缩成行为摘要才行（buddy-proxy #45）
-	return desensitize.Body(body, desensitize.Options{Roles: []string{"system", "developer"}, CompactHarness: true})
-}
-
 func (o *Orchestrator) getHeaders(acc *pool.Account) (map[string]string, *apiError) {
 	mgr := o.manager(acc.UID)
 	if mgr == nil {
@@ -946,10 +928,82 @@ func (o *Orchestrator) runOnce(ctx context.Context, acc *pool.Account, body map[
 	return started, err
 }
 
+// channelIdentityCompatBody removes only a verified fixed identity banner from
+// the leading system message. Everything following it, including skills,
+// project instructions and tool metadata, remains byte-for-byte unchanged.
+// It is used only after an explicit domestic channel rejection, never eagerly.
+func channelIdentityCompatBody(body map[string]any) (map[string]any, bool) {
+	const banner = "You are Claude Code, Anthropic's official CLI for Claude."
+	rewrite := func(text string) (string, bool) {
+		if !strings.HasPrefix(text, banner) {
+			return text, false
+		}
+		tail := text[len(banner):]
+		if tail != "" && !strings.HasPrefix(tail, "\n") && !strings.HasPrefix(tail, "\r\n") {
+			return text, false
+		}
+		return "You are a coding assistant." + tail, true
+	}
+	msgs, ok := body["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return body, false
+	}
+	first, ok := msgs[0].(map[string]any)
+	if !ok || first["role"] != "system" {
+		return body, false
+	}
+	var content any
+	switch value := first["content"].(type) {
+	case string:
+		text, matched := rewrite(value)
+		if !matched {
+			return body, false
+		}
+		content = text
+	case []any:
+		if len(value) == 0 {
+			return body, false
+		}
+		block, ok := value[0].(map[string]any)
+		if !ok || block["type"] != "text" {
+			return body, false
+		}
+		text, _ := block["text"].(string)
+		replaced, matched := rewrite(text)
+		if !matched {
+			return body, false
+		}
+		copyBlock := make(map[string]any, len(block))
+		for k, v := range block {
+			copyBlock[k] = v
+		}
+		copyBlock["text"] = replaced
+		blocks := append([]any(nil), value...)
+		blocks[0] = copyBlock
+		content = blocks
+	default:
+		return body, false
+	}
+	copyMessage := make(map[string]any, len(first))
+	for k, v := range first {
+		copyMessage[k] = v
+	}
+	copyMessage["content"] = content
+	messages := append([]any(nil), msgs...)
+	messages[0] = copyMessage
+	result := make(map[string]any, len(body))
+	for k, v := range body {
+		result[k] = v
+	}
+	result["messages"] = messages
+	return result, true
+}
+
 // openUpstream runs the request against acc, and on a retryable pre-stream
-// failure rotates to fresh accounts (never re-trying one already attempted this
-// request) until it succeeds or the candidate set is exhausted — capped at
-// maxFailoverAttempts total tries so a full upstream outage can't turn one
+// failure rotates to fresh accounts (except for the one identity compatibility
+// retry) until it succeeds or the candidate set is exhausted — capped at
+// maxFailoverAttempts total tries, including at most one fixed identity-banner
+// compatibility retry on a rejected domestic account, so an upstream outage can't turn one
 // client request into an unbounded sequential sweep of a large pool. A failure
 // after bytes have been streamed is never retried (can't un-send). A non-nil
 // scope confines every rotation pick to those UIDs (portal pool isolation —
@@ -970,8 +1024,9 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 	}()
 	const maxFailoverAttempts = 5
 	tried := map[string]bool{}
-	originalBody := body
-	domesticBody := map[string]any(nil) // derive from the original, never a prior attempt
+	compatUsed := false
+	compatUID := ""
+	var compatBody map[string]any
 	for attempt := 0; ; attempt++ {
 
 		sessionPhase(ctx, false)
@@ -1054,17 +1109,15 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 		}
 		sessionPhase(ctx, true)
 		tried[acc.UID] = true
-		// 反审核脱敏按本次实际选中的账号区域决定，只在选定账号后施加一次：
-		// 换号重试不重复注入零宽字符（上游 workbuddy_one open_upstream 同款）。
-		body = originalBody
-		if siterouting.ProfileSite(acc.Profile) != siterouting.International && o.cfg.Desensitize {
-			if domesticBody == nil {
-				domesticBody = o.applyDesensitize(acc, originalBody)
-			}
-			body = domesticBody
-		}
+		// Preserve client instructions and tool metadata on every account attempt.
+		// Region failover must not rewrite the conversation or its identifiers.
 		streamwatch.StartAttempt(ctx)
-		started, err := o.runOnce(ctx, acc, body, sink)
+		attemptBody := body
+		if acc.UID == compatUID && siterouting.ProfileSite(acc.Profile) == siterouting.Domestic {
+			attemptBody = compatBody
+		}
+		compatUID, compatBody = "", nil
+		started, err := o.runOnce(ctx, acc, attemptBody, sink)
 		status := 200
 		if ue, ok := err.(*upstream.UpstreamError); ok {
 			status = ue.StatusCode
@@ -1097,6 +1150,16 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 				o.pool.OnFailure(acc.UID, cooldownSoft)
 			}
 			return acc, err
+		}
+		if o.cfg.ChannelIdentityCompat && !compatUsed && attempt+1 < maxFailoverAttempts &&
+			siterouting.ProfileSite(acc.Profile) == siterouting.Domestic && isChannelDenied(ue.StatusCode, string(ue.Raw)) {
+			if compatible, matched := channelIdentityCompatBody(body); matched {
+				compatUsed, compatUID, compatBody = true, acc.UID, compatible
+				delete(tried, acc.UID)
+				// Re-enter admission and authorization checks before the retry;
+				// do not penalize a usable account for a fixed banner mismatch.
+				continue
+			}
 		}
 		// 分类并对该账号施加处罚（禁用/负缓存/冷却/不罚），返回是否应换号。
 		act := o.penalizeAccount(acc, model, ue)

@@ -26,6 +26,10 @@ func randID(prefix string) string {
 // OpenAI Chat Completions request body.
 func AnthropicRequestToChat(body map[string]any) (map[string]any, error) {
 	var messages []any
+	tools, catalog, err := anthropicClientTools(body)
+	if err != nil {
+		return nil, err
+	}
 
 	if system := body["system"]; system != nil {
 		if sysContent := extractSystemText(system); sysContent != "" {
@@ -39,7 +43,7 @@ func AnthropicRequestToChat(body map[string]any) (map[string]any, error) {
 			if !ok {
 				continue
 			}
-			converted, err := convertAnthropicMessage(mm)
+			converted, err := convertAnthropicMessage(mm, catalog)
 			if err != nil {
 				return nil, err
 			}
@@ -79,12 +83,19 @@ func AnthropicRequestToChat(body map[string]any) (map[string]any, error) {
 			}
 		}
 	}
-	if tools, ok := body["tools"].([]any); ok && len(tools) > 0 {
+	if len(tools) > 0 {
 		chat["tools"] = convertAnthropicTools(tools)
 	}
 	if tc, ok := body["tool_choice"]; ok {
 		switch v := tc.(type) {
 		case map[string]any:
+			if value, present := v["disable_parallel_tool_use"]; present {
+				disabled, ok := value.(bool)
+				if !ok {
+					return nil, fmt.Errorf("tool_choice.disable_parallel_tool_use 必须为布尔值")
+				}
+				chat["parallel_tool_calls"] = !disabled
+			}
 			typ, _ := v["type"].(string)
 			if typ == "" {
 				typ = "any"
@@ -175,7 +186,7 @@ func extractSystemText(system any) string {
 
 // contentWithImages maps Anthropic content blocks to Chat content, preserving
 // image blocks (returns either a string or a []any of typed parts).
-func contentWithImages(blocks any) (any, error) {
+func contentWithImages(blocks any, catalog map[string]map[string]any) (any, error) {
 	switch v := blocks.(type) {
 	case string:
 		return v, nil
@@ -189,6 +200,17 @@ func contentWithImages(blocks any) (any, error) {
 				continue
 			}
 			switch block["type"] {
+			case "tool_reference":
+				name, _ := block["tool_name"].(string)
+				if _, ok := catalog[name]; !ok || name == "" {
+					return nil, fmt.Errorf("tool_reference 必须引用当前 tools 中已定义的客户端工具")
+				}
+				// Chat has no tool_reference block. Keep the discovery result in
+				// the tool's output; the corresponding schema is loaded in tools.
+				encoded, _ := json.Marshal(map[string]any{"type": "tool_reference", "tool_name": name})
+				text := "\n" + string(encoded) + "\n"
+				parts = append(parts, map[string]any{"type": "text", "text": text})
+				textOnly.WriteString(text)
 			case "text":
 				text, _ := block["text"].(string)
 				parts = append(parts, map[string]any{"type": "text", "text": text})
@@ -216,6 +238,8 @@ func contentWithImages(blocks any) (any, error) {
 				}
 				parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}})
 				hasImage = true
+			default:
+				return nil, fmt.Errorf("不支持的 Anthropic 内容块类型: %v", block["type"])
 			}
 		}
 		if hasImage {
@@ -229,7 +253,7 @@ func contentWithImages(blocks any) (any, error) {
 	}
 }
 
-func convertAnthropicMessage(msg map[string]any) ([]any, error) {
+func convertAnthropicMessage(msg map[string]any, catalog map[string]map[string]any) ([]any, error) {
 	role, _ := msg["role"].(string)
 	content := msg["content"]
 
@@ -252,9 +276,24 @@ func convertAnthropicMessage(msg map[string]any) ([]any, error) {
 			}
 			if block["type"] == "tool_result" {
 				tcID, _ := block["tool_use_id"].(string)
-				output, err := contentWithImages(block["content"])
+				output, err := contentWithImages(block["content"], catalog)
 				if err != nil {
 					return nil, err
+				}
+				if value, present := block["is_error"]; present {
+					isError, ok := value.(bool)
+					if !ok {
+						return nil, fmt.Errorf("tool_result.is_error 必须为布尔值")
+					}
+					if isError {
+						const prefix = "[tool_result is_error=true]\n"
+						switch value := output.(type) {
+						case string:
+							output = prefix + value
+						case []any:
+							output = append([]any{map[string]any{"type": "text", "text": prefix}}, value...)
+						}
+					}
 				}
 				result = append(result, map[string]any{"role": "tool", "tool_call_id": tcID, "content": output})
 			} else {
@@ -262,7 +301,7 @@ func convertAnthropicMessage(msg map[string]any) ([]any, error) {
 			}
 		}
 		if len(userBlocks) > 0 {
-			c, err := contentWithImages(userBlocks)
+			c, err := contentWithImages(userBlocks, catalog)
 			if err != nil {
 				return nil, err
 			}
@@ -324,6 +363,115 @@ func extractBlocksText(blocks []any) string {
 		}
 	}
 	return strings.Join(parts, "")
+}
+
+// anthropicClientTools implements client-side discovery for a Chat upstream.
+// Anthropic requires all deferred definitions in each request, but exposes only
+// non-deferred and discovered tools to the model. References in prior tool
+// results remain effective on subsequent turns. This does not execute server
+// tools or scan the client's filesystem for skills/MCP tools.
+// https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool
+func anthropicClientTools(body map[string]any) ([]any, map[string]map[string]any, error) {
+	catalog := make(map[string]map[string]any)
+	loaded := make(map[string]bool)
+	tools, _ := body["tools"].([]any)
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			return nil, nil, fmt.Errorf("tools 必须包含工具定义对象")
+		}
+		typ, _ := tool["type"].(string)
+		if typ != "" && typ != "custom" && typ != "function" {
+			return nil, nil, fmt.Errorf("Chat 上游不支持该 Anthropic 工具类型: %s", typ)
+		}
+		definition := tool
+		if fn, ok := tool["function"].(map[string]any); ok {
+			definition = fn
+		}
+		name, _ := definition["name"].(string)
+		if strings.TrimSpace(name) == "" {
+			return nil, nil, fmt.Errorf("客户端工具必须指定 name")
+		}
+		if _, exists := catalog[name]; exists {
+			return nil, nil, fmt.Errorf("客户端工具 name 不得重复")
+		}
+		catalog[name] = tool
+		deferred := false
+		if value, present := tool["defer_loading"]; present {
+			var valid bool
+			deferred, valid = value.(bool)
+			if !valid {
+				return nil, nil, fmt.Errorf("工具 defer_loading 必须为布尔值")
+			}
+		}
+		loaded[name] = !deferred
+	}
+	var discover func(any) error
+	discover = func(content any) error {
+		blocks, _ := content.([]any)
+		for _, raw := range blocks {
+			block, _ := raw.(map[string]any)
+			switch block["type"] {
+			case "tool_reference":
+				name, _ := block["tool_name"].(string)
+				if _, exists := catalog[name]; !exists || name == "" {
+					return fmt.Errorf("tool_reference 必须引用当前 tools 中已定义的客户端工具")
+				}
+				loaded[name] = true
+			case "tool_use":
+				// A previously invoked deferred tool must remain callable even
+				// after client compaction removes its original search result.
+				if name, _ := block["name"].(string); catalog[name] != nil {
+					loaded[name] = true
+				}
+			case "tool_result":
+				if err := discover(block["content"]); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if messages, ok := body["messages"].([]any); ok {
+		for _, raw := range messages {
+			message, _ := raw.(map[string]any)
+			if err := discover(message["content"]); err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+	var chosenName string
+	switch choice := body["tool_choice"].(type) {
+	case map[string]any:
+		if choice["type"] == "tool" {
+			chosenName, _ = choice["name"].(string)
+		}
+	case string:
+		// Keep the pre-existing named-string compatibility form consistent
+		// with the native Anthropic object form when tools are deferred.
+		if choice != "auto" && choice != "none" && choice != "required" {
+			chosenName = choice
+		}
+	}
+	if catalog[chosenName] != nil {
+		loaded[chosenName] = true
+	}
+	var result []any
+	for _, raw := range tools {
+		tool := raw.(map[string]any)
+		definition := tool
+		if fn, ok := tool["function"].(map[string]any); ok {
+			definition = fn
+		}
+		name, _ := definition["name"].(string)
+		if loaded[name] {
+			result = append(result, tool)
+		}
+	}
+	if len(tools) > 0 && len(result) == 0 {
+		return nil, nil, fmt.Errorf("至少需要一个非延迟或已发现的客户端工具")
+	}
+	return result, catalog, nil
 }
 
 func convertAnthropicTools(tools []any) []any {

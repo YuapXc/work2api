@@ -25,6 +25,7 @@
 ## 功能特性
 
 - **三协议兼容**：`/v1/chat/completions`、`/v1/messages`、`/v1/responses`，流式与非流式均支持，协议之间自动互转。
+- **WorkBuddy 客户端能力保真**：保留客户端提交的技能、Agent、MCP 和项目指令。Anthropic 客户端 ToolSearch 的 `tool_reference` 按当前请求工具定义校验，非延迟及已发现工具加载到 Chat 请求；未发现的延迟工具不会提前展开。并行工具开关与工具错误状态保留。此为协议转换，不等同完整 Anthropic API；不支持的内置工具声明和用户内容块明确报错，签名思考、服务端工具及显式提示缓存不宣称原生支持。语义参考 [工具搜索](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)、[并行工具调用](https://platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use) 和 [技能可见性](https://code.claude.com/docs/en/skills)。
 - **多供应商命名空间路由**：请求按模型名前缀自动分发——`qoder/xxx`→Qoder、`opencode/xxx`→OpenCode，无前缀→WorkBuddy（默认）。
 - **应用 Key 鉴权**：为不同用途创建独立 `sk-...` Key，使用记录按应用统计。
 - **密钥模型白名单**：`/v1/models` 只展示该密钥获准调用的模型及别名。省略 `model`（含 `null`、空字符串）时，不限模型的密钥默认使用 `auto`，仅允许一个模型的密钥默认使用该模型，允许多个模型的密钥需明确指定，否则返回 400。显式指定 `auto` 仍需获得授权；它会交给上游选择，并不表示在密钥白名单内自动选择。
@@ -161,7 +162,8 @@ docker run -d --name work2api -p 8787:8787 \
 | — | `REQUEST_BODY_BUDGET` | `33554432` | 执行与排队共享的请求体缓冲容量预算（32 MiB） |
 | — | `MAX_JSON_ITEMS` / `MAX_JSON_DEPTH` | `100000` / `128` | 解码前限制 JSON 结构符号数量与嵌套深度，防止对象数量放大内存 |
 | — | `MAX_RESPONSE_BYTES` | `8388608` | 每次上游响应上限，SSE 含封装，防止输出聚合无界增长 |
-| — | `DESENSITIZE` | `true` | 对 system/developer 消息脱敏 |
+| — | `DESENSITIZE` | 已停用 | 旧配置忽略；完整保留技能、工具和项目指令，不再摘要替换或插入零宽字符 |
+| — | `CHANNEL_IDENTITY_COMPAT` | `true` | 国内明确渠道拒绝且未开始输出时，对已验证的首行 Claude Code 固定身份声明最多兼容重试一次；完整保留后续指令，计入总计 5 次尝试，失败继续按原规则换号 |
 | — | `RATELIMIT` / `RATELIMIT_INTERVAL` | `true` / `1.5` | 每账号限速 |
 | — | `CHECKIN_HOURS` | `9,21` | 每日自动签到小时 |
 | — | `CREDIT_REFRESH_MIN` | `30` | 额度刷新周期（分钟） |
