@@ -401,6 +401,13 @@ func finalizeCheckin(accountID string, r CheckinResult) CheckinResult {
 // 且不发放任何积分（2026-09-21 实测）。真实领取只走 campaigns 流程。
 // 上游恢复后若返回非 0 统计，可作为 streak 的补充数据源。
 func readDailyCheckinStats(ctx context.Context, deviceToken string, res *CheckinResult) {
+	if ctx.Err() != nil {
+		return
+	}
+	// Legacy statistics are optional; never hold a completed claim behind the
+	// full campaigns request timeout. Parent cancellation still takes priority.
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
 	status, body, raw := doCheckinRequest(ctx, "GET", "/sash/api/v1/me/daily-check-in/status", deviceToken, nil)
 	if status != 200 {
 		if status != 404 && status != 401 {
@@ -575,29 +582,61 @@ func CheckinAllContext(ctx context.Context) []CheckinResult {
 		}}
 	}
 
-	var results []CheckinResult
-	for i := range accounts {
-		if ctx.Err() != nil {
-			break
-		}
-		if account.IsGatewayHidden(accounts[i].ID) {
-			continue
-		}
-		acct := &accounts[i]
+	return checkinBatch(ctx, accounts, func(ctx context.Context, acct *account.Account) CheckinResult {
 		if !account.HasSecret(acct.ID) {
-			results = append(results, CheckinResult{
+			return CheckinResult{
 				Account:   acct.Name,
 				AccountID: acct.ID,
 				Status:    checkinStatusNoToken,
 				Message:   "无 secret，跳过",
-			})
-			continue
+			}
 		}
 		r := checkinAccount(ctx, acct)
 		logger.Info("[Checkin] account=%s status=%s msg=%s", r.Account, r.Status, r.Message)
-		results = append(results, r)
+		return r
+	})
+}
+
+// Each worker owns one result slot. Waiting for all workers before collecting
+// keeps account order stable, while cancellation leaves unstarted accounts out.
+func checkinBatch(ctx context.Context, accounts []account.Account, run func(context.Context, *account.Account) CheckinResult) []CheckinResult {
+	results := make([]CheckinResult, len(accounts))
+	completed := make([]bool, len(accounts))
+	jobs := make(chan int)
+	var workers sync.WaitGroup
+	for worker := 0; worker < 3 && worker < len(accounts); worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for i := range jobs {
+				if ctx.Err() != nil || account.IsGatewayHidden(accounts[i].ID) {
+					continue
+				}
+				results[i] = run(ctx, &accounts[i])
+				completed[i] = true
+			}
+		}()
 	}
-	return results
+schedule:
+	for i := range accounts {
+		if ctx.Err() != nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			break schedule
+		case jobs <- i:
+		}
+	}
+	close(jobs)
+	workers.Wait()
+	var out []CheckinResult
+	for i, done := range completed {
+		if done {
+			out = append(out, results[i])
+		}
+	}
+	return out
 }
 
 // CheckinOne 对指定账号签到，账号不存在返回 error 结果

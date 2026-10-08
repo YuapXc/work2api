@@ -34,6 +34,40 @@ func TestGlobalAccountCheckinDoesNotSendTokenToCN(t *testing.T) {
 	}
 }
 
+func TestAccountRowReflectsCredentialScopedCooldown(t *testing.T) {
+	previous := account.DataRoot()
+	account.SetDataRoot(t.TempDir())
+	t.Cleanup(func() { account.SetDataRoot(previous) })
+	id := "health-fixture"
+	acct := &account.Account{ID: id, Region: account.RegionCN}
+	secret := `{"device_token":"token","refresh_token":"first"}`
+	r := &Runtime{quotaInflight: map[string]bool{id: true}, accountCooldowns: map[[32]byte]time.Time{}}
+	until := time.Now().Add(time.Minute)
+	r.accountCooldowns[modelCatalogKey(acct, secret)] = until
+	row := r.accountRow(id, "fixture", string(acct.Region), "native", "device", true, secret)
+	if row["healthy"] != false || row["has_secret"] != true || row["cooldown_until"] != float64(until.UnixMilli())/1000 {
+		t.Fatal("cooldown not reflected", row)
+	}
+	for _, current := range []string{`{"device_token":"token","refresh_token":"rotated"}`, ""} {
+		row = r.accountRow(id, "fixture", string(acct.Region), "native", "device", true, current)
+		if row["healthy"] != (current != "") || row["cooldown_until"] != nil {
+			t.Fatal("stale credential cooldown leaked", row)
+		}
+	}
+	r.accountCooldowns[modelCatalogKey(acct, secret)] = time.Now().Add(-time.Second)
+	row = r.accountRow(id, "fixture", string(acct.Region), "native", "device", true, secret)
+	if row["healthy"] != true || row["cooldown_until"] != nil {
+		t.Fatal("expired cooldown remained unhealthy", row)
+	}
+	localID := "qoder-local-cn"
+	r.quotaInflight[localID] = true
+	r.accountCooldowns[modelCatalogKey(&account.Account{ID: localID, Region: account.NormalizeRegion("cn")}, "local-token")] = until
+	row = r.accountRow(localID, "local", "cn", "local", "device", false, "local-token")
+	if row["healthy"] != false {
+		t.Fatal("local cooldown identity mismatch", row)
+	}
+}
+
 func TestCatalogEmptySnapshotAndAccountIsolation(t *testing.T) {
 	previous := account.DataRoot()
 	account.SetDataRoot(t.TempDir())

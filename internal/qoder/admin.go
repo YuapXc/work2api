@@ -89,13 +89,14 @@ func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 				if account.IsGatewayHidden(a.ID) {
 					continue
 				}
-				accts = append(accts, r.accountRow(a.ID, a.Name, string(a.Region), "native", a.AuthMode, a.Active))
+				secret, _ := account.GetSecret(a.ID)
+				accts = append(accts, r.accountRow(a.ID, a.Name, string(a.Region), "native", a.AuthMode, a.Active, secret))
 			}
 		}
 	}
 	local := r.detectLocal()
 	for i, c := range local {
-		row := r.accountRow("qoder-local-"+c.Region, "本地 Qoder（"+c.Region+"）", c.Region, "local", "device", i == 0 && len(accts) == 0)
+		row := r.accountRow("qoder-local-"+c.Region, "本地 Qoder（"+c.Region+"）", c.Region, "local", "device", i == 0 && len(accts) == 0, c.DeviceToken)
 		accts = append(accts, row)
 	}
 	d.Accounts = accts
@@ -124,12 +125,25 @@ func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 }
 
 // accountRow builds one enriched account row (aligned with the workbuddy columns).
-func (r *Runtime) accountRow(id, label, region, source, authMode string, active bool) map[string]any {
-	hasSecret := source == "local" || account.HasSecret(id)
+func (r *Runtime) accountRow(id, label, region, source, authMode string, active bool, secret string) map[string]any {
+	hasSecret := secret != ""
 	row := map[string]any{
 		"id": id, "label": label, "region": region, "source": source,
 		"auth_mode": authMode, "active": active, "has_secret": hasSecret,
-		"healthy": hasSecret, // qoder has no cooldown pool; usable == has a secret
+		"healthy": hasSecret,
+	}
+	// Use the same full credential identity as dispatch, including refresh tokens.
+	cooldownRegion := account.Region(region)
+	if source == "local" {
+		cooldownRegion = account.NormalizeRegion(region)
+	}
+	key := modelCatalogKey(&account.Account{ID: id, Region: cooldownRegion}, secret)
+	r.mu.Lock()
+	until := r.accountCooldowns[key]
+	r.mu.Unlock()
+	if hasSecret && time.Now().Before(until) {
+		row["healthy"] = false
+		row["cooldown_until"] = float64(until.UnixMilli()) / 1000
 	}
 	// checkin state from local history
 	streak, _, totalCredits, claimedToday := checkin.LocalStats(id)

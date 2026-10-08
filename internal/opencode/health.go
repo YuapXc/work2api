@@ -184,6 +184,9 @@ func (rt *Runtime) refreshProtocolCapabilities(ctx context.Context) (Capabilitie
 	}
 	var lastErr error
 	for _, proxy := range rt.transports.items {
+		if ctx.Err() != nil {
+			return Capabilities{}, ctx.Err()
+		}
 		if proxy == nil || !proxy.healthy.Load() {
 			continue
 		}
@@ -213,12 +216,19 @@ func (rt *Runtime) refreshAnonymousTier(ctx context.Context, base string) []stri
 	cursor := rt.anonymous.CursorFor("")
 	limit := rt.anonymous.Len()
 	for attempt := 1; attempt <= limit; attempt++ {
+		if ctx.Err() != nil {
+			return nil
+		}
 		node := cursor.Next()
 		if node == nil {
 			break
 		}
 		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		models, status, err := FetchModels(refreshCtx, node.proxy.client, base, anonymousZenKey)
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			cancel()
+			return nil
+		}
 		rt.syncProxyResult(refreshCtx, node.proxy, status, err)
 		cancel()
 		if err == nil {
@@ -234,6 +244,9 @@ func (rt *Runtime) refreshAnonymousTier(ctx context.Context, base string) []stri
 func (rt *Runtime) refreshTier(ctx context.Context, base string, nodes *nodePool) []string {
 	cursor := nodes.Cursor()
 	for attempt := 0; attempt < rt.cfg.Retry.MaxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return nil
+		}
 		node := cursor.Next()
 		if node == nil {
 			return nil
@@ -245,6 +258,10 @@ func (rt *Runtime) refreshTier(ctx context.Context, base string, nodes *nodePool
 			return nil
 		}
 		models, status, err := FetchModels(refreshCtx, proxy.client, base, node.key)
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			cancel()
+			return nil
+		}
 		rt.syncProxyResult(refreshCtx, proxy, status, err)
 		cancel()
 		if err == nil {

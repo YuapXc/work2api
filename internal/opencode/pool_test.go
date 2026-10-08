@@ -4,9 +4,64 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"testing"
 	"time"
 )
+
+type catalogTestTransport func(*http.Request) (*http.Response, error)
+
+func (f catalogTestTransport) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+func TestCatalogCancellationPreservesHealth(t *testing.T) {
+	for _, anonymous := range []bool{false, true} {
+		for _, before := range []bool{false, true} {
+			t.Run(fmt.Sprintf("anonymous=%v/before=%v", anonymous, before), func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				calls := 0
+				proxy := &proxyTransport{client: &http.Client{Transport: catalogTestTransport(func(req *http.Request) (*http.Response, error) {
+					calls++
+					cancel()
+					return nil, req.Context().Err()
+				})}}
+				proxy.healthy.Store(true)
+				transports := &transportPool{items: []*proxyTransport{proxy}}
+				nodes, err := newNodePool([]string{"one", "two"}, transports, time.Minute)
+				if err != nil {
+					t.Fatal(err)
+				}
+				anon := newAnonymousPool(true, transports, time.Minute)
+				rt := &Runtime{cfg: Config{Retry: RetryConfig{MaxAttempts: 3}}, transports: transports, zenNodes: nodes, goNodes: &nodePool{}, anonymous: anon}
+				if before {
+					cancel()
+				}
+				if anonymous {
+					rt.refreshAnonymousTier(ctx, "https://upstream.invalid")
+				} else {
+					rt.refreshTier(ctx, "https://upstream.invalid", nodes)
+				}
+				want := 1
+				if before {
+					want = 0
+				}
+				if calls != want || !proxy.healthy.Load() || proxy.checking.Load() {
+					t.Fatalf("calls=%d healthy=%v checking=%v", calls, proxy.healthy.Load(), proxy.checking.Load())
+				}
+				for _, node := range nodes.nodes {
+					if node.failures.Load() != 0 || node.cooldownUntil.Load() != 0 || nodes.Proxy(node) != proxy {
+						t.Fatal("cancellation penalized/rebound key")
+					}
+				}
+				for _, node := range anon.nodes {
+					if node.failures.Load() != 0 || node.cooldownUntil.Load() != 0 {
+						t.Fatal("cancellation penalized anonymous node")
+					}
+				}
+			})
+		}
+	}
+}
 
 func TestDNSFailurePreservesProxyAndNodeHealth(t *testing.T) {
 	for _, timeout := range []bool{false, true} {
