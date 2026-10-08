@@ -66,6 +66,9 @@ type Runtime struct {
 	modelCacheKey        [32]byte
 	modelCacheLoaded     bool
 	modelCacheStale      bool
+	accountCooldowns     map[[32]byte]time.Time
+	accountModels        map[[32]byte]accountModelSnapshot
+	accountAffinities    map[[32]byte]accountAffinity
 	saltSet              bool
 
 	localOnce  sync.Once
@@ -459,9 +462,72 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 		report.Error = err.Error()
 		return report, err
 	}
+	preferredKey := modelCatalogKey(acct, secret)
+	affinityKey, hasAffinity := requestAffinityKey(req)
+	if sticky, stickySecret := r.affinityAccount(affinityKey, hasAffinity, preferredKey); sticky != nil {
+		acct, secret = sticky, stickySecret
+	}
+	selected := acct
+	selectedSecret := secret
+	tried := map[string]bool{acct.ID: true}
+	model := strings.TrimPrefix(str(req.Payload["model"]), runtimePrefix)
+	agent := bridge.InferAgent(model)
+	if req.Protocol == provider.ProtocolAnthropic {
+		agent = "claude"
+	}
+	if req.Protocol == provider.ProtocolResponses {
+		agent = "codex"
+	}
+	model = bridge.MapModel(agent, model)
+	r.mu.Lock()
+	coolUntil := r.accountCooldowns[modelCatalogKey(acct, secret)]
+	cooling := time.Now().Before(coolUntil)
+	r.mu.Unlock()
+	if cooling {
+		candidate, e := r.nextAccountBridge(ctx, acct.Region, model, tried)
+		if candidate == nil {
+			if e == nil {
+				e = fmt.Errorf("Qoder 账号暂时不可用，请稍后重试")
+				if req.Writer != nil {
+					req.Writer.Header().Set("Retry-After", fmt.Sprintf("%d", max(1, int(time.Until(coolUntil).Seconds()+0.999))))
+				}
+			}
+			writeServeError(req, e)
+			return provider.UsageReport{Status: "error", Error: e.Error()}, e
+		}
+		acct, secret = candidate.account, candidate.secret
+		selected, selectedSecret = acct, secret
+	}
 	report.AccountUID = acct.ID
+	r.rememberAffinity(affinityKey, hasAffinity, preferredKey, acct, secret)
+	next := func(ctx context.Context, model string, previous error) (*bridge.Bridge, error) {
+		if !canFailover(previous) {
+			return nil, nil
+		}
+		r.coolAccount(selected, selectedSecret, previous)
+		if len(tried) >= 3 {
+			return nil, nil
+		}
+		candidate, err := r.nextAccountBridge(ctx, acct.Region, model, tried)
+		if candidate == nil {
+			return nil, err
+		}
+		selected, selectedSecret = candidate.account, candidate.secret
+		report.AccountUID = selected.ID
+		r.rememberAffinity(affinityKey, hasAffinity, preferredKey, selected, selectedSecret)
+		return candidate.bridge, nil
+	}
+	ctx = bridge.WithAccountFallback(ctx, next)
 
 	b, err := r.bridgeFor(ctx, acct, secret)
+	if err != nil && ctx.Err() == nil {
+		candidate, candidateErr := next(ctx, model, err)
+		if candidateErr != nil {
+			err = candidateErr
+		} else if candidate != nil {
+			b, err = candidate, nil
+		}
+	}
 	if err != nil {
 		writeServeError(req, err)
 		report.Status = "error"
@@ -503,6 +569,9 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 		report.Status = "incomplete"
 	}
 	if err != nil {
+		if ctx.Err() == nil && canFailover(err) {
+			r.coolAccount(selected, selectedSecret, err)
+		}
 		report.Status = "error"
 		report.Error = err.Error()
 		return report, err

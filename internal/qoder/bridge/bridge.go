@@ -390,6 +390,39 @@ func deltaDispatcher(onDelta func(Delta), upstreamErr *error) func(string) bool 
 }
 
 func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages []interface{}, model string, tools interface{}, opts CallOpts, onDelta func(Delta)) error {
+	current := b
+	for {
+		emitted := false
+		err := current.callQoderWithOpts(ctx, agent, messages, model, tools, opts, func(d Delta) {
+			if !d.isEmpty() {
+				emitted = true
+			}
+			onDelta(d)
+		})
+		next, _ := ctx.Value(accountFallbackKey{}).(AccountFallback)
+		if err == nil || emitted || ctx.Err() != nil || next == nil {
+			return err
+		}
+		other, nextErr := next(ctx, MapModel(agent, model), err)
+		if nextErr != nil {
+			return nextErr
+		}
+		if other == nil {
+			return err
+		}
+		current = other
+	}
+}
+
+// AccountFallback is request-local; cached bridges never retain routing state.
+type AccountFallback func(context.Context, string, error) (*Bridge, error)
+type accountFallbackKey struct{}
+
+func WithAccountFallback(ctx context.Context, next AccountFallback) context.Context {
+	return context.WithValue(ctx, accountFallbackKey{}, next)
+}
+
+func (b *Bridge) callQoderWithOpts(ctx context.Context, agent string, messages []interface{}, model string, tools interface{}, opts CallOpts, onDelta func(Delta)) error {
 	// 将客户端模型名（claude-sonnet-4-6 等）映射成 Qoder 上游内部 model.key（auto/qmodel_38max/gmodel/dmodel 等）。
 	// 上游对未知 key 会走兜底返回内容，但不会把这次调用计入 quota，这是「请求成功但 dashboard 无用量」的根因。
 	originalModel := model
@@ -500,7 +533,7 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 	// 不可重试，快速失败。闸门做在此处，chat/claude/codex 三协议的
 	// 流式与非流式路径全部自动覆盖。
 	// 说明：连接阶段错误已在 openStreamLines 内部重试过；此处重开是
-	// 第二层防护（有界：最多 TransientMaxRetries 次），主要覆盖流内信封错误。
+	// 已耗尽的连接重试不会再次进入外层；外层仅覆盖建流后的信封/读取错误。
 	var lastErr error
 	for attempt := 0; attempt <= TransientMaxRetries; attempt++ {
 		if attempt > 0 {
@@ -537,7 +570,8 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 		} else {
 			lastErr = streamErr
 		}
-		if emitted || attempt >= TransientMaxRetries || !isRetryableStreamError(lastErr) {
+		var exhausted *streamOpenError
+		if emitted || errors.As(lastErr, &exhausted) || attempt >= TransientMaxRetries || !isRetryableStreamError(lastErr) {
 			return lastErr
 		}
 	}

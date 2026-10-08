@@ -141,3 +141,27 @@ func TestReadBodyCancellationUnblocksAndReturnsContext(t *testing.T) {
 		t.Fatal("cancellation left body read blocked")
 	}
 }
+
+func TestAttemptStagesBoundedAndDetached(t *testing.T) {
+	ctx, timing := WithTiming(context.Background())
+	AttemptHeaders(ctx, 500)
+	for i := 0; i < 20; i++ {
+		StartAttempt(ctx)
+		AttemptHeaders(ctx, 200)
+		AttemptHeaders(ctx, 500)
+	}
+	AttemptResult(ctx, 429)
+	snap := timing.Snapshot()
+	if snap.Attempts != 20 || len(snap.AttemptStages) != 16 || snap.Upstream429 != 1 {
+		t.Fatal(snap)
+	}
+	for i, s := range snap.AttemptStages {
+		if s.Number != i+1 || s.HTTPStatus != 200 || !s.Finished {
+			t.Fatal(s)
+		}
+	}
+	snap.AttemptStages[0].HTTPStatus = 400
+	if timing.Snapshot().AttemptStages[0].HTTPStatus != 200 {
+		t.Fatal("snapshot alias")
+	}
+}

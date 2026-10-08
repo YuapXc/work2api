@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"work2api/internal/qoder/cosy"
@@ -233,6 +234,7 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 		if resp != nil {
 			status = resp.StatusCode
 		}
+		streamwatch.AttemptHeaders(ctx, status)
 		streamwatch.AttemptResult(ctx, status)
 		if err != nil {
 			lastErr = err
@@ -244,7 +246,7 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 					fullURL, attempt+1, TransientMaxRetries+1, err.Error(), attempt+1)
 				continue
 			}
-			return WrapTransportError(err)
+			return &streamOpenError{WrapTransportError(err)}
 		}
 		if resp.StatusCode != 200 {
 			body, readErr := streamwatch.ReadBody(ctx, resp.Body, 1<<20)
@@ -258,7 +260,9 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 					resp.StatusCode, fullURL, attempt+1, TransientMaxRetries+1, attempt+1)
 				continue
 			}
-			return NewUpstreamError(resp.StatusCode, detail)
+			upstream := NewUpstreamError(resp.StatusCode, detail)
+			upstream.RetryAfter = retryAfterDelay(resp.Header.Get("Retry-After"))
+			return &streamOpenError{upstream}
 		}
 
 		// 建流成功：进入流式读取，不再在本层重试。
@@ -319,6 +323,16 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 	return WrapTransportError(lastErr)
 }
 
+func retryAfterDelay(value string) time.Duration {
+	if seconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil && seconds > 0 && seconds <= int64((1<<63-1)/time.Second) {
+		return time.Duration(seconds) * time.Second
+	}
+	if date, err := http.ParseTime(value); err == nil {
+		return max(time.Duration(0), time.Until(date))
+	}
+	return 0
+}
+
 // sleepCtx 可被 ctx 取消的退避等待。
 func sleepCtx(ctx context.Context, d time.Duration) error {
 	select {
@@ -328,3 +342,8 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 		return nil
 	}
 }
+
+// streamOpenError marks a connection failure already handled by the inner retry loop.
+type streamOpenError struct{ error }
+
+func (e *streamOpenError) Unwrap() error { return e.error }

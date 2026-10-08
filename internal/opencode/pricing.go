@@ -27,10 +27,17 @@ const (
 )
 
 type Price struct {
-	ID         string   `json:"id"`
-	Input      *float64 `json:"input_cost,omitempty"`
-	Output     *float64 `json:"output_cost,omitempty"`
-	Deprecated bool     `json:"deprecated"`
+	ID         string               `json:"id"`
+	Input      *float64             `json:"input_cost,omitempty"`
+	Output     *float64             `json:"output_cost,omitempty"`
+	SourceTier Tier                 `json:"source_tier,omitempty"`
+	Limits     map[Tier]ModelLimits `json:"limits,omitempty"`
+	Deprecated bool                 `json:"deprecated"`
+}
+type ModelLimits struct {
+	ContextWindow int `json:"context_window,omitempty"`
+	MaxInput      int `json:"max_input,omitempty"`
+	MaxOutput     int `json:"max_output,omitempty"`
 }
 
 type AnonymousDecision struct {
@@ -209,6 +216,9 @@ func (store *PricingStore) Decide(model string) AnonymousDecision {
 	if !exists {
 		return fallback("metadata_model_missing")
 	}
+	if price.SourceTier == TierGo {
+		return fallback("metadata_zen_model_missing")
+	}
 	decision := AnonymousDecision{
 		Known: true, Deprecated: price.Deprecated, InputCost: price.Input, OutputCost: price.Output,
 	}
@@ -242,6 +252,13 @@ func (store *PricingStore) Price(model string) (Price, bool) {
 	store.mu.RLock()
 	defer store.mu.RUnlock()
 	price, ok := store.models[model]
+	if price.Limits != nil {
+		limits := make(map[Tier]ModelLimits, len(price.Limits))
+		for tier, value := range price.Limits {
+			limits[tier] = value
+		}
+		price.Limits = limits
+	}
 	return price, ok
 }
 
@@ -295,6 +312,7 @@ func decodeModelsDev(data []byte) (map[string]Price, error) {
 		}
 		return left < right
 	})
+	result := make(map[string]Price)
 	for _, key := range keys {
 		if metadataProviderRank(key) > 1 {
 			continue
@@ -313,18 +331,30 @@ func decodeModelsDev(data []byte) (map[string]Price, error) {
 		if len(models) == 0 {
 			continue
 		}
-		result := make(map[string]Price, len(models))
+		tier := TierZen
+		if strings.Contains(strings.ToLower(key), "opencode-go") || strings.Contains(strings.ToLower(key), "opencode_go") {
+			tier = TierGo
+		}
 		for id, raw := range models {
 			model, _ := raw.(map[string]any)
 			modelID := jsonutil.FirstString(jsonutil.StringAt(model, "id"), id)
 			cost := jsonutil.MapAt(model, "cost")
-			result[modelID] = Price{
-				ID: modelID, Input: numberPointer(cost, "input"), Output: numberPointer(cost, "output"), Deprecated: metadataDeprecated(model),
+			limit := jsonutil.MapAt(model, "limit")
+			price, exists := result[modelID]
+			if !exists || price.SourceTier == TierGo && tier == TierZen {
+				price = Price{ID: modelID, Input: numberPointer(cost, "input"), Output: numberPointer(cost, "output"), Deprecated: metadataDeprecated(model), SourceTier: tier, Limits: price.Limits}
 			}
+			if price.Limits == nil {
+				price.Limits = make(map[Tier]ModelLimits)
+			}
+			if _, exists := price.Limits[tier]; !exists {
+				price.Limits[tier] = ModelLimits{max(0, jsonutil.IntAt(limit, "context")), max(0, jsonutil.IntAt(limit, "input")), max(0, jsonutil.IntAt(limit, "output"))}
+			}
+			result[modelID] = price
 		}
-		if len(result) > 0 {
-			return result, nil
-		}
+	}
+	if len(result) > 0 {
+		return result, nil
 	}
 	return nil, errors.New("models.dev contains no OpenCode model metadata")
 }

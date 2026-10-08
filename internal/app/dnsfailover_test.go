@@ -139,3 +139,91 @@ func TestRegionFailoverUsesOriginalInternationalPrompt(t *testing.T) {
 		t.Fatal("international retry or original prompt was mutated")
 	}
 }
+
+type channelRetryUpstream struct {
+	calls   int
+	partial bool
+	body    string
+}
+
+func (f *channelRetryUpstream) StreamUpstream(_ context.Context, _ map[string]string, _ map[string]any, _ string, yield upstream.LineFunc) error {
+	f.calls++
+	if f.calls == 1 {
+		if f.partial {
+			if e := yield(`data: {"choices":[{"delta":{"content":"partial"}}]}`); e != nil {
+				return e
+			}
+		}
+		return &upstream.UpstreamError{StatusCode: 400, Raw: []byte(f.body)}
+	}
+	return nil
+}
+func TestChannelDenialRotatesWithinScopeAndDoesNotReplayOutput(t *testing.T) {
+	for _, tc := range []struct {
+		name                                string
+		scoped, partial, exhausted, content bool
+		wantCalls                           int
+	}{
+		{name: "private", wantCalls: 2}, {name: "authorized scope", scoped: true, wantCalls: 2}, {name: "scope excludes alternative", scoped: true, exhausted: true, wantCalls: 1}, {name: "partial output", partial: true, wantCalls: 1}, {name: "content policy", content: true, wantCalls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o, first := newDNSFailoverOrch(t, &failingUpstream{})
+			mgr := o.managers[first.UID]
+			o.pool = pool.New(map[string]pool.Credential{first.UID: mgr, "alternate": mgr}, "")
+			first = o.pool.Get(first.UID)
+			o.managers["alternate"] = mgr
+			o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: catalogTransport{}})
+			o.models.Refresh()
+			client := &channelRetryUpstream{partial: tc.partial, body: `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`}
+			if tc.content {
+				client.body = `{"msg":"blocked by security policy"}`
+			}
+			o.upstreamClient = client
+			var scope map[string]bool
+			if tc.scoped {
+				scope = map[string]bool{first.UID: true}
+				if !tc.exhausted {
+					scope["alternate"] = true
+				}
+			}
+			o.sessions.bind("sticky", first.UID)
+			served, err := o.openUpstreamScoped(context.Background(), first, map[string]any{}, "test-model", "sticky", func(string) error { return nil }, nil, scope)
+			if client.calls != tc.wantCalls || (err == nil) != (tc.wantCalls == 2) {
+				t.Fatal(client.calls, err)
+			}
+			if tc.wantCalls == 2 && (served.UID != "alternate" || o.sessions.lookup("sticky") != "alternate") {
+				t.Fatal("fallback did not bind alternate", served.UID)
+			}
+			if !tc.partial && !tc.content {
+				if o.modelCooldownUntil(first.UID, "test-model") <= nowSec() || o.modelCooldownUntil(first.UID, "other-model") > nowSec() {
+					t.Fatal("cooldown scope incorrect")
+				}
+				if !o.pool.Get(first.UID).Enabled || o.pool.Get(first.UID).CooldownUntil > nowSec() {
+					t.Fatal("account unnecessarily disabled/cooled")
+				}
+			}
+			if tc.exhausted && o.sessions.lookup("sticky") != "" {
+				t.Fatal("failed sticky binding survived exhausted scope")
+			}
+			if tc.content && o.modelCooldownUntil(first.UID, "test-model") > nowSec() {
+				t.Fatal("content rejection penalized account")
+			}
+		})
+	}
+}
+
+func TestRegionBiasPreservesExistingInternationalSession(t *testing.T) {
+	o, first := newDNSFailoverOrch(t, &failingUpstream{})
+	mgr := o.managers[first.UID]
+	o.pool = pool.New(map[string]pool.Credential{first.UID: mgr, "international": mgr}, "")
+	o.managers["international"] = mgr
+	o.pool.Get(first.UID).Profile = "cn-cli"
+	o.pool.Get("international").Profile = "intl-cli"
+	o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: catalogTransport{}})
+	o.models.Refresh()
+	o.sessions.bind("existing-session", "international")
+	selected, e := o.pickAccount("test-model", "existing-session")
+	if e != nil || selected == nil || selected.UID != "international" {
+		t.Fatal("healthy sticky international session replaced", selected, e)
+	}
+}

@@ -146,6 +146,8 @@ const expiryAmountBias = 2.0
 // expiryWindowDays win (burn expiring credits among same-cost peers), and among
 // those the larger absolute in-window expiring balance is preferred (Option A
 // soft bias); then weighted random. costByUID nil = cost-blind (legacy).
+// Equal known-cost candidates in both regions get a modest domestic weight
+// boost after expiry filtering; unknown-cost and cost-blind picks are unchanged.
 // expiryWindowDays <= 0 falls back to DefaultExpiryWindowDays. Falls back to the
 // soonest-cooldown account when none healthy.
 func (p *Pool) Pick(allowed map[string]bool, costByUID map[string]float64, expiryWindowDays float64) *Account {
@@ -202,10 +204,15 @@ func (p *Pool) Pick(allowed map[string]bool, costByUID map[string]float64, expir
 			}
 		}
 	}
+	// Region is only a soft tie-breaker after cost and expiry filtering.
+	domesticTie := domesticCostTie(poolToPick, costByUID)
 	var totalW float64
 	weights := make([]float64, len(poolToPick))
 	for i, a := range poolToPick {
 		w := weight(a, now, applyIdle)
+		if domesticTie && (a.Profile == "cn-cli" || a.Profile == "cn-work") {
+			w *= 1.25
+		}
 		if maxExpiring > 0 {
 			w *= 1 + expiryAmountBias*(a.expiringWithin(now, expiryWindowDays)/maxExpiring)
 		}
@@ -223,6 +230,33 @@ func (p *Pool) Pick(allowed map[string]bool, costByUID map[string]float64, expir
 	}
 	acc.LastUsed = now
 	return acc
+}
+
+// domesticCostTie is false for cost-blind/all-unknown selection and for
+// non-matching costs. Explicit profiles avoid treating unknown regions as CN.
+func domesticCostTie(candidates []*Account, cost map[string]float64) bool {
+	domestic, international := false, false
+	first := true
+	var reference float64
+	for _, a := range candidates {
+		value, known := cost[a.UID]
+		if !known || value < 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+			return false
+		}
+		if first {
+			reference = value
+			first = false
+		} else if math.Abs(value-reference) > 1e-9 {
+			return false
+		}
+		switch a.Profile {
+		case "cn-cli", "cn-work":
+			domestic = true
+		case "intl-cli", "intl-work":
+			international = true
+		}
+	}
+	return domestic && international
 }
 
 // cheapestGroup returns the candidates sharing the lowest known per-model cost.

@@ -156,3 +156,33 @@ func TestPickExpiringPileIgnoredOutsideWindow(t *testing.T) {
 		t.Fatalf("only the in-window expiring account should be urgent, soonsmall won %d/400", soonHits)
 	}
 }
+
+func TestDomesticPreferenceCannotOverrideCostOrExpiry(t *testing.T) {
+	cn := &Account{UID: "cn", Profile: "cn-cli", Enabled: true}
+	intl := &Account{UID: "intl", Profile: "intl-work", Enabled: true}
+	p := &Pool{accounts: []*Account{cn, intl}}
+	cost := map[string]float64{"cn": 2, "intl": 1}
+	for i := 0; i < 30; i++ {
+		if got := p.Pick(nil, cost, 7); got != intl {
+			t.Fatal("region overrode cost", got)
+		}
+	}
+	soon := nowSec() + 86400
+	intl.CreditsExpireAt = &soon
+	cost["cn"] = 1
+	for i := 0; i < 30; i++ {
+		if got := p.Pick(nil, cost, 7); got != intl {
+			t.Fatal("region overrode urgent expiry", got)
+		}
+	}
+	if !domesticCostTie([]*Account{cn, intl}, cost) {
+		t.Fatal("same-price regions not eligible")
+	}
+	if domesticCostTie([]*Account{cn, intl}, nil) || domesticCostTie([]*Account{cn, intl}, map[string]float64{"cn": 1}) || domesticCostTie([]*Account{cn, intl}, map[string]float64{"cn": 2, "intl": 1}) {
+		t.Fatal("region preference requires equal known costs")
+	}
+	cn.Profile = "unknown"
+	if domesticCostTie([]*Account{cn, intl}, cost) {
+		t.Fatal("unknown profile classified as domestic")
+	}
+}

@@ -30,6 +30,7 @@ const (
 	errSessionDead    ErrKind = "session_dead"    // 登录态失效（401+12153）→ 禁用
 	errNotFound       ErrKind = "not_found"       // 404 偶发 → 短冷却
 	errServer         ErrKind = "server"          // 上游 5xx
+	errChannelDenied  ErrKind = "channel_denied"  // 明确渠道拒绝 → 短暂模型冷却并换授权账号
 	errContentBlocked ErrKind = "content_blocked" // 内容策略拦截 → 不罚号，透传
 	errBadParams      ErrKind = "bad_params"      // 请求体畸形（11101）→ 不罚号，仍轮转
 	errAccountFault   ErrKind = "account_fault"   // 账号级授权/配额故障（11140 / 14017）
@@ -151,6 +152,29 @@ func isModelBlocked(status int, text, lower string) bool {
 		return true
 	}
 	return strings.Contains(strings.ToLower(msg), "service info not found")
+}
+
+// 11128 also denotes message-role validation. Only the explicit channel
+// message together with its business code enables this bounded failover.
+func isChannelDenied(status int, text string) bool {
+	if (status != 400 && status != 403) || !businessCode(text, "11128") || strings.Contains(strings.ToLower(text), "blocked by security policy") {
+		return false
+	}
+	root := jsonRoot(text)
+	nodes := []map[string]any{root}
+	if inner, ok := root["error"].(map[string]any); ok {
+		nodes = append(nodes, inner)
+	}
+	const message = "illegal api invocation from an unapproved channel"
+	for _, node := range nodes {
+		for _, key := range []string{"msg", "message"} {
+			value, ok := node[key].(string)
+			if ok && strings.Contains(strings.ToLower(value), message) && !strings.Contains(strings.ToLower(value), "blocked by security policy") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func hasBusinessEnvelope(text string) bool {
@@ -286,6 +310,8 @@ func classifyUpstream(status int, raw []byte, _ http.Header) ErrKind {
 		return errNotFound
 	case status >= 500:
 		return errServer
+	case isChannelDenied(status, text):
+		return errChannelDenied
 	case isWAFBlocked(status, text):
 		return errWAFBlock
 	case status == 400 && (hitFold(text, lower, invalidImageMarkers) || codeMarker(lower, "11135")):
@@ -322,6 +348,8 @@ func actionFor(kind ErrKind, raw []byte, headers http.Header, now float64) errAc
 		return errAction{Rotate: true, Cooldown: softCooldownSec, Reason: "账号级故障（试用未激活）"}
 	case errServer:
 		return errAction{Rotate: true, Cooldown: serverCooldown, Reason: "上游 5xx"}
+	case errChannelDenied:
+		return errAction{Rotate: true, Cooldown: softCooldownSec, ModelScoped: true, Reason: "该账号模型调用渠道未获准"}
 	case errContentBlocked, errPromptTooLong, errImageInvalid:
 		return errAction{Rotate: false, Cooldown: 0, FailFast: true}
 	case errModelBlocked:

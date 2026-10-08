@@ -352,8 +352,23 @@ func (c *Catalog) Supported(model string) bool {
 // the request (anonymous routes always resolve to TierZen).
 func (c *Catalog) MetadataForTier(model string, tier Tier) Metadata {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.modelMeta[tier][model]
+	md, pricing := c.modelMeta[tier][model], c.pricing
+	c.mu.RUnlock()
+	if pricing != nil {
+		if price, ok := pricing.Price(model); ok {
+			limits := price.Limits[tier]
+			if md.ContextWindow == 0 {
+				md.ContextWindow = limits.ContextWindow
+			}
+			if md.MaxInput == 0 {
+				md.MaxInput = limits.MaxInput
+			}
+			if md.MaxOutput == 0 {
+				md.MaxOutput = limits.MaxOutput
+			}
+		}
+	}
+	return md
 }
 
 func (c *Catalog) supportedLocked(model string) bool {

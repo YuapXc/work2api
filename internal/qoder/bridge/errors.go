@@ -152,13 +152,16 @@ func truncateRunes(s string, max int) string {
 // UpstreamError 携带结构化上游错误：HTTP 状态 + 详情 + 分类后的
 // 错误类型与对客户端可读的中文消息。
 type UpstreamError struct {
-	Status  int    // 上游 HTTP 状态（流内业务错误为 0）
-	Detail  string // 上游原始详情（完整保留，供日志排查）
-	ErrType string // content_policy_rejected / upstream_transient_error / upstream_error
-	Message string // 对客户端可读的消息（已做长度截断）
+	Status     int    // 上游 HTTP 状态（流内业务错误为 0）
+	Detail     string // 上游原始详情（完整保留，供日志排查）
+	ErrType    string // content_policy_rejected / upstream_transient_error / upstream_error
+	Message    string // 对客户端可读的消息（已做长度截断）
+	RetryAfter time.Duration
+	cause      error
 }
 
 func (e *UpstreamError) Error() string { return e.Message }
+func (e *UpstreamError) Unwrap() error { return e.cause }
 
 // FriendlyUpstreamError 把上游错误转成对客户端可读的消息；瞬时故障给出重试指引。
 // 返回 (message, errType)。与 hub friendly_upstream_error 逐句对齐。
@@ -206,7 +209,9 @@ func WrapTransportError(err error) error {
 		return nil
 	}
 	if IsTransientTransport(err) {
-		return NewUpstreamError(502, err.Error())
+		upstream := NewUpstreamError(502, err.Error())
+		upstream.cause = err
+		return upstream
 	}
 	return err
 }

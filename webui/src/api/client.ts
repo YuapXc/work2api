@@ -2,6 +2,7 @@ import axios, { type AxiosInstance, type InternalAxiosRequestConfig } from 'axio
 import { toast } from '@/lib/toast'
 import type {
   AABenchmark,
+  ActiveSession, SessionRow, SessionAccountOption,
   AccountInfo,
   AppInfo,
   CheckinResponse,
@@ -120,6 +121,9 @@ export const api = {
       { model, prompt },
       { timeout: 100000 },
     ),
+  sessions: () => http.get<unknown, { sessions: SessionRow[] }>('/admin/sessions'),
+  sessionAccounts: (id: string) => http.get<unknown, { session: ActiveSession; accounts: SessionAccountOption[] }>(`/admin/sessions/${encodeURIComponent(id)}/accounts`),
+  sessionControl: (id: string, version: number, action: 'switch' | 'reselect' | 'cancel', uid = '') => http.post(`/admin/sessions/${encodeURIComponent(id)}`, { version, action, uid }),
   usageSummary: () => http.get<unknown, UsageSummary>('/admin/usage/summary'),
   usageTimeseries: (granularity = 'hour', points = 24, model?: string) =>
     http.get<unknown, { granularity: string; points: number; data: UsagePoint[] }>(

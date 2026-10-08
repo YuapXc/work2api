@@ -2,7 +2,9 @@ package qoder
 
 import (
 	"context"
+	"crypto/sha256"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -11,6 +13,7 @@ import (
 	"time"
 	"work2api/internal/core/provider"
 	"work2api/internal/qoder/account"
+	"work2api/internal/qoder/bridge"
 	"work2api/internal/qoder/checkin"
 )
 
@@ -164,5 +167,82 @@ func TestPATReimportPreservesMetadataAndFailurePreservesSecret(t *testing.T) {
 	secret, _ := account.GetSecret(a.ID)
 	if secret != "new-pat" {
 		t.Fatal("failed reimport destroyed previous credential")
+	}
+}
+
+func TestPrivateFailoverEligibilityAndAffinityInvalidation(t *testing.T) {
+	oldRoot := account.DataRoot()
+	account.SetDataRoot(t.TempDir())
+	defer account.SetDataRoot(oldRoot)
+	r := &Runtime{saltSet: true, bridges: map[string]*bridge.Bridge{}, bridgeKeys: map[string][32]byte{}, accountModels: map[[32]byte]accountModelSnapshot{}}
+	r.localOnce.Do(func() {})
+	save := func(id string, region account.Region, model string) *account.Account {
+		a := &account.Account{ID: id, Region: region}
+		if e := account.Save(a); e != nil {
+			t.Fatal(e)
+		}
+		secret := "secret-" + id
+		if e := account.SaveSecret(id, secret); e != nil {
+			t.Fatal(e)
+		}
+		r.bridges[id] = &bridge.Bridge{}
+		r.bridgeKeys[id] = sha256.Sum256([]byte(string(region) + "\x00" + secret))
+		r.accountModels[modelCatalogKey(a, secret)] = accountModelSnapshot{map[string]bool{model: true}, time.Now().Add(time.Minute)}
+		return a
+	}
+	primary := save("primary", account.RegionCN, "qfmodel")
+	save("a-global", account.RegionGlobal, "qfmodel")
+	save("b-other-model", account.RegionCN, "other")
+	backup := save("c-backup", account.RegionCN, "qfmodel")
+	candidate, e := r.nextAccountBridge(context.Background(), account.RegionCN, "qfmodel", map[string]bool{primary.ID: true})
+	if e != nil || candidate == nil || candidate.account.ID != backup.ID {
+		t.Fatal(candidate, e)
+	}
+	req := provider.ServeRequest{Headers: http.Header{"Authorization": []string{"Bearer key1"}, "X-Session-Id": []string{"session"}}, Payload: map[string]any{"model": "qoder/qfmodel"}}
+	key, ok := requestAffinityKey(req)
+	preferred := modelCatalogKey(primary, "secret-primary")
+	r.rememberAffinity(key, ok, preferred, backup, "secret-c-backup")
+	if a, _ := r.affinityAccount(key, ok, preferred); a == nil || a.ID != backup.ID {
+		t.Fatal("affinity missing")
+	}
+	req.Headers.Set("Authorization", "Bearer key2")
+	other, _ := requestAffinityKey(req)
+	if key == other {
+		t.Fatal("affinity crosses authenticated keys")
+	}
+	if a, _ := r.affinityAccount(key, ok, [32]byte{}); a != nil {
+		t.Fatal("active change did not invalidate affinity")
+	}
+	if e := account.SetGatewayHidden(backup.ID, true); e != nil {
+		t.Fatal(e)
+	}
+	if a, _ := r.affinityAccount(key, ok, preferred); a != nil {
+		t.Fatal("hidden account revived")
+	}
+	if c, e := r.nextAccountBridge(context.Background(), account.RegionCN, "qfmodel", map[string]bool{primary.ID: true}); e != nil || c != nil {
+		t.Fatal("hidden account selected", c, e)
+	}
+	if e := account.SetGatewayHidden(backup.ID, false); e != nil {
+		t.Fatal(e)
+	}
+	if e := account.SaveSecret(backup.ID, "reimported"); e != nil {
+		t.Fatal(e)
+	}
+	if a, _ := r.affinityAccount(key, ok, preferred); a != nil {
+		t.Fatal("old identity revived")
+	}
+	r.coolAccount(primary, "secret-primary", &bridge.UpstreamError{Status: 429, RetryAfter: 2 * time.Minute})
+	if time.Until(r.accountCooldowns[preferred]) < 119*time.Second {
+		t.Fatal("Retry-After ignored")
+	}
+	for _, cause := range []error{context.Canceled, &net.DNSError{Err: "DNS failed"}, bridge.WrapTransportError(&net.DNSError{Err: "DNS timeout", IsTimeout: true}), &bridge.UpstreamError{Status: 401}, &bridge.UpstreamError{Status: 400, Detail: "invalid_parameter_error"}, &bridge.UpstreamError{Status: 503, Detail: "DataInspectionFailed"}} {
+		if canFailover(cause) {
+			t.Fatal("nonretryable switched", cause)
+		}
+	}
+	for _, cause := range []error{&bridge.UpstreamError{Status: 429}, &bridge.UpstreamError{Status: 503}, io.ErrUnexpectedEOF} {
+		if !canFailover(cause) {
+			t.Fatal("retryable did not switch", cause)
+		}
 	}
 }

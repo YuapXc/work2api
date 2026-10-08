@@ -3,11 +3,15 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 	"work2api/internal/qoder/cosy"
+	"work2api/internal/streamwatch"
 )
 
 func TestQoderResponsesKeepStableItemsAndIncompleteUsage(t *testing.T) {
@@ -371,4 +375,76 @@ func contains(s, sub string) bool {
 			}
 			return false
 		}())
+}
+
+func TestAccountFallbackBeforeOutputAndBoundedConnectionRetries(t *testing.T) {
+	oldBackoff := RetryBackoff
+	RetryBackoff = func(int) time.Duration { return time.Millisecond }
+	defer func() { RetryBackoff = oldBackoff }()
+	for _, partial := range []bool{false, true} {
+		t.Run(map[bool]string{false: "before-output", true: "after-output"}[partial], func(t *testing.T) {
+			var primaryCalls, backupCalls atomic.Int32
+			writeFrame := func(w http.ResponseWriter, body string, status int) {
+				raw, _ := json.Marshal(map[string]any{"body": body, "statusCodeValue": status})
+				_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
+			}
+			primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				primaryCalls.Add(1)
+				if partial {
+					writeFrame(w, `{"choices":[{"delta":{"content":"first"}}]}`, 200)
+					writeFrame(w, `{"message":"provider_error"}`, 503)
+				} else {
+					http.Error(w, "unavailable", 503)
+				}
+			}))
+			defer primary.Close()
+			backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				backupCalls.Add(1)
+				writeFrame(w, `{"choices":[{"delta":{"content":"backup"},"finish_reason":"stop"}]}`, 200)
+			}))
+			defer backup.Close()
+			makeBridge := func(url string) *Bridge {
+				sess, e := cosy.NewSession(cosy.AuthIdentity{Uid: "fixture", UserType: "personal_standard"}, "fixture", "fixture", "fixture")
+				if e != nil {
+					t.Fatal(e)
+				}
+				return &Bridge{sess: sess, client: NewBearerClient(sess), templateBase: map[string]any{}, chatStreamURL: url}
+			}
+			b, b2 := makeBridge(primary.URL), makeBridge(backup.URL)
+			ctx, timing := streamwatch.WithTiming(context.Background())
+			switches := 0
+			ctx = WithAccountFallback(ctx, func(ctx context.Context, model string, cause error) (*Bridge, error) { switches++; return b2, nil })
+			var output strings.Builder
+			err := b.CallQoderWithOpts(ctx, "codex", nil, "qfmodel", nil, CallOpts{}, func(d Delta) { output.WriteString(d.Content) })
+			if partial {
+				if err == nil || switches != 0 || backupCalls.Load() != 0 || output.String() != "first" {
+					t.Fatal(err, switches, output.String())
+				}
+			} else {
+				if err != nil || switches != 1 || primaryCalls.Load() != 3 || backupCalls.Load() != 1 || output.String() != "backup" || timing.Snapshot().Attempts != 4 {
+					t.Fatal(err, switches, primaryCalls.Load(), output.String(), timing.Snapshot())
+				}
+			}
+		})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ctx = WithAccountFallback(ctx, func(context.Context, string, error) (*Bridge, error) {
+		t.Fatal("cancelled request switched account")
+		return nil, nil
+	})
+	sess, _ := cosy.NewSession(cosy.AuthIdentity{Uid: "fixture", UserType: "personal_standard"}, "fixture", "fixture", "fixture")
+	b := &Bridge{sess: sess, client: NewBearerClient(sess), templateBase: map[string]any{}, chatStreamURL: "http://localhost:1"}
+	if err := b.CallQoderWithOpts(ctx, "codex", nil, "qfmodel", nil, CallOpts{}, func(Delta) {}); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+}
+func TestRetryAfterFormats(t *testing.T) {
+	if retryAfterDelay("120") != 120*time.Second || retryAfterDelay("bad") != 0 || retryAfterDelay("-2") != 0 {
+		t.Fatal("invalid numeric Retry-After")
+	}
+	delay := retryAfterDelay(time.Now().Add(time.Minute).UTC().Format(http.TimeFormat))
+	if delay < 58*time.Second || delay > time.Minute {
+		t.Fatal(delay)
+	}
 }

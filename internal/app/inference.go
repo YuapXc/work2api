@@ -64,6 +64,9 @@ func (o *Orchestrator) logUsage(a logArgs) {
 			credits = &c
 		}
 	}
+	if completedTransport {
+		sessionCredits(a.ctx, credits)
+	}
 	uid := ""
 	if a.acc != nil {
 		uid = a.acc.UID

@@ -33,6 +33,13 @@ func TestClassifyUpstream(t *testing.T) {
 		{"500 server", 500, `oops`, errServer},
 		{"403 no envelope waf", 403, `<html>blocked</html>`, errWAFBlock},
 		{"11101 bad params", 400, `{"code":11101,"msg":"Unmarshal chat params failed"}`, errBadParams},
+		{"channel denied", 400, `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`, errChannelDenied},
+		{"nested channel denied", 403, `{"error":{"code":"11128","message":"Illegal API invocation from an unapproved channel"}}`, errChannelDenied},
+		{"11128 role validation is not channel denial", 400, `{"code":11128,"msg":"first message is not system prompt"}`, errClient},
+		{"11128 alone is not channel denial", 400, `{"code":11128}`, errClient},
+		{"channel text without business code stays blocked", 400, `{"msg":"Illegal API invocation from an unapproved channel"}`, errContentBlocked},
+		{"security policy still blocks", 400, `{"code":11128,"msg":"blocked by security policy: Illegal API invocation from an unapproved channel"}`, errContentBlocked},
+		{"echoed input is not channel denial", 400, `{"code":11128,"msg":"bad request","input":"Illegal API invocation from an unapproved channel"}`, errContentBlocked},
 		{"content blocked", 400, `{"msg":"blocked by security policy"}`, errContentBlocked},
 		{"generic 4xx client", 400, `{"msg":"weird"}`, errClient},
 	}
@@ -51,6 +58,9 @@ func TestActionFor(t *testing.T) {
 		if !a.FailFast || a.Rotate || a.Cooldown != 0 {
 			t.Errorf("%s should be fail-fast/no-rotate/no-cooldown, got %+v", k, a)
 		}
+	}
+	if a := actionFor(errChannelDenied, nil, nil, now); !a.Rotate || a.FailFast || a.Disable || !a.ModelScoped || a.Cooldown != softCooldownSec {
+		t.Fatal("channel denial action", a)
 	}
 	// session dead / account-ban：禁用
 	if a := actionFor(errSessionDead, nil, nil, now); !a.Disable {

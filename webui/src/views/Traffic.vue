@@ -20,12 +20,14 @@ import WSpinner from '@/components/ui/WSpinner.vue'
 import WIcon from '@/components/ui/WIcon.vue'
 import TrendChart from '@/components/TrendChart.vue'
 import BarList from '@/components/BarList.vue'
+import SessionsPanel from '@/components/SessionsPanel.vue'
 import { buildLabelMap } from '@/utils/accountLabel'
 
 const route = useRoute()
 const router = useRouter()
-const tab = ref((route.query.tab as string) === 'logs' ? 'logs' : 'analytics')
-watch(tab, (t) => router.replace({ query: t === 'logs' ? { tab: 'logs' } : {} }))
+const tab = ref(['logs', 'sessions'].includes(String(route.query.tab)) ? String(route.query.tab) : 'analytics')
+watch(tab, (t) => { router.replace({ query: t !== 'analytics' ? { tab: t } : {} }); loadTab(t) })
+watch(() => route.query.tab, (value) => { tab.value = ['logs', 'sessions'].includes(String(value)) ? String(value) : 'analytics' })
 
 // ================= 分析 =================
 const summary = ref<UsageSummary | null>(null)
@@ -190,18 +192,21 @@ async function exportCSV() {
   }
 }
 
-onMounted(() => {
-  loadAnalytics()
-  loadFilters()
-  loadAccountLabels()
-  loadLogs()
-})
+function loadTab(value: string) {
+  if (value === 'analytics') void loadAnalytics().catch(() => {})
+  if (value === 'logs') {
+    void loadFilters().catch(() => {})
+    void loadAccountLabels()
+    void loadLogs().catch(() => {})
+  }
+}
+onMounted(() => loadTab(tab.value))
 </script>
 
 <template>
-  <WPage title="流量" sub="调用量分析与逐条调用日志。">
+  <WPage title="流量" sub="调用量分析、调用日志与活跃会话账号调整。">
     <template #actions>
-      <WTabs v-model="tab" :tabs="[{ key: 'analytics', label: '分析' }, { key: 'logs', label: '日志' }]" />
+      <WTabs v-model="tab" :tabs="[{ key: 'analytics', label: '分析' }, { key: 'logs', label: '日志' }, { key: 'sessions', label: '会话' }]" />
     </template>
 
     <!-- ============ 分析 ============ -->
@@ -257,7 +262,7 @@ onMounted(() => {
     </template>
 
     <!-- ============ 日志 ============ -->
-    <template v-else>
+    <template v-else-if="tab === 'logs'">
       <div class="mb-4 flex flex-wrap items-center gap-2">
         <WInput v-model="searchInput" placeholder="搜索输入/输出/思考内容" class="w-full sm:w-64" @enter="applyFilter">
           <template #prefix><WIcon name="search" :size="16" class="text-faint" /></template>
@@ -323,6 +328,8 @@ onMounted(() => {
     </template>
 
     <!-- 记录详情 -->
+    <SessionsPanel v-if="tab === 'sessions'" />
+
     <WModal v-model:open="detailOpen" size="lg" title="调用详情">
       <WSpinner v-if="detailLoading" label="加载中" />
       <div v-else-if="detail" class="space-y-4">

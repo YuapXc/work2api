@@ -1045,3 +1045,21 @@ func TestCatalogPartialFailurePreservesOnlyConfirmedMappings(t *testing.T) {
 		}
 	}
 }
+
+func TestAdmissionSnapshotExplainsWaitWithoutSelectingAccounts(t *testing.T) {
+	a := newModelAdmission(&config.Config{MaxConcurrentRequests: 4})
+	a.queue = []*modelTicket{{key: "paced", limit: 4}, {key: "limited", limit: 1, ready: true}, {key: "buffer", limit: 4, ready: true, bufferBytes: a.bufferBudget + 1}, {key: "account", limit: 4, ready: true, chooseAccount: func(map[string]bool) (*pool.Account, *apiError) {
+		t.Fatal("snapshot invoked account selection")
+		return nil, nil
+	}}}
+	a.byKey["limited"] = 1
+	reasons := a.snapshot()["waiting_reasons"].(map[string]int)
+	if reasons["upstream_pacing"] != 1 || reasons["key_or_user_limit"] != 1 || reasons["response_buffer_budget"] != 1 || reasons["account_busy"] != 1 {
+		t.Fatal(reasons)
+	}
+	a.active = a.capacity
+	reasons = a.snapshot()["waiting_reasons"].(map[string]int)
+	if reasons["execution_limit"] != 1 || reasons["account_busy"] != 0 {
+		t.Fatal(reasons)
+	}
+}

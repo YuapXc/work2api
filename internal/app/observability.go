@@ -21,16 +21,17 @@ type callBucket struct {
 	ExecutionCount                                   int64
 }
 type callObservation struct {
-	RequestID   string `json:"request_id"`
-	Status      int    `json:"http_status"`
-	Outcome     string `json:"outcome"`
-	Attempts    int    `json:"attempts"`
-	Upstream429 int    `json:"upstream_429"`
-	Queue       int64  `json:"queue_ms"`
-	Account     int64  `json:"account_wait_ms"`
-	Total       int64  `json:"total_ms"`
-	First       *int64 `json:"first_byte_ms"`
-	Execution   *int64 `json:"execution_ms"`
+	AttemptStages []streamwatch.AttemptStage `json:"attempt_stages,omitempty"`
+	RequestID     string                     `json:"request_id"`
+	Status        int                        `json:"http_status"`
+	Outcome       string                     `json:"outcome"`
+	Attempts      int                        `json:"attempts"`
+	Upstream429   int                        `json:"upstream_429"`
+	Queue         int64                      `json:"queue_ms"`
+	Account       int64                      `json:"account_wait_ms"`
+	Total         int64                      `json:"total_ms"`
+	First         *int64                     `json:"first_byte_ms"`
+	Execution     *int64                     `json:"execution_ms"`
 }
 type callMonitor struct {
 	mu         sync.Mutex
@@ -87,6 +88,7 @@ func (m *callMonitor) record(t streamwatch.TimingSnapshot, status int) {
 	duration := time.Since(t.Start)
 	addTiming(&b.Total, duration.Milliseconds())
 	observation := callObservation{RequestID: t.RequestID, Status: status, Outcome: t.Outcome, Attempts: t.Attempts, Upstream429: t.Upstream429, Queue: t.Queue.Milliseconds(), Account: t.Account.Milliseconds(), Total: duration.Milliseconds()}
+	observation.AttemptStages = append([]streamwatch.AttemptStage(nil), t.AttemptStages...)
 	if observation.Outcome == "" {
 		if status >= 400 {
 			observation.Outcome = "error"

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -691,7 +692,7 @@ func (o *Orchestrator) pickAccountExcludingIn(model, sessionKey string, tried ma
 			// 换号重试时候选已耗尽（都试过或都在冷却），交由调用方返回上一次的错误。
 			return nil, errBody(503, "模型 "+model+" 的可用账号均已尝试或冷却", "auth_error")
 		}
-		return nil, errBody(429, "模型 "+model+" 的可用账号均已达到每日上限，请稍后重试", "rate_limit_error")
+		return nil, errBody(429, "模型 "+model+" 的可用账号暂处于冷却，请稍后重试", "rate_limit_error")
 	}
 	// 会话粘性：此前绑定的账号若仍可用（在候选集、未模型冷却、账号冷却≤30s、启用、
 	// 且本轮未试过），直接复用以保住上游 prompt cache 命中；否则解粘回池按权重重选并重绑。
@@ -972,31 +973,86 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 	originalBody := body
 	domesticBody := map[string]any(nil) // derive from the original, never a prior attempt
 	for attempt := 0; ; attempt++ {
-		if lease, ok := ctx.Value(modelLeaseKey{}).(*modelLease); ok {
-			choose, chooseErr := o.accountSelector(model, acc.UID, tried, scope)
-			if chooseErr != nil {
-				return acc, chooseErr
-			}
-			selected, selectErr := lease.bindAccount(ctx, choose)
-			if selectErr != nil {
-				return acc, selectErr
-			}
-			acc = selected
-			// A private account may be moved to shared-only while this request
-			// waits. Recheck ownership after waiting, before reading credentials.
-			if scope == nil {
-				excluded, err := o.db.PrivatePoolExcludedUIDs()
-				if err != nil {
-					return acc, errBody(503, "账号权限查询失败", "server_error")
+
+		sessionPhase(ctx, false)
+		_, tracked := ctx.Value(sessionCallKey{}).(*sessionCall)
+		if lease, leased := ctx.Value(modelLeaseKey{}).(*modelLease); leased || tracked {
+			for revisionRetry := 0; ; revisionRetry++ {
+				selection := &sessionSelection{key: sessionKey}
+				choose, chooseErr := o.accountSelector(model, acc.UID, tried, scope, selection)
+				if chooseErr != nil {
+					return acc, chooseErr
 				}
-				if excluded[acc.UID] {
-					return acc, errBody(403, "账号使用范围已变更，请重新请求", "permission_error")
+				var selected *pool.Account
+				var selectErr error
+				if leased {
+					selected, selectErr = lease.bindAccount(ctx, choose)
+				} else {
+					var aerr *apiError
+					selected, aerr = choose(map[string]bool{})
+					if aerr != nil {
+						selectErr = aerr
+					}
+				}
+				if selectErr != nil {
+					return acc, selectErr
+				}
+				if selected == nil && !leased && revisionRetry < 3 {
+					continue
+				}
+				acc = selected
+				if acc == nil {
+					return acc, errBody(503, "账号暂不可用", "model_unavailable")
+				}
+				// A private account may be moved to shared-only while this request
+				// waits. Recheck ownership after waiting, before reading credentials.
+				if scope == nil {
+					excluded, err := o.db.PrivatePoolExcludedUIDs()
+					if err != nil {
+						return acc, errBody(503, "账号权限查询失败", "server_error")
+					}
+					if excluded[acc.UID] {
+						if selection.action == "switch" {
+							o.sessions.reject(selection.key, selection.version)
+						}
+						return acc, errBody(403, "账号使用范围已变更，请重新请求", "permission_error")
+					}
+				}
+				if validate, ok := ctx.Value(portalDispatchCheckKey{}).(func(string, string) *apiError); ok {
+					if aerr := validate(acc.UID, model); aerr != nil {
+						if selection.action == "switch" {
+							o.sessions.reject(selection.key, selection.version)
+						}
+						return acc, aerr
+					}
+				}
+				// Catalog prices can change while this request is queued. Recheck
+				// outside admission's mutex before consuming a manual preference.
+				if selection.action == "switch" {
+					fresh := o.modelCostByUID(model, map[string]bool{selection.baseline: true, selection.target: true})
+					base, baseOK := fresh[selection.baseline]
+					target, targetOK := fresh[selection.target]
+					if !baseOK || !targetOK || base < 0 || target < 0 || math.IsNaN(base) || math.IsNaN(target) || math.IsInf(base, 0) || math.IsInf(target, 0) || target > base+1e-9 {
+						o.sessions.reject(selection.key, selection.version)
+						if revisionRetry >= 3 {
+							return acc, errBody(503, "会话账号调整频繁，请重试", "session_routing_changed")
+						}
+						continue
+					}
+				}
+				if o.sessions.commit(selection, acc.UID) {
+					break
+				}
+				if revisionRetry >= 3 {
+					return acc, errBody(503, "会话账号调整频繁，请重试", "session_routing_changed")
 				}
 			}
+
 			if sessionKey != "" {
 				o.sessions.bind(sessionKey, acc.UID)
 			}
 		}
+		sessionPhase(ctx, true)
 		tried[acc.UID] = true
 		// 反审核脱敏按本次实际选中的账号区域决定，只在选定账号后施加一次：
 		// 换号重试不重复注入零宽字符（上游 workbuddy_one open_upstream 同款）。
@@ -1047,6 +1103,9 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 		if act.FailFast || !act.Rotate {
 			return acc, err
 		}
+		if sessionKey != "" {
+			o.sessions.unbindMatching(sessionKey, acc.UID)
+		}
 		if attempt+1 >= maxFailoverAttempts {
 			return acc, err
 		}
@@ -1064,7 +1123,7 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 // Capture authorized candidates outside admission's mutex. Dispatch consults
 // live cooldown/enable state; portal authority is revalidated just before sending.
 // The selector is synchronous and does not perform network or database I/O.
-func (o *Orchestrator) accountSelector(model, preferred string, tried map[string]bool, scope map[string]bool) (func(map[string]bool) (*pool.Account, *apiError), *apiError) {
+func (o *Orchestrator) accountSelector(model, preferred string, tried map[string]bool, scope map[string]bool, routing ...*sessionSelection) (func(map[string]bool) (*pool.Account, *apiError), *apiError) {
 	allowed, aerr := o.modelAccountUIDs(model)
 	if aerr != nil {
 		return nil, aerr
@@ -1106,9 +1165,34 @@ func (o *Orchestrator) accountSelector(model, preferred string, tried map[string
 		}
 		// Preserve original routing before considering occupancy. Busy accounts
 		// must not lose affinity or cost/expiry preference merely to fill slots.
+
+		routePreferred := preferred
+		if len(routing) > 0 && routing[0].key != "" {
+			selection := routing[0]
+			uid, action, target, baseline, version := o.sessions.route(selection.key)
+			selection.version = version
+			selection.action, selection.target, selection.baseline = action, target, baseline
+			if uid != "" {
+				routePreferred = uid
+			}
+			switch action {
+			case "reselect":
+				routePreferred = ""
+			case "switch":
+				baseCost, baseKnown := cost[baseline]
+				targetCost, targetKnown := cost[target]
+				candidate := o.pool.Get(target)
+				if !ready[target] || candidate == nil || !candidate.Healthy(now) || !baseKnown || !targetKnown || baseCost < 0 || targetCost < 0 || math.IsNaN(baseCost) || math.IsNaN(targetCost) || math.IsInf(baseCost, 0) || math.IsInf(targetCost, 0) || targetCost > baseCost+1e-9 {
+					o.sessions.reject(selection.key, version)
+					return nil, nil // Retry selection against the new version on the queue wakeup.
+				}
+				routePreferred = target
+			}
+		}
 		var selected *pool.Account
-		if ready[preferred] {
-			selected = o.pool.Get(preferred)
+		if ready[routePreferred] {
+
+			selected = o.pool.Get(routePreferred)
 		} else {
 			selected = o.pool.Pick(ready, cost, window)
 			if selected != nil {

@@ -40,6 +40,10 @@ async function load() {
   }
 }
 
+function waitingLabel(reason: string): string {
+  return ({ upstream_pacing: '请求间隔', key_or_user_limit: '用户/Key 并发', shared_limit: '共享并发', memory_pressure: '内存保护', response_buffer_budget: '响应缓冲', execution_limit: '全局并发', account_busy: '账号名额', fairness: '公平调度' } as Record<string,string>)[reason] || reason
+}
+
 function rejectionLabel(reason: string): string {
   return ({ model_queue_full: '模型队列满', key_queue_full: '密钥队列满', model_queue_timeout: '等待超时', request_capacity: '普通请求繁忙', heavy_admin_capacity: '重管理请求繁忙', body_read_capacity: '请求体读取繁忙', body_budget_exhausted: '请求体内存不足', shared_queue_full: '用户池队列满', response_buffer_budget: '单请求响应预算不足' } as Record<string,string>)[reason] || reason
 }
@@ -94,6 +98,9 @@ onUnmounted(() => timer && clearInterval(timer))
         <span>最长等待 {{ (ov.admission.oldest_wait_ms / 1000).toFixed(1) }} 秒</span>
         <span>请求体占用 {{ ((ov.request_body_bytes || 0) / 1048576).toFixed(1) }} MiB</span>
       </div>
+      <div v-if="ov.admission.queued && ov.admission.waiting_reasons" class="mt-2 text-small text-faint">
+        当前等待：{{ Object.entries(ov.admission.waiting_reasons).map(([reason, count]) => `${waitingLabel(reason)} ${count}`).join(' · ') }}
+      </div>
       <div v-if="Object.keys(ov.admission.rejected).length" class="mt-2 text-small text-faint">
         本次启动以来的容量拒绝：{{ Object.entries(ov.admission.rejected).map(([reason, count]) => `${rejectionLabel(reason)} ${count}`).join(' · ') }}
       </div>
@@ -110,6 +117,17 @@ onUnmounted(() => timer && clearInterval(timer))
         <span>总耗时 P95 ≤ {{ ov.call_metrics.total_p95_ms == null ? '—' : ov.call_metrics.total_p95_ms + ' ms' }}</span>
       </div>
       <p class="mt-2 text-micro text-faint">P95 为固定区间估算；首响应指首字节，包含等待与协议初始化，非模型首个 token。重启后重新统计。</p>
+      <details v-if="ov.call_metrics.recent?.some(call => call.attempt_stages?.length)" class="mt-3 text-small text-muted">
+        <summary class="cursor-pointer">最近调用的连接与重试记录</summary>
+        <div v-for="call in ov.call_metrics.recent.slice(0, 8)" :key="call.request_id" class="mt-2">
+          <span class="mono">{{ call.request_id.slice(0, 12) }}</span> · {{ call.attempts }} 次尝试 · HTTP {{ call.http_status }}
+          <div v-for="stage in call.attempt_stages" :key="stage.number" class="ml-3 text-micro text-faint">
+            第 {{ stage.number }} 次：{{ stage.headers_finished ? `连接/响应头 ${stage.header_wait_ms} ms · ${stage.http_status ? 'HTTP ' + stage.http_status : '连接失败'}` : '响应头阶段未完成' }}
+          </div>
+          <div v-if="call.attempts > (call.attempt_stages?.length || 0)" class="ml-3 text-micro text-faint">仅保留前 16 次尝试的阶段记录</div>
+        </div>
+        <p class="mt-2 text-micro text-faint">响应头耗时不包含完整生成时间；请求正文与凭据不进入这些记录。</p>
+      </details>
     </WCard>
     <template v-if="ov">
       <!-- 预警条 -->

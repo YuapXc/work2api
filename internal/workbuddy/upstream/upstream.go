@@ -147,6 +147,11 @@ func (c *Client) StreamUpstream(ctx context.Context, headers map[string]string, 
 		req.Header.Set(k, v)
 	}
 	resp, err := c.hc.Do(req)
+	status := 0
+	if resp != nil {
+		status = resp.StatusCode
+	}
+	streamwatch.AttemptHeaders(ctx, status)
 	if err != nil {
 		return err
 	}

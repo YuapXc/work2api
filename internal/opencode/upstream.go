@@ -192,11 +192,13 @@ func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies 
 		if err != nil {
 			return nil, err, attempts
 		}
+		streamwatch.StartAttempt(ctx)
 		resp, err := node.proxy.client.Do(req)
 		attemptStatus := 0
 		if resp != nil {
 			attemptStatus = resp.StatusCode
 		}
+		streamwatch.AttemptHeaders(ctx, attemptStatus)
 		streamwatch.AttemptResult(req.Context(), attemptStatus)
 		if ctx.Err() != nil {
 			lastResponse, lastErr = resp, err
@@ -412,11 +414,13 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies map[Ti
 			lastErr = errors.New("upstream key has no proxy binding")
 			break
 		}
+		streamwatch.StartAttempt(ctx)
 		resp, err := proxy.client.Do(req)
 		attemptStatus := 0
 		if resp != nil {
 			attemptStatus = resp.StatusCode
 		}
+		streamwatch.AttemptHeaders(ctx, attemptStatus)
 		streamwatch.AttemptResult(req.Context(), attemptStatus)
 		if ctx.Err() != nil {
 			lastResponse, lastErr = resp, err

@@ -532,16 +532,35 @@ func (a *modelAdmission) snapshot() map[string]any {
 		rejected[k] = v
 	}
 	sharedQueued := 0
+	waitingReasons := map[string]int{}
 	for _, t := range a.queue {
 		if t.shared {
 			sharedQueued++
 		}
+		reason := "fairness"
+		switch {
+		case !t.ready:
+			reason = "upstream_pacing"
+		case a.byKey[t.key] >= t.limit:
+			reason = "key_or_user_limit"
+		case !a.sharedRoomLocked(t):
+			reason = "shared_limit"
+		case a.memoryUsage != nil && a.memoryUsage() >= a.memoryHigh:
+			reason = "memory_pressure"
+		case !t.bufferHeld && (a.buffers+t.bufferBytes > a.bufferBudget || t.shared && a.sharedBuffers+t.bufferBytes > a.sharedBufferBudget):
+			reason = "response_buffer_budget"
+		case a.active >= a.capacity:
+			reason = "execution_limit"
+		case t.chooseAccount != nil && !t.accountHeld:
+			reason = "account_busy"
+		}
+		waitingReasons[reason]++
 	}
 	byModel := make(map[string]int, len(a.byModel))
 	for model, count := range a.byModel {
 		byModel[model] = count
 	}
-	return map[string]any{"buffer_reserved_bytes": a.buffers, "buffer_budget_bytes": a.bufferBudget, "shared_buffer_reserved_bytes": a.sharedBuffers, "shared_buffer_budget_bytes": a.sharedBufferBudget, "memory_high_bytes": a.memoryHigh, "memory_pressure": a.memoryUsage != nil && a.memoryUsage() >= a.memoryHigh, "account_capacity": a.accountLimit, "account_running": copyCounts(a.byAccount), "portal_model_running": byModel, "shared_running": a.sharedActive, "shared_capacity": a.sharedCapacity, "shared_queued": sharedQueued, "shared_queue_capacity": a.sharedQueue, "user_queue_capacity": a.userQueue, "running": a.active, "queued": len(a.queue), "capacity": a.capacity, "queue_capacity": a.queueSize, "wait_limit_ms": a.wait.Milliseconds(), "oldest_wait_ms": oldest.Milliseconds(), "rejected": rejected}
+	return map[string]any{"waiting_reasons": waitingReasons, "buffer_reserved_bytes": a.buffers, "buffer_budget_bytes": a.bufferBudget, "shared_buffer_reserved_bytes": a.sharedBuffers, "shared_buffer_budget_bytes": a.sharedBufferBudget, "memory_high_bytes": a.memoryHigh, "memory_pressure": a.memoryUsage != nil && a.memoryUsage() >= a.memoryHigh, "account_capacity": a.accountLimit, "account_running": copyCounts(a.byAccount), "portal_model_running": byModel, "shared_running": a.sharedActive, "shared_capacity": a.sharedCapacity, "shared_queued": sharedQueued, "shared_queue_capacity": a.sharedQueue, "user_queue_capacity": a.userQueue, "running": a.active, "queued": len(a.queue), "capacity": a.capacity, "queue_capacity": a.queueSize, "wait_limit_ms": a.wait.Milliseconds(), "oldest_wait_ms": oldest.Milliseconds(), "rejected": rejected}
 }
 
 func (s *Server) admitModel(w http.ResponseWriter, r *http.Request, p *Principal) (*http.Request, func(), bool) {

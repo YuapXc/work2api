@@ -90,15 +90,17 @@ type sessionEntry struct {
 	uid     string
 	expires float64
 	order   *list.Element
+	info    *sessionState
 }
 
 // sessionRouter 是 会话键 → 账号 uid 的粘性映射（TTL + 惰性 GC，纯内存）。
 type sessionRouter struct {
-	mu    sync.Mutex
-	ttl   float64
-	max   int
-	m     map[string]sessionEntry
-	order *list.List
+	mu       sync.Mutex
+	ttl      float64
+	max      int
+	m        map[string]sessionEntry
+	order    *list.List
+	sequence uint64
 }
 
 func newSessionRouter() *sessionRouter {
@@ -123,19 +125,37 @@ func (r *sessionRouter) bind(key, uid string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if entry, ok := r.m[key]; ok {
+		if entry.info != nil {
+			return
+		} // Tracked routes commit only after account admission.
 		entry.uid, entry.expires = uid, now+r.ttl
 		r.order.MoveToBack(entry.order)
 		r.m[key] = entry
 		return
 	}
 	for len(r.m) >= r.max && r.order.Len() > 0 {
-		r.removeLocked(r.order.Front().Value.(string))
+		if !r.evictIdleLocked() {
+			return
+		}
 	}
 	r.m[key] = sessionEntry{uid: uid, expires: now + r.ttl, order: r.order.PushBack(key)}
 }
 
 // Evict oldest bindings under pressure; ordinary lookup does not renew TTL
 // or alter account selection. Every auxiliary entry has the same hard cap.
+// Never evict a running or queued observation to make room for an idle binding.
+func (r *sessionRouter) evictIdleLocked() bool {
+	for el := r.order.Front(); el != nil; el = el.Next() {
+		key := el.Value.(string)
+		e := r.m[key]
+		if e.info == nil || e.info.Running+e.info.Waiting == 0 {
+			r.removeLocked(key)
+			return true
+		}
+	}
+	return false
+}
+
 func (r *sessionRouter) removeLocked(key string) {
 	if entry, ok := r.m[key]; ok {
 		r.order.Remove(entry.order)
@@ -143,12 +163,26 @@ func (r *sessionRouter) removeLocked(key string) {
 	}
 }
 
-func (r *sessionRouter) unbind(key string) {
+func (r *sessionRouter) unbind(key string) { r.unbindMatching(key, "") }
+
+// An older in-flight failure must not clear a newer account binding.
+func (r *sessionRouter) unbindMatching(key, failedUID string) {
 	if key == "" {
 		return
 	}
 	r.mu.Lock()
-	r.removeLocked(key)
+	if failedUID != "" && r.m[key].uid != failedUID {
+		r.mu.Unlock()
+		return
+	}
+	if entry, ok := r.m[key]; ok && entry.info != nil {
+		entry.uid = ""
+		r.sequence++
+		entry.info.Version = r.sequence
+		r.m[key] = entry
+	} else {
+		r.removeLocked(key)
+	}
 	r.mu.Unlock()
 }
 
@@ -164,7 +198,7 @@ func (r *sessionRouter) lookup(key string) string {
 	if !ok {
 		return ""
 	}
-	if e.expires <= now {
+	if e.expires <= now && (e.info == nil || e.info.Running+e.info.Waiting == 0) {
 		r.removeLocked(key)
 		return ""
 	}

@@ -228,8 +228,8 @@ export interface UsageRecord {
 }
 
 export interface Overview {
-  call_metrics?: { requests: number; errors: number; incomplete: number; attempts: number; upstream_429: number; wait_p95_ms: number | null; queue_p95_ms: number | null; account_wait_p95_ms: number | null; execution_p95_ms: number | null; first_byte_p95_ms: number | null; total_p95_ms: number | null }
-  admission?: { memory_pressure?: boolean; buffer_reserved_bytes?: number; buffer_budget_bytes?: number; shared_running?: number; shared_capacity?: number; account_running?: Record<string,number>; account_capacity?: number; running: number; queued: number; capacity: number; queue_capacity: number; oldest_wait_ms: number; wait_limit_ms: number; rejected: Record<string,number> }
+  call_metrics?: { recent?: { request_id: string; attempts: number; http_status: number; attempt_stages?: { number: number; header_wait_ms: number; http_status: number; headers_finished: boolean }[] }[]; requests: number; errors: number; incomplete: number; attempts: number; upstream_429: number; wait_p95_ms: number | null; queue_p95_ms: number | null; account_wait_p95_ms: number | null; execution_p95_ms: number | null; first_byte_p95_ms: number | null; total_p95_ms: number | null }
+  admission?: { waiting_reasons?: Record<string, number>; memory_pressure?: boolean; buffer_reserved_bytes?: number; buffer_budget_bytes?: number; shared_running?: number; shared_capacity?: number; account_running?: Record<string,number>; account_capacity?: number; running: number; queued: number; capacity: number; queue_capacity: number; oldest_wait_ms: number; wait_limit_ms: number; rejected: Record<string,number> }
   request_body_bytes?: number
   accounts: AccountInfo[]
   /** 预警提示（后端按当前额度状态实时计算，仅用于展示） */
@@ -321,4 +321,16 @@ export interface AppInfo {
   user_id?: number | null
   /** 可用模型白名单（空数组 = 不限制） */
   allowed_models: string[]
+}
+
+export interface ActiveSession {
+ id: string; model: string; app: string; user_id: number; source: string; version: number
+ started_at: number; last_at: number; expires_at: number; requests: number; running: number; waiting: number
+ credits: number; credits_known: number; credits_unknown: number; account_uid: string
+ pending_action: string; target_uid: string; route_status: string; route_message: string
+}
+export interface SessionRow { id: string; session: ActiveSession; account_label: string; target_label: string }
+export interface SessionAccountOption {
+ uid: string; label: string; site: string; remaining: number | null; cost: number | null
+ running: number; selectable: boolean; reason: string; cost_relation: string
 }
