@@ -10,26 +10,31 @@ import (
 // Observations and controls share the affinity map's bounded, in-memory lifetime.
 // No conversation text, raw session identifier or credential is retained.
 type sessionState struct {
-	ID           string  `json:"id"`
-	Model        string  `json:"model"`
-	App          string  `json:"app"`
-	UserID       int64   `json:"user_id"`
-	Source       string  `json:"source"`
-	Version      uint64  `json:"version"`
-	Started      float64 `json:"started_at"`
-	Last         float64 `json:"last_at"`
-	Requests     int     `json:"requests"`
-	Running      int     `json:"running"`
-	Waiting      int     `json:"waiting"`
-	Credits      float64 `json:"credits"`
-	Known        int     `json:"credits_known"`
-	Unknown      int     `json:"credits_unknown"`
-	Pending      string  `json:"pending_action"`
-	Target       string  `json:"target_uid"`
-	RouteStatus  string  `json:"route_status"`
-	RouteMessage string  `json:"route_message"`
-	LastUID      string  `json:"-"`
-	scope        map[string]bool
+	ID            string  `json:"id"`
+	Model         string  `json:"model"`
+	App           string  `json:"app"`
+	UserID        int64   `json:"user_id"`
+	Source        string  `json:"source"`
+	Version       uint64  `json:"version"`
+	Started       float64 `json:"started_at"`
+	Last          float64 `json:"last_at"`
+	Requests      int     `json:"requests"`
+	Running       int     `json:"running"`
+	Waiting       int     `json:"waiting"`
+	Credits       float64 `json:"credits"`
+	Known         int     `json:"credits_known"`
+	Unknown       int     `json:"credits_unknown"`
+	Pending       string  `json:"pending_action"`
+	Target        string  `json:"target_uid"`
+	RouteStatus   string  `json:"route_status"`
+	RouteMessage  string  `json:"route_message"`
+	LastSuccess   string  `json:"last_success_uid"`
+	LastAttempt   string  `json:"last_attempt_uid"`
+	ManualUID     string  `json:"-"`
+	ControlEpoch  uint64  `json:"-"`
+	AgentRequests int     `json:"agent_requests"`
+	LastUID       string  `json:"-"`
+	scope         map[string]bool
 }
 type sessionView struct {
 	sessionState
@@ -38,15 +43,18 @@ type sessionView struct {
 }
 type sessionCallKey struct{}
 type sessionCall struct {
-	router  *sessionRouter
-	key     string
-	state   *sessionState
-	running bool
+	router         *sessionRouter
+	key            string
+	state          *sessionState
+	running        bool
+	controlVersion uint64
+	targetUID      string
 }
 type sessionSelection struct {
 	key                      string
 	version                  uint64
 	action, target, baseline string
+	call                     *sessionCall
 }
 
 func (r *sessionRouter) begin(ctx context.Context, key, model string, p *Principal, body map[string]any) (context.Context, func()) {
@@ -79,6 +87,9 @@ func (r *sessionRouter) begin(ctx context.Context, key, model string, p *Princip
 	if entry.info == nil {
 		r.sequence++
 		source := strings.SplitN(extractSessionKey(body), ":", 2)[0]
+		if identity, ok := ctx.Value(requestSessionIdentityKey{}).(requestSessionIdentity); ok {
+			source = strings.SplitN(identity.key, ":", 2)[0]
+		}
 		entry.info = &sessionState{ID: key, Model: model, Source: source, Version: r.sequence, Started: now, LastUID: entry.uid}
 	}
 	info := entry.info
@@ -88,6 +99,9 @@ func (r *sessionRouter) begin(ctx context.Context, key, model string, p *Princip
 		info.scope = copySessionScope(p.AccountScope)
 	}
 	info.Requests++
+	if identity, ok := ctx.Value(requestSessionIdentityKey{}).(requestSessionIdentity); ok && identity.agent != "" {
+		info.AgentRequests++
+	}
 	info.Waiting++
 	info.Last = now
 	entry.expires = now + r.ttl
@@ -206,7 +220,7 @@ func (r *sessionRouter) route(key string) (uid, action, target, baseline string,
 	}
 	return e.uid, e.info.Pending, e.info.Target, e.info.LastUID, e.info.Version
 }
-func (r *sessionRouter) reject(key string, version uint64) {
+func (r *sessionRouter) reject(key string, version uint64, reason ...string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e := r.m[key]
@@ -217,8 +231,12 @@ func (r *sessionRouter) reject(key string, version uint64) {
 	e.info.Target = ""
 	e.info.RouteStatus = "failed"
 	e.info.RouteMessage = "目标账号权限、成本或可用状态已变化，已恢复自动选择"
+	if len(reason) > 0 {
+		e.info.RouteMessage = reason[0]
+	}
 	r.sequence++
 	e.info.Version = r.sequence
+	e.info.ControlEpoch = r.sequence
 }
 func (r *sessionRouter) commit(selection *sessionSelection, uid string) bool {
 	if selection == nil || selection.key == "" {
@@ -235,8 +253,13 @@ func (r *sessionRouter) commit(selection *sessionSelection, uid string) bool {
 	}
 	changed := e.uid != uid || e.info.Pending != ""
 	if e.info.Pending != "" {
-		e.info.RouteStatus = "applied"
-		e.info.RouteMessage = "账号调整已生效"
+		e.info.RouteStatus = "selected"
+		e.info.RouteMessage = "目标账号已选定，等待开始调用"
+		if e.info.Pending == "switch" {
+			e.info.ManualUID = uid
+		} else {
+			e.info.ManualUID = ""
+		}
 		e.info.Pending = ""
 		e.info.Target = ""
 	}
@@ -244,11 +267,75 @@ func (r *sessionRouter) commit(selection *sessionSelection, uid string) bool {
 		r.sequence++
 		e.info.Version = r.sequence
 	}
+	if selection.call != nil && selection.action != "" {
+		selection.call.controlVersion = e.info.ControlEpoch
+		selection.call.targetUID = uid
+	}
 	e.uid = uid
 	e.info.LastUID = uid
 	e.expires = nowSec() + r.ttl
 	r.m[selection.key] = e
 	return true
+}
+
+// Only the request that consumed this control can report its outcome. Later
+// controls and older concurrent calls cannot overwrite that operation.
+func (r *sessionRouter) attempt(ctx context.Context, uid string) {
+	c, _ := ctx.Value(sessionCallKey{}).(*sessionCall)
+	if c == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e := r.m[c.key]
+	if e.info != c.state {
+		return
+	}
+	e.info.LastAttempt = uid
+	if c.controlVersion != 0 && c.controlVersion == e.info.ControlEpoch {
+		e.info.RouteStatus = "executing"
+		e.info.RouteMessage = "指定调整的账号开始调用"
+		if uid != c.targetUID {
+			e.info.RouteMessage = "目标账号失败，正在尝试其他授权账号"
+		}
+	}
+}
+
+func (r *sessionRouter) outcome(ctx context.Context, uid string, err error) {
+	c, _ := ctx.Value(sessionCallKey{}).(*sessionCall)
+	if c == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e := r.m[c.key]
+	if e.info != c.state {
+		return
+	}
+	if err == nil && e.uid == uid {
+		e.info.LastSuccess = uid
+	}
+	if c.controlVersion == 0 || c.controlVersion != e.info.ControlEpoch {
+		return
+	}
+	if err == nil {
+		e.info.RouteStatus = "applied"
+		e.info.RouteMessage = "调整账号已成功完成调用"
+		if uid != c.targetUID {
+			e.info.RouteStatus = "fallback"
+			e.info.RouteMessage = "目标账号失败，已由其他授权账号完成调用"
+		}
+	} else {
+		e.info.RouteStatus = "failed"
+		e.info.RouteMessage = "调整账号调用未成功；后续按授权和故障规则处理"
+	}
+}
+
+func (r *sessionRouter) manuallyPinned(key, uid string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e := r.m[key]
+	return uid != "" && e.info != nil && e.info.ManualUID == uid
 }
 func (r *sessionRouter) control(key string, version uint64, action, target string) bool {
 	r.mu.Lock()
@@ -259,6 +346,7 @@ func (r *sessionRouter) control(key string, version uint64, action, target strin
 	}
 	r.sequence++
 	e.info.Version = r.sequence
+	e.info.ControlEpoch = r.sequence
 	if action == "cancel" {
 		e.info.Pending = ""
 		e.info.Target = ""

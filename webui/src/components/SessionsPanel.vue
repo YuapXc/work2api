@@ -11,6 +11,8 @@ import WTable from '@/components/ui/WTable.vue'
 
 const rows = ref<SessionRow[]>([]), loading = ref(false), failed = ref(false)
 const search = ref(''), model = ref(''), account = ref(''), status = ref(''), sort = ref('recent')
+const showSingleInferred = ref(false)
+const isWeak = (source: string) => ['fb', 'user', 'pck'].includes(source)
 const selectedID = ref(''), options = ref<SessionAccountOption[]>([]), target = ref('')
 const optionsLoading = ref(false), optionsVersion = ref(-1), saving = ref(false)
 const drawer = ref<HTMLElement | null>(null)
@@ -25,6 +27,7 @@ const filtered = computed(() => {
  const query = search.value.toLowerCase().trim()
  const result = rows.value.filter(r => {
   const s = r.session
+  if (!showSingleInferred.value && isWeak(s.source) && s.requests === 1 && !s.running && !s.waiting && !s.pending_action && s.id !== selectedID.value) return false
   return (!query || `${s.id} ${s.app} ${s.user_id} ${s.model} ${r.account_label}`.toLowerCase().includes(query)) &&
    (!model.value || s.model === model.value) && (!account.value || s.account_uid === account.value) &&
    (!status.value || (status.value === 'running' ? s.running > 0 : status.value === 'waiting' ? s.waiting > 0 : status.value === 'pending' ? !!s.pending_action : !s.running && !s.waiting))
@@ -37,7 +40,7 @@ const columns = [
  { key: 'state', label: '状态' }, { key: 'credits', label: '已观测积分', align: 'right' as const },
  { key: 'last', label: '最近调用' }, { key: 'action', label: '' },
 ]
-function sourceLabel(source: string) { return ({ pck: '显式缓存标识', cid: '显式对话标识', user: '用户字段标识', fb: '首条消息推断' } as Record<string, string>)[source] || '会话标识' }
+function sourceLabel(source: string) { return ({ sid: '显式会话标识', pck: '缓存分组标识（弱识别）', cid: '显式对话标识', user: '用户字段（弱识别）', fb: '首条消息推断' } as Record<string, string>)[source] || '会话标识' }
 function accountLabel(row: SessionRow) { return row.account_label || (row.session.account_uid ? row.session.account_uid.slice(0, 8) : '尚未绑定') }
 function stateLabel(row: SessionRow) { const s = row.session; return [s.running ? `执行中 ${s.running}` : '', s.waiting ? `排队中 ${s.waiting}` : ''].filter(Boolean).join(' / ') || '等待下一次调用' }
 async function refresh() {
@@ -104,13 +107,14 @@ onUnmounted(() => { alive = false; clearTimeout(timer); document.removeEventList
    <WSelect v-model="sort" :options="[{value:'recent',label:'最近调用'},{value:'credits',label:'积分消耗'}]" />
    <WButton :loading="loading" @click="refresh">刷新</WButton>
   </div>
-  <p class="mb-3 text-micro text-faint">仅 WorkBuddy。保留最近 30 分钟的会话绑定，正在执行的会话继续保留；重启清空。积分仅累计完成调用的实际上报值。</p>
+  <p class="mb-3 text-micro text-faint">仅 WorkBuddy。保留最近 30 分钟的会话绑定，正在执行的会话继续保留；重启清空。积分仅累计完成调用的实际上报值。相同会话的子 Agent 合并归因。</p>
+  <label class="mb-3 flex items-center gap-2 text-micro text-muted"><input v-model="showSingleInferred" type="checkbox">显示已结束的单次推断记录（无稳定标识时无法保证连续识别）</label>
   <p v-if="failed" role="alert" class="mb-3 text-small text-warn">刷新失败，显示上次数据；自动刷新已暂停，请点击刷新重试。</p>
   <div class="overflow-hidden rounded-xl border border-line bg-surface">
    <WTable :columns="columns" :rows="filtered" row-key="id" min-width="880px" :loading="loading">
     <template #cell-identity="{row}">
      <div class="text-ink">{{ row.session.app || '未命名应用' }}<span v-if="row.session.user_id" class="ml-2 text-micro text-faint">用户 {{ row.session.user_id }}</span></div>
-     <div class="mono text-micro text-faint">{{ row.session.id.slice(0, 10) }} <span v-if="row.session.source === 'fb'" class="font-sans">· 推断会话</span></div>
+     <div class="mono text-micro text-faint">{{ row.session.id.slice(0, 10) }} <span v-if="isWeak(row.session.source)" class="font-sans">· 弱识别</span></div>
     </template>
     <template #cell-model="{row}"><span class="mono">{{ row.session.model }}</span></template>
     <template #cell-account="{row}"><div class="text-ink">{{ accountLabel(row as SessionRow) }}</div><div v-if="row.session.pending_action" class="text-micro text-route">待切换：{{ row.session.pending_action === 'switch' ? row.target_label || row.session.target_uid.slice(0,8) : '按成本重新选择' }}</div></template>
@@ -126,7 +130,7 @@ onUnmounted(() => { alive = false; clearTimeout(timer); document.removeEventList
     <section ref="drawer" role="dialog" aria-modal="true" aria-labelledby="session-drawer-title" tabindex="-1" class="flex h-full w-full max-w-xl flex-col border-l border-line bg-surface shadow-xl outline-none">
      <header class="flex items-center justify-between border-b border-line px-5 py-4"><h2 id="session-drawer-title" class="font-semibold text-ink">调整会话账号</h2><WButton variant="subtle" :disabled="saving" @click="close">关闭</WButton></header>
      <div v-if="selected" class="flex-1 space-y-5 overflow-y-auto p-5">
-      <div><div class="text-ink">{{ selected.session.app || '未命名应用' }} / {{ selected.session.model }}</div><div class="mono mt-1 text-micro text-faint">{{ selected.session.id.slice(0,12) }}</div><p class="mt-2 text-micro text-faint">{{ sourceLabel(selected.session.source) }}{{ selected.session.source === 'fb' ? '：相同开场可能共用绑定，上下文裁剪可能改变识别。' : '；同一对话的不同模型分别绑定。' }}</p></div>
+      <div><div class="text-ink">{{ selected.session.app || '未命名应用' }} / {{ selected.session.model }}</div><div class="mono mt-1 text-micro text-faint">{{ selected.session.id.slice(0,12) }}</div><p class="mt-2 text-micro text-faint">{{ sourceLabel(selected.session.source) }}{{ isWeak(selected.session.source) ? '：可能合并独立任务或拆分连续请求；建议客户端发送 X-Session-ID。' : '；同一对话的不同模型分别绑定。' }}</p><p v-if="selected.session.agent_requests" class="mt-1 text-micro text-faint">其中子 Agent 请求 {{ selected.session.agent_requests }} 次</p><p v-if="selected.last_success_label" class="mt-1 text-micro text-faint">最后成功：{{ selected.last_success_label }}</p><p v-if="selected.last_attempt_label" class="mt-1 text-micro text-faint">最后尝试：{{ selected.last_attempt_label }}</p></div>
       <div class="border-y border-line py-3 text-small"><div>当前账号：<span class="text-ink">{{ accountLabel(selected) }}</span></div><div class="mt-1">{{ stateLabel(selected) }}</div><div class="mt-1 text-micro text-faint">自 {{ dt(selected.session.started_at) }} 开始观测 · {{ selected.session.requests }} 次请求</div></div>
       <div v-if="selected.session.route_message" role="status" class="rounded-lg border border-line px-3 py-2 text-small" :class="selected.session.route_status === 'failed' ? 'text-warn' : 'text-route'">{{ selected.session.route_message }}<div v-if="selected.session.pending_action === 'switch'" class="mt-1">目标：{{ selected.target_label || selected.session.target_uid.slice(0,8) }}</div><WButton v-if="selected.session.pending_action" size="sm" variant="subtle" class="mt-2" :loading="saving" @click="apply('cancel')">取消待切换</WButton></div>
       <div><div class="mb-2 flex items-center justify-between"><h3 class="text-small font-semibold text-ink">可选账号</h3><WButton size="sm" variant="subtle" :loading="optionsLoading" :disabled="saving" @click="loadOptions().catch(() => {})">刷新账号</WButton></div>
@@ -144,7 +148,7 @@ onUnmounted(() => { alive = false; clearTimeout(timer); document.removeEventList
       <div v-if="targetOption" class="rounded-lg border border-route/40 bg-route/5 p-3 text-small text-ink">{{ accountLabel(selected) }} → {{ targetOption.label || targetOption.uid.slice(0,8) }}<p class="mt-2 text-micro text-muted">下一次尚未开始执行的请求生效；正在执行的请求继续完成。换号可能降低缓存命中，同成本换号只分摊消耗。</p></div>
      </div>
      <div v-else class="flex-1 p-5 text-small text-warn">会话已过期或被移除，请关闭后重新选择。</div>
-     <footer class="flex flex-wrap justify-end gap-2 border-t border-line p-4"><WButton :disabled="!selected || saving" @click="apply('reselect')">按成本重新选择</WButton><WButton variant="primary" :disabled="!selected || !target || changed || optionsLoading" :loading="saving" @click="apply('switch')">应用到下一次调用</WButton><p class="w-full text-right text-micro text-faint">按成本重新选择可能仍命中原账号。</p></footer>
+     <footer class="flex flex-wrap justify-end gap-2 border-t border-line p-4"><WButton :disabled="!selected || saving" @click="apply('reselect')">按成本更换账号</WButton><WButton variant="primary" :disabled="!selected || !target || changed || optionsLoading" :loading="saving" @click="apply('switch')">应用到下一次调用</WButton><p class="w-full text-right text-micro text-faint">仅更换至同成本或更低成本账号；成功后保持新绑定。</p></footer>
     </section>
    </div>
   </Teleport>

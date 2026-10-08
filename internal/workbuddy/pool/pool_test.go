@@ -157,7 +157,7 @@ func TestPickExpiringPileIgnoredOutsideWindow(t *testing.T) {
 	}
 }
 
-func TestDomesticPreferenceCannotOverrideCostOrExpiry(t *testing.T) {
+func TestPaidDomesticPreferencePreservesCostAndFreeExpiry(t *testing.T) {
 	cn := &Account{UID: "cn", Profile: "cn-cli", Enabled: true}
 	intl := &Account{UID: "intl", Profile: "intl-work", Enabled: true}
 	p := &Pool{accounts: []*Account{cn, intl}}
@@ -171,8 +171,14 @@ func TestDomesticPreferenceCannotOverrideCostOrExpiry(t *testing.T) {
 	intl.CreditsExpireAt = &soon
 	cost["cn"] = 1
 	for i := 0; i < 30; i++ {
+		if got := p.Pick(nil, cost, 7); got != cn {
+			t.Fatal("paid domestic preference missing", got)
+		}
+	}
+	cost["cn"], cost["intl"] = 0, 0
+	for i := 0; i < 30; i++ {
 		if got := p.Pick(nil, cost, 7); got != intl {
-			t.Fatal("region overrode urgent expiry", got)
+			t.Fatal("free routing lost expiry preference", got)
 		}
 	}
 	if !domesticCostTie([]*Account{cn, intl}, cost) {

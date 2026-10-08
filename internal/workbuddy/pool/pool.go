@@ -142,12 +142,13 @@ const expiryAmountBias = 2.0
 // when costByUID is provided, first restrict to the cheapest cost group (cost
 // is the top priority — a cheaper account is chosen even over a soon-to-expire
 // costlier one, so the latter's expiring credits may go unused; unknown cost
-// ranks last). Within that group, accounts with credits expiring inside
+// ranks last). For a known positive cost, domestic accounts in that cheapest
+// group take priority. Within the remaining group, credits expiring inside
 // expiryWindowDays win (burn expiring credits among same-cost peers), and among
 // those the larger absolute in-window expiring balance is preferred (Option A
 // soft bias); then weighted random. costByUID nil = cost-blind (legacy).
-// Equal known-cost candidates in both regions get a modest domestic weight
-// boost after expiry filtering; unknown-cost and cost-blind picks are unchanged.
+// Free candidates retain the modest domestic weight boost after expiry filtering;
+// unknown-cost and cost-blind picks are unchanged.
 // expiryWindowDays <= 0 falls back to DefaultExpiryWindowDays. Falls back to the
 // soonest-cooldown account when none healthy.
 func (p *Pool) Pick(allowed map[string]bool, costByUID map[string]float64, expiryWindowDays float64) *Account {
@@ -181,6 +182,17 @@ func (p *Pool) Pick(allowed map[string]bool, costByUID map[string]float64, expir
 	if costByUID != nil {
 		candidates = cheapestGroup(candidates, costByUID)
 	}
+	// Paid models reserve international credits when the cheapest known group
+	// contains domestic accounts. Free/unknown pricing keeps existing routing.
+	var domestic []*Account
+	for _, a := range candidates {
+		if cost, known := costByUID[a.UID]; known && cost > 0 && !math.IsNaN(cost) && !math.IsInf(cost, 0) && (a.Profile == "cn-cli" || a.Profile == "cn-work") {
+			domestic = append(domestic, a)
+		}
+	}
+	if len(domestic) > 0 {
+		candidates = domestic
+	}
 	var urgent []*Account
 	for _, a := range candidates {
 		if daysToExpiry(a, now) <= expiryWindowDays {
@@ -204,7 +216,7 @@ func (p *Pool) Pick(allowed map[string]bool, costByUID map[string]float64, expir
 			}
 		}
 	}
-	// Region is only a soft tie-breaker after cost and expiry filtering.
+	// Free models retain the original soft regional tie-breaker.
 	domesticTie := domesticCostTie(poolToPick, costByUID)
 	var totalW float64
 	weights := make([]float64, len(poolToPick))

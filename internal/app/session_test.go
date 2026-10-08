@@ -21,6 +21,7 @@ func TestSessionAffinityIsolatedByUserAndModel(t *testing.T) {
 		principalSessionKey(&Principal{UserID: 2}, "model-a", body),
 		principalSessionKey(&Principal{UserID: 1}, "model-b", body),
 		principalSessionKey(&Principal{}, "model-a", body),
+		principalSessionKey(&Principal{UserID: 1, AppID: 9}, "model-a", body),
 	} {
 		if a == other || len(a) != 64 {
 			t.Fatal("affinity namespace collision")
@@ -31,6 +32,151 @@ func TestSessionAffinityIsolatedByUserAndModel(t *testing.T) {
 	}
 }
 
+func TestRequestSessionIdentitySurvivesChangedMessagesAndConversion(t *testing.T) {
+	principal := &Principal{UserID: 1, AppID: 7}
+	body := map[string]any{"messages": []any{map[string]any{"role": "user", "content": "first"}}, "metadata": map[string]any{"conversation_id": "body-session"}}
+	req := httptest.NewRequest("POST", "/v1/messages", nil)
+	req.Header.Set("X-Claude-Code-Session-Id", "session-123")
+	req.Header.Set("X-Session-ID", "other-id")
+	req = withRequestSessionIdentity(req, body)
+	key := requestSessionKey(req, principal, "model", body)
+	if key != scopedSessionKey(principal, "model", "sid:session-123") {
+		t.Fatal("official header priority lost")
+	}
+	if key != requestSessionKey(req, principal, "model", nil) {
+		t.Fatal("conversion changed session identity")
+	}
+	for _, raw := range []string{`{"session_id":"session-123","device_id":"private"}`, "user_device_account_account_session_12345678-1234-1234-1234-123456789abc"} {
+		if got := extractSessionKey(map[string]any{"metadata": map[string]any{"user_id": raw}}); !strings.HasPrefix(got, "sid:") {
+			t.Fatal("legacy session not extracted", got)
+		}
+	}
+	if extractSessionKey(map[string]any{"metadata": map[string]any{"user_id": "ordinary-user-id"}}) != "" {
+		t.Fatal("user treated as conversation")
+	}
+	for _, value := range []string{strings.Repeat("x", 513), "bad\x00id"} {
+		r := httptest.NewRequest("POST", "/v1/messages", nil)
+		r.Header.Set("X-Session-Id", value)
+		r = withRequestSessionIdentity(r, map[string]any{"session_id": "body-session"})
+		if got := requestSessionKey(r, principal, "model", nil); got != scopedSessionKey(principal, "model", "sid:body-session") {
+			t.Fatal("invalid header overrode valid body")
+		}
+	}
+}
+
+func TestManualOutcomeTracksFallbackAndIgnoresOlderControl(t *testing.T) {
+	r := newSessionRouter()
+	ctx, finish := r.begin(context.Background(), "tracked", "model", nil, nil)
+	defer finish()
+	v, _ := r.view("tracked")
+	r.control(v.ID, v.Version, "switch", "target")
+	v, _ = r.view("tracked")
+	call := ctx.Value(sessionCallKey{}).(*sessionCall)
+	if !r.commit(&sessionSelection{key: v.ID, version: v.Version, action: "switch", call: call}, "target") {
+		t.Fatal("commit")
+	}
+	v, _ = r.view("tracked")
+	if v.RouteStatus != "selected" {
+		t.Fatal("selection prematurely succeeded")
+	}
+	r.attempt(ctx, "target")
+	r.outcome(ctx, "target", io.ErrUnexpectedEOF)
+	r.unbindMatching("tracked", "target")
+	v, _ = r.view("tracked")
+	r.commit(&sessionSelection{key: v.ID, version: v.Version}, "backup")
+	r.attempt(ctx, "backup")
+	r.outcome(ctx, "backup", nil)
+	v, _ = r.view("tracked")
+	if v.RouteStatus != "fallback" || v.LastSuccess != "backup" || v.LastAttempt != "backup" || v.UID != "backup" {
+		t.Fatalf("wrong fallback state: %+v", v)
+	}
+	r.control(v.ID, v.Version, "switch", "new-target")
+	r.outcome(ctx, "backup", io.ErrUnexpectedEOF)
+	v, _ = r.view("tracked")
+	if v.RouteStatus != "pending" || v.Target != "new-target" {
+		t.Fatal("old outcome overwrote new control")
+	}
+}
+
+func TestPaidSessionMigrationHonorsManualPinCostAndScope(t *testing.T) {
+	o, first := newDNSFailoverOrch(t, &failingUpstream{})
+	o.pool = pool.New(map[string]pool.Credential{first.UID: catalogOffline{first.Mgr}, "domestic": catalogOffline{first.Mgr}}, "")
+	intl, cn := o.pool.Get(first.UID), o.pool.Get("domestic")
+	intl.Profile = "intl-work"
+	cn.Profile = "cn-cli"
+	ready := map[string]bool{intl.UID: true, cn.UID: true}
+	paid := map[string]float64{intl.UID: 1, cn.UID: 1}
+	if got := o.preferDomesticSession("s", intl, ready, paid, 7); got != cn {
+		t.Fatal("paid session did not migrate")
+	}
+	for _, cost := range []map[string]float64{nil, {intl.UID: 0, cn.UID: 0}, {intl.UID: 1, cn.UID: 2}} {
+		if got := o.preferDomesticSession("s", intl, ready, cost, 7); got != intl {
+			t.Fatal("free/unknown/cost priority changed")
+		}
+	}
+	if got := o.preferDomesticSession("s", intl, map[string]bool{intl.UID: true}, paid, 7); got != intl {
+		t.Fatal("migration escaped scope")
+	}
+	o.sessions.bind("s", cn.UID)
+	_, finish := o.sessions.begin(context.Background(), "s", "model", nil, nil)
+	defer finish()
+	v, _ := o.sessions.view("s")
+	o.sessions.control("s", v.Version, "switch", intl.UID)
+	v, _ = o.sessions.view("s")
+	o.sessions.commit(&sessionSelection{key: "s", version: v.Version, action: "switch"}, intl.UID)
+	if got := o.preferDomesticSession("s", intl, ready, paid, 7); got != intl {
+		t.Fatal("automatic migration overrode manual international pin")
+	}
+}
+
+func TestStableSessionAcrossProtocolHandlers(t *testing.T) {
+	o, acc := newDNSFailoverOrch(t, &failingUpstream{})
+	o.upstreamClient = sessionSuccessfulUpstream{}
+	o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: sessionCostCatalog{}})
+	o.models.Refresh()
+	app, err := o.db.CreateApp("identity", o.hashKey("identity-key"), "", "", "", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(o)
+	for _, protocol := range []string{"chat", "anthropic", "responses"} {
+		for turn := 0; turn < 2; turn++ {
+			body := map[string]any{"model": "test-model", "stream": false, "messages": []any{map[string]any{"role": "user", "content": strings.Repeat("changed", turn+1)}}}
+			path := "/v1/chat/completions"
+			if protocol == "anthropic" {
+				path = "/v1/messages"
+				body["max_tokens"] = 64
+			}
+			if protocol == "responses" {
+				path = "/v1/responses"
+				body["input"] = "changed input"
+				delete(body, "messages")
+			}
+			raw, _ := json.Marshal(body)
+			req := httptest.NewRequest("POST", path, strings.NewReader(string(raw)))
+			req.Header.Set("Authorization", "Bearer identity-key")
+			req.Header.Set("X-Claude-Code-Session-ID", "stable")
+			if turn == 1 {
+				req.Header.Set("X-Claude-Code-Agent-ID", "child")
+			}
+			w := httptest.NewRecorder()
+			handler := http.HandlerFunc(s.handleChat)
+			if protocol != "chat" {
+				handler = func(w http.ResponseWriter, r *http.Request) { s.handleConverted(w, r, protocol) }
+			}
+			s.requestGuard(handler).ServeHTTP(w, req)
+			if w.Code != 200 {
+				t.Fatalf("%s: %d %s", protocol, w.Code, w.Body)
+			}
+		}
+	}
+	key := scopedSessionKey(&Principal{AppID: app}, "test-model", "sid:stable")
+	v, ok := o.sessions.view(key)
+	if !ok || v.Requests != 6 || v.AgentRequests != 3 || v.Running != 0 || v.Waiting != 0 || v.UID != acc.UID || len(o.sessions.views()) != 1 {
+		t.Fatalf("fragmented or duplicated requests: %+v", v)
+	}
+}
+
 func TestExtractSessionKey(t *testing.T) {
 	cases := []struct {
 		name string
@@ -38,7 +184,7 @@ func TestExtractSessionKey(t *testing.T) {
 		want string
 	}{
 		{"prompt_cache_key wins", map[string]any{"prompt_cache_key": "abc", "user": "longuser123"}, "pck:abc"},
-		{"metadata conversation_id", map[string]any{"metadata": map[string]any{"conversation_id": "conv-9"}}, "cid:conv-9"},
+		{"metadata conversation_id", map[string]any{"metadata": map[string]any{"conversation_id": "conv-9"}}, "sid:conv-9"},
 		{"user field", map[string]any{"user": "session-12345"}, "user:session-12345"},
 		{"user too short ignored, falls to msg", map[string]any{"user": "abc", "messages": []any{map[string]any{"role": "user", "content": "hi there"}}}, "fb:"},
 		{"message text fingerprint", map[string]any{"messages": []any{map[string]any{"role": "user", "content": "hello world"}}}, "fb:"},
@@ -156,9 +302,12 @@ func TestSessionControlRevisionAndObservation(t *testing.T) {
 	if v.UID != "a" || v.Target != "b" || v.Running != 1 {
 		t.Fatalf("inflight was changed: %+v", v)
 	}
-	if !r.commit(&sessionSelection{key: key, version: v.Version}, "b") {
+	call, _ := ctx.Value(sessionCallKey{}).(*sessionCall)
+	if !r.commit(&sessionSelection{key: key, version: v.Version, action: "switch", call: call}, "b") {
 		t.Fatal("fresh selection failed")
 	}
+	r.attempt(ctx, "b")
+	r.outcome(ctx, "b", nil)
 	value := 2.5
 	sessionCredits(ctx, &value)
 	sessionCredits(ctx, nil)
@@ -256,6 +405,27 @@ func TestSessionSelectorPendingAndScope(t *testing.T) {
 	if aerr != nil || picked == nil || picked.UID != "second" {
 		t.Fatal("automatic routing did not recover")
 	}
+	v, _ = o.sessions.view(key)
+	o.sessions.control(key, v.Version, "reselect", "")
+	picked, aerr = choose(map[string]bool{})
+	v, _ = o.sessions.view(key)
+	if picked != nil || aerr != nil || v.Pending != "" || !strings.Contains(v.RouteMessage, "没有其他同成本") {
+		t.Fatal("reselection without an authorized alternative was not explained")
+	}
+	v, _ = o.sessions.view(key)
+	o.sessions.control(key, v.Version, "reselect", "")
+	choose, aerr = o.accountSelector("test-model", "second", nil, map[string]bool{acc.UID: true, "second": true}, selection)
+	if aerr != nil {
+		t.Fatal(aerr)
+	}
+	picked, aerr = choose(map[string]bool{acc.UID: true})
+	if picked != nil || aerr != nil {
+		t.Fatal("reselection bypassed its busy alternative by returning to the original account")
+	}
+	picked, aerr = choose(map[string]bool{})
+	if aerr != nil || picked == nil || picked.UID != acc.UID || selection.target != acc.UID {
+		t.Fatal("reselection did not exclude the original account")
+	}
 }
 func TestSessionAdminAuthenticationAndVersion(t *testing.T) {
 	o, _ := newDNSFailoverOrch(t, &failingUpstream{})
@@ -295,7 +465,8 @@ func TestSessionQueuedRequestUsesManualTarget(t *testing.T) {
 	o.managers["second"] = o.managers[acc.UID]
 	o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: sessionCostCatalog{}})
 	o.models.Refresh()
-	if _, err := o.db.CreateApp("queue", o.hashKey("queue-key"), "", "", "", "", 0); err != nil {
+	app, err := o.db.CreateApp("queue", o.hashKey("queue-key"), "", "", "", "", 0)
+	if err != nil {
 		t.Fatal(err)
 	}
 	s := NewServer(o)
@@ -307,13 +478,14 @@ func TestSessionQueuedRequestUsesManualTarget(t *testing.T) {
 	}
 	defer blocker.release()
 	body := map[string]any{"model": "test-model", "prompt_cache_key": "queue-session", "messages": []any{map[string]any{"role": "user", "content": "hello"}}}
-	key := principalSessionKey(&Principal{}, "test-model", body)
+	key := scopedSessionKey(&Principal{AppID: app}, "test-model", "sid:queue-session")
 	o.sessions.bind(key, acc.UID)
 	payload, _ := json.Marshal(body)
 	result := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(string(payload))).WithContext(ctx)
 		req.Header.Set("Authorization", "Bearer queue-key")
+		req.Header.Set("X-Claude-Code-Session-ID", "queue-session")
 		w := httptest.NewRecorder()
 		s.requestGuard(http.HandlerFunc(s.handleChat)).ServeHTTP(w, req)
 		result <- w

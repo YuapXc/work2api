@@ -64,10 +64,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(context.WithValue(r.Context(), requestStreamKey{}, boolVal(payload["stream"])))
 	// Observe authenticated, model-authorized WorkBuddy requests before queueing.
 	// The later protocol path refreshes scope without counting this call twice.
+	r = withRequestSessionIdentity(r, payload)
 	finishSession := func() {}
 	if _, external := provider.RuntimeForModel(principal.EffectiveModel); !external {
 		var sessionCtx context.Context
-		sessionCtx, finishSession = s.o.sessions.begin(r.Context(), principalSessionKey(principal, principal.EffectiveModel, payload), principal.EffectiveModel, principal, payload)
+		sessionCtx, finishSession = s.o.sessions.begin(r.Context(), requestSessionKey(r, principal, principal.EffectiveModel, payload), principal.EffectiveModel, principal, payload)
 		r = r.WithContext(sessionCtx)
 	}
 	defer finishSession()
@@ -98,7 +99,7 @@ func (s *Server) runChatPath(w http.ResponseWriter, r *http.Request, payload map
 	body := s.o.enhanceBody(upstream.BuildUpstreamBody(payload))
 	model := strOr(body["model"], "auto")
 	// 会话键从原始 payload 提取（BuildUpstreamBody 已剥掉 prompt_cache_key/metadata）
-	sessionKey := principalSessionKey(principal, model, payload)
+	sessionKey := requestSessionKey(r, principal, model, payload)
 	sessionCtx, finishSession := s.o.sessions.begin(r.Context(), sessionKey, model, principal, payload)
 	r = r.WithContext(sessionCtx)
 	defer finishSession()
@@ -262,10 +263,11 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 	r = r.WithContext(context.WithValue(r.Context(), requestStreamKey{}, streamHint))
 	// Observe authenticated, model-authorized WorkBuddy requests before queueing.
 	// The later protocol path refreshes scope without counting this call twice.
+	r = withRequestSessionIdentity(r, payload)
 	finishSession := func() {}
 	if _, external := provider.RuntimeForModel(principal.EffectiveModel); !external {
 		var sessionCtx context.Context
-		sessionCtx, finishSession = s.o.sessions.begin(r.Context(), principalSessionKey(principal, principal.EffectiveModel, payload), principal.EffectiveModel, principal, payload)
+		sessionCtx, finishSession = s.o.sessions.begin(r.Context(), requestSessionKey(r, principal, principal.EffectiveModel, payload), principal.EffectiveModel, principal, payload)
 		r = r.WithContext(sessionCtx)
 	}
 	defer finishSession()
@@ -318,7 +320,7 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 	}
 	chatBody = o.enhanceBody(chatBody)
 	model := strOr(chatBody["model"], "auto")
-	sessionKey := principalSessionKey(principal, model, payload)
+	sessionKey := requestSessionKey(r, principal, model, payload)
 	sessionCtx, finishSession := s.o.sessions.begin(r.Context(), sessionKey, model, principal, payload)
 	r = r.WithContext(sessionCtx)
 	defer finishSession()

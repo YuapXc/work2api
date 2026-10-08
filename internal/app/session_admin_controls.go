@@ -30,7 +30,7 @@ func (s *Server) adminSessions(w http.ResponseWriter, r *http.Request) {
 	}
 	rows := []map[string]any{}
 	for _, v := range s.o.sessions.views() {
-		rows = append(rows, map[string]any{"id": v.ID, "session": v, "account_label": labels[v.UID], "target_label": labels[v.Target]})
+		rows = append(rows, map[string]any{"id": v.ID, "session": v, "account_label": labels[v.UID], "target_label": labels[v.Target], "last_success_label": labels[v.LastSuccess], "last_attempt_label": labels[v.LastAttempt]})
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, 200, map[string]any{"sessions": rows, "memory_only": true, "capacity": s.o.sessions.max})

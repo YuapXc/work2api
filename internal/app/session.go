@@ -10,8 +10,11 @@ package app
 
 import (
 	"container/list"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +23,10 @@ import (
 // Keep account affinity isolated between users and models; retain only a bounded hash.
 func principalSessionKey(p *Principal, model string, body map[string]any) string {
 	key := extractSessionKey(body)
+	return scopedSessionKey(p, model, key)
+}
+
+func scopedSessionKey(p *Principal, model, key string) string {
 	if key == "" {
 		return ""
 	}
@@ -27,8 +34,53 @@ func principalSessionKey(p *Principal, model string, body map[string]any) string
 	if p != nil && p.UserID > 0 {
 		namespace = "portal:" + strconv.FormatInt(p.UserID, 10)
 	}
+	if p != nil {
+		namespace += ":app:" + strconv.FormatInt(p.AppID, 10)
+	}
 	hash := sha256.Sum256([]byte(namespace + "\x00" + model + "\x00" + key))
 	return hex.EncodeToString(hash[:])
+}
+
+type requestSessionIdentity struct{ key, agent string }
+type requestSessionIdentityKey struct{}
+
+// Resolve once from the original request, before conversion or queueing.
+func withRequestSessionIdentity(r *http.Request, body map[string]any) *http.Request {
+	identity := requestSessionIdentity{}
+	for _, name := range []string{"X-Claude-Code-Session-Id", "X-Session-Id", "Session-Id", "X-Conversation-Id", "Conversation-Id"} {
+		if value := boundedSessionID(r.Header.Get(name)); value != "" {
+			identity.key = "sid:" + value
+			break
+		}
+	}
+	if identity.key == "" {
+		identity.key = extractSessionKey(body)
+	}
+	if value := boundedSessionID(r.Header.Get("X-Claude-Code-Agent-Id")); value != "" {
+		sum := sha256.Sum256([]byte(value))
+		identity.agent = hex.EncodeToString(sum[:])[:16]
+	}
+	return r.WithContext(context.WithValue(r.Context(), requestSessionIdentityKey{}, identity))
+}
+
+func requestSessionKey(r *http.Request, p *Principal, model string, body map[string]any) string {
+	if identity, ok := r.Context().Value(requestSessionIdentityKey{}).(requestSessionIdentity); ok {
+		return scopedSessionKey(p, model, identity.key)
+	}
+	return principalSessionKey(p, model, body)
+}
+
+func boundedSessionID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 512 {
+		return ""
+	}
+	for _, c := range value {
+		if c < 32 || c == 127 {
+			return ""
+		}
+	}
+	return value
 }
 
 // extractSessionKey 从（转换前的原始）客户端请求体提取会话键；无会话特征返回空串。
@@ -37,17 +89,37 @@ func extractSessionKey(body map[string]any) string {
 	if body == nil {
 		return ""
 	}
-	// 1) OpenAI prompt_cache_key
-	if k, ok := body["prompt_cache_key"].(string); ok && strings.TrimSpace(k) != "" {
-		return "pck:" + strings.TrimSpace(k)
+	for _, name := range []string{"session_id", "conversation_id"} {
+		if value, _ := body[name].(string); boundedSessionID(value) != "" {
+			return "sid:" + boundedSessionID(value)
+		}
 	}
 	// 2) metadata.conversation_id
 	if meta, ok := body["metadata"].(map[string]any); ok {
-		for _, key := range []string{"conversation_id", "conversationId"} {
-			if cid, ok := meta[key].(string); ok && strings.TrimSpace(cid) != "" {
-				return "cid:" + strings.TrimSpace(cid)
+		for _, key := range []string{"conversation_id", "conversationId", "session_id"} {
+			if cid, ok := meta[key].(string); ok && boundedSessionID(cid) != "" {
+				return "sid:" + boundedSessionID(cid)
 			}
 		}
+		if raw, _ := meta["user_id"].(string); len(raw) <= 512 {
+			var identity struct {
+				SessionID string `json:"session_id"`
+			}
+			if json.Unmarshal([]byte(raw), &identity) == nil && boundedSessionID(identity.SessionID) != "" {
+				return "sid:" + boundedSessionID(identity.SessionID)
+			}
+			if index := strings.LastIndex(raw, "_session_"); strings.HasPrefix(raw, "user_") && index >= 0 {
+				value := raw[index+9:]
+				if len(value) == 36 && value[8] == '-' && value[13] == '-' && value[18] == '-' && value[23] == '-' {
+					if decoded, err := hex.DecodeString(strings.ReplaceAll(value, "-", "")); err == nil && len(decoded) == 16 {
+						return "sid:" + strings.ToLower(value)
+					}
+				}
+			}
+		}
+	}
+	if k, _ := body["prompt_cache_key"].(string); boundedSessionID(k) != "" {
+		return "pck:" + boundedSessionID(k)
 	}
 	// 3) OpenAI user 字段（只取"看起来像标识"的值，避免普通备注误粘）
 	if u, ok := body["user"].(string); ok {
@@ -177,6 +249,7 @@ func (r *sessionRouter) unbindMatching(key, failedUID string) {
 	}
 	if entry, ok := r.m[key]; ok && entry.info != nil {
 		entry.uid = ""
+		entry.info.ManualUID = ""
 		r.sequence++
 		entry.info.Version = r.sequence
 		r.m[key] = entry

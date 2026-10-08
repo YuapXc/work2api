@@ -699,7 +699,7 @@ func (o *Orchestrator) pickAccountExcludingIn(model, sessionKey string, tried ma
 		if uid := o.sessions.lookup(sessionKey); uid != "" && !tried[uid] {
 			if ready[uid] {
 				if a := o.pool.Get(uid); a != nil && a.Callable() && a.CooldownUntil-now <= sessionStickyMaxCooldown {
-					return a, nil
+					return o.preferDomesticSession(sessionKey, a, ready, o.modelCostByUID(model, ready), o.expiryWindowDays()), nil
 				}
 			}
 			o.sessions.unbind(sessionKey)
@@ -755,7 +755,7 @@ func (o *Orchestrator) pickInScope(model, sessionKey string, tried map[string]bo
 		if uid := o.sessions.lookup(sessionKey); uid != "" {
 			if ready[uid] {
 				if a := o.pool.Get(uid); a != nil && a.Callable() && a.CooldownUntil-now <= sessionStickyMaxCooldown {
-					return a, nil
+					return o.preferDomesticSession(sessionKey, a, ready, o.modelCostByUID(model, ready), o.expiryWindowDays()), nil
 				}
 			}
 			o.sessions.unbind(sessionKey)
@@ -924,6 +924,7 @@ func (o *Orchestrator) runOnce(ctx context.Context, acc *pool.Account, body map[
 	if client == nil {
 		client = upstream.Shared()
 	}
+	o.sessions.attempt(ctx, acc.UID)
 	err := client.StreamUpstream(ctx, headers, body, url, wrapped)
 	return started, err
 }
@@ -1034,6 +1035,7 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 		if lease, leased := ctx.Value(modelLeaseKey{}).(*modelLease); leased || tracked {
 			for revisionRetry := 0; ; revisionRetry++ {
 				selection := &sessionSelection{key: sessionKey}
+				selection.call, _ = ctx.Value(sessionCallKey{}).(*sessionCall)
 				choose, chooseErr := o.accountSelector(model, acc.UID, tried, scope, selection)
 				if chooseErr != nil {
 					return acc, chooseErr
@@ -1067,7 +1069,7 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 						return acc, errBody(503, "账号权限查询失败", "server_error")
 					}
 					if excluded[acc.UID] {
-						if selection.action == "switch" {
+						if selection.action == "switch" || selection.action == "reselect" {
 							o.sessions.reject(selection.key, selection.version)
 						}
 						return acc, errBody(403, "账号使用范围已变更，请重新请求", "permission_error")
@@ -1075,7 +1077,7 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 				}
 				if validate, ok := ctx.Value(portalDispatchCheckKey{}).(func(string, string) *apiError); ok {
 					if aerr := validate(acc.UID, model); aerr != nil {
-						if selection.action == "switch" {
+						if selection.action == "switch" || selection.action == "reselect" {
 							o.sessions.reject(selection.key, selection.version)
 						}
 						return acc, aerr
@@ -1083,7 +1085,7 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 				}
 				// Catalog prices can change while this request is queued. Recheck
 				// outside admission's mutex before consuming a manual preference.
-				if selection.action == "switch" {
+				if selection.action == "switch" || selection.action == "reselect" {
 					fresh := o.modelCostByUID(model, map[string]bool{selection.baseline: true, selection.target: true})
 					base, baseOK := fresh[selection.baseline]
 					target, targetOK := fresh[selection.target]
@@ -1103,7 +1105,7 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 				}
 			}
 
-			if sessionKey != "" {
+			if sessionKey != "" && !tracked {
 				o.sessions.bind(sessionKey, acc.UID)
 			}
 		}
@@ -1118,6 +1120,7 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 		}
 		compatUID, compatBody = "", nil
 		started, err := o.runOnce(ctx, acc, attemptBody, sink)
+		o.sessions.outcome(ctx, acc.UID, err)
 		status := 200
 		if ue, ok := err.(*upstream.UpstreamError); ok {
 			status = ue.StatusCode
@@ -1150,6 +1153,14 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 				o.pool.OnFailure(acc.UID, cooldownSoft)
 			}
 			return acc, err
+		}
+		if isChannelDenied(ue.StatusCode, string(ue.Raw)) {
+			_, matched := channelIdentityCompatBody(body)
+			source := "none"
+			if identity, ok := ctx.Value(requestSessionIdentityKey{}).(requestSessionIdentity); ok {
+				source = strings.SplitN(identity.key, ":", 2)[0]
+			}
+			log.Printf("渠道拒绝诊断: profile=%s fixed_identity_match=%t compat_enabled=%t compat_used=%t session_source=%s", acc.Profile, matched, o.cfg.ChannelIdentityCompat, compatUsed, source)
 		}
 		if o.cfg.ChannelIdentityCompat && !compatUsed && attempt+1 < maxFailoverAttempts &&
 			siterouting.ProfileSite(acc.Profile) == siterouting.Domestic && isChannelDenied(ue.StatusCode, string(ue.Raw)) {
@@ -1211,6 +1222,7 @@ func (o *Orchestrator) accountSelector(model, preferred string, tried map[string
 	}
 	cost := o.modelCostByUID(model, allowed)
 	window := o.expiryWindowDays()
+	var migrationFrom, migrationTarget string
 	return func(busy map[string]bool) (*pool.Account, *apiError) {
 		ready := map[string]bool{}
 		now := nowSec()
@@ -1241,6 +1253,19 @@ func (o *Orchestrator) accountSelector(model, preferred string, tried map[string
 			switch action {
 			case "reselect":
 				routePreferred = ""
+				baseCost, known := cost[baseline]
+				alternatives := map[string]bool{}
+				for uid := range ready {
+					if value, ok := cost[uid]; uid != baseline && known && ok && baseCost >= 0 && !math.IsNaN(baseCost) && !math.IsInf(baseCost, 0) && value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0) && value <= baseCost+1e-9 {
+						alternatives[uid] = true
+					}
+				}
+				if len(alternatives) == 0 {
+					o.sessions.reject(selection.key, version, "没有其他同成本或更低成本的健康授权账号，保留原选择")
+					return nil, nil
+				}
+				ready = alternatives
+				routePreferred = preferred
 			case "switch":
 				baseCost, baseKnown := cost[baseline]
 				targetCost, targetKnown := cost[target]
@@ -1256,6 +1281,24 @@ func (o *Orchestrator) accountSelector(model, preferred string, tried map[string
 		if ready[routePreferred] {
 
 			selected = o.pool.Get(routePreferred)
+			if len(routing) == 0 || routing[0].action == "" {
+				key := func() string {
+					if len(routing) > 0 {
+						return routing[0].key
+					}
+					return ""
+				}()
+				if migrationFrom == routePreferred && ready[migrationTarget] && !o.sessions.manuallyPinned(key, routePreferred) {
+					selected = o.pool.Get(migrationTarget)
+				} else {
+					selected = o.preferDomesticSession(key, selected, ready, cost, window)
+					if selected != nil && selected.UID != routePreferred {
+						migrationFrom, migrationTarget = routePreferred, selected.UID
+					} else {
+						migrationFrom, migrationTarget = "", ""
+					}
+				}
+			}
 		} else {
 			selected = o.pool.Pick(ready, cost, window)
 			if selected != nil {
@@ -1265,8 +1308,44 @@ func (o *Orchestrator) accountSelector(model, preferred string, tried map[string
 		if selected != nil && busy[selected.UID] {
 			return nil, nil
 		}
+		if selected != nil && len(routing) > 0 && routing[0].action == "reselect" {
+			routing[0].target = selected.UID
+		}
 		return selected, nil
 	}, nil
+}
+
+// Migrate automatic paid international bindings only when the cheapest healthy
+// authorized group has a domestic option. Explicit administrator pins win.
+func (o *Orchestrator) preferDomesticSession(key string, current *pool.Account, ready map[string]bool, costs map[string]float64, window float64) *pool.Account {
+	if current == nil || siterouting.ProfileSite(current.Profile) != siterouting.International || o.sessions.manuallyPinned(key, current.UID) {
+		return current
+	}
+	base, known := costs[current.UID]
+	if !known || base <= 0 || math.IsNaN(base) || math.IsInf(base, 0) {
+		return current
+	}
+	minimum := math.Inf(1)
+	for _, candidate := range o.pool.Accounts() {
+		if !ready[candidate.UID] || !candidate.Healthy(nowSec()) {
+			continue
+		}
+		if cost, ok := costs[candidate.UID]; ok && cost >= 0 && !math.IsNaN(cost) && !math.IsInf(cost, 0) && cost < minimum {
+			minimum = cost
+		}
+	}
+	if minimum <= 0 || minimum > base+1e-9 {
+		return current
+	}
+	for _, candidate := range o.pool.Accounts() {
+		cost, ok := costs[candidate.UID]
+		if ready[candidate.UID] && candidate.Healthy(nowSec()) && siterouting.ProfileSite(candidate.Profile) == siterouting.Domestic && ok && math.Abs(cost-minimum) <= 1e-9 {
+			if selected := o.pool.Pick(ready, costs, window); selected != nil {
+				return selected
+			}
+		}
+	}
+	return current
 }
 
 func (o *Orchestrator) refreshCreditsFor(ctx context.Context, acc *pool.Account) {
