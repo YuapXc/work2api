@@ -871,15 +871,23 @@ func (o *Orchestrator) enhanceBody(body map[string]any) map[string]any {
 	return body
 }
 
-func (o *Orchestrator) getHeaders(acc *pool.Account) (map[string]string, *apiError) {
+func (o *Orchestrator) getHeaders(ctx context.Context, acc *pool.Account) (map[string]string, error) {
 	mgr := o.manager(acc.UID)
 	if mgr == nil {
 		return nil, errBody(503, "账号凭据不可用", "auth_error")
 	}
-	h, err := mgr.GetChatHeaders()
+	h, err := mgr.GetChatHeadersContext(ctx)
 	if err != nil {
-		o.pool.OnFailure(acc.UID, cooldownHard)
-		return nil, errBody(503, "账号 token 刷新失败，请到 WebUI 重新扫码登录", "auth_error")
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if errors.Is(err, credentials.ErrLoginRequired) {
+			return nil, &upstream.UpstreamError{StatusCode: 401, Raw: []byte(`{"error":{"message":"账号凭据失效，请重新授权","type":"auth_error"}}`)}
+		}
+		if isLocalNetworkFailure(err) {
+			return nil, err
+		}
+		return nil, &upstream.UpstreamError{StatusCode: 503, Raw: []byte(`{"error":{"message":"账号凭据刷新暂时失败，请稍后重试","type":"upstream_error"}}`)}
 	}
 	return h, nil
 }
@@ -908,19 +916,59 @@ func (o *Orchestrator) runOnce(ctx context.Context, acc *pool.Account, body map[
 			return false, aerr
 		}
 	}
-	headers, aerr := o.getHeaders(acc)
+	headers, aerr := o.getHeaders(ctx, acc)
 	if aerr != nil {
 		return false, aerr
+	}
+	// Refresh waiters can outlive a permission change or client cancellation.
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if validate, ok := ctx.Value(portalDispatchCheckKey{}).(func(string, string) *apiError); ok {
+		if aerr := validate(acc.UID, strOr(body["model"], "")); aerr != nil {
+			return false, aerr
+		}
 	}
 	url, _ := siterouting.ChatURLForProfile(acc.Profile)
 	started := false
 	var responseBytes int64
+	var preamble []string
+	preambleBytes := 0
 	wrapped := func(line string) error {
 		responseBytes += int64(len(line))
 		if responseBytes > streamwatch.ResponseLimit(ctx) {
 			return streamwatch.ErrResponseTooLarge
 		}
-		started = true
+		if !started {
+			var chunk map[string]any
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			parsed := json.Unmarshal([]byte(data), &chunk) == nil
+			terminal := data == "[DONE]"
+			if choices, ok := chunk["choices"].([]any); ok {
+				for _, value := range choices {
+					choice, _ := value.(map[string]any)
+					if finish, _ := choice["finish_reason"].(string); finish != "" {
+						terminal = true
+					}
+				}
+			}
+			if parsed && !terminal && !upstream.HasOutput(chunk) {
+				preambleBytes += len(line)
+				if preambleBytes > 64*1024 {
+					return streamwatch.ErrResponseTooLarge
+				}
+				preamble = append(preamble, line)
+				return nil
+			}
+			started = true // From here, a writer error also prohibits replay.
+			for _, prefix := range preamble {
+				diagnostic(ctx).observe(prefix)
+				if err := sink(prefix); err != nil {
+					return err
+				}
+			}
+			preamble = nil
+		}
 		diagnostic(ctx).observe(line)
 		return sink(line)
 	}
@@ -1107,15 +1155,15 @@ func (o *Orchestrator) openUpstreamScoped(ctx context.Context, acc *pool.Account
 				return acc, err
 			}
 			// 流已开始又中断：软冷却（可能是上游中途掉线），不重试已开始的流。
-			o.pool.OnFailure(acc.UID, cooldownSoft)
+			if !isLocalNetworkFailure(err) {
+				o.pool.OnFailure(acc.UID, cooldownSoft)
+			}
 			return acc, err
 		}
 		if !upstreamErr {
-			// 本机 DNS 解析失败是机器级故障（对所有上游同时生效、通常秒级自愈），
-			// 不是这个账号的毛病。打冷却会把一次抖动放大成整模型不可用、且期间
-			// 连「再探一次」的机会都没有。当前请求快速失败且不处罚账号，
-			// 由后续请求重试，避免对同地域同域名的账号重复解析。
-			if !isLocalDNSFailure(err) {
+			// Typed DNS/local routing failures are not account failures. Fail
+			// promptly without poisoning healthy accounts or retrying the same path.
+			if !isLocalNetworkFailure(err) {
 				o.pool.OnFailure(acc.UID, cooldownSoft)
 			}
 			return acc, err

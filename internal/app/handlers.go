@@ -67,6 +67,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	r = withRequestSessionIdentity(r, payload)
 	finishSession := func() {}
 	if _, external := provider.RuntimeForModel(principal.EffectiveModel); !external {
+		if err := upstream.ValidateChoiceCount(payload); err != nil {
+			writeAPIErr(w, errBody(400, "WorkBuddy 仅支持 n=1；并行 Agent 请分别发送独立请求", "invalid_request_error"))
+			return
+		}
 		var sessionCtx context.Context
 		sessionCtx, finishSession = s.o.sessions.begin(r.Context(), requestSessionKey(r, principal, principal.EffectiveModel, payload), principal.EffectiveModel, principal, payload)
 		r = r.WithContext(sessionCtx)
@@ -130,8 +134,9 @@ func (s *Server) runChatPath(w http.ResponseWriter, r *http.Request, payload map
 			writeJSON(w, 500, errBody(500, "streaming unsupported", "server_error").body)
 			return
 		}
+		sentRole := false
 		sink := func(line string) error {
-			clean := sanitizeChatSSE(line)
+			clean := sanitizeChatSSEWithRole(line, &sentRole)
 			if clean != "" {
 				if err := writeChunk(clean + "\n\n"); err != nil {
 					return err
@@ -266,6 +271,10 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 	r = withRequestSessionIdentity(r, payload)
 	finishSession := func() {}
 	if _, external := provider.RuntimeForModel(principal.EffectiveModel); !external {
+		if err := upstream.ValidateChoiceCount(payload); err != nil {
+			writeAPIErr(w, errBody(400, "WorkBuddy 仅支持 n=1；并行 Agent 请分别发送独立请求", "invalid_request_error"))
+			return
+		}
 		var sessionCtx context.Context
 		sessionCtx, finishSession = s.o.sessions.begin(r.Context(), requestSessionKey(r, principal, principal.EffectiveModel, payload), principal.EffectiveModel, principal, payload)
 		r = r.WithContext(sessionCtx)

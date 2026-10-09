@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"strings"
@@ -135,6 +136,9 @@ type LineFunc func(line string) error
 // data line. Strict validation mirrors the Python impl: a stream missing a
 // finish reason or lacking any content/tool_calls is treated as invalid.
 func (c *Client) StreamUpstream(ctx context.Context, headers map[string]string, body map[string]any, url string, yield LineFunc) error {
+	if err := ValidateChoiceCount(body); err != nil {
+		return err
+	}
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -184,38 +188,34 @@ func (c *Client) handleJSONResponse(resp *http.Response, yield LineFunc) error {
 	if err := json.Unmarshal(stripBOM(raw), &chunk); err != nil {
 		return invalidStream("上游返回了无效 JSON，无法读取模型响应")
 	}
-	choicesAny, _ := chunk["choices"].([]any)
-	if len(choicesAny) == 0 {
-		return &UpstreamError{StatusCode: 502, Raw: raw}
-	}
-	for _, ch := range choicesAny {
-		choice, ok := ch.(map[string]any)
-		if !ok {
+	choices, _ := chunk["choices"].([]any)
+	for _, v := range choices {
+		choice, _ := v.(map[string]any)
+		if choice == nil {
 			continue
 		}
-		if _, hasDelta := choice["delta"]; !hasDelta {
-			if msg, ok := choice["message"].(map[string]any); ok {
-				choice["delta"] = msg
-			}
+		if _, exists := choice["delta"]; !exists {
+			choice["delta"] = choice["message"]
 		}
-		if empty(choice["finish_reason"]) {
-			if delta, ok := choice["delta"].(map[string]any); ok {
-				if _, hasTC := delta["tool_calls"]; hasTC {
-					choice["finish_reason"] = "tool_calls"
+		if delta, ok := choice["delta"].(map[string]any); ok {
+			if calls, ok := delta["tool_calls"].([]any); ok {
+				for i, v := range calls {
+					if call, ok := v.(map[string]any); ok {
+						call["index"] = i
+					}
 				}
 			}
 		}
 	}
-	if !anyChoice(choicesAny, func(c map[string]any) bool { return !empty(c["finish_reason"]) }) {
-		return invalidStream("上游 JSON 响应缺少结束原因，结果可能不完整")
+	state := completionState{}
+	if err := state.observe(chunk); err != nil {
+		return err
 	}
-	if !anyChoice(choicesAny, func(c map[string]any) bool {
-		delta, _ := c["delta"].(map[string]any)
-		fr, _ := c["finish_reason"].(string)
-		return (delta != nil && (!empty(delta["content"]) || !empty(delta["tool_calls"]))) ||
-			fr == "length" || fr == "content_filter"
-	}) {
-		return invalidStream("上游 JSON 响应没有正文或工具调用")
+	if err := state.complete(true); err != nil {
+		return err
+	}
+	if state.finish == "" {
+		choices[0].(map[string]any)["finish_reason"] = "tool_calls"
 	}
 	out, _ := json.Marshal(chunk)
 	if err := yield("data: " + string(out)); err != nil {
@@ -226,82 +226,77 @@ func (c *Client) handleJSONResponse(resp *http.Response, yield LineFunc) error {
 
 // streamSSE consumes and validates a real SSE stream.
 func streamSSE(resp *http.Response, yield LineFunc) error {
-	// 看门狗：空闲 180s / 总时长 30min（与 qoder 通道同款双超时）。ResponseHeaderTimeout
-	// 只管首字节；这里管流中挂起。
 	watch := streamwatch.NewWatch(resp.Body, resp.Request.Context(), 0, 0)
 	defer watch.Close()
 	scanner := bufio.NewScanner(watch.Reader(resp.Body))
+	scanner.Split(scanEventLine)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
-
-	finished := false
+	state := completionState{}
+	var event strings.Builder
+	var terminal []string
+	terminalBytes := 0
 	done := false
-	sawToolCalls := false
-	sawContent := false
-	finishReason := ""
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if !strings.HasPrefix(line, "data:") {
-			continue
+	process := func() error {
+		if event.Len() == 0 {
+			return nil
 		}
-		data := strings.TrimSpace(line[5:])
-		if data == "[DONE]" {
-			if !finished && sawToolCalls {
-				if err := yield(`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`); err != nil {
-					return err
-				}
-				finished = true
-			}
-			if !finished {
-				return invalidStream("上游流缺少结束原因，结果可能不完整")
-			}
-			if !(sawContent || sawToolCalls || finishReason == "length" || finishReason == "content_filter") {
-				return invalidStream("上游流没有正文或工具调用")
-			}
-			done = true
-			if err := yield(line); err != nil {
+		data := strings.TrimSuffix(event.String(), "\n")
+		event.Reset()
+		if strings.TrimSpace(data) == "[DONE]" {
+			if err := state.complete(true); err != nil {
 				return err
 			}
-			break
+			if state.finish == "" {
+				terminal = append(terminal, `data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`)
+			}
+			done = true
+			return nil
 		}
 		var chunk map[string]any
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+		if json.Unmarshal([]byte(data), &chunk) != nil {
 			return invalidStream("上游返回了无效 SSE 数据")
 		}
-		if _, isErr := chunk["error"]; isErr {
-			return &UpstreamError{StatusCode: 502, Raw: []byte(data)}
-		}
-		choices, _ := chunk["choices"].([]any)
-		if !codeOK(chunk["code"]) && len(choices) == 0 {
-			return &UpstreamError{StatusCode: 502, Raw: []byte(data)}
-		}
-		for _, ch := range choices {
-			choice, ok := ch.(map[string]any)
-			if !ok {
-				continue
-			}
-			if !empty(choice["finish_reason"]) {
-				finished = true
-				if fr, ok := choice["finish_reason"].(string); ok {
-					finishReason = fr
-				}
-			}
-			if delta, ok := choice["delta"].(map[string]any); ok {
-				if !empty(delta["content"]) {
-					sawContent = true
-				}
-				// reasoning-only 响应（仅思考链、无正文，finish_reason=stop）合法：上游 collect
-				// 把 reasoning 计入正文；不计会误判"没有正文"，把已推给客户端的流判为无效→502。
-				if !empty(delta["reasoning_content"]) {
-					sawContent = true
-				}
-				if !empty(delta["tool_calls"]) {
-					sawToolCalls = true
-				}
-			}
-		}
-		if err := yield(line); err != nil {
+		if err := state.observe(chunk); err != nil {
 			return err
+		}
+		raw, _ := json.Marshal(chunk) // Multi-line SSE data becomes one adapter-safe line.
+		line := "data: " + string(raw)
+		if state.finish != "" {
+			terminalBytes += len(line)
+			if terminalBytes > 8*1024*1024 {
+				return invalidStream("上游结束事件过大")
+			}
+			terminal = append(terminal, line)
+			return nil
+		}
+		return yield(line)
+	}
+	firstLine := true
+	for scanner.Scan() {
+		line := scanner.Text()
+		if firstLine {
+			line = strings.TrimPrefix(line, "\ufeff")
+			firstLine = false
+		}
+		if line == "" {
+			if err := process(); err != nil {
+				return err
+			}
+			if done {
+				break
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			value := strings.TrimPrefix(line, "data:")
+			value = strings.TrimPrefix(value, " ")
+			if event.Len()+len(value)+1 > 8*1024*1024 {
+				return invalidStream("上游 SSE 事件过大")
+			}
+			event.WriteString(value)
+			event.WriteByte('\n')
+		} else if line == "data" {
+			event.WriteByte('\n')
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -310,16 +305,45 @@ func streamSSE(resp *http.Response, yield LineFunc) error {
 		}
 		return err
 	}
-	if !finished {
-		return invalidStream("上游流提前结束，未收到结束原因")
-	}
-	if !(sawContent || sawToolCalls || finishReason == "length" || finishReason == "content_filter") {
-		return invalidStream("上游流没有正文或工具调用")
-	}
+	// Compatibility: a complete terminal JSON event may precede EOF without a
+	// final blank line. Never infer successful completion from partial text.
 	if !done {
-		return yield("data: [DONE]")
+		if err := process(); err != nil {
+			return err
+		}
 	}
-	return nil
+	if err := state.complete(done); err != nil {
+		return err
+	}
+	for _, line := range terminal {
+		if err := yield(line); err != nil {
+			return err
+		}
+	}
+	return yield("data: [DONE]")
+}
+
+// SSE accepts LF, CRLF and CR, and joins data fields at the event boundary.
+func scanEventLine(data []byte, atEOF bool) (int, []byte, error) {
+	for i, c := range data {
+		if c == '\n' {
+			return i + 1, data[:i], nil
+		}
+		if c == '\r' {
+			if i+1 == len(data) && !atEOF {
+				return 0, nil, nil
+			}
+			advance := i + 1
+			if advance < len(data) && data[advance] == '\n' {
+				advance++
+			}
+			return advance, data[:i], nil
+		}
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
 }
 
 // CollectStream aggregates a standard OpenAI SSE stream into a single
@@ -331,6 +355,7 @@ func CollectStream(fallbackModel string, produce func(yield LineFunc) error) (ma
 	model := ""
 	finishReason := ""
 	var usage map[string]any
+	state := completionState{}
 
 	err := produce(func(line string) error {
 		if !strings.HasPrefix(line, "data:") {
@@ -342,7 +367,10 @@ func CollectStream(fallbackModel string, produce func(yield LineFunc) error) (ma
 		}
 		var chunk map[string]any
 		if json.Unmarshal([]byte(data), &chunk) != nil {
-			return nil
+			return invalidStream("上游返回了无效 SSE 数据")
+		}
+		if err := state.observe(chunk); err != nil {
+			return err
 		}
 		if m, ok := chunk["model"].(string); ok && m != "" {
 			model = m
@@ -406,8 +434,8 @@ func CollectStream(fallbackModel string, produce func(yield LineFunc) error) (ma
 	if err != nil && !errors.Is(err, errDone) {
 		return nil, err
 	}
-	if finishReason == "" {
-		return nil, invalidStream("上游流缺少结束原因，结果可能不完整")
+	if err := state.complete(false); err != nil {
+		return nil, err
 	}
 
 	message := map[string]any{"role": "assistant", "content": contentParts.String()}
@@ -493,6 +521,9 @@ func stripBOM(b []byte) []byte {
 func toInt(v any) (int, bool) {
 	switch x := v.(type) {
 	case float64:
+		if math.IsNaN(x) || math.IsInf(x, 0) || math.Trunc(x) != x || x < 0 || x > 1024 {
+			return 0, false
+		}
 		return int(x), true
 	case int:
 		return x, true

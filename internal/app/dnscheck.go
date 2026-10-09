@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"net"
+	"syscall"
 )
 
 // isLocalDNSFailure 判定一次上游失败是否由「本机域名解析失败」引起。
@@ -25,4 +26,18 @@ func isLocalDNSFailure(err error) bool {
 	}
 	var dnsErr *net.DNSError
 	return errors.As(err, &dnsErr)
+}
+
+// Only typed resolver and local routing/address failures are exempt. Refusal,
+// reset, EOF, TLS, HTTP errors and ambiguous timeouts remain upstream failures.
+func isLocalNetworkFailure(err error) bool {
+	if isLocalDNSFailure(err) {
+		return true
+	}
+	for _, code := range []syscall.Errno{syscall.ENETUNREACH, syscall.EHOSTUNREACH, syscall.ENETDOWN, syscall.EADDRNOTAVAIL} {
+		if errors.Is(err, code) {
+			return true
+		}
+	}
+	return isWindowsLocalNetworkFailure(err)
 }

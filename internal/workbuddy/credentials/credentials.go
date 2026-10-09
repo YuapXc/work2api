@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"work2api/internal/statebackup"
 
 	"work2api/internal/workbuddy/httpclient"
 	"work2api/internal/workbuddy/profiles"
@@ -81,7 +83,17 @@ type Manager struct {
 	cached  *Session
 	mtime   time.Time
 	retired bool
+	flight  *refreshTask
 }
+
+type refreshTask struct {
+	done   chan struct{}
+	err    error
+	cancel context.CancelFunc
+}
+
+var ErrLoginRequired = errors.New("账号登录态失效，请重新授权")
+var ErrCredentialsChanged = errors.New("账号凭据已变更，请重试")
 
 // NewManager returns a credential manager for one *.info file.
 func NewManager(path string) *Manager {
@@ -99,6 +111,9 @@ func (m *Manager) Retire(removeFile bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.retired = true
+	if m.flight != nil {
+		m.flight.cancel()
+	}
 	if removeFile {
 		var failures []error
 		for _, path := range []string{m.path, m.path + ".tmp"} {
@@ -169,6 +184,8 @@ func (m *Manager) isExpired() bool {
 
 // Profile returns the current credential's profile (falls back to default).
 func (m *Manager) Profile() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	s, err := m.session()
 	if err != nil {
 		return siterouting.DefaultProfile
@@ -182,6 +199,8 @@ func (m *Manager) Profile() string {
 
 // Endpoint returns the current credential's upstream entry.
 func (m *Manager) Endpoint() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	s, err := m.session()
 	if err != nil {
 		ep, _ := siterouting.EndpointForProfile(siterouting.DefaultProfile)
@@ -194,19 +213,39 @@ func (m *Manager) Endpoint() string {
 	return ep
 }
 
-// refresh fetches a new token and writes it back atomically. Caller holds mu.
-func (m *Manager) refresh() error {
-	return m.refreshContext(context.Background())
-}
-
 func (m *Manager) refreshContext(ctx context.Context) error {
+	m.mu.Lock()
 	if m.retired {
+		m.mu.Unlock()
 		return errors.New("账号已移除")
 	}
 	s, err := m.session()
 	if err != nil {
+		m.mu.Unlock()
 		return err
 	}
+	original, err := json.Marshal(s.raw)
+	if err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	// Work on a private snapshot; network waits never hold the manager mutex.
+	var raw map[string]any
+	if err := json.Unmarshal(original, &raw); err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	snapshot := &Session{raw: raw}
+	snapshot.Auth, _ = raw["auth"].(map[string]any)
+	snapshot.Account, _ = raw["account"].(map[string]any)
+	if snapshot.Auth == nil {
+		snapshot.Auth = map[string]any{}
+	}
+	if snapshot.Account == nil {
+		snapshot.Account = map[string]any{}
+	}
+	s = snapshot
+	m.mu.Unlock()
 	headers := profiles.CredentialHeaders(s.Auth, profiles.Account(s.Account))
 	refreshToken, _ := s.Auth["refreshToken"].(string)
 	headers["X-Refresh-Token"] = refreshToken
@@ -227,10 +266,22 @@ func (m *Manager) refreshContext(ctx context.Context) error {
 		return err
 	}
 	defer resp.Body.Close()
-	body := readAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+	if err != nil {
+		return err
+	}
+	if len(body) > 1<<20 {
+		return errors.New("刷新 token 响应过大")
+	}
+	if resp.StatusCode == 401 {
+		return ErrLoginRequired
+	}
 	var data map[string]any
 	if err := json.Unmarshal(body, &data); err != nil {
 		return errors.New("刷新 token 失败（非 JSON 响应）")
+	}
+	if code, _ := data["code"].(float64); code == 12153 || code == 11140 {
+		return ErrLoginRequired
 	}
 	if resp.StatusCode >= 400 {
 		return errors.New("刷新 token 失败（HTTP " + itoa(resp.StatusCode) + "）")
@@ -239,8 +290,11 @@ func (m *Manager) refreshContext(ctx context.Context) error {
 		return errors.New("刷新 token 失败")
 	}
 	newAuth, _ := data["data"].(map[string]any)
-	if newAuth == nil {
+	if token, _ := newAuth["accessToken"].(string); token == "" {
 		return errors.New("刷新 token 失败：空 data")
+	}
+	if empty(newAuth["refreshToken"]) {
+		newAuth["refreshToken"] = s.Auth["refreshToken"]
 	}
 	if empty(newAuth["domain"]) {
 		newAuth["domain"] = s.Auth["domain"]
@@ -257,6 +311,23 @@ func (m *Manager) refreshContext(ctx context.Context) error {
 			newAuth["refreshExpiresAt"] = float64(now) + in*1000
 		}
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.retired {
+		return errors.New("账号已移除")
+	}
+	// A re-import, deletion or desktop credential rotation must win over an old response.
+	current, err := m.readRaw()
+	if err != nil {
+		return err
+	}
+	currentRaw, err := json.Marshal(current.raw)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(currentRaw, original) {
+		return ErrCredentialsChanged
+	}
 	s.Auth = newAuth
 	s.raw["auth"] = newAuth
 	// atomic write-back
@@ -269,6 +340,7 @@ func (m *Manager) refreshContext(ctx context.Context) error {
 		return err
 	}
 	if err := os.Rename(tmp, m.path); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	m.cached = s
@@ -293,44 +365,92 @@ func encryptedToken(auth map[string]any) bool {
 	return false
 }
 
-// GetHeaders returns request headers, refreshing the token if expired.
-func (m *Manager) GetHeaders() (map[string]string, error) {
+// ensureFresh shares a bounded refresh, while each waiter retains its own
+// cancellation. The task owns a backup lease until its atomic write completes.
+func (m *Manager) ensureFresh(ctx context.Context, force bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if s, err := m.session(); err == nil && encryptedToken(s.Auth) {
-		return nil, errors.New("该账号 token 被 CodeBuddy 加密存储（$wbEncrypted），无法直接读取；请在 WebUI 重新扫码登录导入该账号")
+	if m.retired {
+		m.mu.Unlock()
+		return errors.New("账号已移除")
 	}
-	if m.isExpired() {
-		if err := m.refresh(); err != nil {
-			return nil, err
+	if s, err := m.session(); err != nil {
+		m.mu.Unlock()
+		return err
+	} else if encryptedToken(s.Auth) {
+		m.mu.Unlock()
+		return ErrLoginRequired
+	}
+	task := m.flight
+	if task == nil && !force && !m.isExpired() {
+		m.mu.Unlock()
+		return nil
+	}
+	if task == nil {
+		sharedCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		task = &refreshTask{done: make(chan struct{}), cancel: cancel}
+		m.flight = task
+		leave := statebackup.Enter()
+		go func() {
+			defer leave()
+			defer cancel()
+			err := m.refreshContext(sharedCtx)
+			m.mu.Lock()
+			task.err = err
+			m.flight = nil
+			close(task.done)
+			m.mu.Unlock()
+		}()
+	}
+	m.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-task.done:
+		if err := ctx.Err(); err != nil {
+			return err
 		}
+		return task.err
 	}
-	s, err := m.session()
-	if err != nil {
-		return nil, err
-	}
-	return profiles.CredentialHeaders(s.Auth, profiles.Account(s.Account)), nil
 }
 
-// GetChatHeaders returns chat-path headers: credential identity plus the
-// per-request X-Request-ID / X-Conversation-Message-ID /
-// X-Conversation-Request-ID triple (shared value, see profiles.ChatHeaders).
+func (m *Manager) GetHeaders() (map[string]string, error) {
+	return m.GetHeadersContext(context.Background())
+}
+func (m *Manager) GetHeadersContext(ctx context.Context) (map[string]string, error) {
+	return m.headersContext(ctx, false)
+}
 func (m *Manager) GetChatHeaders() (map[string]string, error) {
+	return m.GetChatHeadersContext(context.Background())
+}
+func (m *Manager) GetChatHeadersContext(ctx context.Context) (map[string]string, error) {
+	return m.headersContext(ctx, true)
+}
+func (m *Manager) headersContext(ctx context.Context, chat bool) (map[string]string, error) {
+	if err := m.ensureFresh(ctx, false); err != nil {
+		return nil, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if s, err := m.session(); err == nil && encryptedToken(s.Auth) {
-		return nil, errors.New("该账号 token 被 CodeBuddy 加密存储（$wbEncrypted），无法直接读取；请在 WebUI 重新扫码登录导入该账号")
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	if m.isExpired() {
-		if err := m.refresh(); err != nil {
-			return nil, err
-		}
+	if m.retired {
+		return nil, errors.New("账号已移除")
 	}
 	s, err := m.session()
 	if err != nil {
 		return nil, err
 	}
-	return profiles.ChatHeaders(s.Auth, profiles.Account(s.Account)), nil
+	if encryptedToken(s.Auth) {
+		return nil, ErrLoginRequired
+	}
+	if chat {
+		return profiles.ChatHeaders(s.Auth, profiles.Account(s.Account)), nil
+	}
+	return profiles.CredentialHeaders(s.Auth, profiles.Account(s.Account)), nil
 }
 
 // CatalogHeaders returns model-catalog request headers.
@@ -350,9 +470,7 @@ func (m *Manager) Keepalive() bool {
 }
 
 func (m *Manager) KeepaliveContext(ctx context.Context) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.refreshContext(ctx) == nil
+	return m.ensureFresh(ctx, true) == nil
 }
 
 // RawSession returns the full auth file content.
@@ -387,21 +505,6 @@ func empty(v any) bool {
 	default:
 		return false
 	}
-}
-
-func readAll(r interface{ Read([]byte) (int, error) }) []byte {
-	buf := make([]byte, 0, 4096)
-	tmp := make([]byte, 4096)
-	for {
-		n, err := r.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-		}
-		if err != nil {
-			break
-		}
-	}
-	return buf
 }
 
 func itoa(n int) string {

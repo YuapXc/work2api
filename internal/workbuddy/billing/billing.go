@@ -59,8 +59,16 @@ const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
 // running intl proxy would otherwise break domestic billing calls.
 var httpClient = httpclient.New(20 * time.Second)
 
-func billingHeaders(mgr Credential) (map[string]string, error) {
-	h, err := mgr.GetHeaders()
+func billingHeaders(ctx context.Context, mgr Credential) (map[string]string, error) {
+	var h map[string]string
+	var err error
+	if contextual, ok := mgr.(interface {
+		GetHeadersContext(context.Context) (map[string]string, error)
+	}); ok {
+		h, err = contextual.GetHeadersContext(ctx)
+	} else {
+		h, err = mgr.GetHeaders()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +89,7 @@ func postJSON(ctx context.Context, mgr Credential, url string, body map[string]a
 }
 
 func postJSONStatus(ctx context.Context, mgr Credential, url string, body map[string]any) (map[string]any, int, error) {
-	headers, err := billingHeaders(mgr)
+	headers, err := billingHeaders(ctx, mgr)
 	if err != nil {
 		return nil, 0, err
 	}

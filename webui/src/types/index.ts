@@ -34,7 +34,7 @@ export interface AccountInfo {
 }
 
 export interface Settings {
-	portal_public_url?: string
+  portal_public_url?: string
   portal_disabled_models?: string
   checkin_hours: string
   credit_refresh_min: string
@@ -204,6 +204,17 @@ export interface UsagePoint {
 }
 
 export interface UsageDiagnostics {
+  performance?: {
+    request_id: string
+    queue_ms: number
+    account_wait_ms: number
+    total_ms: number
+    first_byte_ms?: number
+    execution_ms?: number
+    attempts: number
+    upstream_429: number
+    attempt_stages?: { number: number; header_wait_ms: number; http_status: number; headers_finished: boolean }[]
+  }
   finish_reason?: string
   requested_output_limits?: Record<string, number>
   effective_output_limits?: Record<string, number>

@@ -99,6 +99,9 @@ func TestCompleteBackupRestoresDatabaseAndSecrets(t *testing.T) {
 	if !errors.Is(err, errBackupBusy) {
 		t.Fatal("active calls should defer capture", err)
 	}
+	if err := os.WriteFile(filepath.Join(o.cfg.DataDir, ".instance.lock"), []byte("process-only"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	if err := o.runBackup(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -137,6 +140,9 @@ func TestCompleteBackupRestoresDatabaseAndSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, expected := range manifest.Files {
+		if strings.HasSuffix(name, ".instance.lock") {
+			t.Fatal("process lock entered backup", name)
+		}
 		actual := sha256.Sum256(contents[name])
 		if hex.EncodeToString(actual[:]) != expected {
 			t.Fatal("member checksum", name)

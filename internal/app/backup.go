@@ -260,6 +260,9 @@ func (o *Orchestrator) runBackup(ctx context.Context) (err error) {
 			if path == dbPath || path == dbPath+"-wal" || path == dbPath+"-shm" {
 				return nil
 			}
+			if !d.IsDir() && (strings.HasSuffix(d.Name(), ".instance.lock") || d.Name() == ".instance.json") {
+				return nil // Process ownership is not restorable application data.
+			}
 			if d.Type()&os.ModeSymlink != 0 {
 				return fmt.Errorf("snapshot source contains a symlink: %s", path)
 			}

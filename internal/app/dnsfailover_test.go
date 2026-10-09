@@ -11,10 +11,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 	"work2api/internal/config"
 	"work2api/internal/store"
+	"work2api/internal/streamwatch"
 	"work2api/internal/workbuddy/adapters"
 	"work2api/internal/workbuddy/credentials"
 	"work2api/internal/workbuddy/models"
@@ -78,6 +80,8 @@ func TestOpenUpstreamFailureAccounting(t *testing.T) {
 		{"wrapped dns", fmt.Errorf("dial: %w", dnsErr), false, false},
 		{"dns timeout", &net.DNSError{Err: "timeout", Name: "upstream.invalid", IsTimeout: true}, false, false},
 		{"connection reset", errors.New("connection reset"), false, true},
+		{"local route unavailable", fmt.Errorf("dial: %w", syscall.ENETUNREACH), false, false},
+		{"local route lost during stream", fmt.Errorf("read: %w", syscall.ENETDOWN), true, false},
 		{"upstream 429", &upstream.UpstreamError{StatusCode: 429, Raw: []byte(`{"error":{"message":"rate limited"}}`)}, false, true},
 		{"canceled", context.Canceled, false, false},
 		{"stream interrupted", errors.New("connection reset"), true, true},
@@ -100,6 +104,52 @@ func TestOpenUpstreamFailureAccounting(t *testing.T) {
 				t.Fatalf("unexpected account penalty: cooldown=%v failures=%d", got.CooldownUntil, got.FailureCount)
 			}
 		})
+	}
+}
+
+func TestUsageTimingFinalizedAfterResponseAndRetainedAfterRestart(t *testing.T) {
+	o, _ := newDNSFailoverOrch(t, &failingUpstream{})
+	path := filepath.Join(t.TempDir(), "timings.db")
+	db, err := store.New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	o.db = db
+	s := NewServer(o)
+	h := s.observeCalls(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		streamwatch.QueueWait(r.Context(), 10*time.Millisecond, false)
+		streamwatch.QueueWait(r.Context(), 5*time.Millisecond, true)
+		streamwatch.StartAttempt(r.Context())
+		streamwatch.AttemptHeaders(r.Context(), 200)
+		for i := 0; i < 2; i++ {
+			o.logUsage(logArgs{ctx: r.Context(), t0: time.Now(), status: "ok", model: "test", protocol: "chat"})
+		}
+		_, _ = w.Write([]byte("complete")) // Usage was inserted before the first write.
+	}))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/v1/chat/completions", nil))
+	rows, err := o.db.UsageRecent(10, "", "", nil, "", true, 0, "")
+	if err != nil || len(rows) != 2 {
+		t.Fatal(rows, err)
+	}
+	for _, row := range rows {
+		p := row["diagnostics"].(store.UsageDiagnostics).Performance
+		if p == nil || p.RequestID == "" || p.FirstByteMS == nil || p.ExecutionMS == nil || p.QueueMS != 10 || p.AccountWaitMS != 5 || p.Attempts != 1 || len(p.Stages) != 1 {
+			t.Fatal(p)
+		}
+	}
+	// Reopen the exact database to prove this is not the in-memory ring.
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	rows, err = reopened.UsageRecent(10, "", "", nil, "", true, 0, "")
+	if err != nil || len(rows) != 2 || rows[0]["diagnostics"].(store.UsageDiagnostics).Performance == nil {
+		t.Fatal(rows, err)
 	}
 }
 
@@ -503,5 +553,134 @@ func TestRegionBiasPreservesExistingInternationalSession(t *testing.T) {
 	selected, e := o.pickAccount("test-model", "existing-session")
 	if e != nil || selected == nil || selected.UID != "international" {
 		t.Fatal("healthy sticky international session replaced", selected, e)
+	}
+}
+
+// This uses the real upstream HTTP parser, rather than only testing a converter.
+func TestWorkBuddyResponseIntegrity(t *testing.T) {
+	tool := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\""}}]}}]}`
+	tail := `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":null,"function":{"name":null,"arguments":"ok\"}"}}]},"finish_reason":"tool_calls"}]}`
+	content := `{"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`
+	reason := `{"choices":[{"index":0,"delta":{"reasoning_content":"thinking"},"finish_reason":"stop"}]}`
+	cases := []struct {
+		name, wire, mime string
+		bad              bool
+	}{
+		{"complete tools", "data: " + tool + "\n\ndata: " + tail + "\n\ndata: [DONE]\n\n", "text/event-stream", false},
+		{"missing tool finish compatibility", "data: " + strings.Replace(tool, `{\"q\":\"`, `{}`, 1) + "\n\ndata: [DONE]\n\n", "text/event-stream", false},
+		{"truncated tools", "data: " + tool + "\n\ndata: [DONE]\n\n", "text/event-stream", true},
+		{"bad tool finish", "data: " + tool + "\n\ndata: " + strings.Replace(tail, "tool_calls\"}]}", "stop\"}]}", 1) + "\n\ndata: [DONE]\n\n", "text/event-stream", true},
+		{"changed id", "data: " + tool + "\n\ndata: " + strings.Replace(tail, `"id":null`, `"id":"call-2"`, 1) + "\n\ndata: [DONE]\n\n", "text/event-stream", true},
+		{"real truncation", "data: " + tool + "\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n", "text/event-stream", false},
+		{"reasoning only SSE", "data: " + reason + "\n\ndata: [DONE]\n\n", "text/event-stream", false},
+		{"reasoning only JSON", reason, "application/json", false},
+		{"JSON message tools", `{"choices":[{"message":{"tool_calls":[{"id":"call-json","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`, "application/json", false},
+		{"empty JSON tool call", `{"choices":[{"message":{"tool_calls":[{"id":"call-json","function":{"name":"lookup","arguments":""}}]}}]}`, "application/json", true},
+		{"terminal usage", "data: " + content + "\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":3}}}\n\ndata: [DONE]\n\n", "text/event-stream", false},
+		{"complete finish EOF", "data: " + content, "text/event-stream", false},
+		{"UTF-8 BOM SSE", "\ufeffdata: " + content + "\r\n\r\ndata: [DONE]\r\n\r\n", "text/event-stream", false},
+		{"DONE without finish", `data: {"choices":[{"delta":{"content":"partial"}}]}` + "\n\ndata: [DONE]\n\n", "text/event-stream", true},
+		{"multi-line CR events", "data: {\rdata: \"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\r\rdata: [DONE]\r\r", "text/event-stream", false},
+		{"output after finish", "data: " + content + "\n\ndata: " + content + "\n\ndata: [DONE]\n\n", "text/event-stream", true},
+		{"fractional index", "data: " + strings.Replace(content, `"index":0`, `"index":0.5`, 1) + "\n\ndata: [DONE]\n\n", "text/event-stream", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tc.mime)
+				_, _ = w.Write([]byte(tc.wire))
+			}))
+			defer srv.Close()
+			var lines []string
+			err := upstream.Shared().StreamUpstream(context.Background(), nil, map[string]any{}, srv.URL, func(line string) error { lines = append(lines, line); return nil })
+			if (err != nil) != tc.bad {
+				t.Fatalf("bad=%v err=%v lines=%v", tc.bad, err, lines)
+			}
+			if tc.bad {
+				for _, line := range lines {
+					if strings.Contains(line, `"finish_reason"`) || strings.Contains(line, "[DONE]") {
+						t.Fatal("invalid response published successful terminal", line)
+					}
+				}
+			}
+			if !tc.bad && (len(lines) == 0 || lines[len(lines)-1] != "data: [DONE]") {
+				t.Fatal("missing DONE", lines)
+			}
+			if tc.name == "terminal usage" && !strings.Contains(strings.Join(lines, "\n"), `"cached_tokens":3`) {
+				t.Fatal("terminal cache usage lost", lines)
+			}
+		})
+	}
+}
+
+type preambleFailureUpstream struct {
+	calls   int
+	content bool
+}
+
+func (f *preambleFailureUpstream) StreamUpstream(_ context.Context, _ map[string]string, _ map[string]any, _ string, yield upstream.LineFunc) error {
+	f.calls++
+	if err := yield(`data: {"choices":[{"delta":{"role":"assistant","function_call":{"name":"","arguments":""}}}]}`); err != nil {
+		return err
+	}
+	if f.calls == 1 {
+		if f.content {
+			if err := yield(`data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}`); err != nil {
+				return err
+			}
+		}
+		return &upstream.UpstreamError{StatusCode: 503, Raw: []byte(`{"error":{"message":"temporary"}}`)}
+	}
+	if err := yield(`data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`); err != nil {
+		return err
+	}
+	return yield("data: [DONE]")
+}
+func TestWorkBuddyPreambleFailover(t *testing.T) {
+	for _, content := range []bool{false, true} {
+		t.Run(fmt.Sprint(content), func(t *testing.T) {
+			o, first := newDNSFailoverOrch(t, &failingUpstream{})
+			mgr := o.managers[first.UID]
+			o.pool = pool.New(map[string]pool.Credential{first.UID: mgr, "alternate": mgr}, "")
+			first = o.pool.Get(first.UID)
+			o.managers["alternate"] = mgr
+			o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: catalogTransport{}})
+			o.models.Refresh()
+			client := &preambleFailureUpstream{content: content}
+			o.upstreamClient = client
+			var lines []string
+			_, err := o.openUpstream(context.Background(), first, map[string]any{"model": "test-model"}, "test-model", "", func(line string) error { lines = append(lines, line); return nil }, nil)
+			if content {
+				if err == nil || client.calls != 1 {
+					t.Fatal("replayed thinking", client.calls, err)
+				}
+			} else {
+				if err != nil || client.calls != 2 || len(lines) != 3 {
+					t.Fatal("preamble blocked fallback or leaked", client.calls, err, lines)
+				}
+			}
+		})
+	}
+}
+func TestWorkBuddySSEMetadataRetention(t *testing.T) {
+	role := false
+	first := sanitizeChatSSEWithRole(`data: {"choices":[{"delta":{"role":"assistant"}}]}`, &role)
+	if first == "" {
+		t.Fatal("first role lost")
+	}
+	if got := sanitizeChatSSEWithRole(`data: {"choices":[{"delta":{"role":"assistant","function_call":{"name":"","arguments":""}}}]}`, &role); got != "" {
+		t.Fatal("duplicate dummy preamble retained", got)
+	}
+	got := sanitizeChatSSEWithRole(`data: {"choices":[{"delta":{"content":"","tool_calls":[]}}],"usage":{"prompt_tokens":7}}`, &role)
+	if !strings.Contains(got, `"prompt_tokens":7`) || !strings.Contains(got, `"choices":[]`) {
+		t.Fatal("usage dropped", got)
+	}
+	if err := upstream.ValidateChoiceCount(map[string]any{"n": 1.5}); err == nil {
+		t.Fatal("fractional n accepted")
+	}
+	for _, body := range []map[string]any{{}, {"n": 1}, {"n": float64(1)}} {
+		if err := upstream.ValidateChoiceCount(body); err != nil {
+			t.Fatal("normal choice count rejected", err)
+		}
 	}
 }

@@ -28,6 +28,9 @@ func diagnosticErrorKind(ctx context.Context, err error) string {
 	if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 		return "cancelled"
 	}
+	if isLocalNetworkFailure(err) {
+		return "local_network"
+	}
 	if ue, ok := err.(*upstream.UpstreamError); ok {
 		return string(classifyUpstream(ue.StatusCode, ue.Raw, ue.Header))
 	}

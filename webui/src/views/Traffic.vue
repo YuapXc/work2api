@@ -372,7 +372,16 @@ onMounted(() => loadTab(tab.value))
           <div>客户端输出预算：{{ budgetLabel(detail.diagnostics.requested_output_limits) }}</div>
           <div>实际发送预算：{{ budgetLabel(detail.diagnostics.effective_output_limits) }}</div>
           <div>输入处理：{{ compatibilityLabel(detail.diagnostics.compatibility) }}</div>
-          <div v-if="detail.diagnostics.error_kind">故障分类：{{ detail.diagnostics.error_kind }}</div>
+          <div v-if="detail.diagnostics.error_kind">故障分类：{{ detail.diagnostics.error_kind === 'local_network' ? '本地网络或 DNS 不可达（未处罚账号）' : detail.diagnostics.error_kind }}</div>
+      <div v-if="detail.diagnostics.performance" class="border-t border-line pt-2 space-y-1">
+        <div class="mono break-all">请求标识：{{ detail.diagnostics.performance.request_id }}</div>
+      <div>整次请求：{{ detail.diagnostics.performance.total_ms }} ms · 上游尝试 {{ detail.diagnostics.performance.attempts }} 次</div>
+      <div>排队 / 账号等待：{{ detail.diagnostics.performance.queue_ms }} / {{ detail.diagnostics.performance.account_wait_ms }} ms</div>
+      <div>首响应：{{ detail.diagnostics.performance.first_byte_ms == null ? '未写出响应' : detail.diagnostics.performance.first_byte_ms + ' ms' }} · 执行：{{ detail.diagnostics.performance.execution_ms == null ? '未发起调用' : detail.diagnostics.performance.execution_ms + ' ms' }}</div>
+      <div v-for="stage in detail.diagnostics.performance.attempt_stages" :key="stage.number">第 {{ stage.number }} 次：{{ stage.headers_finished ? '响应头等待 ' + stage.header_wait_ms + ' ms · 状态 ' + (stage.http_status || '未收到 HTTP 响应') : '未收到响应头' }}</div>
+      <div class="text-micro text-faint">首响应为网关首字节，非模型首个 token。重试记录共享整次请求计时。</div>
+        <div v-if="detail.diagnostics.performance.attempts > (detail.diagnostics.performance.attempt_stages?.length || 0)" class="text-micro text-faint">仅保留前 16 次尝试的阶段记录。</div>
+      </div>
           <div v-if="detail.status === 'incomplete'" class="text-warn">{{ completionLabel(detail) }}</div>
         </div>
         <div v-if="detail.error" class="rounded-lg border border-fault/40 bg-fault/5 p-3">

@@ -120,13 +120,16 @@ func TestUsageDiagnosticsMigrationAndRoundTrip(t *testing.T) {
 	if err = db.LogUsage(UsageParams{Model: "new", Status: "incomplete", Diagnostics: facts}); err != nil {
 		t.Fatal(err)
 	}
+	if err = db.UpdateUsagePerformance([]int64{2}, UsagePerformance{RequestID: "test-request", Attempts: 1, QueueMS: 7}); err != nil {
+		t.Fatal(err)
+	}
 	for _, light := range []bool{true, false} {
 		rows, err := db.UsageRecent(10, "", "", nil, "", light, 0, "")
 		if err != nil || len(rows) != 2 {
 			t.Fatal(rows, err)
 		}
 		value, ok := rows[0]["diagnostics"].(UsageDiagnostics)
-		if !ok || value.FinishReason != "length" || value.EffectiveLimits["max_tokens"] != 1000 || rows[1]["diagnostics"] != nil {
+		if !ok || value.FinishReason != "length" || value.EffectiveLimits["max_tokens"] != 1000 || value.Performance == nil || value.Performance.QueueMS != 7 || rows[1]["diagnostics"] != nil {
 			t.Fatal(rows)
 		}
 	}

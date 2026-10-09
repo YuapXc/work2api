@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"syscall"
 	"testing"
 )
 
@@ -28,6 +29,22 @@ func TestIsLocalDNSFailure(t *testing.T) {
 	for _, tc := range cases {
 		if got := isLocalDNSFailure(tc.err); got != tc.want {
 			t.Errorf("%s: got %v want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestLocalNetworkClassificationDoesNotGuess(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{&url.Error{Op: "Post", Err: &net.OpError{Op: "dial", Err: syscall.ENETUNREACH}}, true},
+		{syscall.EHOSTUNREACH, true}, {syscall.EADDRNOTAVAIL, true},
+		{syscall.ECONNREFUSED, false}, {syscall.ECONNRESET, false}, {syscall.ETIMEDOUT, false},
+		{errors.New("network is unreachable"), false}, {errors.New("proxyconnect tcp: 502"), false},
+	} {
+		if got := isLocalNetworkFailure(tc.err); got != tc.want {
+			t.Fatalf("%v: got %v want %v", tc.err, got, tc.want)
 		}
 	}
 }

@@ -12,6 +12,8 @@
 /.gobuildtmp/
 *.exe
 *.test
+*.instance.lock
+.instance.json
 *.out
 
 # 本地环境变量（可能含 ADMIN_TOKEN 等，敏感）；.env.example 模板照常提交

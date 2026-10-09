@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"math"
@@ -182,6 +183,8 @@ func (s *Server) observeCalls(next http.Handler) http.Handler {
 			return
 		}
 		ctx, t := streamwatch.WithTiming(r.Context())
+		rows := &usageTimingRows{}
+		ctx = context.WithValue(ctx, usageTimingKey{}, rows)
 		r = r.WithContext(ctx)
 		var id [16]byte
 		if _, err := rand.Read(id[:]); err == nil {
@@ -193,7 +196,9 @@ func (s *Server) observeCalls(next http.Handler) http.Handler {
 			if r.Context().Err() != nil {
 				streamwatch.Outcome(ctx, "error")
 			}
-			s.calls.record(t.Snapshot(), writer.status)
+			snapshot := t.Snapshot()
+			s.calls.record(snapshot, writer.status)
+			s.persistUsageTiming(rows, snapshot)
 		}()
 		next.ServeHTTP(writer, r)
 	})

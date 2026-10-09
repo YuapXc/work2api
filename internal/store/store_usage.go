@@ -110,16 +110,22 @@ type UsageParams struct {
 
 // UsageDiagnostics contains protocol facts only, never prompts or credentials.
 type UsageDiagnostics struct {
-	FinishReason    string         `json:"finish_reason,omitempty"`
-	RequestedLimits map[string]int `json:"requested_output_limits,omitempty"`
-	EffectiveLimits map[string]int `json:"effective_output_limits,omitempty"`
-	Compatibility   string         `json:"compatibility,omitempty"`
-	ErrorKind       string         `json:"error_kind,omitempty"`
-	Started         bool           `json:"upstream_started"`
+	FinishReason    string            `json:"finish_reason,omitempty"`
+	RequestedLimits map[string]int    `json:"requested_output_limits,omitempty"`
+	EffectiveLimits map[string]int    `json:"effective_output_limits,omitempty"`
+	Compatibility   string            `json:"compatibility,omitempty"`
+	ErrorKind       string            `json:"error_kind,omitempty"`
+	Started         bool              `json:"upstream_started"`
+	Performance     *UsagePerformance `json:"performance,omitempty"`
 }
 
 // LogUsage inserts one usage record.
 func (d *DB) LogUsage(p UsageParams) error {
+	_, err := d.LogUsageWithID(p)
+	return err
+}
+
+func (d *DB) LogUsageWithID(p UsageParams) (int64, error) {
 	if p.Status == "" {
 		p.Status = "ok"
 	}
@@ -141,7 +147,7 @@ func (d *DB) LogUsage(p UsageParams) error {
 	if p.Diagnostics != nil {
 		raw, err := json.Marshal(p.Diagnostics)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		diagnostics = string(raw)
 	}
@@ -150,7 +156,7 @@ func (d *DB) LogUsage(p UsageParams) error {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	_, err := d.db.Exec(
+	result, err := d.db.Exec(
 		`INSERT INTO usage_logs (ts, model, protocol, account_uid, input_tokens, output_tokens,
 		   total_tokens, latency_ms, status, error, input_content, output_content,
 		   reasoning_content, credits, app_name, user_id, reasoning_effort, tokens_known, cached_tokens, app_id, diagnostics)
@@ -158,7 +164,10 @@ func (d *DB) LogUsage(p UsageParams) error {
 		float64(time.Now().UnixNano())/1e9, p.Model, p.Protocol, p.AccountUID,
 		p.InputTokens, p.OutputTokens, total, p.LatencyMs, p.Status, p.Error,
 		p.InputContent, p.OutputContent, p.ReasoningContent, credits, p.AppName, userID, effort, p.TokensKnown, cached, nullableID(p.AppID), diagnostics)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
 }
 
 // UsageRowCount returns the exact usage_logs row count (O(n); avoid on hot path).

@@ -75,7 +75,7 @@ func (o *Orchestrator) logUsage(a logArgs) {
 	if effort == "" {
 		effort = "default"
 	}
-	_ = o.db.LogUsage(store.UsageParams{
+	rowID, logErr := o.db.LogUsageWithID(store.UsageParams{
 		Diagnostics:      usageDiagnostics(a.ctx),
 		Model:            a.model,
 		Protocol:         a.protocol,
@@ -96,6 +96,9 @@ func (o *Orchestrator) logUsage(a logArgs) {
 		AppID:            a.appID,
 		ReasoningEffort:  effort,
 	})
+	if logErr == nil {
+		trackUsageTiming(a.ctx, rowID)
+	}
 }
 
 // clipContent 把落库的 content 截到 max 字节（0=不截），主要挡 base64 图片这类
@@ -241,7 +244,9 @@ func deltaParts(line string) (string, string, string) {
 
 // sanitizeChatSSE strips empty delta fields from a passthrough Chat SSE line.
 // Returns "" if the whole line should be dropped.
-func sanitizeChatSSE(line string) string {
+func sanitizeChatSSE(line string) string { return sanitizeChatSSEWithRole(line, nil) }
+
+func sanitizeChatSSEWithRole(line string, sentRole *bool) string {
 	if !strings.HasPrefix(line, "data:") {
 		return line
 	}
@@ -265,6 +270,18 @@ func sanitizeChatSSE(line string) string {
 			continue
 		}
 		if delta, ok := choice["delta"].(map[string]any); ok {
+			if sentRole != nil {
+				if role, ok := delta["role"].(string); ok && role != "" {
+					if *sentRole {
+						delete(delta, "role")
+					} else {
+						*sentRole = true
+					}
+				}
+			}
+			if fn, ok := delta["function_call"].(map[string]any); ok && len(fn) <= 2 && isEmptyVal(fn["name"]) && isEmptyVal(fn["arguments"]) {
+				delete(delta, "function_call")
+			}
 			for _, k := range []string{"content", "reasoning_content", "refusal", "function_call", "tool_calls", "reasoning"} {
 				if v, has := delta[k]; has && isEmptyVal(v) {
 					delete(delta, k)
@@ -280,8 +297,11 @@ func sanitizeChatSSE(line string) string {
 		}
 		kept = append(kept, choice)
 	}
-	if len(kept) == 0 {
+	if len(kept) == 0 && chunk["usage"] == nil {
 		return ""
+	}
+	if kept == nil {
+		kept = []any{}
 	}
 	chunk["choices"] = kept
 	b, _ := json.Marshal(chunk)
