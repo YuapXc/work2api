@@ -8,6 +8,7 @@ import WToaster from '../src/components/ui/WToaster.vue'
 import WButton from '../src/components/ui/WButton.vue'
 import WInput from '../src/components/ui/WInput.vue'
 import WLed from '../src/components/ui/WLed.vue'
+import PasswordChangeForm from '../src/components/PasswordChangeForm.vue'
 import { toast } from '../src/lib/toast'
 
 const route = useRoute()
@@ -184,7 +185,7 @@ onUnmounted(() => { disposed = true; window.removeEventListener('focus', refresh
           <span class="mono font-semibold tracking-tight">work2api</span>
           <span class="text-micro text-faint">门户</span>
         </div>
-        <nav class="ml-4 hidden gap-1 md:flex">
+        <nav v-if="!me.user.must_change_password" class="ml-4 hidden gap-1 md:flex">
           <button
             v-for="item in nav" :key="item.key"
             class="rounded-lg px-3 py-1.5 text-small font-medium transition-colors"
@@ -203,7 +204,7 @@ onUnmounted(() => { disposed = true; window.removeEventListener('focus', refresh
         </div>
       </div>
       <!-- 移动端导航 -->
-      <nav class="flex gap-1 overflow-x-auto border-t border-line px-3 py-2 md:hidden">
+      <nav v-if="!me.user.must_change_password" class="flex gap-1 overflow-x-auto border-t border-line px-3 py-2 md:hidden">
         <button
           v-for="item in nav" :key="item.key"
           class="whitespace-nowrap rounded-lg px-3 py-1.5 text-small font-medium transition-colors"
@@ -212,7 +213,7 @@ onUnmounted(() => { disposed = true; window.removeEventListener('focus', refresh
         >{{ item.label }}</button>
       </nav>
     </header>
-    <main class="mx-auto w-full max-w-4xl flex-1 px-4 py-6"><p v-if="connectionError" class="mb-4 text-micro text-fault">{{ connectionError }} <button class="text-brand hover:underline" @click="probe">重试连接</button></p><router-view :me="me" @refresh="probe" /></main>
+    <main class="mx-auto w-full max-w-4xl flex-1 px-4 py-6"><p v-if="connectionError" class="mb-4 text-micro text-fault">{{ connectionError }} <button class="text-brand hover:underline" @click="probe">重试连接</button></p><section v-if="me.user.must_change_password" class="glass mx-auto max-w-md rounded-xl p-6 space-y-4"><h1 class="font-semibold">设置个人密码</h1><PasswordChangeForm :change="api.changePassword" forced @done="probe" /></section><router-view v-else :me="me" @refresh="probe" /></main>
   </div>
 
   <WToaster />

@@ -111,7 +111,7 @@ func Login(db *store.DB, username, password string) (*store.User, string, error)
 		return nil, "", err
 	}
 	expires := float64(nowUnix() + SessionTTL)
-	if err := db.CreateUserSessionForPassword(HashToken(token), user.ID, expires, user.PasswordHash); err != nil {
+	if err := db.CreateUserSessionForPassword(HashToken(token), user.ID, expires, user.PasswordHash, user.AuthVersion); err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			return nil, "", ErrBadCredentials
 		}
@@ -156,6 +156,9 @@ func ChangePassword(db *store.DB, userID int64, oldPassword, newPassword string)
 	}
 	if !VerifyPassword(user.PasswordHash, oldPassword) {
 		return ErrBadCredentials
+	}
+	if oldPassword == newPassword {
+		return errors.New("新密码必须与当前密码不同")
 	}
 	hash, err := HashPassword(newPassword)
 	if err != nil {

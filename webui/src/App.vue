@@ -9,6 +9,9 @@ import WInput from '@/components/ui/WInput.vue'
 import WLed from '@/components/ui/WLed.vue'
 import WToaster from '@/components/ui/WToaster.vue'
 import WConfirm from '@/components/ui/WConfirm.vue'
+import WModal from '@/components/ui/WModal.vue'
+import PasswordChangeForm from '@/components/PasswordChangeForm.vue'
+import type { AdminIdentity } from '@/api/portal'
 
 const route = useRoute()
 const router = useRouter()
@@ -50,29 +53,45 @@ const adminUsername = ref('')
 const adminPassword = ref('')
 const passwordEnabled = ref(false)
 const authError = ref('')
+const identity = ref<AdminIdentity | null>(null)
+const passwordModal = ref(false)
+let authEpoch = 0
+async function loadIdentity(epoch = authEpoch) {
+  const result = await api.adminIdentity()
+  if (epoch === authEpoch) identity.value = result.identity
+}
+function clearAuth() {
+  authEpoch++; authOk.value = false; identity.value = null; passwordModal.value = false
+  healthy.value = total.value = null
+}
+function passwordChanged() { clearAuth(); toast.success('密码已修改，请重新登录') }
 
 async function checkAuth() {
+  const epoch = ++authEpoch
   authChecking.value = true
   authError.value = ''
   try {
     // 空 body 的 POST /admin/login 即会话探测：后端校验 cookie/头部，不消耗限速。
     const res = await fetch('/admin/login', { method: 'POST', body: '{}' })
     const state = await res.json().catch(() => ({}))
+    if (epoch !== authEpoch) return
     passwordEnabled.value = !!state.password_enabled
     loginMode.value = passwordEnabled.value ? 'password' : 'token'
     authOk.value = res.ok
-    if (authOk.value) void refreshHealth()
+    if (authOk.value) { await loadIdentity(epoch); if (epoch === authEpoch) void refreshHealth() }
   } catch {
+    if (epoch !== authEpoch) return
     authOk.value = false
     authError.value = '网络异常，请稍后重试'
-  }
-  authChecking.value = false
+  } finally { authChecking.value = false }
 }
 
 async function onLogin() {
+  if (authLoading.value) return
   const t = tokenInput.value.trim()
   if (loginMode.value === 'token' ? !t : !adminUsername.value.trim() || !adminPassword.value) return toast.error('请填写登录信息')
   authLoading.value = true
+  const epoch = ++authEpoch
   authError.value = ''
   try {
     const res = await fetch('/admin/login', {
@@ -81,7 +100,10 @@ async function onLogin() {
       body: JSON.stringify(loginMode.value === 'token' ? { token: t } : { username: adminUsername.value.trim(), password: adminPassword.value }),
     })
     const data = await res.json().catch(() => ({}))
+    if (epoch !== authEpoch) return
     if (res.ok) {
+      await loadIdentity(epoch)
+      if (epoch !== authEpoch) return
       authOk.value = true
       tokenInput.value = ''
       adminPassword.value = ''
@@ -92,6 +114,7 @@ async function onLogin() {
       toast.error(authError.value)
     }
   } catch {
+    if (epoch !== authEpoch) return
     authError.value = '网络异常，请稍后重试'
     toast.error(authError.value)
   } finally {
@@ -104,7 +127,7 @@ async function logout() {
     const response = await fetch('/admin/logout', { method: 'POST' })
     if (!response.ok) throw new Error('退出登录失败，请重试')
     localStorage.removeItem('workbuddy_admin_token')
-    authOk.value = false
+    clearAuth()
     toast.success('已退出登录')
   } catch (e: any) { toast.error(e?.message || '退出登录失败，请检查连接') }
 }
@@ -116,19 +139,21 @@ let timer: ReturnType<typeof setInterval> | null = null
 const healthRefreshFailed = ref(false)
 let healthRefreshing = false
 async function refreshHealth() {
-  if (!authOk.value) return
+  if (!authOk.value || identity.value?.must_change_password) return
   if (healthRefreshing) return
   healthRefreshing = true
+  const epoch = authEpoch
   try {
     const data = await api.health()
+    if (epoch !== authEpoch || !authOk.value) return
     healthRefreshFailed.value = false
     healthy.value = data.available_providers ?? 0
     total.value = data.total_providers ?? 0
   } catch (err: any) {
+    if (epoch !== authEpoch || !authOk.value) return
     healthRefreshFailed.value = true
     if (err?.response?.status === 401 || err?.response?.status === 403) {
-      authOk.value = false
-      healthy.value = total.value = null
+      clearAuth()
     }
   } finally { healthRefreshing = false }
 }
@@ -162,9 +187,9 @@ onUnmounted(() => timer && clearInterval(timer))
       </p>
       <template v-if="loginMode === 'password'">
         <label class="mb-1.5 block text-small text-muted">管理员用户名</label>
-        <WInput v-model="adminUsername" placeholder="管理员用户名" class="mb-3" />
+        <WInput v-model="adminUsername" autocomplete="username" placeholder="管理员用户名" class="mb-3" />
         <label class="mb-1.5 block text-small text-muted">密码</label>
-        <WInput v-model="adminPassword" type="password" class="mb-3" @enter="onLogin" />
+        <WInput v-model="adminPassword" autocomplete="current-password" type="password" class="mb-3" @enter="onLogin" />
       </template>
       <template v-else>
         <label class="mb-1.5 block text-small text-muted">管理 Token</label>
@@ -176,6 +201,10 @@ onUnmounted(() => timer && clearInterval(timer))
         <WIcon name="keys" :size="16" /> 登录
       </WButton>
     </div>
+  </div>
+
+  <div v-else-if="identity?.must_change_password" class="flex min-h-screen items-center justify-center bg-bg p-4">
+    <section class="glass w-full max-w-md rounded-xl p-6 space-y-4"><h1 class="font-semibold">设置个人管理密码</h1><PasswordChangeForm :change="api.adminPassword" forced @done="passwordChanged" /><WButton @click="logout">退出</WButton></section>
   </div>
 
   <!-- 控制台外壳 -->
@@ -212,6 +241,7 @@ onUnmounted(() => timer && clearInterval(timer))
       </nav>
 
       <div class="space-y-3 border-t border-line px-4 py-4">
+        <WButton v-if="identity?.id" size="sm" block @click="passwordModal = true">{{ identity.username }} · 修改密码</WButton>
         <div class="flex items-center gap-2 text-micro text-muted">
           <WLed :tone="serving ? 'live' : healthy == null ? 'muted' : 'fault'" />
           <span>{{ gwText }}</span>
@@ -245,6 +275,7 @@ onUnmounted(() => timer && clearInterval(timer))
     </div>
   </div>
 
+  <WModal v-model:open="passwordModal" title="修改管理密码" size="sm"><PasswordChangeForm v-if="passwordModal" :change="api.adminPassword" @done="passwordChanged" /></WModal>
   <WToaster />
   <WConfirm />
 </template>

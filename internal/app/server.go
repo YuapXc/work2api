@@ -177,7 +177,7 @@ func (s *Server) requestGuard(next http.Handler) http.Handler {
 			if limit <= 0 {
 				limit = 16 * 1024 * 1024
 			}
-			if r.URL.Path == "/admin/login" || strings.HasPrefix(r.URL.Path, "/portal/api/") {
+			if r.URL.Path == "/admin/login" || strings.HasPrefix(r.URL.Path, "/portal/api/") || strings.HasPrefix(r.URL.Path, "/admin/identity") || strings.HasPrefix(r.URL.Path, "/admin/portal/users") || r.URL.Path == "/admin/portal/bootstrap" {
 				limit = 8 * 1024
 			}
 			if r.ContentLength > limit {
@@ -304,13 +304,18 @@ func (s *Server) adminGuard(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		sessionOK, headerOK := s.adminAuth(r)
+		identity, sessionOK, headerOK := s.resolveAdminIdentity(r)
 		if !sessionOK && !headerOK {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]any{
 				"message": "管理端会话无效或已过期，请重新登录（或携带 X-Admin-Token 请求头）。",
 				"type":    "unauthorized"}})
 			return
 		}
+		if identity.MustChangePassword && r.URL.Path != "/admin/identity" && r.URL.Path != "/admin/identity/password" {
+			writeAPIErr(w, errBody(403, "请先修改临时密码", "password_change_required"))
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), adminIdentityKey{}, identity))
 		// Header-authenticated scripts are exempt; ambient browser cookies must
 		// not authorize a sibling origin, even when it is considered same-site.
 		if sessionOK && !headerOK && !s.adminOriginAllowed(r, true) {

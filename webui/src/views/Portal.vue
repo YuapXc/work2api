@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { api } from '@/api/client'
-import type { PortalOverview, PortalGroup, PortalUser, PortalAccount, PortalInvite } from '@/api/portal'
+import type { PortalOverview, PortalGroup, PortalAccount, PortalInvite } from '@/api/portal'
 import { toast } from '@/lib/toast'
 import WButton from '@/components/ui/WButton.vue'
 import WInput from '@/components/ui/WInput.vue'
+import IdentityManager from '@/components/IdentityManager.vue'
 import { fmtTime } from '../../src-portal/api'
 
 const data = ref<PortalOverview>({ users: [], invites: [], groups: [], accounts: [], contributions: [], registration_mode: '' })
@@ -28,11 +29,9 @@ const sharingDrafts = ref<Record<string, { mode: string; groups: number[] }>>({}
 const models = ref<string[]>([])
 const modelNames = ref<Record<string, string>>({})
 const groupDrafts = ref<Record<number, string[]>>({})
-const passwords = ref<Record<number, string>>({})
 const accountDrafts = ref<Record<number, string>>({})
-const concurrencyDrafts = ref<Record<number, string>>({})
 const userDrafts = ref<Record<number, string>>({})
-const adminsExist = computed(() => data.value.users.some(u => u.role === 'admin'))
+const adminsExist = computed(() => data.value.users.some(u => ['admin', 'owner'].includes(u.role)))
 function parseModels(value: string[] | string): string[] {
   if (Array.isArray(value)) return value
   try { const parsed: unknown = JSON.parse(value || '[]'); return Array.isArray(parsed) ? parsed.filter((m): m is string => typeof m === 'string') : [] } catch { return [] }
@@ -74,7 +73,6 @@ async function load() {
     defaultAuto.value = !!data.value.default_auto_grant
     for (const a of data.value.accounts || []) sharingDrafts.value[a.uid] = { mode: a.sharing_mode || 'private', groups: data.value.groups.filter(g => accountsOf(g).includes(a.uid)).map(g => g.id) }
     for (const g of data.value.groups) groupDrafts.value[g.id] = parseModels(g.allowed_models).filter(isPublicModel)
-    for (const u of data.value.users) concurrencyDrafts.value[u.id] = String(Math.min(data.value.user_concurrency_overrides?.[String(u.id)] || 0, data.value.user_concurrency_max || 4))
     loaded.value = true
   } catch (e: any) { error.value = e?.response?.data?.error?.message || e?.message || '加载失败' }
   finally { loading.value = false }
@@ -89,13 +87,7 @@ async function mutate(action: () => Promise<unknown>, message: string) {
 }
 async function bootstrap() {
   if (!bootstrapName.value.trim() || !bootstrapPass.value) return toast.error('请填写管理员用户名和密码')
-  await mutate(async () => { await api.portalWrite('bootstrap', { username: bootstrapName.value.trim(), password: bootstrapPass.value }); bootstrapPass.value = '' }, '管理员账号已初始化')
-}
-async function resetPassword(u: PortalUser) {
-  const password = passwords.value[u.id]
-  if (!password) return toast.error('请填写新密码')
-  if (!confirm(`重置「${u.username}」的密码并撤销该用户全部会话？`)) return
-  await mutate(async () => { await api.portalWrite(`users/${u.id}/password`, { new_password: password }); passwords.value[u.id] = '' }, '密码已重置')
+  await mutate(async () => { await api.portalWrite('bootstrap', { username: bootstrapName.value.trim(), password: bootstrapPass.value }); bootstrapPass.value = ''; window.location.reload() }, '超级管理员账号已初始化')
 }
 async function removeGroup(g: PortalGroup) {
   if (!confirm(`删除分组「${g.name}」及其授权？`)) return
@@ -191,17 +183,10 @@ async function copyInvite(invite: PortalInvite, link = false) {
       </article>
     </section>
     <div v-if="loaded && !adminsExist" class="glass rounded-xl p-5 space-y-3">
-      <h2 class="font-semibold">初始化管理员账号</h2><p class="text-small text-faint">通过私有入口的管理 Token 登录后设置密码；Token 保留用于恢复管理访问。</p>
+      <h2 class="font-semibold">初始化超级管理员账号</h2><p class="text-small text-faint">通过私有入口的管理 Token 登录后设置密码；Token 保留用于恢复管理访问。</p>
       <WInput v-model="bootstrapName" placeholder="管理员用户名" /><WInput v-model="bootstrapPass" type="password" placeholder="8–72 字节密码" /><WButton variant="primary" :loading="busy" @click="bootstrap">初始化</WButton>
     </div>
-    <section class="glass rounded-xl p-5 space-y-3">
-      <h2 class="font-semibold">用户与密码恢复</h2><p class="text-micro text-faint">默认每用户同时执行 {{ data.user_concurrency || 4 }} 个请求；所有 Key 合并计算。可按用户调整，最多 {{ data.user_concurrency_max || 4 }}；共享、账号和全局上限仍生效。调整适用于后续请求。</p><p v-if="!data.users.length" class="text-small text-faint">暂无用户。</p>
-      <div v-for="u in data.users" :key="u.id" class="rounded-lg border border-line p-3 space-y-2">
-        <div class="flex items-center gap-2 text-small"><label :for="`concurrency-${u.id}`">执行并发</label><select :id="`concurrency-${u.id}`" v-model="concurrencyDrafts[u.id]" :disabled="busy" class="rounded-lg border border-line bg-bg p-2"><option value="0">默认</option><option v-for="n in (data.user_concurrency_max || 4)" :key="n" :value="String(n)">{{ n }}</option></select><WButton size="sm" :disabled="busy" @click="mutate(() => api.portalWrite(`users/${u.id}/concurrency`, { limit: Number(concurrencyDrafts[u.id]) }), '并发上限已更新')">保存并发</WButton></div>
-        <div class="flex flex-wrap items-center gap-3"><span>{{ u.username }} <span class="text-micro text-faint">#{{ u.id }} · {{ u.role }} · {{ u.status }}</span></span><WButton size="sm" :disabled="busy" @click="mutate(() => api.portalWrite(`users/${u.id}/status`, { status: u.status === 'active' ? 'disabled' : 'active' }), '用户状态已更新')">{{ u.status === 'active' ? '停用' : '启用' }}</WButton></div>
-        <div class="flex gap-2"><WInput v-model="passwords[u.id]" type="password" placeholder="新密码（8–72 字节）" /><WButton size="sm" :disabled="busy" @click="resetPassword(u)">重置密码并退出设备</WButton></div>
-      </div>
-    </section>
+    <IdentityManager v-if="loaded" :users="data.users" :max-concurrency="data.user_concurrency_max || 4" :overrides="data.user_concurrency_overrides" @refresh="load" />
     <section class="glass rounded-xl p-5 space-y-3">
       <h2 class="font-semibold">邀请码</h2><div class="flex gap-2"><WInput v-model="inviteDays" placeholder="有效天数（1–365）" /><WButton :disabled="busy" @click="createInvite">生成邀请码</WButton></div>
       <label for="portal-public-url" class="block text-small text-muted">公网门户地址</label>

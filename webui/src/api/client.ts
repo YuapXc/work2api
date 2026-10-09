@@ -25,13 +25,10 @@ const http: AxiosInstance = axios.create({
   withCredentials: true,
 })
 
-// 请求拦截：兼容模式——localStorage 里存有 X-Admin-Token 时附加（脚本/旧部署），
-// 会话 cookie 始终随请求发送，服务端两者任一通过即可。
+// Management uses only the login cookie. Retire legacy stored recovery credentials
+// so they cannot override an individual administrator's identity or audit actor.
+localStorage.removeItem('workbuddy_admin_token')
 http.interceptors.request.use((config) => {
-  const token = localStorage.getItem('workbuddy_admin_token') || ''
-  if (token) {
-    config.headers['X-Admin-Token'] = token
-  }
   const userToken = localStorage.getItem('workbuddy_user_token') || ''
   if (userToken) {
     config.headers['X-User-Token'] = userToken
@@ -83,11 +80,7 @@ http.interceptors.response.use(
   },
 )
 
-/** 设置/清除管理 Token（保存到 localStorage） */
-export function setAdminToken(token: string) {
-  if (token) localStorage.setItem('workbuddy_admin_token', token)
-  else localStorage.removeItem('workbuddy_admin_token')
-}
+
 
 export function setUserToken(token: string) {
   if (token) localStorage.setItem('workbuddy_user_token', token)
@@ -96,6 +89,11 @@ export function setUserToken(token: string) {
 
 export const api = {
   portalOverview: () => http.get<unknown, import('./portal').PortalOverview>('/admin/portal/overview'),
+  adminIdentity: () => http.get<unknown, { identity: import('./portal').AdminIdentity; owner_exists: boolean }>('/admin/identity'),
+  adminReauth: (body: { password?: string; token?: string }) => http.post('/admin/identity/reauth', body),
+  adminPassword: (old_password: string, new_password: string) => http.post('/admin/identity/password', { old_password, new_password }),
+  adminOwner: (target_id: number, claim: boolean) => http.post<unknown, { ok: boolean; login_required: boolean }>('/admin/identity/owner', { target_id, claim }),
+  identityAudit: () => http.get<unknown, { records: { id: number; ts: number; actor_name: string; target_name: string; auth_method: string; action: string; before_value: string; after_value: string }[] }>('/admin/identity/audit'),
   portalWrite: (path: string, body: unknown) => http.post<unknown, Record<string, unknown>>('/admin/portal/' + path, body),
   portalDelete: (path: string) => http.delete<unknown, { ok: boolean }>('/admin/portal/' + path),
   health: () => http.get<unknown, { available_providers: number; total_providers: number }>('/admin/health'),

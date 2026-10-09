@@ -28,12 +28,14 @@ const MaxUserSessions = 32
 // --- users ---
 
 type User struct {
-	ID           int64   `json:"id"`
-	Username     string  `json:"username"`
-	Role         string  `json:"role"`
-	Status       string  `json:"status"`
-	CreatedAt    float64 `json:"created_at"`
-	PasswordHash string  `json:"-"` // never serialized
+	ID                 int64   `json:"id"`
+	Username           string  `json:"username"`
+	Role               string  `json:"role"`
+	Status             string  `json:"status"`
+	CreatedAt          float64 `json:"created_at"`
+	AuthVersion        int64   `json:"-"`
+	MustChangePassword bool    `json:"must_change_password"`
+	PasswordHash       string  `json:"-"` // never serialized
 }
 
 // CreateUser inserts a user; username uniqueness is enforced by a UNIQUE index.
@@ -65,9 +67,9 @@ func (d *DB) getUserBy(col string, v any) (*User, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	row := d.db.QueryRow(
-		"SELECT id, username, password_hash, role, status, created_at FROM users WHERE "+col+" = ?", v)
+		"SELECT id, username, password_hash, role, status, created_at, auth_version, must_change_password FROM users WHERE "+col+" = ?", v)
 	var u User
-	if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.Status, &u.CreatedAt); err != nil {
+	if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.Status, &u.CreatedAt, &u.AuthVersion, &u.MustChangePassword); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -76,24 +78,36 @@ func (d *DB) getUserBy(col string, v any) (*User, error) {
 	return &u, nil
 }
 
-// SetUserStatus flips active/disabled. Disabled users lose eligibility on the
-// next eligibility check without needing to touch sessions here (the per-request
-// user lookup is authoritative).
+// SetUserStatus is an internal status mutation; the HTTP surface uses
+// ManageIdentity for actor authorization. Every actual change revokes sessions.
 func (d *DB) SetUserStatus(id int64, status string) error {
+	if status != "active" && status != "disabled" {
+		return errors.New("无效账号状态")
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	res, err := d.db.Exec("UPDATE users SET status=?, updated_at=? WHERE id=?", status, float64(time.Now().UnixNano())/1e9, id)
+	tx, err := d.db.Begin()
 	if err != nil {
 		return err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
+	defer tx.Rollback()
+	var role, current string
+	if err := tx.QueryRow("SELECT role,status FROM users WHERE id=?", id).Scan(&role, &current); err != nil {
 		return err
 	}
-	if n == 0 {
-		return fmt.Errorf("用户不存在：%d", id)
+	if role == "owner" {
+		return errors.New("不能停用超级管理员")
 	}
-	return nil
+	if current == status {
+		return nil
+	}
+	if _, err := tx.Exec("UPDATE users SET status=? WHERE id=?", status, id); err != nil {
+		return err
+	}
+	if err := invalidateIdentity(tx, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // UpdateUserPassword replaces the hash and revokes sessions atomically. An
@@ -106,7 +120,7 @@ func (d *DB) UpdateUserPassword(id int64, passwordHash string, expectedHash ...s
 		return err
 	}
 	defer tx.Rollback()
-	query := "UPDATE users SET password_hash=?,updated_at=? WHERE id=?"
+	query := "UPDATE users SET password_hash=?,updated_at=?,auth_version=auth_version+1,must_change_password=0 WHERE id=?"
 	args := []any{passwordHash, float64(time.Now().UnixNano()) / 1e9, id}
 	if len(expectedHash) > 0 {
 		query += " AND password_hash=? AND status='active'"
@@ -129,6 +143,11 @@ func (d *DB) UpdateUserPassword(id int64, passwordHash string, expectedHash ...s
 	if _, err := tx.Exec("DELETE FROM user_sessions WHERE user_id=?", id); err != nil {
 		return err
 	}
+	if len(expectedHash) > 0 {
+		if err := identityAudit(tx, IdentityActor{ID: id, Method: "password"}, id, "self_password", "", ""); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
@@ -145,7 +164,7 @@ func (d *DB) HasAnyUser() (bool, error) {
 func (d *DB) ListUsers() ([]User, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	rows, err := d.db.Query("SELECT id, username, password_hash, role, status, created_at FROM users ORDER BY id ASC")
+	rows, err := d.db.Query("SELECT id, username, password_hash, role, status, created_at, auth_version, must_change_password FROM users ORDER BY id ASC")
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +172,7 @@ func (d *DB) ListUsers() ([]User, error) {
 	out := []User{}
 	for rows.Next() {
 		var u User
-		if err := rows.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.Status, &u.CreatedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.Status, &u.CreatedAt, &u.AuthVersion, &u.MustChangePassword); err != nil {
 			return nil, err
 		}
 		out = append(out, u)
@@ -166,7 +185,7 @@ func (d *DB) ListUsers() ([]User, error) {
 func (d *DB) DeleteUserHard(id int64) (bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	res, err := d.db.Exec("DELETE FROM users WHERE id=?", id)
+	res, err := d.db.Exec("DELETE FROM users WHERE id=? AND role='user'", id)
 	if err != nil {
 		return false, err
 	}
@@ -190,10 +209,10 @@ func (d *DB) CreateUserSession(tokenHash string, userID int64, expiresAt float64
 
 // CreateUserSessionForPassword refuses issuance when credentials or status
 // changed after bcrypt verification, closing concurrent reset/disable races.
-func (d *DB) CreateUserSessionForPassword(tokenHash string, userID int64, expiresAt float64, expectedHash string) error {
-	return d.createUserSession(tokenHash, userID, expiresAt, expectedHash)
+func (d *DB) CreateUserSessionForPassword(tokenHash string, userID int64, expiresAt float64, expectedHash string, expectedVersion ...int64) error {
+	return d.createUserSession(tokenHash, userID, expiresAt, expectedHash, expectedVersion...)
 }
-func (d *DB) createUserSession(tokenHash string, userID int64, expiresAt float64, expectedHash string) error {
+func (d *DB) createUserSession(tokenHash string, userID int64, expiresAt float64, expectedHash string, expectedVersion ...int64) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	tx, err := d.db.Begin()
@@ -205,8 +224,12 @@ func (d *DB) createUserSession(tokenHash string, userID int64, expiresAt float64
 	if _, err := tx.Exec("DELETE FROM user_sessions WHERE expires_at<=?", now); err != nil {
 		return err
 	}
-	res, err := tx.Exec(`INSERT INTO user_sessions(token_hash,user_id,expires_at,created_at)
- SELECT ?,id,?,? FROM users WHERE id=? AND status='active' AND (?='' OR password_hash=?)`, tokenHash, expiresAt, now, userID, expectedHash, expectedHash)
+	version := int64(-1)
+	if len(expectedVersion) > 0 {
+		version = expectedVersion[0]
+	}
+	res, err := tx.Exec(`INSERT INTO user_sessions(token_hash,user_id,expires_at,created_at,auth_version)
+ SELECT ?,id,?,?,auth_version FROM users WHERE id=? AND status='active' AND (?='' OR password_hash=?) AND (?=-1 OR auth_version=?)`, tokenHash, expiresAt, now, userID, expectedHash, expectedHash, version, version)
 	if err != nil {
 		return err
 	}
@@ -229,7 +252,7 @@ func (d *DB) createUserSession(tokenHash string, userID int64, expiresAt float64
 func (d *DB) GetUserSession(tokenHash string) (*UserSession, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	row := d.db.QueryRow("SELECT token_hash, user_id, expires_at FROM user_sessions WHERE token_hash = ?", tokenHash)
+	row := d.db.QueryRow("SELECT s.token_hash, s.user_id, s.expires_at FROM user_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.auth_version=u.auth_version", tokenHash)
 	var s UserSession
 	if err := row.Scan(&s.TokenHash, &s.UserID, &s.ExpiresAt); err != nil {
 		if err == sql.ErrNoRows {
@@ -819,9 +842,14 @@ func (d *DB) ListResourceGroups() ([]ResourceGroup, error) {
 func (d *DB) CreateInitialAdmin(username, passwordHash string) (int64, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
 	now := float64(time.Now().UnixNano()) / 1e9
-	res, err := d.db.Exec(`INSERT INTO users(username,password_hash,role,status,created_at,updated_at)
- SELECT ?,?,'admin','active',?,? WHERE NOT EXISTS(SELECT 1 FROM users WHERE role='admin')`, username, passwordHash, now, now)
+	res, err := tx.Exec(`INSERT INTO users(username,password_hash,role,status,created_at,updated_at)
+ SELECT ?,?,'owner','active',?,? WHERE NOT EXISTS(SELECT 1 FROM users WHERE role IN ('admin','owner'))`, username, passwordHash, now, now)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return 0, ErrConflict
@@ -835,13 +863,20 @@ func (d *DB) CreateInitialAdmin(username, passwordHash string) (int64, error) {
 	if n == 0 {
 		return 0, ErrConflict
 	}
-	return res.LastInsertId()
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if err := identityAudit(tx, IdentityActor{Recovery: true, Method: "bootstrap"}, id, "bootstrap", "", "owner"); err != nil {
+		return 0, err
+	}
+	return id, tx.Commit()
 }
 func (d *DB) HasAdminUser() (bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	var n int
-	err := d.db.QueryRow("SELECT COUNT(*) FROM users WHERE role='admin'").Scan(&n)
+	err := d.db.QueryRow("SELECT COUNT(*) FROM users WHERE role IN ('admin','owner')").Scan(&n)
 	return n > 0, err
 }
 func (d *DB) GroupUserIDs(groupID int64) ([]int64, error) {

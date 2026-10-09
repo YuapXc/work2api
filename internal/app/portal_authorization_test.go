@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +16,152 @@ import (
 	"work2api/internal/workbuddy/pool"
 	"work2api/internal/workbuddy/ratelimit"
 )
+
+func TestManagedAdminHTTPPasswordGateAndRoleEpoch(t *testing.T) {
+	s, user := portalFixture(t)
+	s.o.cfg.AdminToken = "identity-recovery"
+	hash, err := portalauth.HashPassword("ownerpassword")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerID, err := s.o.db.CreateInitialAdmin("owner", hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	s.mountIdentity(mux)
+	mux.HandleFunc("GET /admin/protected", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	handler := s.adminGuard(mux)
+	request := func(method, path, body string, cookie *http.Cookie) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, path, strings.NewReader(body))
+		r.Header.Set("Sec-Fetch-Site", "same-origin")
+		if cookie != nil {
+			r.AddCookie(cookie)
+		}
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+	ownerCookie := adminLoginCookie(t, s, `{"username":"owner","password":"ownerpassword"}`)
+	if err := s.o.attachPortalScope(&Principal{UserID: ownerID}); err == nil {
+		t.Fatal("owner identity granted portal calling eligibility")
+	}
+	w := request("POST", "/admin/portal/users", `{"username":"New-Admin","password":"temporarypass","role":"admin"}`, ownerCookie)
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	staff, _ := s.o.db.GetUserByUsername("new-admin")
+	if staff == nil || !staff.MustChangePassword {
+		t.Fatal("missing normalized temporary admin")
+	}
+	cookie := adminLoginCookie(t, s, `{"username":"NEW-ADMIN","password":"temporarypass"}`)
+	if w := request("GET", "/admin/protected", "", cookie); w.Code != 403 {
+		t.Fatal("temporary password accessed management", w.Code)
+	}
+	if w := request("GET", "/admin/identity", "", cookie); w.Code != 200 || !strings.Contains(w.Body.String(), `"must_change_password":true`) {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	if w := request("POST", "/admin/identity/password", `{"old_password":"temporarypass","new_password":"temporarypass"}`, cookie); w.Code != 400 {
+		t.Fatal("same temporary password accepted")
+	}
+	if w := request("POST", "/admin/identity/password", `{"old_password":"temporarypass","new_password":"personalpassword"}`, cookie); w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	if w := request("GET", "/admin/protected", "", cookie); w.Code != 401 {
+		t.Fatal("old admin cookie survived password change")
+	}
+	cookie = adminLoginCookie(t, s, `{"username":"new-admin","password":"personalpassword"}`)
+	if w := request("GET", "/admin/protected", "", cookie); w.Code != 200 {
+		t.Fatal("completed admin unable to manage")
+	}
+	if w := request("POST", "/admin/portal/users", `{"username":"illegal-admin","password":"temporarypass","role":"admin"}`, cookie); w.Code == 200 {
+		t.Fatal("ordinary administrator appointed administrator")
+	}
+	if w := request("POST", "/admin/portal/users/"+fmt.Sprint(ownerID)+"/role", `{"role":"user"}`, cookie); w.Code == 200 {
+		t.Fatal("ordinary administrator demoted owner")
+	}
+	// Owner demotes and promotes without changing the password. Old cookies must not revive.
+	path := "/admin/portal/users/" + fmt.Sprint(staff.ID) + "/role"
+	for _, role := range []string{"user", "admin"} {
+		if w := request("POST", path, `{"role":"`+role+`"}`, ownerCookie); w.Code != 200 {
+			t.Fatal(w.Code, w.Body.String())
+		}
+	}
+	if w := request("GET", "/admin/protected", "", cookie); w.Code != 401 {
+		t.Fatal("old role epoch revived")
+	}
+	ownerActor := store.IdentityActor{ID: ownerID, Method: "password"}
+	if err := s.o.db.ManageIdentity(ownerActor, user.ID, "password", hash); err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := portalauth.Login(s.o.db, user.Username, "ownerpassword")
+	if err != nil {
+		t.Fatal(err)
+	}
+	portalHandler := s.portalGuard(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	for path, want := range map[string]int{"/portal/api/me": 200, "/portal/api/keys": 403} {
+		r := httptest.NewRequest("GET", path, nil)
+		r.AddCookie(&http.Cookie{Name: portalauth.UserCookieName, Value: token})
+		w := httptest.NewRecorder()
+		portalHandler.ServeHTTP(w, r)
+		if w.Code != want {
+			t.Fatal(path, w.Code)
+		}
+	}
+	if err := s.o.attachPortalScope(&Principal{UserID: user.ID}); err == nil {
+		t.Fatal("temporary credentials bypassed API Key protection")
+	}
+	cookie = adminLoginCookie(t, s, `{"username":"new-admin","password":"personalpassword"}`)
+	s.sessions.mu.Lock()
+	entry := s.sessions.sessions[cookie.Value]
+	entry.verifiedAt = time.Now().Add(-6 * time.Minute)
+	s.sessions.sessions[cookie.Value] = entry
+	s.sessions.mu.Unlock()
+	create := `{"username":"managed-user","password":"temporarypass","role":"user"}`
+	if w := request("POST", "/admin/portal/users", create, cookie); w.Code != 403 {
+		t.Fatal("expired step-up accepted")
+	}
+	if w := request("POST", "/admin/identity/reauth", `{"password":"wrong"}`, cookie); w.Code != 401 {
+		t.Fatal("wrong reauthentication proof accepted")
+	}
+	if w := request("POST", "/admin/identity/reauth", `{"password":"personalpassword"}`, cookie); w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	for i := 0; i < loginWindowMax+1; i++ {
+		if w := request("POST", "/admin/identity/reauth", `{"password":"personalpassword"}`, cookie); w.Code != 200 {
+			t.Fatal("successful step-up verification incorrectly locked out operator", i, w.Code)
+		}
+	}
+	if w := request("POST", "/admin/portal/users", create, cookie); w.Code != 200 {
+		t.Fatal("ordinary admin could not create ordinary user", w.Code, w.Body.String())
+	}
+}
+
+func TestAdminSessionCapsArePerIdentityAndBoundedGlobally(t *testing.T) {
+	sessions := newAdminSessionManager()
+	protected := sessions.createForUser(1, "hash")
+	for i := 0; i < maxSessionsPerAdmin+3; i++ {
+		sessions.createForUser(2, "other")
+	}
+	if !sessions.validate(protected) {
+		t.Fatal("another identity evicted active session below global bound")
+	}
+	count := 0
+	for _, entry := range sessions.sessions {
+		if entry.userID == 2 {
+			count++
+		}
+	}
+	if count != maxSessionsPerAdmin {
+		t.Fatal("per-identity cap", count)
+	}
+	for i := 3; i < maxSessions+20; i++ {
+		sessions.createForUser(int64(i), "hash")
+	}
+	if len(sessions.sessions) != maxSessions {
+		t.Fatal("unbounded admin sessions", len(sessions.sessions))
+	}
+}
 
 func TestNewContributionCatalogVerificationAndScopeAffinity(t *testing.T) {
 	s, owner := portalFixture(t)

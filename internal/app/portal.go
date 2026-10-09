@@ -42,6 +42,7 @@ var portalOAuthBegin = oauth.Begin
 var portalOAuthPoll = oauth.Poll
 
 func (s *Server) mountPortal(mux *http.ServeMux) {
+	s.mountIdentity(mux)
 	// 认证（限流在 portalGuard 按路径做）
 	mux.HandleFunc("GET /portal/api/auth/state", s.portalAuthState)
 	mux.HandleFunc("POST /portal/api/auth/register", s.portalRegister)
@@ -155,6 +156,10 @@ func (s *Server) portalGuard(next http.Handler) http.Handler {
 		user, err := s.portalUser(r)
 		if err != nil {
 			writeJSON(w, 401, errBody(401, "请先登录", "unauthorized").body)
+			return
+		}
+		if user.MustChangePassword && path != "/portal/api/me" && path != "/portal/api/auth/password" {
+			writeAPIErr(w, errBody(403, "请先修改临时密码", "password_change_required"))
 			return
 		}
 		// 轮询端点单独限流（每用户），防高频打上游。
@@ -341,6 +346,10 @@ func (s *Server) portalChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 401, errBody(401, "请先登录", "unauthorized").body)
 		return
 	}
+	if !s.portalLoginLimiter.allow("password:" + strconv.FormatInt(user.ID, 10)) {
+		writeAPIErr(w, localOverload("login_attempts"))
+		return
+	}
 	body, _ := readJSON(r)
 	oldPass, _ := body["old_password"].(string)
 	newPass, _ := body["new_password"].(string)
@@ -392,7 +401,7 @@ func portalUserView(u *store.User) map[string]any {
 	if u == nil {
 		return nil
 	}
-	return map[string]any{"id": u.ID, "username": u.Username, "role": u.Role}
+	return map[string]any{"id": u.ID, "username": u.Username, "role": u.Role, "must_change_password": u.MustChangePassword}
 }
 
 // --- 会话内接口 ---
@@ -401,6 +410,11 @@ func portalUserView(u *store.User) map[string]any {
 // the portal can show 可用模型 without probing /v1/models.
 func (s *Server) portalMe(w http.ResponseWriter, r *http.Request) {
 	user := portalCtx(r)
+	if user.MustChangePassword {
+		writeJSON(w, 200, map[string]any{"user": portalUserView(user), "eligible": false,
+			"eligible_accounts": 0, "groups_enabled": 0, "available_models": []string{}, "own_models": []string{}, "shared_models": []string{}})
+		return
+	}
 	accounts, err := s.o.db.OwnedAccountUIDs(user.ID)
 	if err != nil {
 		writeAPIErr(w, errBody(503, "账号查询失败", "server_error"))
@@ -1373,7 +1387,10 @@ func (s *Server) adminPortalResetPassword(w http.ResponseWriter, r *http.Request
 		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
 		return
 	}
-	if err := s.o.db.UpdateUserPassword(id, hash); err != nil {
+	if !s.identityStepUp(w, r) {
+		return
+	}
+	if err := s.o.db.ManageIdentity(identityFromRequest(r).Actor, id, "password", hash); err != nil {
 		writeJSON(w, 400, errBody(400, "用户不存在或重置失败", "invalid_request_error").body)
 		return
 	}
@@ -1468,12 +1485,12 @@ func (s *Server) adminPortalUserStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, errBody(400, "status 必须是 active 或 disabled", "invalid_request_error").body)
 		return
 	}
-	if err := s.o.db.SetUserStatus(id, status); err != nil {
-		writeJSON(w, 404, errBody(404, err.Error(), "invalid_request_error").body)
+	if !s.identityStepUp(w, r) {
 		return
 	}
-	if status == "disabled" {
-		_, _ = s.o.db.DeleteUserSessions(id) // 停用立即撤销全部会话
+	if err := s.o.db.ManageIdentity(identityFromRequest(r).Actor, id, "status", status); err != nil {
+		writeAPIErr(w, errBody(400, err.Error(), "identity_rejected"))
+		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
 }

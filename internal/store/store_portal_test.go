@@ -10,6 +10,180 @@ import (
 	"time"
 )
 
+func TestManagedIdentityAuthorizationRevocationAndTransfer(t *testing.T) {
+	db := mustDB(t)
+	owner, err := db.CreateInitialAdmin("owner", "owner-hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := IdentityActor{ID: owner, Method: "password"}
+	admin, err := db.CreateManagedUser(actor, "staff", "staff-hash", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := db.CreateManagedUser(actor, "managed", "temporary-hash", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	appID, err := db.CreateApp("kept-key", "key-hash", "prefix", "", "", `["model-a"]`, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u, _ := db.GetUser(admin); !u.MustChangePassword {
+		t.Fatal("temporary password not enforced")
+	}
+	if _, err := db.CreateManagedUser(IdentityActor{ID: admin}, "bad", "hash", "admin"); err == nil {
+		t.Fatal("temporary administrator could manage identities")
+	}
+	if err := db.UpdateUserPassword(admin, "staff-final", "staff-hash"); err != nil {
+		t.Fatal(err)
+	}
+	staff, _ := db.GetUser(admin)
+	staffActor := IdentityActor{ID: admin, Version: staff.AuthVersion, Method: "password"}
+	for _, target := range []int64{owner, admin} {
+		for _, action := range []string{"role", "status", "password"} {
+			if err := db.ManageIdentity(staffActor, target, action, "user"); err == nil {
+				t.Fatal("administrator changed protected identity", target, action)
+			}
+		}
+	}
+	if _, err := db.CreateManagedUser(staffActor, "escalated", "hash", "admin"); err == nil {
+		t.Fatal("administrator created administrator")
+	}
+	if err := db.CreateUserSession("old-session", user, float64(time.Now().Add(time.Hour).Unix())); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ManageIdentity(actor, user, "role", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if session, _ := db.GetUserSession("old-session"); session != nil {
+		t.Fatal("role change retained portal session")
+	}
+	apps, err := db.ListApps()
+	if err != nil || len(apps) != 1 || apps[0].ID != appID || apps[0].UserID != user || (len(apps[0].AllowedModels) != 1 || apps[0].AllowedModels[0] != "model-a") {
+		t.Fatal("role change modified existing Key ownership or model scope", apps, err)
+	}
+	if err := db.ManageIdentity(actor, admin, "role", "user"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ManageIdentity(actor, admin, "role", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateManagedUser(staffActor, "stale-actor", "hash", "user"); err == nil {
+		t.Fatal("stale role epoch resurrected")
+	}
+	if err := db.TransferOwner(actor, user, false); err == nil {
+		t.Fatal("transferred owner to temporary credentials")
+	}
+	if err := db.TransferOwner(actor, admin, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateManagedUser(actor, "stale-owner", "hash", "admin"); err == nil {
+		t.Fatal("old owner retained appointment authority")
+	}
+	if err := db.SetUserStatus(admin, "disabled"); err == nil {
+		t.Fatal("owner disabled through internal helper")
+	}
+	if deleted, err := db.DeleteUserHard(admin); err != nil || deleted {
+		t.Fatal("owner deleted", err)
+	}
+	if _, err := db.CreateUser("second-owner", "hash", "owner"); err == nil {
+		t.Fatal("multiple owners permitted")
+	}
+	rows, err := db.IdentityAudits()
+	if err != nil || len(rows) < 7 {
+		t.Fatal("missing identity audit", len(rows), err)
+	}
+	for _, row := range rows {
+		for _, value := range row {
+			if text, ok := value.(string); ok && (text == "staff-final" || text == "temporary-hash" || text == "owner-hash") {
+				t.Fatal("password material leaked into audit")
+			}
+		}
+	}
+}
+
+func TestConcurrentOwnerClaimDoesNotOverwriteWinner(t *testing.T) {
+	db := mustDB(t)
+	first, err := db.CreateUser("first-admin", "hash", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.CreateUser("second-admin", "hash", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan error, 2)
+	for _, id := range []int64{first, second} {
+		go func(target int64) {
+			results <- db.TransferOwner(IdentityActor{Recovery: true, Method: "recovery_session"}, target, true)
+		}(id)
+	}
+	successes := 0
+	for i := 0; i < 2; i++ {
+		if <-results == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatal("competing claims accepted", successes)
+	}
+	var owners int
+	if err := db.db.QueryRow("SELECT COUNT(*) FROM users WHERE role='owner'").Scan(&owners); err != nil || owners != 1 {
+		t.Fatal("owner uniqueness violated", owners, err)
+	}
+}
+
+func TestOwnerMigrationAndExplicitRecoveryClaim(t *testing.T) {
+	for _, count := range []int{1, 2} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "migration.db")
+			db, err := New(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var first int64
+			for i := 0; i < count; i++ {
+				id, e := db.CreateUser(fmt.Sprintf("admin%d", i), "hash", "admin")
+				if e != nil {
+					t.Fatal(e)
+				}
+				if i == 0 {
+					first = id
+				}
+			}
+			if _, err := db.db.Exec("PRAGMA user_version=18"); err != nil {
+				t.Fatal(err)
+			}
+			db.Close()
+			db, err = New(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			u, _ := db.GetUser(first)
+			if count == 1 {
+				if u.Role != "owner" || u.AuthVersion != 1 {
+					t.Fatal("single operator migration", u)
+				}
+			} else {
+				if u.Role != "admin" {
+					t.Fatal("ambiguous owner guessed")
+				}
+				if err := db.TransferOwner(IdentityActor{ID: first, Method: "password"}, first, true); err == nil {
+					t.Fatal("non-recovery claim allowed")
+				}
+				if err := db.TransferOwner(IdentityActor{Recovery: true, Method: "recovery_session"}, first, true); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := db.TransferOwner(IdentityActor{Recovery: true}, first, true); err == nil {
+				t.Fatal("owner claim overwrote existing owner")
+			}
+		})
+	}
+}
+
 func mustDB(t *testing.T) *DB {
 	t.Helper()
 	db, err := New(filepath.Join(t.TempDir(), "portal.db"))

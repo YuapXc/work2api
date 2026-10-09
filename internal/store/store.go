@@ -32,7 +32,8 @@ import (
 // rebuilds apps to drop the global-unique name constraint (per-user naming).
 // v16 adds stable usage app IDs and independent daily execution quotas.
 // v18 adds bounded, content-free request diagnostics to usage records.
-const SchemaVersion = 18
+// v19 adds owner identity, credential epochs, temporary passwords and identity audit.
+const SchemaVersion = 19
 
 // DB wraps the SQLite connection.
 type DB struct {
@@ -358,6 +359,29 @@ CREATE TABLE IF NOT EXISTS user_daily_quota (
 CREATE INDEX IF NOT EXISTS idx_contrib_user ON contributions(user_id);
 `
 	if _, err := tx.Exec(portalSchema); err != nil {
+		return err
+	}
+	// Multi-operator identity migration is additive and transactional.
+	for _, statement := range []string{
+		"ALTER TABLE users ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE user_sessions ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 0",
+	} {
+		if _, err := tx.Exec(statement); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return err
+		}
+	}
+	if version < 19 {
+		if _, err := tx.Exec(`UPDATE users SET role='owner',auth_version=auth_version+1 WHERE role='admin' AND status='active'
+   AND (SELECT COUNT(*) FROM users WHERE role='admin')=1 AND NOT EXISTS(SELECT 1 FROM users WHERE role='owner')`); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_single_owner ON users(role) WHERE role='owner';
+ CREATE TABLE IF NOT EXISTS identity_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, actor_id INTEGER NOT NULL,
+  auth_method TEXT NOT NULL, target_id INTEGER NOT NULL, action TEXT NOT NULL, before_value TEXT NOT NULL, after_value TEXT NOT NULL
+ );`); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion)); err != nil {

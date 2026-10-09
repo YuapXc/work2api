@@ -287,6 +287,9 @@ func (o *Orchestrator) attachPortalScope(p *Principal) *apiError {
 	if err != nil || user == nil || user.Status != "active" {
 		return errBody(403, "账号不可用，请联系管理员", "portal_user_disabled")
 	}
+	if user.MustChangePassword {
+		return errBody(403, "请先修改临时密码", "password_change_required")
+	}
 	eligible, err := o.db.ActiveContributionUIDs(p.UserID)
 	if err != nil {
 		return errBody(500, "资格查询失败", "server_error")

@@ -1,4 +1,5 @@
-export interface PortalUser { id: number; username: string; role: string; status: string }
+export interface PortalUser { id: number; username: string; role: string; status: string; must_change_password?: boolean }
+export interface AdminIdentity { id: number; username: string; role: string; recovery: boolean; must_change_password: boolean }
 export interface PortalInvite { code: string; used_by: number | null; expires_at: number }
 export interface PortalGroup {
   id: number; name: string; provider: string; enabled: boolean; allowed_models: string[] | string

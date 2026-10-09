@@ -33,7 +33,7 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
 }
 
 export interface Me {
-  user: { id: number; username: string; role: string }
+  user: { id: number; username: string; role: string; must_change_password: boolean }
   eligible: boolean
   eligible_accounts: number
   groups_enabled: number

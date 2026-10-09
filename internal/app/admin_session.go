@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 	"work2api/internal/portal/portalauth"
+	"work2api/internal/store"
 )
 
 // sessionTTL is how long an admin session cookie stays valid (24h per user
@@ -20,9 +21,11 @@ const sessionTTL = 24 * time.Hour
 // cookieName is the HttpOnly session cookie for the WebUI admin surface.
 const cookieName = "w2a_admin_session"
 
-// maxSessions caps the in-memory session table (single-operator deployments);
+// maxSessions bounds memory across operators; each identity also has its own cap.
+// At the global bound,
 // oldest-expiring sessions are evicted when exceeded.
-const maxSessions = 16
+const maxSessions = 256
+const maxSessionsPerAdmin = 8
 
 // adminSessionEntry is one signed-in operator. Token is a 32-byte random value;
 // only its SHA-256 is meaningful for comparison, but with an in-memory table
@@ -32,6 +35,8 @@ type adminSessionEntry struct {
 	expires      time.Time
 	userID       int64
 	passwordHash string
+	authVersion  int64
+	verifiedAt   time.Time
 }
 
 // adminSessionManager issues and validates admin login sessions in memory. Nothing
@@ -57,10 +62,30 @@ func newToken() string {
 // maxSessions evict the soonest-expiring session.
 func (m *adminSessionManager) create() string { return m.createForUser(0, "") }
 
-func (m *adminSessionManager) createForUser(userID int64, passwordHash string) string {
+func (m *adminSessionManager) createForUser(userID int64, passwordHash string, version ...int64) string {
 	token := newToken()
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := time.Now()
+	count := 0
+	oldestUser := ""
+	var oldestUserExpiry time.Time
+	for key, entry := range m.sessions {
+		if !entry.expires.After(now) {
+			delete(m.sessions, key)
+			continue
+		}
+		if entry.userID == userID {
+			count++
+			if oldestUser == "" || entry.expires.Before(oldestUserExpiry) {
+				oldestUser = key
+				oldestUserExpiry = entry.expires
+			}
+		}
+	}
+	if count >= maxSessionsPerAdmin {
+		delete(m.sessions, oldestUser)
+	}
 	if len(m.sessions) >= maxSessions {
 		oldest := ""
 		var oldestExp time.Time
@@ -74,7 +99,11 @@ func (m *adminSessionManager) createForUser(userID int64, passwordHash string) s
 		}
 		delete(m.sessions, oldest)
 	}
-	m.sessions[token] = adminSessionEntry{expires: time.Now().Add(sessionTTL), userID: userID, passwordHash: passwordHash}
+	v := int64(0)
+	if len(version) > 0 {
+		v = version[0]
+	}
+	m.sessions[token] = adminSessionEntry{expires: time.Now().Add(sessionTTL), userID: userID, passwordHash: passwordHash, authVersion: v, verifiedAt: now}
 	return token
 }
 
@@ -130,6 +159,14 @@ func newLoginRateLimiter() *loginRateLimiter {
 // allow reports whether an attempt from ip may proceed.
 func (l *loginRateLimiter) allow(ip string) bool { return l.allowLimit(ip, loginWindowMax) }
 
+// Successful step-up verification clears failed attempts for that identity.
+// Repeated legitimate management actions must not trigger a password lockout.
+func (l *loginRateLimiter) clear(key string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.attempt, key)
+}
+
 func (l *loginRateLimiter) allowLimit(ip string, max int) bool {
 	now := time.Now()
 	l.mu.Lock()
@@ -165,27 +202,8 @@ func (l *loginRateLimiter) allowLimit(ip string, max int) bool {
 // OR a valid X-Admin-Token/Bearer header (kept for scripts) authenticates. The
 // three return values mirror the legacy adminGuard's needs.
 func (s *Server) adminAuth(r *http.Request) (sessionOK, headerOK bool) {
-	if c, err := r.Cookie(cookieName); err == nil && c.Value != "" {
-		sessionOK = s.sessions.validate(c.Value)
-		if sessionOK {
-			s.sessions.mu.Lock()
-			entry := s.sessions.sessions[c.Value]
-			s.sessions.mu.Unlock()
-			if entry.userID > 0 {
-				u, err := s.o.db.GetUser(entry.userID)
-				if err != nil || u == nil || u.Status != "active" || u.Role != "admin" || u.PasswordHash != entry.passwordHash {
-					s.sessions.drop(c.Value)
-					sessionOK = false
-				}
-			}
-		}
-	}
-	if header := r.Header.Get("X-Admin-Token"); header != "" {
-		headerOK = s.o.cfg.AdminToken != "" && subtle.ConstantTimeCompare([]byte(header), []byte(s.o.cfg.AdminToken)) == 1
-	} else if a := r.Header.Get("Authorization"); strings.HasPrefix(a, "Bearer ") {
-		headerOK = s.o.cfg.AdminToken != "" && subtle.ConstantTimeCompare([]byte(strings.TrimSpace(a[7:])), []byte(s.o.cfg.AdminToken)) == 1
-	}
-	return sessionOK, headerOK
+	_, sessionOK, headerOK = s.resolveAdminIdentity(r)
+	return
 }
 
 // handleAdminLogin exchanges an ADMIN_TOKEN for an HttpOnly session cookie.
@@ -235,6 +253,8 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	token, _ := body["token"].(string)
 	var userID int64
 	var passwordHash string
+	var authVersion int64
+	var temporary bool
 	valid := token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.o.cfg.AdminToken)) == 1
 	if username, ok := body["username"].(string); ok && token == "" {
 		password, _ := body["password"].(string)
@@ -246,10 +266,12 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		if rawSession != "" {
 			portalauth.Logout(s.o.db, rawSession)
 		}
-		if err == nil && u != nil && u.Role == "admin" {
+		if err == nil && u != nil && store.IsAdminRole(u.Role) {
 			valid = true
 			userID = u.ID
 			passwordHash = u.PasswordHash
+			authVersion = u.AuthVersion
+			temporary = u.MustChangePassword
 		}
 	}
 	if !valid {
@@ -257,7 +279,7 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 401, map[string]any{"ok": false, "message": "管理员凭据无效"})
 		return
 	}
-	value := s.sessions.createForUser(userID, passwordHash)
+	value := s.sessions.createForUser(userID, passwordHash, authVersion)
 	http.SetCookie(w, &http.Cookie{
 		Name:     cookieName,
 		Value:    value,
@@ -267,7 +289,7 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		Secure:   r.TLS != nil || s.o.cfg.AdminCookieSecure,
 		SameSite: http.SameSiteLaxMode,
 	})
-	writeJSON(w, 200, map[string]any{"ok": true})
+	writeJSON(w, 200, map[string]any{"ok": true, "must_change_password": temporary})
 }
 
 // handleAdminLogout drops the session (cookie itself is cleared by the client
