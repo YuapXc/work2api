@@ -21,7 +21,6 @@ import WIcon from '@/components/ui/WIcon.vue'
 import TrendChart from '@/components/TrendChart.vue'
 import BarList from '@/components/BarList.vue'
 import SessionsPanel from '@/components/SessionsPanel.vue'
-import { buildLabelMap } from '@/utils/accountLabel'
 
 const route = useRoute()
 const router = useRouter()
@@ -88,20 +87,35 @@ const filterOpts = ref<{ protocols: string[]; models: string[]; apps: string[]; 
 })
 const searchInput = ref('')
 
-// account_uid → 显示名（含 workbuddy 别名）。日志表原本只显示 uid 短码，别名看不到。
-// 仅覆盖 workbuddy 池账号；其它供应商/已删除账号回退 uid 短码（不误标「已移除」）。
+// Channel-scoped labels prevent identically named resource IDs from colliding.
 const labelMap = ref<Record<string, string>>({})
+const labelProviders = ref<string[]>([])
+const defaultLabelProvider = ref('workbuddy')
 async function loadAccountLabels() {
   try {
-    const res = await api.accounts()
-    labelMap.value = buildLabelMap(res.accounts || [])
-  } catch {
-    labelMap.value = {}
-  }
+    const providers = (await api.getProviders()).providers
+    labelProviders.value = providers.map(p => p.name)
+    defaultLabelProvider.value = providers.find(p => p.default)?.name || ''
+    const results = await Promise.allSettled(providers.map(p => api.getProvider(p.name)))
+    const next: Record<string, string> = {}
+    results.forEach((result, i) => {
+      const prefix = providers[i].name + '/'
+      if (result.status === 'rejected') {
+        for (const [key, value] of Object.entries(labelMap.value)) if (key.startsWith(prefix)) next[key] = value
+        return
+      }
+      const resources = result.value.resources || []
+      const counts = new Map<string, number>()
+      for (const resource of resources) counts.set(resource.label, (counts.get(resource.label) || 0) + 1)
+      for (const resource of resources) next[prefix + resource.id] = resource.label + ((counts.get(resource.label) || 0) > 1 ? ' · ' + resource.id.slice(0,8) : '')
+    })
+    labelMap.value = next
+  } catch { /* Keep the last successful label snapshot. */ }
 }
-function acctLabel(uid?: string | null): string {
+function acctLabel(uid?: string | null, model = ''): string {
   if (!uid) return '—'
-  return labelMap.value[uid] || uid.slice(0, 8)
+  const channel = labelProviders.value.find(name => model.startsWith(name + '/')) || defaultLabelProvider.value
+  return labelMap.value[channel + '/' + uid] || uid.slice(0, 8)
 }
 
 async function loadFilters() {
@@ -134,15 +148,15 @@ watch(page, loadLogs)
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
 
 const logCols: Column[] = [
-  { key: 'ts', label: '时间', mono: true },
-  { key: 'model', label: '模型' },
-  { key: 'protocol', label: '协议' },
-  { key: 'account_uid', label: '账号', mono: true },
-  { key: 'tokens', label: 'Tokens（入/出）', align: 'right', mono: true },
-  { key: 'credits', label: '额度', align: 'right', mono: true },
-  { key: 'latency_ms', label: '延迟', align: 'right', mono: true },
-  { key: 'status', label: '状态' },
-  { key: 'actions', label: '', align: 'right' },
+  { nowrap: true, key: 'ts', label: '时间', mono: true },
+  { nowrap: true, key: 'model', label: '模型' },
+  { nowrap: true, key: 'protocol', label: '协议' },
+  { nowrap: true, key: 'account_uid', label: '账号', mono: true },
+  { nowrap: true, key: 'tokens', label: 'Tokens（入/出）', align: 'right', mono: true },
+  { nowrap: true, key: 'credits', label: '额度', align: 'right', mono: true },
+  { nowrap: true, key: 'latency_ms', label: '延迟', align: 'right', mono: true },
+  { nowrap: true, key: 'status', label: '状态' },
+  { nowrap: true, key: 'actions', label: '', align: 'right' },
 ]
 
 // 详情
@@ -294,7 +308,8 @@ onMounted(() => loadTab(tab.value))
         <WSpinner v-if="logLoading && !records.length" center label="加载中" />
         <WTable v-else :columns="logCols" :rows="records" row-key="id" min-width="960px">
           <template #cell-ts="{ value }">{{ dt(value, 'MM-DD HH:mm:ss') }}</template>
-          <template #cell-account_uid="{ value }">{{ acctLabel(value) }}</template>
+          <template #cell-model="{ value }"><div class="max-w-48 truncate" :title="value">{{ value }}</div></template>
+          <template #cell-account_uid="{ value, row }"><div class="max-w-36 truncate" :title="acctLabel(value, row.model)">{{ acctLabel(value, row.model) }}</div></template>
           <template #cell-tokens="{ row }">
             <div class="text-right leading-tight">
               <div><span class="text-ink">{{ int(row.input_tokens) }}</span><span class="text-faint"> / {{ int(row.output_tokens) }}</span></div>

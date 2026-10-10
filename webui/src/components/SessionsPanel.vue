@@ -8,9 +8,12 @@ import WButton from '@/components/ui/WButton.vue'
 import WInput from '@/components/ui/WInput.vue'
 import WSelect from '@/components/ui/WSelect.vue'
 import WTable from '@/components/ui/WTable.vue'
+import { providerMeta } from '@/lib/providers'
 
 const rows = ref<SessionRow[]>([]), loading = ref(false), failed = ref(false)
 const search = ref(''), model = ref(''), account = ref(''), status = ref(''), sort = ref('recent')
+const channel = ref('')
+const channels = computed(() => [...new Set(rows.value.map(r => r.provider || 'workbuddy'))].map(value => ({ value, label: providerMeta(value).label })))
 const showSingleInferred = ref(false)
 const isWeak = (source: string) => ['fb', 'user', 'pck'].includes(source)
 const selectedID = ref(''), options = ref<SessionAccountOption[]>([]), target = ref('')
@@ -28,7 +31,7 @@ const filtered = computed(() => {
  const result = rows.value.filter(r => {
   const s = r.session
   if (!showSingleInferred.value && isWeak(s.source) && s.requests === 1 && !s.running && !s.waiting && !s.pending_action && s.id !== selectedID.value) return false
-  return (!query || `${s.id} ${s.app} ${s.user_id} ${s.model} ${r.account_label}`.toLowerCase().includes(query)) &&
+  return (!channel.value || (r.provider || 'workbuddy') === channel.value) && (!query || `${s.id} ${s.app} ${s.user_id} ${s.model} ${r.account_label}`.toLowerCase().includes(query)) &&
    (!model.value || s.model === model.value) && (!account.value || s.account_uid === account.value) &&
    (!status.value || (status.value === 'running' ? s.running > 0 : status.value === 'waiting' ? s.waiting > 0 : status.value === 'pending' ? !!s.pending_action : !s.running && !s.waiting))
  })
@@ -42,7 +45,7 @@ const columns = [
 ]
 function compatibilityLabel(value: string) { return ({ identity: '固定身份兼容', client_metadata: '客户端身份与归因精简' } as Record<string, string>)[value] || '' }
 function sourceLabel(source: string) { return ({ sid: '显式会话标识', pck: '缓存分组标识（弱识别）', cid: '显式对话标识', user: '用户字段（弱识别）', fb: '首条消息推断' } as Record<string, string>)[source] || '会话标识' }
-function accountLabel(row: SessionRow) { return row.account_label || (row.session.account_uid ? row.session.account_uid.slice(0, 8) : '尚未绑定') }
+function accountLabel(row: SessionRow) { return row.account_label || (row.session.account_uid ? row.session.account_uid.slice(0, 8) : row.controllable === false ? '未上报' : '尚未绑定') }
 function stateLabel(row: SessionRow) { const s = row.session; return [s.running ? `执行中 ${s.running}` : '', s.waiting ? `排队中 ${s.waiting}` : ''].filter(Boolean).join(' / ') || '等待下一次调用' }
 async function refresh() {
  if (loading.value || !alive) return
@@ -65,6 +68,7 @@ async function loadOptions() {
  } finally { if (alive && request === optionsRequest) optionsLoading.value = false }
 }
 async function open(row: SessionRow) {
+ if (row.controllable === false) return
  previousFocus = document.activeElement as HTMLElement
  previousOverflow = document.body.style.overflow; document.body.style.overflow = 'hidden'
  selectedID.value = row.session.id; options.value = []; target.value = ''; optionsVersion.value = -1
@@ -102,28 +106,29 @@ onUnmounted(() => { alive = false; clearTimeout(timer); document.removeEventList
  <div>
   <div class="mb-3 flex flex-wrap gap-2">
    <WInput v-model="search" placeholder="搜索应用、用户、会话或账号" class="w-full sm:w-64" />
+   <WSelect v-model="channel" :options="channels" placeholder="全部渠道" />
    <WSelect v-model="model" :options="models" placeholder="全部模型" class="min-w-36" />
    <WSelect v-model="account" :options="accounts" placeholder="全部账号" class="min-w-36" />
    <WSelect v-model="status" :options="[{value:'running',label:'正在执行'},{value:'waiting',label:'正在排队'},{value:'pending',label:'待切换'},{value:'idle',label:'近期空闲'}]" placeholder="全部状态" />
    <WSelect v-model="sort" :options="[{value:'recent',label:'最近调用'},{value:'credits',label:'积分消耗'}]" />
    <WButton :loading="loading" @click="refresh">刷新</WButton>
   </div>
-  <p class="mb-3 text-micro text-faint">仅 WorkBuddy。保留最近 30 分钟的会话绑定，正在执行的会话继续保留；重启清空。积分仅累计完成调用的实际上报值。相同会话的子 Agent 合并归因。</p>
+  <p class="mb-3 text-micro text-faint">保留最近 30 分钟的会话，执行中继续保留，重启清空。WorkBuddy 支持调整账号；其他渠道仅观察带显式会话标识的执行请求，不代表粘性绑定。额度只累计实际上报值。</p>
   <label class="mb-3 flex items-center gap-2 text-micro text-muted"><input v-model="showSingleInferred" type="checkbox">显示已结束的单次推断记录（无稳定标识时无法保证连续识别）</label>
   <p v-if="failed" role="alert" class="mb-3 text-small text-warn">刷新失败，显示上次数据；自动刷新已暂停，请点击刷新重试。</p>
   <div class="overflow-hidden rounded-xl border border-line bg-surface">
    <WTable :columns="columns" :rows="filtered" row-key="id" min-width="880px" :loading="loading">
     <template #cell-identity="{row}">
-     <div class="text-ink">{{ row.session.app || '未命名应用' }}<span v-if="row.session.user_id" class="ml-2 text-micro text-faint">用户 {{ row.session.user_id }}</span></div>
+     <div class="text-ink">{{ row.session.app || '未命名应用' }}<span class="ml-2 text-micro text-faint">{{ providerMeta(row.provider || 'workbuddy').label }}</span><span v-if="row.session.user_id" class="ml-2 text-micro text-faint">用户 {{ row.session.user_id }}</span></div>
      <div class="mono text-micro text-faint">{{ row.session.id.slice(0, 10) }} <span v-if="isWeak(row.session.source)" class="font-sans">· 弱识别</span></div>
     </template>
     <template #cell-model="{row}"><span class="mono">{{ row.session.model }}</span></template>
-    <template #cell-account="{row}"><div class="text-ink">{{ accountLabel(row as SessionRow) }}</div><div v-if="row.session.pending_action" class="text-micro text-route">待切换：{{ row.session.pending_action === 'switch' ? row.target_label || row.session.target_uid.slice(0,8) : '按成本重新选择' }}</div></template>
+    <template #cell-account="{row}"><div class="text-ink">{{ accountLabel(row as SessionRow) }}</div><div v-if="row.controllable === false && row.session.account_uid" class="text-micro text-faint">最近完成调用的账号</div><div v-if="row.session.pending_action" class="text-micro text-route">待切换：{{ row.session.pending_action === 'switch' ? row.target_label || row.session.target_uid.slice(0,8) : '按成本重新选择' }}</div></template>
     <template #cell-state="{row}"><span :class="row.session.running ? 'text-live' : row.session.waiting ? 'text-warn' : 'text-muted'">{{ stateLabel(row as SessionRow) }}</span><div v-if="row.session.route_status === 'failed'" class="text-micro text-fault">调整未生效</div></template>
     <template #cell-credits="{row}"><span class="mono">{{ row.session.credits_known ? credits(row.session.credits) : '未知' }}</span><div v-if="row.session.credits_unknown" class="text-micro text-faint">{{ row.session.credits_unknown }} 次未上报</div></template>
     <template #cell-last="{row}"><span class="text-micro">{{ dt(row.session.last_at) }}</span></template>
-    <template #cell-action="{row}"><WButton size="sm" variant="subtle" @click="open(row as SessionRow)">调整账号</WButton></template>
-    <template #empty><div class="px-5 py-10 text-center text-small text-faint">{{ loading ? '正在读取会话…' : rows.length ? '没有符合筛选条件的会话' : '暂无已观测会话。使用支持会话标识的客户端调用 WorkBuddy 后，会话会出现在这里。' }}</div></template>
+    <template #cell-action="{row}"><span v-if="row.controllable === false" class="text-micro text-faint">仅观察</span><WButton v-else size="sm" variant="subtle" @click="open(row as SessionRow)">调整账号</WButton></template>
+    <template #empty><div class="px-5 py-10 text-center text-small text-faint">{{ loading ? '正在读取会话…' : rows.length ? '没有符合筛选条件的会话' : '暂无已观测会话。客户端发送稳定的会话标识（如 X-Session-ID）后可持续观察。' }}</div></template>
    </WTable>
   </div>
   <Teleport to="body">

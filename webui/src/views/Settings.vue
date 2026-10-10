@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted, computed } from 'vue'
 import { api } from '@/api/client'
-import type { Settings } from '@/types'
+import type { Settings, ProviderSummary } from '@/types'
 import { toast } from '@/lib/toast'
 import WPage from '@/components/ui/WPage.vue'
 import WCard from '@/components/ui/WCard.vue'
@@ -12,6 +12,7 @@ import WToggle from '@/components/ui/WToggle.vue'
 import WSpinner from '@/components/ui/WSpinner.vue'
 
 const loading = ref(true)
+const loadFailed = ref(false)
 const saving = ref(false)
 const s = reactive<Record<string, string>>({
   checkin_hours: '',
@@ -28,8 +29,8 @@ const s = reactive<Record<string, string>>({
   qoder_machine_salt: '',
 })
 const keepalive = ref(true)
-const qoderAutoCheckin = ref(false)
-const qoderAutoQuota = ref(false)
+const maintenanceProviders = ref<ProviderSummary[]>([])
+const maintenanceValues = reactive<Record<string, boolean>>({})
 const backupEnabled = ref(false)
 const backingUp = ref(false)
 const backup = ref<{ status: string; last_success: number | null }>({ status: '', last_success: null })
@@ -47,35 +48,40 @@ const clearAA = ref(false)
 
 async function load() {
   loading.value = true
+  loadFailed.value = false
   try {
     const data = (await api.getSettings()) as Settings & Record<string, string>
     for (const k of Object.keys(s)) if (data[k] != null) s[k] = String(data[k])
     keepalive.value = String(data.keepalive_enabled ?? '1') === '1'
-    qoderAutoCheckin.value = String(data.qoder_auto_checkin ?? '0') === '1'
-    qoderAutoQuota.value = String(data.qoder_auto_quota ?? '0') === '1'
+    maintenanceProviders.value = (await api.getProviders()).providers.filter(p => p.maintenance?.length)
+    for (const p of maintenanceProviders.value) for (const option of p.maintenance || []) {
+      maintenanceValues[option.key] = String(data[option.key] ?? (option.default ? '1' : '0')) === '1'
+    }
     backupEnabled.value = String(data.backup_enabled ?? '0') === '1'
     backup.value = await api.backupStatus()
     costAware.value = String(data.cost_aware_routing ?? '1') === '1'
     alertOn.value = String(data.alert_enabled ?? '0') === '1'
     aaEnabled.value = !!data.aa_enabled
     aaMasked.value = data.aa_api_key_masked || ''
+  } catch {
+    loadFailed.value = true
   } finally {
     loading.value = false
   }
 }
 
 async function save() {
+  if (loading.value || loadFailed.value || saving.value) return
   saving.value = true
   try {
     const payload: Record<string, unknown> = {
       ...s,
       keepalive_enabled: keepalive.value ? '1' : '0',
-      qoder_auto_checkin: qoderAutoCheckin.value ? '1' : '0',
-      qoder_auto_quota: qoderAutoQuota.value ? '1' : '0',
       backup_enabled: backupEnabled.value ? '1' : '0',
       cost_aware_routing: costAware.value ? '1' : '0',
       alert_enabled: alertOn.value ? '1' : '0',
     }
+    for (const p of maintenanceProviders.value) for (const option of p.maintenance || []) payload[option.key] = maintenanceValues[option.key] ? '1' : '0'
     if (clearAA.value) payload.clear_aa_api_key = true
     else if (aaKeyInput.value.trim()) payload.aa_api_key = aaKeyInput.value.trim()
     await api.saveSettings(payload as Partial<Settings>)
@@ -120,9 +126,10 @@ onMounted(load)
 <template>
   <WPage title="设置" sub="自动签到、额度刷新、模型缓存、保活与额度预警的全局配置。">
     <template #actions>
-      <WButton variant="primary" :loading="saving" @click="save"><span>保存设置</span></WButton>
+      <WButton variant="primary" :disabled="loading || loadFailed" :loading="saving" @click="save"><span>保存设置</span></WButton>
     </template>
 
+    <div v-if="loadFailed" role="alert" class="mb-3 text-small text-warn">设置读取不完整，已暂停保存以避免覆盖现有配置。<WButton class="ml-2" @click="load">重新读取</WButton></div>
     <WSpinner v-if="loading" center label="加载中" />
     <div v-else class="grid gap-4 lg:grid-cols-2">
       <!-- 定时任务 -->
@@ -136,14 +143,13 @@ onMounted(load)
             <label class="text-small text-muted">额度刷新间隔（分）</label>
             <WInput v-model="s.credit_refresh_min" placeholder="30" />
           </div>
-            <div class="grid grid-cols-[1fr_9rem] items-center gap-3">
-              <label class="text-small text-muted" title="仅中国站，按活动窗口补领，失败最多重试三次；默认关闭">Qoder 中国站自动签到</label>
-              <WToggle v-model="qoderAutoCheckin" />
+          <div v-for="p in maintenanceProviders" :key="p.name" class="space-y-3 rounded-lg border border-line p-3">
+            <div class="text-small font-medium text-ink">{{ p.display_name }} 维护</div>
+            <div v-for="option in p.maintenance" :key="option.key" class="flex items-center justify-between gap-3">
+              <div><label :for="option.key" class="text-small text-muted">{{ option.label }}</label><p class="text-micro text-faint">{{ option.description }}</p></div>
+              <WToggle :id="option.key" v-model="maintenanceValues[option.key]" />
             </div>
-            <div class="grid grid-cols-[1fr_9rem] items-center gap-3">
-              <label class="text-small text-muted" title="沿用上方额度刷新间隔；默认关闭">Qoder 定期刷新额度</label>
-              <WToggle v-model="qoderAutoQuota" />
-            </div>
+          </div>
           <div class="grid grid-cols-[1fr_9rem] items-center gap-3">
             <label class="text-small text-muted">模型目录刷新（时）</label>
             <WInput v-model="s.model_refresh_hour" placeholder="6" />

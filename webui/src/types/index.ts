@@ -302,6 +302,9 @@ export interface RecordsResponse {
 
 /** 供应商摘要（GET /admin/providers 的每一项） */
 export interface ProviderSummary {
+
+  maintenance?: { key: string; label: string; description: string; default: boolean }[]
+  config_editor?: string
   name: string
   display_name: string
   ready: boolean
@@ -315,7 +318,26 @@ export interface ProviderSummary {
 }
 
 /** 供应商详情（GET /admin/providers/{name}）：摘要字段 + 账号/模型行 */
+export interface ResourceAction {
+  label: string
+  enabled: boolean
+  reason?: string
+  value?: string
+  confirmation?: string
+}
+export interface ResourceSummary {
+  status?: string
+  quota?: { remaining: number | null; total: number | null; expires_at: number | null; stale: boolean; refresh_failed: boolean }
+  id: string
+  kind: string
+  label: string
+  source?: string
+  region?: string
+  actions: Record<string, ResourceAction>
+}
+
 export interface ProviderDetail extends ProviderSummary {
+  resources?: ResourceSummary[]
   accounts: Record<string, unknown>[]
   models: Record<string, unknown>[]
 }
@@ -351,7 +373,7 @@ export interface ActiveSession {
  pending_action: string; target_uid: string; route_status: string; route_message: string; compatibility?: string
  last_success_uid?: string; last_attempt_uid?: string; agent_requests?: number
 }
-export interface SessionRow { id: string; session: ActiveSession; account_label: string; target_label: string; last_success_label?: string; last_attempt_label?: string }
+export interface SessionRow { id: string; provider?: string; controllable?: boolean; session: ActiveSession; account_label: string; target_label: string; last_success_label?: string; last_attempt_label?: string }
 export interface SessionAccountOption {
  uid: string; label: string; site: string; remaining: number | null; cost: number | null
  running: number; selectable: boolean; reason: string; cost_relation: string

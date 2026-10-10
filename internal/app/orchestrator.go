@@ -65,8 +65,9 @@ type Orchestrator struct {
 	crypto   *crypto.Manager
 	bench    *benchmarks.Store
 
-	backup   backupState
-	sessions *sessionRouter
+	backup       backupState
+	sessions     *sessionRouter
+	observations provider.SessionObservations
 }
 
 type cdEntry = wbruntime.CooldownEntry

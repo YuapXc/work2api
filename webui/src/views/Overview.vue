@@ -65,11 +65,11 @@ function provStat(p: ProviderSummary): string {
 }
 
 const recentCols: Column[] = [
-  { key: 'ts', label: '时间', mono: true },
-  { key: 'model', label: '模型' },
-  { key: 'account_uid', label: '账号', mono: true },
-  { key: 'total_tokens', label: 'Tokens', align: 'right', mono: true },
-  { key: 'status', label: '状态' },
+  { nowrap: true, key: 'ts', label: '时间', mono: true },
+  { nowrap: true, key: 'model', label: '模型' },
+  { nowrap: true, key: 'account_uid', label: '账号', mono: true },
+  { nowrap: true, key: 'total_tokens', label: 'Tokens', align: 'right', mono: true },
+  { nowrap: true, key: 'status', label: '状态' },
 ]
 const recent = computed(() => (ov.value?.recent || []).slice(0, 8))
 

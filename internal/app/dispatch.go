@@ -52,14 +52,20 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 	if _, ok := w.(http.Flusher); ok {
 		output = &flushCancelWriter{writer}
 	}
-	report, err := rt.Serve(ctx, provider.ServeRequest{
+	request := provider.ServeRequest{
 		Caller:   call.Caller,
 		Protocol: proto,
 		Payload:  payload,
 		Writer:   output,
 		AppName:  principal.AppName,
 		Headers:  r.Header,
-	})
+	}
+	var report provider.UsageReport
+	if native, ok := rt.(provider.NativeSessionObserver); !ok || !native.OwnsSessionObservations() {
+		finish := s.o.observations.Begin(rt.Name(), request)
+		defer func() { finish(report) }()
+	}
+	report, err := rt.Serve(ctx, request)
 	if err != nil {
 		report.Status, report.Error = "error", err.Error()
 		if !writer.committed && r.Context().Err() == nil {

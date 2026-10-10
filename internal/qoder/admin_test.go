@@ -106,6 +106,18 @@ func TestCatalogEmptySnapshotAndAccountIsolation(t *testing.T) {
 }
 
 func TestQuotaEntryIncludesEveryCreditBucket(t *testing.T) {
+	for _, value := range []int64{1800000000000, 1800000000} {
+		e := buildQuotaEntry(&account.QuotaInfo{ExpiresAt: value, DedicatedPackages: []account.QuotaPackage{{Remaining: 1, ExpireAt: value}}})
+		if e.expiresAt != 1800000000 || e.packages[0]["expire_at"] != float64(1800000000) {
+			t.Fatal("expiry units disagree", value, e)
+		}
+	}
+	for _, value := range []int64{0, -1, 253402214400000} {
+		e := buildQuotaEntry(&account.QuotaInfo{ExpiresAt: value, DedicatedPackages: []account.QuotaPackage{{Remaining: 1, ExpireAt: value}}})
+		if e.expiresAt != 0 || e.packages[0]["expire_at"] != nil {
+			t.Fatal("unknown/sentinel expiry exposed", value, e)
+		}
+	}
 	q := &account.QuotaInfo{
 		UserQuota:         &account.QuotaBucket{Used: 100, Total: 2000, Remaining: 1900, ResetTime: "2026-11-01T00:00:00Z"},
 		AddonQuota:        &account.QuotaBucket{Used: 50, Total: 300, Remaining: 250},

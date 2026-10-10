@@ -7,6 +7,8 @@ export interface Column {
   align?: 'left' | 'right' | 'center'
   mono?: boolean
   width?: string
+  minWidth?: string
+  nowrap?: boolean
   hint?: string
 }
 defineProps<{
@@ -29,7 +31,7 @@ const alignCls = { left: 'text-left', right: 'text-right', center: 'text-center'
             :key="c.key"
             class="whitespace-nowrap bg-elevated/60 px-3 py-2.5 text-micro font-semibold uppercase tracking-wide text-faint first:rounded-tl-lg last:rounded-tr-lg"
             :class="alignCls[c.align || 'left']"
-            :style="c.width ? { width: c.width } : {}"
+            :style="{ width: c.width, minWidth: c.minWidth }"
           >
             {{ c.label }}
             <span v-if="c.hint" class="ml-1 cursor-help text-faint/70" :title="c.hint">?</span>
@@ -46,7 +48,8 @@ const alignCls = { left: 'text-left', right: 'text-right', center: 'text-center'
             v-for="c in columns"
             :key="c.key"
             class="px-3 py-2.5 align-middle"
-            :class="[alignCls[c.align || 'left'], c.mono ? 'mono text-ink' : 'text-muted']"
+            :class="[alignCls[c.align || 'left'], c.mono ? 'mono text-ink' : 'text-muted', c.nowrap ? 'whitespace-nowrap' : '']"
+            :style="{ minWidth: c.minWidth }"
           >
             <slot :name="`cell-${c.key}`" :row="row" :value="row[c.key]">{{ row[c.key] }}</slot>
           </td>

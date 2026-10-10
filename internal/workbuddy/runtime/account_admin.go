@@ -148,6 +148,63 @@ func (o *Runtime) DeleteAccount(uid string) error {
 	return nil
 }
 
+// RenameAccount changes only the gateway alias, never the upstream identity.
+func (o *Runtime) RenameAccount(uid, name string) error {
+	o.AccountMu.Lock()
+	defer o.AccountMu.Unlock()
+	row, err := o.db.GetAccount(uid)
+	if err != nil {
+		return err
+	}
+	if row == nil || row["provider"] != "workbuddy" {
+		return fmt.Errorf("账号不存在")
+	}
+	name = strings.TrimSpace(name)
+	if err := o.db.SetAccountState(uid, map[string]any{"alias": name}); err != nil {
+		return err
+	}
+	o.Pool.SetAlias(uid, name)
+	return nil
+}
+
 func BillingCheckin(ctx context.Context, mgr *credentials.Manager) (billing.CheckinResult, error) {
 	return billing.DailyCheckin(ctx, mgr)
+}
+
+func (o *Runtime) SetAccountEnabled(uid string, enabled bool) error {
+	o.AccountMu.Lock()
+	defer o.AccountMu.Unlock()
+	row, err := o.db.GetAccount(uid)
+	if err != nil {
+		return err
+	}
+	if row == nil || row["provider"] != "workbuddy" {
+		return fmt.Errorf("账号不存在")
+	}
+	value, reason := 0, "手动停用"
+	if enabled {
+		value, reason = 1, ""
+	}
+	if err := o.db.SetAccountState(uid, map[string]any{"enabled": value, "disabled_reason": reason}); err != nil {
+		return err
+	}
+	o.Pool.SetEnabled(uid, enabled, reason)
+	return nil
+}
+
+func (o *Runtime) SetAccountPriority(uid string, priority int) error {
+	o.AccountMu.Lock()
+	defer o.AccountMu.Unlock()
+	row, err := o.db.GetAccount(uid)
+	if err != nil {
+		return err
+	}
+	if row == nil || row["provider"] != "workbuddy" {
+		return fmt.Errorf("账号不存在")
+	}
+	if err := o.db.SetAccountState(uid, map[string]any{"priority": priority}); err != nil {
+		return err
+	}
+	o.Pool.SetPriority(uid, priority)
+	return nil
 }

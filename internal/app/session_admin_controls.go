@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"work2api/internal/core/provider"
 
 	"work2api/internal/workbuddy/siterouting"
 )
@@ -30,10 +31,36 @@ func (s *Server) adminSessions(w http.ResponseWriter, r *http.Request) {
 	}
 	rows := []map[string]any{}
 	for _, v := range s.o.sessions.Views() {
-		rows = append(rows, map[string]any{"id": v.ID, "session": v, "account_label": labels[v.UID], "target_label": labels[v.Target], "last_success_label": labels[v.LastSuccess], "last_attempt_label": labels[v.LastAttempt]})
+		rows = append(rows, map[string]any{"id": v.ID, "provider": s.o.wb.Name(), "controllable": true, "session": v, "account_label": labels[v.UID], "target_label": labels[v.Target], "last_success_label": labels[v.LastSuccess], "last_attempt_label": labels[v.LastAttempt]})
 	}
+	resourceLabels := map[string]string{}
+	for _, rt := range s.o.runtimes.Runtimes() {
+		if native, ok := rt.(provider.NativeSessionObserver); ok && native.OwnsSessionObservations() {
+			continue
+		}
+		if admin, ok := rt.(provider.AdminRuntime); ok {
+			for _, resource := range admin.AdminData(r.Context()).Resources {
+				resourceLabels[rt.Name()+"/"+resource.ID] = resource.Label
+			}
+		}
+	}
+	for _, v := range s.o.observations.Views() {
+		rows = append(rows, map[string]any{"id": v.ID, "provider": v.Provider, "controllable": false, "session": v, "account_label": resourceLabels[v.Provider+"/"+v.UID], "target_label": ""})
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		last := func(row map[string]any) float64 {
+			switch v := row["session"].(type) {
+			case sessionView:
+				return v.Last
+			case provider.ObservedSession:
+				return v.Last
+			}
+			return 0
+		}
+		return last(rows[i]) > last(rows[j])
+	})
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, 200, map[string]any{"sessions": rows, "memory_only": true, "capacity": s.o.sessions.Max})
+	writeJSON(w, 200, map[string]any{"sessions": rows, "memory_only": true, "capacity": s.o.sessions.Max + 2000})
 }
 func (s *Server) sessionOptions(v sessionView) ([]sessionAccountOption, *apiError) {
 	allowed, aerr := s.o.modelAccountUIDs(v.Model)

@@ -15,6 +15,7 @@ var _ provider.AdminRuntime = (*Runtime)(nil)
 func (rt *Runtime) AdminData(ctx context.Context) provider.AdminData {
 	d := provider.AdminData{
 		DisplayName:  "OpenCode",
+		ConfigEditor: "opencode-tiers",
 		Ready:        rt.Ready(),
 		Capabilities: []string{"models", "config"},
 	}
@@ -34,6 +35,16 @@ func (rt *Runtime) AdminData(ctx context.Context) provider.AdminData {
 		accts = append(accts, map[string]any{"id": "anonymous", "label": "匿名（public）", "tier": "anonymous", "key_count": 1})
 	}
 	d.Accounts = accts
+	d.Resources = []provider.ResourceSummary{}
+	for _, row := range accts {
+		kind := "key_tier"
+		if row["tier"] == "anonymous" {
+			kind = "anonymous"
+		}
+		d.Resources = append(d.Resources, provider.ResourceMetadata(row, kind, map[string]provider.ResourceAction{
+			"config": {Label: "编辑配置", Enabled: true},
+		}))
+	}
 
 	models := []map[string]any{}
 	for _, m := range rt.Models(ctx) {

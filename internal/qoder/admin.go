@@ -78,6 +78,10 @@ func (r *Runtime) queryQuota(ctx context.Context, id, region, token string) (*ac
 // background on a miss, so page loads never block on the upstream billing call.
 func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 	d := provider.AdminData{
+		Maintenance: []provider.MaintenanceOption{
+			{Key: "qoder_auto_checkin", Label: "中国站自动签到", Description: "按活动窗口补领，失败最多重试三次；默认关闭"},
+			{Key: "qoder_auto_quota", Label: "定期刷新额度", Description: "沿用全局额度刷新间隔；默认关闭"},
+		},
 		DisplayName:  "Qoder",
 		Ready:        r.Ready(),
 		Capabilities: []string{"accounts", "models", "checkin", "credits", "oauth", "local_detect", "add_account"},
@@ -100,6 +104,24 @@ func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 		accts = append(accts, row)
 	}
 	d.Accounts = accts
+	d.Resources = []provider.ResourceSummary{}
+	for _, row := range accts {
+		local := row["source"] == "local"
+		name, _ := row["label"].(string)
+		removeLabel := "删除"
+		confirmation := "删除网关保存的账号与凭据，历史用量保留；重新导入或授权可恢复。"
+		reason := ""
+		if local {
+			removeLabel = "隐藏"
+			confirmation = "仅在网关持续隐藏此账号，不删除 Qoder 桌面凭据；重新导入或授权可恢复。"
+			reason = "桌面登录态由客户端管理"
+		}
+		d.Resources = append(d.Resources, provider.ResourceMetadata(row, "account", map[string]provider.ResourceAction{
+			"rename":   {Label: "重命名", Enabled: !local, Value: name, Reason: reason},
+			"activate": {Label: "设为激活", Enabled: !local, Reason: reason},
+			"delete":   {Label: removeLabel, Enabled: true, Confirmation: confirmation},
+		}))
+	}
 
 	models := []map[string]any{}
 	for _, m := range r.Models(ctx) {
@@ -252,7 +274,7 @@ func (r *Runtime) refreshQuotaContext(ctx context.Context, id, source, region st
 }
 
 func buildQuotaEntry(q *account.QuotaInfo) quotaEntry {
-	e := quotaEntry{plan: q.Plan, exceeded: q.IsQuotaExceeded, expiresAt: q.ExpiresAt, ts: time.Now()}
+	e := quotaEntry{plan: q.Plan, exceeded: q.IsQuotaExceeded, expiresAt: quotaExpirySeconds(q.ExpiresAt), ts: time.Now()}
 	if q.UserQuota != nil {
 		e.remaining += q.UserQuota.Remaining
 		e.total += q.UserQuota.Total
@@ -270,12 +292,24 @@ func buildQuotaEntry(q *account.QuotaInfo) quotaEntry {
 		e.remaining += p.Remaining
 		e.total += p.Total
 		pkg := map[string]any{"name": p.Label, "remain": p.Remaining, "used": p.Used, "total": p.Total}
-		if p.ExpireAt > 0 {
-			pkg["expire_at"] = float64(p.ExpireAt) / 1000.0 // 上游毫秒 → 秒（WebUI rel/dt 口径）
+		if expiry := quotaExpirySeconds(p.ExpireAt); expiry > 0 {
+			pkg["expire_at"] = float64(expiry)
 		}
 		e.packages = append(e.packages, pkg)
 	}
 	return e
+}
+
+// Quota timestamps are milliseconds upstream. Accept legacy seconds, but omit
+// nonpositive values and the far-future unlimited sentinel used by Qoder.
+func quotaExpirySeconds(value int64) int64 {
+	if value >= 100000000000 {
+		value /= 1000
+	}
+	if value <= 0 || value >= 4102444800 {
+		return 0
+	}
+	return value
 }
 
 // ResetTime is a replenishment boundary, not an expiry; keep the two distinct.

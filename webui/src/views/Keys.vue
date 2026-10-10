@@ -21,16 +21,16 @@ const apps = ref<AppInfo[]>([])
 const loading = ref(true)
 
 const cols: Column[] = [
-  { key: 'id', label: 'ID', mono: true },
+  { key: 'id', label: 'ID', mono: true, nowrap: true },
   { key: 'name', label: '名称' },
-  { key: 'key_prefix', label: '密钥', mono: true },
+  { key: 'key_prefix', label: '密钥', mono: true, nowrap: true },
   { key: 'allowed_models', label: '可用模型' },
-  { key: 'requests', label: '请求数', align: 'right', mono: true },
-  { key: 'tokens', label: 'Tokens', align: 'right', mono: true },
-  { key: 'credits', label: '消耗额度', align: 'right', mono: true, hint: '该密钥累计消耗的额度' },
-  { key: 'created_at', label: '创建时间', mono: true },
-  { key: 'enabled', label: '状态' },
-  { key: 'actions', label: '操作', align: 'right' },
+  { key: 'requests', nowrap: true, label: '请求数', align: 'right', mono: true },
+  { key: 'tokens', nowrap: true, label: 'Tokens', align: 'right', mono: true },
+  { key: 'credits', nowrap: true, label: '消耗额度', align: 'right', mono: true, hint: '该密钥累计消耗的额度' },
+  { key: 'created_at', label: '创建时间', mono: true, nowrap: true },
+  { key: 'enabled', label: '状态', nowrap: true },
+  { key: 'actions', label: '操作', align: 'right', minWidth: '14rem', nowrap: true },
 ]
 
 async function load() {
@@ -177,8 +177,8 @@ onMounted(load)
       <WSpinner v-if="loading" center label="加载中" />
       <WTable v-else :columns="cols" :rows="apps" row-key="id" min-width="880px">
         <template #cell-name="{ row }">
-          <div class="font-medium text-ink">{{ row.name }}</div>
-          <div v-if="row.note" class="text-micro text-faint">{{ row.note }}</div>
+          <div class="w-28 truncate font-medium text-ink" :title="row.name">{{ row.name }}</div>
+          <div v-if="row.note" class="w-28 truncate text-micro text-faint" :title="row.note">{{ row.note }}</div>
         </template>
         <template #cell-key_prefix="{ value }">
           <span class="text-muted">{{ value }}…</span>
@@ -186,10 +186,10 @@ onMounted(load)
         <template #cell-allowed_models="{ row }">
           <button
             type="button"
-            class="text-left text-small transition-colors"
+            class="block w-40 truncate text-left text-small transition-colors"
             :class="row.allowed_models?.length ? 'text-ink' : 'text-muted hover:text-brand'"
             @click="openModels(row)"
-            title="点击编辑可用模型"
+            :title="modelCell(row) + '（点击编辑）'"
           >
             {{ modelCell(row) }}
           </button>

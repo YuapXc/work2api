@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"sort"
 
@@ -18,10 +20,53 @@ func (s *Server) mountProviderAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/providers/{name}/oauth/poll", s.adminProviderOAuthPoll)
 	mux.HandleFunc("POST /admin/providers/{name}/accounts/{id}/activate", s.adminProviderActivate)
 	mux.HandleFunc("POST /admin/providers/{name}/accounts/{id}/rename", s.adminProviderRename)
+	mux.HandleFunc("POST /admin/providers/{name}/accounts/{id}/settings", s.adminProviderAccountSettings)
 	mux.HandleFunc("POST /admin/providers/{name}/accounts/import", s.adminProviderImportAccount)
 	mux.HandleFunc("DELETE /admin/providers/{name}/accounts/{id}", s.adminProviderDeleteAccount)
 	mux.HandleFunc("GET /admin/providers/{name}/config", s.adminProviderGetConfig)
 	mux.HandleFunc("POST /admin/providers/{name}/config", s.adminProviderSaveConfig)
+}
+
+func (s *Server) adminProviderAccountSettings(w http.ResponseWriter, r *http.Request) {
+	rt, ok := s.accountManager(w, r.PathValue("name"))
+	if !ok {
+		return
+	}
+	var body struct {
+		Enabled  *bool `json:"enabled"`
+		Priority *int  `json:"priority"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&body); err != nil {
+		writeAPIErr(w, errBody(400, "请求格式错误", "invalid_request_error"))
+		return
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF || (body.Enabled == nil) == (body.Priority == nil) {
+		writeAPIErr(w, errBody(400, "每次只更新一个账号设置", "invalid_request_error"))
+		return
+	}
+	var err error
+	if body.Enabled != nil {
+		operation, supported := rt.(provider.AccountEnabler)
+		if !supported {
+			writeAPIErr(w, errBody(400, "该渠道不支持账号启停", "invalid_request_error"))
+			return
+		}
+		err = operation.SetAccountEnabled(r.PathValue("id"), *body.Enabled)
+	} else {
+		operation, supported := rt.(provider.AccountPrioritizer)
+		if !supported {
+			writeAPIErr(w, errBody(400, "该渠道不支持优先级", "invalid_request_error"))
+			return
+		}
+		err = operation.SetAccountPriority(r.PathValue("id"), *body.Priority)
+	}
+	if err != nil {
+		writeAPIErr(w, errBody(400, err.Error(), "invalid_request_error"))
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 // configRuntime resolves a provider to its ConfigRuntime, or writes an error.
@@ -75,18 +120,13 @@ func (s *Server) adminProviderSaveConfig(w http.ResponseWriter, r *http.Request)
 }
 
 // accountManager resolves a provider to its AccountManager, or writes an error.
-func (s *Server) accountManager(w http.ResponseWriter, name string) (provider.AccountManager, bool) {
+func (s *Server) accountManager(w http.ResponseWriter, name string) (provider.Runtime, bool) {
 	rt, ok := s.o.runtimes.ByName(name)
 	if !ok {
 		writeJSON(w, 404, errBody(404, "未知供应商："+name, "invalid_request_error").Body)
 		return nil, false
 	}
-	am, ok := rt.(provider.AccountManager)
-	if !ok {
-		writeJSON(w, 400, errBody(400, name+" 不支持账号管理", "invalid_request_error").Body)
-		return nil, false
-	}
-	return am, true
+	return rt, true
 }
 
 func (s *Server) adminProviderActivate(w http.ResponseWriter, r *http.Request) {
@@ -94,7 +134,12 @@ func (s *Server) adminProviderActivate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := am.ActivateAccount(r.PathValue("id")); err != nil {
+	activate, supported := am.(provider.AccountActivator)
+	if !supported {
+		writeAPIErr(w, errBody(400, "该渠道不支持激活账号", "invalid_request_error"))
+		return
+	}
+	if err := activate.ActivateAccount(r.PathValue("id")); err != nil {
 		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").Body)
 		return
 	}
@@ -106,9 +151,18 @@ func (s *Server) adminProviderRename(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	body, _ := readJSON(r)
-	name, _ := body["name"].(string)
-	if err := am.RenameAccount(r.PathValue("id"), name); err != nil {
+	body, bodyErr := readJSON(r)
+	name, validName := body["name"].(string)
+	if bodyErr != nil || !validName {
+		writeAPIErr(w, errBody(400, "名称必须为字符串", "invalid_request_error"))
+		return
+	}
+	rename, supported := am.(provider.AccountRenamer)
+	if !supported {
+		writeAPIErr(w, errBody(400, "该渠道不支持重命名", "invalid_request_error"))
+		return
+	}
+	if err := rename.RenameAccount(r.PathValue("id"), name); err != nil {
 		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").Body)
 		return
 	}
@@ -120,7 +174,12 @@ func (s *Server) adminProviderDeleteAccount(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	if err := am.DeleteAccount(r.PathValue("id")); err != nil {
+	remove, supported := am.(provider.AccountDeleter)
+	if !supported {
+		writeAPIErr(w, errBody(400, "该渠道不支持删除账号", "invalid_request_error"))
+		return
+	}
+	if err := remove.DeleteAccount(r.PathValue("id")); err != nil {
 		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").Body)
 		return
 	}
@@ -286,7 +345,7 @@ func runtimeSummary(name string, d provider.AdminData) map[string]any {
 	return map[string]any{
 		"name": name, "display_name": d.DisplayName, "ready": d.Ready,
 		"default": d.Default, "capabilities": d.Capabilities, "status": d.Status,
-		"notes": d.Notes,
+		"notes": d.Notes, "config_editor": d.ConfigEditor, "maintenance": d.Maintenance,
 	}
 }
 
@@ -294,6 +353,7 @@ func runtimeSummary(name string, d provider.AdminData) map[string]any {
 func adminDataToMap(name string, d provider.AdminData) map[string]any {
 	m := runtimeSummary(name, d)
 	m["accounts"] = d.Accounts
+	m["resources"] = d.Resources
 	m["models"] = d.Models
 	return m
 }

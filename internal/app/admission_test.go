@@ -17,6 +17,7 @@ import (
 
 	"work2api/internal/config"
 	"work2api/internal/core/provider"
+	"work2api/internal/store"
 	"work2api/internal/streamwatch"
 	"work2api/internal/workbuddy/models"
 	"work2api/internal/workbuddy/pool"
@@ -1274,6 +1275,87 @@ type nativeProtocolProbe struct {
 	seen provider.ServeRequest
 }
 
+type renameOnlyProbe struct {
+	registryProbe
+	name string
+}
+
+func (p *renameOnlyProbe) RenameAccount(id, name string) error {
+	p.name = name
+	return nil
+}
+
+func TestIndependentManagementCapabilitiesAndStrictSettings(t *testing.T) {
+	o, acc := newDNSFailoverOrch(t, &failingUpstream{})
+	s := NewServer(o)
+	probe := &renameOnlyProbe{registryProbe: registryProbe{name: "rename-only", prefix: "rename-only/"}}
+	if err := o.runtimes.Register(probe); err != nil {
+		t.Fatal(err)
+	}
+	request := func(name, id, body string, handler http.HandlerFunc) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", "/admin/providers/fixture/accounts/fixture", strings.NewReader(body))
+		r.SetPathValue("name", name)
+		r.SetPathValue("id", id)
+		w := httptest.NewRecorder()
+		handler(w, r)
+		return w
+	}
+	if w := request("rename-only", "fixture", `{"name":"new-name"}`, s.adminProviderRename); w.Code != 200 || probe.name != "new-name" {
+		t.Fatal("independent rename rejected", w.Code, w.Body.String())
+	}
+	for _, body := range []string{`{}`, `{"name":null}`, `{"name":5}`, `{`} {
+		if w := request("rename-only", "fixture", body, s.adminProviderRename); w.Code != 400 || probe.name != "new-name" {
+			t.Fatal("bad body changed name", w.Code, body)
+		}
+	}
+	if w := request("rename-only", "fixture", `{}`, s.adminProviderActivate); w.Code != 400 {
+		t.Fatal("unsupported activation allowed", w.Code)
+	}
+	for _, body := range []string{`{}`, `{"enabled":true,"priority":1}`, `{"enabled":"yes"}`, `{"priority":1.5}`, `{"priority":1} {}`, `{"unknown":true}`} {
+		if w := request("workbuddy", acc.UID, body, s.adminProviderAccountSettings); w.Code != 400 {
+			t.Fatal("bad settings accepted", body, w.Code)
+		}
+	}
+	if w := request("rename-only", "fixture", `{"enabled":false}`, s.adminProviderAccountSettings); w.Code != 400 {
+		t.Fatal("unsupported enable allowed", w.Code)
+	}
+	if w := request("workbuddy", "missing", `{"enabled":false}`, s.adminProviderAccountSettings); w.Code != 400 {
+		t.Fatal("missing account accepted", w.Code)
+	}
+	if _, err := o.db.UpsertProviderAccount(store.ProviderAccount{UID: acc.UID, Provider: "workbuddy", Profile: acc.Profile}); err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{`{"enabled":false}`, `{"priority":7}`} {
+		if w := request("workbuddy", acc.UID, body, s.adminProviderAccountSettings); w.Code != 200 {
+			t.Fatal("WB setting failed", w.Code, w.Body.String())
+		}
+	}
+	if w := request("workbuddy", acc.UID, `{"name":"  alias  "}`, s.adminProviderRename); w.Code != 200 {
+		t.Fatal("WB alias failed", w.Code, w.Body.String())
+	}
+	persisted, err := o.db.GetAccount(acc.UID)
+	current := o.wb.Pool.Get(acc.UID)
+	if err != nil || current.Enabled || current.Priority != 7 || current.Alias != "alias" || persisted["alias"] != "alias" {
+		t.Fatal("pool and persistent state diverged", persisted, current, err)
+	}
+	resource := provider.ResourceMetadata(map[string]any{"id": "resource", "label": "safe", "access_token": "secret-fixture", "password": "secret-fixture"}, "account", map[string]provider.ResourceAction{"rename": {Label: "重命名", Enabled: true}})
+	encoded, _ := json.Marshal(resource)
+	if strings.Contains(string(encoded), "secret-fixture") {
+		t.Fatal("management summary exposed credentials")
+	}
+	if resource.Quota.Remaining != nil || resource.Status != "unknown" {
+		t.Fatal("unknown quota reported as available", resource)
+	}
+	zero := provider.ResourceMetadata(map[string]any{"credits_remaining": float64(0), "healthy": true}, "account", nil)
+	if zero.Quota.Remaining == nil || *zero.Quota.Remaining != 0 || zero.Status != "healthy" {
+		t.Fatal("zero balance confused with unknown", zero)
+	}
+	data := o.wb.AdminData(context.Background())
+	if len(data.Resources) != 1 || data.Resources[0].ID != acc.UID || !data.Resources[0].Actions["priority"].Enabled || data.Resources[0].Actions["activate"].Enabled {
+		t.Fatal("WB action semantics changed", data.Resources)
+	}
+}
+
 func (*nativeProtocolProbe) Ready() bool { return true }
 func (p *nativeProtocolProbe) Serve(ctx context.Context, req provider.ServeRequest) (provider.UsageReport, error) {
 	p.seen = req
@@ -1305,6 +1387,9 @@ func TestNamespacedNativeRequestWorksWithoutWorkBuddyAccounts(t *testing.T) {
 	}
 	if state := s.modelsAdmission.snapshot(); state["running"] != 0 || state["queued"] != 0 || state["buffer_reserved_bytes"] != int64(0) {
 		t.Fatal("native request leaked resources", state)
+	}
+	if observed := o.observations.Views(); len(observed) != 1 || observed[0].Provider != "native" || observed[0].Model != "native/model" || observed[0].Running != 0 || observed[0].Requests != 1 {
+		t.Fatal("common observation missing", observed)
 	}
 }
 
@@ -1482,5 +1567,67 @@ func TestProviderRefreshGateCanceledWaiterAndIdentityChange(t *testing.T) {
 	}
 	if err := <-next; err != nil || calls.Load() != 1 {
 		t.Fatal("changed identity shared old result", err)
+	}
+}
+
+func TestCommonSessionObservationIsolationAndCompletion(t *testing.T) {
+	var observations provider.SessionObservations
+	request := provider.ServeRequest{Caller: provider.Caller{AppID: 1}, AppName: "client", Payload: map[string]any{"model": "qoder/model", "session_id": "PRIVATE_SESSION_SIGNAL"}}
+	first := observations.Begin("qoder", request)
+	second := observations.Begin("qoder", request)
+	request.Caller.AppID = 2
+	other := observations.Begin("qoder", request)
+	request.Caller.AppID = 1
+	channel := observations.Begin("opencode", request)
+	rows := observations.Views()
+	if len(rows) != 3 {
+		t.Fatal("auth/channel isolation", rows)
+	}
+	for _, row := range rows {
+		if row.Requests == 2 && row.Running != 2 {
+			t.Fatal("concurrent requests lost", row)
+		}
+	}
+	encoded, _ := json.Marshal(rows)
+	if bytes.Contains(encoded, []byte("PRIVATE_SESSION_SIGNAL")) {
+		t.Fatal("raw session signal retained")
+	}
+	credits := 1.5
+	first(provider.UsageReport{AccountUID: "account", Credits: &credits})
+	first(provider.UsageReport{Credits: &credits}) // completion is idempotent
+	second(provider.UsageReport{AccountUID: "account"})
+	other(provider.UsageReport{})
+	channel(provider.UsageReport{})
+	for _, row := range observations.Views() {
+		if row.Running != 0 {
+			t.Fatal("execution leaked", row)
+		}
+		if row.Requests == 2 && (row.Credits != 1.5 || row.Known != 1 || row.Unknown != 1 || row.UID != "account") {
+			t.Fatal("usage attribution incorrect", row)
+		}
+	}
+	request.Payload = map[string]any{"model": "qoder/model", "request_id": "not-a-session"}
+	observations.Begin("qoder", request)(provider.UsageReport{})
+	if len(observations.Views()) != 3 {
+		t.Fatal("request ID manufactured a session")
+	}
+	var bounded provider.SessionObservations
+	finish := make([]func(provider.UsageReport), 2000)
+	for i := range finish {
+		request.Payload["session_id"] = fmt.Sprint(i)
+		finish[i] = bounded.Begin("qoder", request)
+	}
+	request.Payload["session_id"] = "overflow"
+	bounded.Begin("qoder", request)(provider.UsageReport{})
+	if len(bounded.Views()) != 2000 {
+		t.Fatal("active observations evicted or capacity exceeded")
+	}
+	finish[0](provider.UsageReport{})
+	bounded.Begin("qoder", request)(provider.UsageReport{})
+	if len(bounded.Views()) != 2000 {
+		t.Fatal("idle eviction failed")
+	}
+	for _, end := range finish {
+		end(provider.UsageReport{})
 	}
 }

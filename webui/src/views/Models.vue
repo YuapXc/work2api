@@ -190,7 +190,7 @@ onBeforeUnmount(() => { loadVersion++ })
 
     <WSpinner v-if="loading && !entries.length" center label="加载中" />
     <template v-else>
-      <div class="mb-4 grid gap-3" :class="aaConfigured ? 'grid-cols-4' : 'grid-cols-3'">
+      <div class="mb-4 grid gap-3" :class="aaConfigured ? 'grid-cols-2 sm:grid-cols-4' : 'grid-cols-2 sm:grid-cols-3'">
         <WStat label="模型总数" :value="stats.total" tone="brand" />
         <WStat label="多模态" :value="stats.multi" tone="route" />
         <WStat label="支持工具" :value="stats.tool" tone="live" />
@@ -216,7 +216,7 @@ onBeforeUnmount(() => { loadVersion++ })
         <span class="ml-auto text-small text-faint">{{ filtered.length }} / {{ entries.length }}</span>
       </div>
 
-      <div v-if="filtered.length" class="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+      <div v-if="filtered.length" class="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
         <ModelCard v-for="e in filtered" :key="e.provider + '/' + e.model.id" :model="e.model" :provider="e.provider" :reserve-desc="anyDesc" :reserve-efforts="anyEfforts" :reserve-cost="anyCost" />
       </div>
       <WEmpty v-else title="没有匹配的模型" hint="调整搜索或筛选条件，或刷新目录。" />

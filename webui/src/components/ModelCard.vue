@@ -115,13 +115,13 @@ const pricingNotes = computed(() => {
 <template>
   <!-- h-full + flex-col：网格行内三张卡等高（grid 默认 stretch），各区段用 min-h
        预留高度对齐，footer 用 mt-auto 压到底，跨卡横向成带、可读性更好。 -->
-  <div class="glass flex h-full flex-col gap-3 rounded-xl p-4 transition-colors hover:border-brand/40">
+  <div class="glass flex h-full min-w-0 flex-col gap-3 rounded-xl p-4 transition-colors hover:border-brand/40">
     <div class="flex min-h-[2.5rem] items-start justify-between gap-2">
       <div class="min-w-0">
         <div class="truncate font-semibold text-ink" :title="m.name || m.id">{{ m.name || m.id }}</div>
         <div class="mono truncate text-micro text-faint" :title="m.id">{{ m.id }}</div>
       </div>
-      <WTag :tone="pm.tone">{{ pm.label }}</WTag>
+      <WTag :tone="pm.tone" class="shrink-0 whitespace-nowrap">{{ pm.label }}</WTag>
     </div>
 
     <div class="flex min-h-[1.625rem] flex-wrap gap-1.5">
@@ -244,12 +244,12 @@ const pricingNotes = computed(() => {
       <span
         v-for="a in accounts.slice(0, 6)"
         :key="a.uid"
-        class="inline-flex items-center gap-1 rounded-md bg-elevated px-1.5 py-0.5 text-micro"
+        class="inline-flex max-w-full items-center gap-1 rounded-md bg-elevated px-1.5 py-0.5 text-micro"
         :class="a.healthy ? 'text-live' : 'text-faint'"
         :title="`${a.label || a.uid}${a.site_label ? ' · ' + a.site_label : ''}${a.model_cooldown ? ' · 本模型冷却中' : ''}`"
       >
         <span class="h-1.5 w-1.5 rounded-full" :class="a.healthy ? 'bg-live' : 'bg-faint'" />
-        {{ a.label || a.uid.slice(0, 6) }}
+        <span class="truncate">{{ a.label || a.uid.slice(0, 6) }}</span>
       </span>
       <span v-if="accounts.length > 6" class="text-micro text-faint">+{{ accounts.length - 6 }}</span>
     </div>

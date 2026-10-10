@@ -19,6 +19,7 @@ func (r *Runtime) AccountsForDisplay() []map[string]any {
 		// 曾误写成 checked_in_today，导致签到成功后页面状态永不同步。
 		a["checkin_today"] = dates[uid] == today
 		a["label"] = AccountLabel(a)
+		a["supports_checkin"] = a["site"] != "international"
 	}
 	return accounts
 }
@@ -188,6 +189,8 @@ func (r *Runtime) AdminRefreshCredits(ctx context.Context) (map[string]any, erro
 	r.RefreshAllCredits(ctx, r.db)
 	return map[string]any{"ok": true, "accounts": r.AccountsForDisplay()}, ctx.Err()
 }
+func (r *Runtime) OwnsSessionObservations() bool { return true }
+
 func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 	accounts := r.AccountsForDisplay()
 	var remain, total float64
@@ -201,7 +204,17 @@ func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 	}
 	models := r.Catalog.ListCached()
 	r.AttachModelAccounts(models)
-	return provider.AdminData{DisplayName: "WorkBuddy", Ready: len(accounts) > 0, Default: true, Capabilities: []string{"accounts", "models", "checkin", "credits", "oauth", "upload"}, Accounts: accounts, Models: models, Status: map[string]any{"account_count": len(accounts), "healthy_count": healthy, "model_count": len(models), "credits_remaining": math.Round(remain*100) / 100, "credits_total": math.Round(total*100) / 100}}
+	resources := []provider.ResourceSummary{}
+	for _, a := range accounts {
+		alias, _ := a["alias"].(string)
+		resources = append(resources, provider.ResourceMetadata(a, "account", map[string]provider.ResourceAction{
+			"rename":   {Label: "别名", Enabled: true, Value: alias},
+			"delete":   {Label: "删除", Enabled: true, Confirmation: "移出网关分发并保留历史用量；桌面原始凭据保留并持续隐藏，重新导入或授权可恢复。"},
+			"enabled":  {Label: "启用", Enabled: true},
+			"priority": {Label: "优先级", Enabled: true},
+		}))
+	}
+	return provider.AdminData{Resources: resources, DisplayName: "WorkBuddy", Ready: len(accounts) > 0, Default: true, Capabilities: []string{"accounts", "models", "checkin", "credits", "oauth", "upload"}, Accounts: accounts, Models: models, Status: map[string]any{"account_count": len(accounts), "healthy_count": healthy, "model_count": len(models), "credits_remaining": math.Round(remain*100) / 100, "credits_total": math.Round(total*100) / 100}}
 }
 func SiteLabel(site string) string {
 	switch site {

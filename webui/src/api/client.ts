@@ -176,6 +176,8 @@ export const api = {
 
   // ---------- 供应商逐账号动作（qoder 原生账号）：激活 / 重命名 / 删除 ----------
   // 设为激活账号（qoder 对应 workbuddy 的优先级：由哪个账号服务请求）
+  providerAccountSettings: (name: string, id: string, patch: { enabled?: boolean; priority?: number }) =>
+    http.post<unknown, { ok: boolean }>(`/admin/providers/${encodeURIComponent(name)}/accounts/${encodeURIComponent(id)}/settings`, patch),
   providerActivateAccount: (name: string, id: string) =>
     http.post<unknown, { ok: boolean }>(
       `/admin/providers/${encodeURIComponent(name)}/accounts/${encodeURIComponent(id)}/activate`),

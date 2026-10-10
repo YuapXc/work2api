@@ -102,14 +102,17 @@ type CheckinHistorian interface {
 // accounts (config key tiers) and no checkin/credits. The WebUI renders columns
 // and actions from Capabilities rather than assuming one uniform shape.
 type AdminData struct {
-	DisplayName  string           // e.g. "Qoder"
-	Ready        bool             // has a usable credential/config
-	Default      bool             // the un-namespaced default provider (workbuddy)
-	Capabilities []string         // subset of: accounts, models, checkin, credits, oauth, upload, config, local_detect, add_account
-	Accounts     []map[string]any // provider-shaped account rows (may be empty)
-	Models       []map[string]any // provider-shaped model rows (namespaced ids)
-	Status       map[string]any   // summary numbers for the overview card
-	Notes        string           // guidance when not ready (e.g. how to configure)
+	Maintenance  []MaintenanceOption
+	ConfigEditor string            // identifies an optional frontend editor extension, not a generic config schema
+	DisplayName  string            // e.g. "Qoder"
+	Ready        bool              // has a usable credential/config
+	Default      bool              // the un-namespaced default provider (workbuddy)
+	Capabilities []string          // subset of: accounts, models, checkin, credits, oauth, upload, config, local_detect, add_account
+	Accounts     []map[string]any  // provider-shaped account rows (may be empty)
+	Resources    []ResourceSummary // typed, credential-free per-resource management metadata
+	Models       []map[string]any  // provider-shaped model rows (namespaced ids)
+	Status       map[string]any    // summary numbers for the overview card
+	Notes        string            // guidance when not ready (e.g. how to configure)
 }
 
 // AdminRuntime is an optional capability: a Runtime that exposes management data.
