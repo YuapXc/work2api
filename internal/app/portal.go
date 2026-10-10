@@ -21,6 +21,7 @@ import (
 	"work2api/internal/store"
 	"work2api/internal/workbuddy/credentials"
 	"work2api/internal/workbuddy/oauth"
+	wbruntime "work2api/internal/workbuddy/runtime"
 	"work2api/internal/workbuddy/siterouting"
 )
 
@@ -92,22 +93,22 @@ func (s *Server) mountPortal(mux *http.ServeMux) {
 func (s *Server) adminPortalBootstrap(w http.ResponseWriter, r *http.Request) {
 	body, err := readJSON(r)
 	if err != nil {
-		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").Body)
 		return
 	}
 	username, _ := body["username"].(string)
 	password, _ := body["password"].(string)
 	username, hash, err := portalauth.UserPasswordHash(username, password)
 	if err != nil {
-		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").Body)
 		return
 	}
 	id, err := s.o.db.CreateInitialAdmin(username, hash)
 	if err != nil {
 		if errors.Is(err, store.ErrConflict) {
-			writeJSON(w, 409, errBody(409, "管理员已初始化或用户名已存在", "conflict").body)
+			writeJSON(w, 409, errBody(409, "管理员已初始化或用户名已存在", "conflict").Body)
 		} else {
-			writeJSON(w, 500, errBody(500, "初始化失败", "server_error").body)
+			writeJSON(w, 500, errBody(500, "初始化失败", "server_error").Body)
 		}
 		return
 	}
@@ -141,13 +142,13 @@ func (s *Server) portalGuard(next http.Handler) http.Handler {
 		// 写操作（含认证接口）一律同源校验；带会话的写请求要求浏览器信号
 		// （与 adminGuard 一致），认证接口保持宽松以兼容旧客户端。
 		if r.Method != http.MethodGet && r.Method != http.MethodHead && !s.adminOriginAllowed(r, !isPortalAuthPath(path)) {
-			writeJSON(w, 403, errBody(403, "拒绝跨源请求", "forbidden").body)
+			writeJSON(w, 403, errBody(403, "拒绝跨源请求", "forbidden").Body)
 			return
 		}
 		if isPortalAuthPath(path) {
 			if r.Method == http.MethodPost && path != "/portal/api/auth/logout" && (!s.portalLoginLimiter.allowLimit("ip:"+s.rateLimitIP(r), 60) || !s.portalLoginLimiter.allowLimit("global", 300)) {
 				w.Header().Set("Retry-After", "600")
-				writeJSON(w, 429, errBody(429, "尝试次数过多，请 10 分钟后再试", "rate_limit_error").body)
+				writeJSON(w, 429, errBody(429, "尝试次数过多，请 10 分钟后再试", "rate_limit_error").Body)
 				return
 			}
 			next.ServeHTTP(w, r)
@@ -155,7 +156,7 @@ func (s *Server) portalGuard(next http.Handler) http.Handler {
 		}
 		user, err := s.portalUser(r)
 		if err != nil {
-			writeJSON(w, 401, errBody(401, "请先登录", "unauthorized").body)
+			writeJSON(w, 401, errBody(401, "请先登录", "unauthorized").Body)
 			return
 		}
 		if user.MustChangePassword && path != "/portal/api/me" && path != "/portal/api/auth/password" {
@@ -188,7 +189,7 @@ func (s *Server) portalGuard(next http.Handler) http.Handler {
 			}
 			s.portalPollMu.Unlock()
 			if !lim.allow() {
-				writeJSON(w, 429, errBody(429, "轮询过于频繁，请稍后再试", "rate_limit_error").body)
+				writeJSON(w, 429, errBody(429, "轮询过于频繁，请稍后再试", "rate_limit_error").Body)
 				return
 			}
 		}
@@ -224,17 +225,17 @@ func (s *Server) portalAuthState(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) portalRegister(w http.ResponseWriter, r *http.Request) {
 	if !s.o.cfg.PortalEnabled {
-		writeJSON(w, 403, errBody(403, "门户未启用", "forbidden").body)
+		writeJSON(w, 403, errBody(403, "门户未启用", "forbidden").Body)
 		return
 	}
 	body, err := readJSON(r)
 	if err != nil {
-		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").Body)
 		return
 	}
 	mode := s.o.cfg.PortalRegistrationMode
 	if mode != "open" && mode != "invite" {
-		writeJSON(w, 403, errBody(403, "当前未开放注册", "forbidden").body)
+		writeJSON(w, 403, errBody(403, "当前未开放注册", "forbidden").Body)
 		return
 	}
 	username, _ := body["username"].(string)
@@ -243,7 +244,7 @@ func (s *Server) portalRegister(w http.ResponseWriter, r *http.Request) {
 	code := strings.ToUpper(strings.TrimSpace(invite))
 	if mode == "invite" {
 		if !inviteCodeRe.MatchString(code) {
-			writeJSON(w, 400, errBody(400, "邀请码格式无效", "invalid_request_error").body)
+			writeJSON(w, 400, errBody(400, "邀请码格式无效", "invalid_request_error").Body)
 			return
 		}
 		if s.inviteRejected(w, code) {
@@ -274,11 +275,11 @@ func (s *Server) portalRegister(w http.ResponseWriter, r *http.Request) {
 	// 注册即登录：直接发会话，省一次登录交互。
 	user, err := s.o.db.GetUser(id)
 	if err != nil || user == nil {
-		writeJSON(w, 500, errBody(500, "用户查询失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "用户查询失败", "server_error").Body)
 		return
 	}
 	if serr := s.startPortalSession(w, r, user.ID, hash); serr != nil {
-		writeJSON(w, 500, errBody(500, "会话创建失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "会话创建失败", "server_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "user": portalUserView(user)})
@@ -290,28 +291,28 @@ func (s *Server) portalRegister(w http.ResponseWriter, r *http.Request) {
 func (s *Server) inviteRejected(w http.ResponseWriter, code string) bool {
 	c, err := s.o.db.FindInviteCode(code)
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "邀请码查询失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "邀请码查询失败", "server_error").Body)
 		return true
 	}
 	if c != nil {
 		if c["used_by"] != nil {
-			writeJSON(w, 400, errBody(400, "邀请码已被使用", "invalid_request_error").body)
+			writeJSON(w, 400, errBody(400, "邀请码已被使用", "invalid_request_error").Body)
 			return true
 		}
 		if exp, _ := c["expires_at"].(float64); exp != 0 && exp <= float64(time.Now().Unix()) {
-			writeJSON(w, 400, errBody(400, "邀请码已过期", "invalid_request_error").body)
+			writeJSON(w, 400, errBody(400, "邀请码已过期", "invalid_request_error").Body)
 			return true
 		}
 		return false // 存在且未消费：交给原子消费
 	}
-	writeJSON(w, 400, errBody(400, "邀请码无效", "invalid_request_error").body)
+	writeJSON(w, 400, errBody(400, "邀请码无效", "invalid_request_error").Body)
 	return true
 }
 
 func (s *Server) portalLogin(w http.ResponseWriter, r *http.Request) {
 	body, err := readJSON(r)
 	if err != nil {
-		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").Body)
 		return
 	}
 	username, _ := body["username"].(string)
@@ -325,7 +326,7 @@ func (s *Server) portalLogin(w http.ResponseWriter, r *http.Request) {
 	user, token, err := portalauth.Login(s.o.db, username, password)
 	if err != nil {
 		time.Sleep(200 * time.Millisecond) // 等时耗：未知用户也走 dummy bcrypt，此处再加固定延迟
-		writeJSON(w, 401, errBody(401, "用户名或密码错误", "auth_error").body)
+		writeJSON(w, 401, errBody(401, "用户名或密码错误", "auth_error").Body)
 		return
 	}
 	s.setPortalCookie(w, r, token)
@@ -343,7 +344,7 @@ func (s *Server) portalLogout(w http.ResponseWriter, r *http.Request) {
 func (s *Server) portalChangePassword(w http.ResponseWriter, r *http.Request) {
 	user := portalCtx(r)
 	if user == nil {
-		writeJSON(w, 401, errBody(401, "请先登录", "unauthorized").body)
+		writeJSON(w, 401, errBody(401, "请先登录", "unauthorized").Body)
 		return
 	}
 	if !s.portalLoginLimiter.allow("password:" + strconv.FormatInt(user.ID, 10)) {
@@ -354,14 +355,14 @@ func (s *Server) portalChangePassword(w http.ResponseWriter, r *http.Request) {
 	oldPass, _ := body["old_password"].(string)
 	newPass, _ := body["new_password"].(string)
 	if err := portalauth.ChangePassword(s.o.db, user.ID, oldPass, newPass); err != nil {
-		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").Body)
 		return
 	}
 	// ChangePassword 撤销了全部会话（含当前）；重发一个让本浏览器保持登录，
 	// 其它设备全部下线（HANDOFF §4）。
 	_, token, serr := portalauth.Login(s.o.db, user.Username, newPass)
 	if serr != nil {
-		writeJSON(w, 500, errBody(500, "会话创建失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "会话创建失败", "server_error").Body)
 		return
 	}
 	s.setPortalCookie(w, r, token)
@@ -427,7 +428,7 @@ func (s *Server) portalMe(w http.ResponseWriter, r *http.Request) {
 	}
 	enabledGroups := 0
 	p := &Principal{UserID: user.ID}
-	if aerr := s.o.attachPortalScope(p); aerr != nil && aerr.status >= 500 {
+	if aerr := s.o.attachPortalScope(p); aerr != nil && aerr.Status >= 500 {
 		writeAPIErr(w, aerr)
 		return
 	}
@@ -474,7 +475,7 @@ func (s *Server) portalListKeys(w http.ResponseWriter, r *http.Request) {
 	user := portalCtx(r)
 	apps, err := s.o.db.UserApps(user.ID)
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "查询失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "查询失败", "server_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"keys": apps})
@@ -486,18 +487,18 @@ func (s *Server) portalListKeys(w http.ResponseWriter, r *http.Request) {
 func (s *Server) portalCreateKey(w http.ResponseWriter, r *http.Request) {
 	user := portalCtx(r)
 	if !s.o.cfg.PortalEnabled {
-		writeJSON(w, 403, errBody(403, "门户未启用", "forbidden").body)
+		writeJSON(w, 403, errBody(403, "门户未启用", "forbidden").Body)
 		return
 	}
 	body, _ := readJSON(r)
 	name, _ := body["name"].(string)
 	name = strings.TrimSpace(name)
 	if name == "" {
-		writeJSON(w, 400, errBody(400, "请填写 Key 名称", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "请填写 Key 名称", "invalid_request_error").Body)
 		return
 	}
 	if len(name) > 64 {
-		writeJSON(w, 400, errBody(400, "Key 名称过长（≤64 字符）", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "Key 名称过长（≤64 字符）", "invalid_request_error").Body)
 		return
 	}
 	available := s.portalAvailableModels(user.ID)
@@ -519,7 +520,7 @@ func (s *Server) portalCreateKey(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if !available[m] {
-				writeJSON(w, 403, errBody(403, "模型 "+m+" 不在共享范围内", "model_not_allowed").body)
+				writeJSON(w, 403, errBody(403, "模型 "+m+" 不在共享范围内", "model_not_allowed").Body)
 				return
 			}
 			req = append(req, m)
@@ -539,30 +540,30 @@ func (s *Server) portalCreateKey(w http.ResponseWriter, r *http.Request) {
 	}
 	count, err := s.o.db.CountUserApps(user.ID)
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "查询失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "查询失败", "server_error").Body)
 		return
 	}
 	if count >= s.o.cfg.PortalKeyMaxPerUser {
-		writeJSON(w, 403, errBody(403, fmt.Sprintf("每个用户最多创建 %d 个 Key", s.o.cfg.PortalKeyMaxPerUser), "forbidden").body)
+		writeJSON(w, 403, errBody(403, fmt.Sprintf("每个用户最多创建 %d 个 Key", s.o.cfg.PortalKeyMaxPerUser), "forbidden").Body)
 		return
 	}
 	key := s.o.genAPIKey()
 	enc, err := s.o.crypto.Encrypt(key)
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "Key 创建失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "Key 创建失败", "server_error").Body)
 		return
 	}
 	id, err := s.o.db.CreateAppForUserLimited(user.ID, name, s.o.hashKey(key), enc, s.o.cfg.PortalKeyMaxPerUser, allowedJSON, key[:min(10, len(key))]+"…")
 	if err != nil {
 		if errors.Is(err, store.ErrKeyLimit) {
-			writeJSON(w, 403, errBody(403, "Key 数量已达上限", "forbidden").body)
+			writeJSON(w, 403, errBody(403, "Key 数量已达上限", "forbidden").Body)
 			return
 		}
 		if errors.Is(err, store.ErrConflict) {
-			writeJSON(w, 409, errBody(409, "同名 Key 已存在", "conflict").body)
+			writeJSON(w, 409, errBody(409, "同名 Key 已存在", "conflict").Body)
 			return
 		}
-		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"id": id, "key": key, "ok": true})
@@ -582,7 +583,7 @@ func (s *Server) portalAvailableModels(userID int64) map[string]bool {
 // model scope. A model existing only on someone else's site is not usable.
 func (o *Orchestrator) portalCatalogPermissions(p *Principal) map[string]bool {
 	allowed := map[string]bool{}
-	for _, entry := range o.models.ListCached() {
+	for _, entry := range o.wb.Catalog.ListCached() {
 		id := str2(entry["id"])
 		if !p.PortalModels[id] {
 			continue
@@ -603,15 +604,15 @@ func (s *Server) portalModels(w http.ResponseWriter, r *http.Request) {
 	p := &Principal{UserID: portalCtx(r).ID}
 	items := []map[string]any{}
 	if aerr := s.o.attachPortalScope(p); aerr != nil {
-		if aerr.status >= 500 {
+		if aerr.Status >= 500 {
 			writeAPIErr(w, aerr)
 			return
 		}
-		writeJSON(w, 200, map[string]any{"models": items, "source": s.o.models.Source()})
+		writeJSON(w, 200, map[string]any{"models": items, "source": s.o.wb.Catalog.Source()})
 		return
 	}
 	visible := s.o.portalCatalogPermissions(p)
-	for _, model := range s.o.models.ListCached() {
+	for _, model := range s.o.wb.Catalog.ListCached() {
 		id := str2(model["id"])
 		if !visible[id] {
 			continue
@@ -625,7 +626,7 @@ func (s *Server) portalModels(w http.ResponseWriter, r *http.Request) {
 		items = append(items, item)
 	}
 	sort.Slice(items, func(i, j int) bool { return str2(items[i]["id"]) < str2(items[j]["id"]) })
-	writeJSON(w, 200, map[string]any{"models": items, "source": s.o.models.Source()})
+	writeJSON(w, 200, map[string]any{"models": items, "source": s.o.wb.Catalog.Source()})
 }
 
 func (s *Server) portalToggleKey(w http.ResponseWriter, r *http.Request) {
@@ -633,11 +634,11 @@ func (s *Server) portalToggleKey(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	enabled, owned, err := s.o.db.ToggleAppOwned(id, user.ID)
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "操作失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "操作失败", "server_error").Body)
 		return
 	}
 	if !owned {
-		writeJSON(w, 404, errBody(404, "Key 不存在", "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, "Key 不存在", "invalid_request_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "enabled": enabled})
@@ -660,7 +661,7 @@ func (s *Server) portalSetKeyModels(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if !available[m] {
-			writeJSON(w, 403, errBody(403, "模型 "+m+" 不在共享范围内", "model_not_allowed").body)
+			writeJSON(w, 403, errBody(403, "模型 "+m+" 不在共享范围内", "model_not_allowed").Body)
 			return
 		}
 		req = append(req, m)
@@ -672,11 +673,11 @@ func (s *Server) portalSetKeyModels(w http.ResponseWriter, r *http.Request) {
 	}
 	ok, err := s.o.db.SetAppModelsOwned(id, user.ID, allowedJSON)
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "操作失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "操作失败", "server_error").Body)
 		return
 	}
 	if !ok {
-		writeJSON(w, 404, errBody(404, "Key 不存在", "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, "Key 不存在", "invalid_request_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "allowed_models": req})
@@ -687,12 +688,12 @@ func (s *Server) portalDeleteKey(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	ok, err := s.o.db.DeleteAppOwned(id, user.ID)
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "操作失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "操作失败", "server_error").Body)
 		return
 	}
 	if !ok {
 		// 与"不存在"同响应：不向他人 Key 的存在性提供预言。
-		writeJSON(w, 404, errBody(404, "Key 不存在", "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, "Key 不存在", "invalid_request_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -715,14 +716,14 @@ type portalContributionTask struct {
 func (s *Server) portalContributionBegin(w http.ResponseWriter, r *http.Request) {
 	user := portalCtx(r)
 	if !s.o.cfg.PortalEnabled {
-		writeJSON(w, 403, errBody(403, "门户未启用", "forbidden").body)
+		writeJSON(w, 403, errBody(403, "门户未启用", "forbidden").Body)
 		return
 	}
 	body, _ := readJSON(r)
 	site, _ := body["site"].(string)
 	accepted, _ := body["accepted"].(bool)
 	if !accepted {
-		writeJSON(w, 400, errBody(400, "请先阅读并同意共享范围说明", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "请先阅读并同意共享范围说明", "invalid_request_error").Body)
 		return
 	}
 	now := time.Now()
@@ -741,7 +742,7 @@ func (s *Server) portalContributionBegin(w http.ResponseWriter, r *http.Request)
 	}
 	if active >= s.o.cfg.PortalMaxTasksPerUser || len(s.portalTasks) >= portalMaxTasks {
 		s.portalMu.Unlock()
-		writeJSON(w, 429, errBody(429, "扫码任务已达上限，请稍后再试", "rate_limit_error").body)
+		writeJSON(w, 429, errBody(429, "扫码任务已达上限，请稍后再试", "rate_limit_error").Body)
 		return
 	}
 	s.portalTasks[reservation] = t
@@ -749,14 +750,14 @@ func (s *Server) portalContributionBegin(w http.ResponseWriter, r *http.Request)
 	defer s.removePortalTask(reservation)
 	res, err := portalOAuthBegin(site)
 	if err != nil {
-		writeJSON(w, 502, errBody(502, "发起登录失败："+err.Error(), "upstream_error").body)
+		writeJSON(w, 502, errBody(502, "发起登录失败："+err.Error(), "upstream_error").Body)
 		return
 	}
 	state, _ := res["state"].(string)
 	authURL, _ := res["authUrl"].(string)
 	siteKey, _ := res["site"].(string)
 	if state == "" || authURL == "" {
-		writeJSON(w, 502, errBody(502, "上游未返回登录会话", "upstream_error").body)
+		writeJSON(w, 502, errBody(502, "上游未返回登录会话", "upstream_error").Body)
 		return
 	}
 	s.portalMu.Lock()
@@ -779,7 +780,7 @@ func (s *Server) portalContributionPoll(w http.ResponseWriter, r *http.Request) 
 	t := s.portalTasks[taskID]
 	if t == nil || t.userID != user.ID {
 		s.portalMu.Unlock()
-		writeJSON(w, 404, errBody(404, "任务不存在或已过期", "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, "任务不存在或已过期", "invalid_request_error").Body)
 		return
 	}
 	if time.Now().After(t.expires) {
@@ -830,7 +831,7 @@ func (s *Server) portalContributionPoll(w http.ResponseWriter, r *http.Request) 
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	verified := s.o.models.RefreshAccount(ctx, uid)
+	verified := s.o.wb.Catalog.RefreshAccount(ctx, uid)
 	// 脱敏输出（HANDOFF §6）：只回打码 uid。
 	writeJSON(w, 200, map[string]any{
 		"status": "ready", "account_uid_masked": maskUID(uid), "site": site, "models_verified": verified,
@@ -847,7 +848,7 @@ func (s *Server) removePortalTask(taskID string) {
 func (s *Server) portalContributionCancel(w http.ResponseWriter, r *http.Request) {
 	body, err := readJSON(r)
 	if err != nil {
-		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").Body)
 		return
 	}
 	taskID, _ := body["task_id"].(string)
@@ -855,7 +856,7 @@ func (s *Server) portalContributionCancel(w http.ResponseWriter, r *http.Request
 	t := s.portalTasks[taskID]
 	if t == nil || t.userID != portalCtx(r).ID {
 		s.portalMu.Unlock()
-		writeJSON(w, 404, errBody(404, "任务不存在或已过期", "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, "任务不存在或已过期", "invalid_request_error").Body)
 		return
 	}
 	delete(s.portalTasks, taskID)
@@ -869,8 +870,8 @@ func (s *Server) completePortalContribution(userID int64, uid, site string, res 
 	if uid == "" {
 		return errors.New("上游账号信息不完整")
 	}
-	s.o.accountMu.Lock()
-	defer s.o.accountMu.Unlock()
+	s.o.wb.AccountMu.Lock()
+	defer s.o.wb.AccountMu.Unlock()
 	user, err := s.o.db.GetUser(userID)
 	if err != nil || user == nil || user.Status != "active" {
 		return errors.New("用户状态已变更，请重新登录")
@@ -890,7 +891,7 @@ func (s *Server) completePortalContribution(userID int64, uid, site string, res 
 		if err != nil {
 			return errors.New("账号归属查询失败，请重试")
 		}
-		if account != nil || s.o.manager(uid) != nil || s.o.pool.Get(uid) != nil {
+		if account != nil || s.o.manager(uid) != nil || s.o.wb.Pool.Get(uid) != nil {
 			return errors.New("该账号已存在系统中，如需贡献请联系管理员处理")
 		}
 	}
@@ -911,7 +912,7 @@ func (s *Server) completePortalContribution(userID int64, uid, site string, res 
 		return errors.New("授权数据无效")
 	}
 	// Check before reserving ownership or retiring credentials, including retries.
-	path := filepath.Join(s.o.projectAuths, "workbuddy-"+safeUID(uid)+".info")
+	path := filepath.Join(s.o.wb.ProjectAuths, "workbuddy-"+safeUID(uid)+".info")
 	if old, err := os.ReadFile(path); err == nil {
 		var saved struct {
 			Account struct {
@@ -943,31 +944,31 @@ func (s *Server) completePortalContribution(userID int64, uid, site string, res 
 			return errors.New("旧凭据停止失败，请重试")
 		}
 	}
-	if err := os.MkdirAll(s.o.projectAuths, 0700); err != nil {
+	if err := os.MkdirAll(s.o.wb.ProjectAuths, 0700); err != nil {
 		return errors.New("凭据保存失败，请重试")
 	}
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		return errors.New("凭据保存失败，请重试")
 	}
-	if _, err := s.o.db.UpsertAccount(session); err != nil {
+	if _, err := wbruntime.PersistAccount(s.o.db, session); err != nil {
 		return errors.New("账号登记失败，请重试")
 	}
 	if err := s.o.db.SetAccountHidden(uid, false); err != nil {
 		return errors.New("账号登记失败，请重试")
 	}
 	mgr := credentials.NewManager(path)
-	s.o.pool.AddAccountDisabled(uid, mgr)
+	s.o.wb.Pool.AddAccountDisabled(uid, mgr)
 	s.o.setManager(uid, mgr)
 	if err := s.o.db.ActivateContributionWithGroups(id, userID); err != nil {
 		return errors.New("贡献资格登记失败，请重试")
 	}
-	s.o.pool.SetEnabled(uid, true, "")
+	s.o.wb.Pool.SetEnabled(uid, true, "")
 	return nil
 }
 
 // apiErrMsg extracts a human-readable message from an apiError body.
 func apiErrMsg(e *apiError) string {
-	if em, ok := e.body["error"].(map[string]any); ok {
+	if em, ok := e.Body["error"].(map[string]any); ok {
 		if msg, ok := em["message"].(string); ok {
 			return msg
 		}
@@ -1004,11 +1005,11 @@ func (s *Server) portalRevokeContribution(w http.ResponseWriter, r *http.Request
 	if reason == "" {
 		reason = "贡献者撤回共享"
 	}
-	s.o.accountMu.Lock()
-	defer s.o.accountMu.Unlock()
+	s.o.wb.AccountMu.Lock()
+	defer s.o.wb.AccountMu.Unlock()
 	cons, err := s.o.db.UserContributions(user.ID)
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "查询失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "查询失败", "server_error").Body)
 		return
 	}
 	var owned *store.Contribution
@@ -1019,27 +1020,27 @@ func (s *Server) portalRevokeContribution(w http.ResponseWriter, r *http.Request
 		}
 	}
 	if owned == nil {
-		writeJSON(w, 404, errBody(404, "贡献不存在", "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, "贡献不存在", "invalid_request_error").Body)
 		return
 	}
 	ok, err := s.o.db.WithdrawContribution(id, user.ID, reason)
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "操作失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "操作失败", "server_error").Body)
 		return
 	}
 	if !ok {
-		writeJSON(w, 404, errBody(404, "贡献不存在或状态不允许撤回", "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, "贡献不存在或状态不允许撤回", "invalid_request_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 func (s *Server) contributionCatalogStatus(uid string) string {
-	a := s.o.pool.Get(uid)
+	a := s.o.wb.Pool.Get(uid)
 	if a == nil || !a.Enabled {
 		return "unavailable"
 	}
-	for _, model := range s.o.models.ListCached() {
+	for _, model := range s.o.wb.Catalog.ListCached() {
 		if s.o.modelEntryAccountUIDs(model)[uid] {
 			return "ready"
 		}
@@ -1064,7 +1065,7 @@ func (s *Server) portalRefreshContributionModels(w http.ResponseWriter, r *http.
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
-		if !s.o.models.RefreshAccount(ctx, c.AccountUID) {
+		if !s.o.wb.Catalog.RefreshAccount(ctx, c.AccountUID) {
 			w.Header().Set("Retry-After", "10")
 			writeAPIErr(w, errBody(503, "模型目录暂未验证，请稍后重试；账号已保留", "catalog_pending"))
 			return
@@ -1079,7 +1080,7 @@ func (s *Server) portalListContributions(w http.ResponseWriter, r *http.Request)
 	user := portalCtx(r)
 	cons, err := s.o.db.UserContributions(user.ID)
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "查询失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "查询失败", "server_error").Body)
 		return
 	}
 	out := []map[string]any{}
@@ -1112,8 +1113,8 @@ func (s *Server) portalShareContribution(w http.ResponseWriter, r *http.Request)
 		writeAPIErr(w, errBody(404, "账号不存在", "not_found"))
 		return
 	}
-	s.o.accountMu.Lock()
-	defer s.o.accountMu.Unlock()
+	s.o.wb.AccountMu.Lock()
+	defer s.o.wb.AccountMu.Unlock()
 	ok, err := s.o.db.RestoreContributionSharing(id, portalCtx(r).ID)
 	if err != nil {
 		writeAPIErr(w, errBody(503, "恢复共享失败，请重试", "server_error"))
@@ -1176,27 +1177,27 @@ func localMidnightUnix() int64 {
 func (s *Server) adminPortalOverview(w http.ResponseWriter, r *http.Request) {
 	users, err := s.o.db.ListUsers()
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "查询失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "查询失败", "server_error").Body)
 		return
 	}
 	invites, err := s.o.db.ListInviteCodes()
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "查询失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "查询失败", "server_error").Body)
 		return
 	}
 	groups, err := s.portalGroupViews()
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "查询失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "查询失败", "server_error").Body)
 		return
 	}
 	contributions, err := s.o.db.ListContributions()
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "查询失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "查询失败", "server_error").Body)
 		return
 	}
 	rawAccounts, err := s.o.db.ListAccounts()
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "查询失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "查询失败", "server_error").Body)
 		return
 	}
 	accounts := []map[string]any{}
@@ -1251,8 +1252,8 @@ func (s *Server) adminPortalDefaultGroup(w http.ResponseWriter, r *http.Request)
 		writeAPIErr(w, errBody(400, "请明确自动授权规则", "invalid_request_error"))
 		return
 	}
-	s.o.accountMu.Lock()
-	defer s.o.accountMu.Unlock()
+	s.o.wb.AccountMu.Lock()
+	defer s.o.wb.AccountMu.Unlock()
 	if err := s.o.db.SetDefaultPortalGroup(int64(n), auto); err != nil {
 		writeAPIErr(w, errBody(400, err.Error(), "invalid_request_error"))
 		return
@@ -1281,8 +1282,8 @@ func (s *Server) adminPortalAccountSharing(w http.ResponseWriter, r *http.Reques
 		}
 		ids = append(ids, int64(n))
 	}
-	s.o.accountMu.Lock()
-	defer s.o.accountMu.Unlock()
+	s.o.wb.AccountMu.Lock()
+	defer s.o.wb.AccountMu.Unlock()
 	if err := s.o.db.SetPlatformAccountSharing(r.PathValue("uid"), mode, ids); err != nil {
 		writeAPIErr(w, errBody(400, err.Error(), "invalid_request_error"))
 		return
@@ -1303,7 +1304,7 @@ func (s *Server) portalGroupViews() ([]map[string]any, error) {
 	for _, id := range parseJSONStringArray(settings["portal_disabled_models"]) {
 		disabled[id] = true
 	}
-	catalog := s.o.models.ListCached()
+	catalog := s.o.wb.Catalog.ListCached()
 	users, err := s.o.db.ListUsers()
 	if err != nil {
 		return nil, err
@@ -1348,7 +1349,7 @@ func (s *Server) portalGroupViews() ([]map[string]any, error) {
 		}
 		ready := map[string]bool{}
 		for _, uid := range backed {
-			if a := s.o.pool.Get(uid); a != nil && a.Enabled && a.CooldownUntil <= nowSec() {
+			if a := s.o.wb.Pool.Get(uid); a != nil && a.Enabled && a.CooldownUntil <= nowSec() {
 				ready[uid] = true
 			}
 		}
@@ -1378,20 +1379,20 @@ func (s *Server) adminPortalResetPassword(w http.ResponseWriter, r *http.Request
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	body, err := readJSON(r)
 	if err != nil {
-		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").Body)
 		return
 	}
 	password, _ := body["new_password"].(string)
 	hash, err := portalauth.HashPassword(password)
 	if err != nil {
-		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").Body)
 		return
 	}
 	if !s.identityStepUp(w, r) {
 		return
 	}
 	if err := s.o.db.ManageIdentity(identityFromRequest(r).Actor, id, "password", hash); err != nil {
-		writeJSON(w, 400, errBody(400, "用户不存在或重置失败", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "用户不存在或重置失败", "invalid_request_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -1400,11 +1401,11 @@ func (s *Server) adminPortalResetPassword(w http.ResponseWriter, r *http.Request
 func (s *Server) adminPortalRevokeInvite(w http.ResponseWriter, r *http.Request) {
 	ok, err := s.o.db.RevokeInviteCode(strings.ToUpper(r.PathValue("code")))
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "撤销失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "撤销失败", "server_error").Body)
 		return
 	}
 	if !ok {
-		writeJSON(w, 404, errBody(404, "邀请码不存在或已使用", "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, "邀请码不存在或已使用", "invalid_request_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -1446,8 +1447,8 @@ func (s *Server) adminPortalUserConcurrency(w http.ResponseWriter, r *http.Reque
 		writeAPIErr(w, errBody(400, "并发需为 0（默认）至共享执行上限之间的整数", "invalid_request_error"))
 		return
 	}
-	s.o.accountMu.Lock()
-	defer s.o.accountMu.Unlock()
+	s.o.wb.AccountMu.Lock()
+	defer s.o.wb.AccountMu.Unlock()
 	settings, err := s.o.db.GetSettings()
 	if err != nil {
 		writeAPIErr(w, errBody(503, "读取设置失败", "server_error"))
@@ -1471,7 +1472,7 @@ func (s *Server) adminPortalUserConcurrency(w http.ResponseWriter, r *http.Reque
 func (s *Server) adminPortalUsers(w http.ResponseWriter, r *http.Request) {
 	users, err := s.o.db.ListUsers()
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "查询失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "查询失败", "server_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"users": users})
@@ -1482,7 +1483,7 @@ func (s *Server) adminPortalUserStatus(w http.ResponseWriter, r *http.Request) {
 	body, _ := readJSON(r)
 	status, _ := body["status"].(string)
 	if status != "active" && status != "disabled" {
-		writeJSON(w, 400, errBody(400, "status 必须是 active 或 disabled", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "status 必须是 active 或 disabled", "invalid_request_error").Body)
 		return
 	}
 	if !s.identityStepUp(w, r) {
@@ -1498,7 +1499,7 @@ func (s *Server) adminPortalUserStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) adminPortalInvites(w http.ResponseWriter, r *http.Request) {
 	codes, err := s.o.db.ListInviteCodes()
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "查询失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "查询失败", "server_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"invites": codes})
@@ -1516,7 +1517,7 @@ func (s *Server) adminPortalCreateInvite(w http.ResponseWriter, r *http.Request)
 		expires = float64(time.Now().Unix()) + days*86400
 	}
 	if err := s.o.db.CreateInviteCode(code, expires); err != nil {
-		writeJSON(w, 500, errBody(500, "保存失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "保存失败", "server_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"code": code, "expires_at": expires})
@@ -1545,7 +1546,7 @@ func genInviteCode() string {
 func (s *Server) adminPortalGroups(w http.ResponseWriter, r *http.Request) {
 	groups, err := s.portalGroupViews()
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "查询失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "查询失败", "server_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"groups": groups})
@@ -1556,16 +1557,16 @@ func (s *Server) adminPortalCreateGroup(w http.ResponseWriter, r *http.Request) 
 	name, _ := body["name"].(string)
 	name = strings.TrimSpace(name)
 	if name == "" || len(name) > 64 {
-		writeJSON(w, 400, errBody(400, "分组名称需为 1–64 字符", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "分组名称需为 1–64 字符", "invalid_request_error").Body)
 		return
 	}
 	id, err := s.o.db.CreateResourceGroup(name, "workbuddy", "")
 	if err != nil {
 		if errors.Is(err, store.ErrConflict) {
-			writeJSON(w, 409, errBody(409, "同名分组已存在", "conflict").body)
+			writeJSON(w, 409, errBody(409, "同名分组已存在", "conflict").Body)
 			return
 		}
-		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"id": id, "ok": true})
@@ -1601,7 +1602,7 @@ func (s *Server) adminPortalGroupModels(w http.ResponseWriter, r *http.Request) 
 		allowed = string(b)
 	}
 	if err := s.o.db.SetGroupModels(id, allowed); err != nil {
-		writeJSON(w, 404, errBody(404, err.Error(), "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, err.Error(), "invalid_request_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "allowed_models": models})
@@ -1612,7 +1613,7 @@ func (s *Server) adminPortalGroupEnable(w http.ResponseWriter, r *http.Request) 
 	body, _ := readJSON(r)
 	enabled, _ := body["enabled"].(bool)
 	if err := s.o.db.SetGroupEnabled(id, enabled); err != nil {
-		writeJSON(w, 404, errBody(404, err.Error(), "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, err.Error(), "invalid_request_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "enabled": enabled})
@@ -1625,7 +1626,7 @@ func (s *Server) adminPortalGroupAccounts(w http.ResponseWriter, r *http.Request
 	uid, _ := body["account_uid"].(string)
 	uid = strings.TrimSpace(uid)
 	if uid == "" {
-		writeJSON(w, 400, errBody(400, "缺少 account_uid", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "缺少 account_uid", "invalid_request_error").Body)
 		return
 	}
 	var err error
@@ -1645,11 +1646,11 @@ func (s *Server) adminPortalGroupAccounts(w http.ResponseWriter, r *http.Request
 	case "remove":
 		err = s.o.db.RemoveGroupAccount(id, uid)
 	default:
-		writeJSON(w, 400, errBody(400, "action 必须是 add 或 remove", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "action 必须是 add 或 remove", "invalid_request_error").Body)
 		return
 	}
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "操作失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "操作失败", "server_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -1661,7 +1662,7 @@ func (s *Server) adminPortalGroupGrants(w http.ResponseWriter, r *http.Request) 
 	action, _ := body["action"].(string)
 	userID, _ := body["user_id"].(float64)
 	if userID <= 0 {
-		writeJSON(w, 400, errBody(400, "缺少 user_id", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "缺少 user_id", "invalid_request_error").Body)
 		return
 	}
 	var err error
@@ -1671,11 +1672,11 @@ func (s *Server) adminPortalGroupGrants(w http.ResponseWriter, r *http.Request) 
 	case "revoke":
 		err = s.o.db.RevokeGroup(int64(userID), id)
 	default:
-		writeJSON(w, 400, errBody(400, "action 必须是 grant 或 revoke", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "action 必须是 grant 或 revoke", "invalid_request_error").Body)
 		return
 	}
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "操作失败", "server_error").body)
+		writeJSON(w, 500, errBody(500, "操作失败", "server_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})

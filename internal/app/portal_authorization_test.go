@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	wbruntime "work2api/internal/workbuddy/runtime"
 
 	"work2api/internal/portal/portalauth"
 	"work2api/internal/store"
@@ -165,16 +166,16 @@ func TestAdminSessionCapsArePerIdentityAndBoundedGlobally(t *testing.T) {
 
 func TestNewContributionCatalogVerificationAndScopeAffinity(t *testing.T) {
 	s, owner := portalFixture(t)
-	acc := s.o.pool.Accounts()[0]
-	s.o.pool = pool.New(map[string]pool.Credential{acc.UID: catalogOffline{acc.Mgr}}, "")
-	s.o.models = models.NewWithCatalogClient(s.o.pool, s.o.db, &http.Client{Transport: catalogTransport{}})
+	acc := s.o.wb.Pool.Accounts()[0]
+	s.o.wb.Pool = pool.New(map[string]pool.Credential{acc.UID: catalogOffline{acc.Mgr}}, "")
+	s.o.wb.Catalog = models.NewWithCatalogClient(s.o.wb.Pool, s.o.db, &http.Client{Transport: catalogTransport{}})
 	if _, err := s.o.db.CreateContribution(owner.ID, acc.UID, "workbuddy", "codebuddy", "active"); err != nil {
 		t.Fatal(err)
 	}
 	if len(s.portalAvailableModels(owner.ID)) != 0 {
 		t.Fatal("unverified account got models")
 	}
-	if !s.o.models.RefreshAccount(context.Background(), acc.UID) {
+	if !s.o.wb.Catalog.RefreshAccount(context.Background(), acc.UID) {
 		t.Fatal("account catalog not verified")
 	}
 	if !s.portalAvailableModels(owner.ID)["test-model"] {
@@ -185,7 +186,7 @@ func TestNewContributionCatalogVerificationAndScopeAffinity(t *testing.T) {
 	if _, err := s.o.pickInScope("test-model", key, nil, scope); err != nil {
 		t.Fatal(err)
 	}
-	if s.o.sessions.lookup(key) != acc.UID {
+	if s.o.sessions.Lookup(key) != acc.UID {
 		t.Fatal("scoped account not bound")
 	}
 	if _, err := s.o.pickInScope("test-model", key, nil, map[string]bool{}); err == nil {
@@ -202,10 +203,10 @@ func TestNewContributionCatalogVerificationAndScopeAffinity(t *testing.T) {
 
 func TestPersonalAccountAccessSurvivesWithdrawalWithoutGroup(t *testing.T) {
 	s, owner := portalFixture(t)
-	acc := s.o.pool.Accounts()[0]
-	s.o.pool = pool.New(map[string]pool.Credential{acc.UID: catalogOffline{acc.Mgr}}, "")
-	s.o.models = models.NewWithCatalogClient(s.o.pool, s.o.db, &http.Client{Transport: catalogTransport{}})
-	s.o.models.Refresh()
+	acc := s.o.wb.Pool.Accounts()[0]
+	s.o.wb.Pool = pool.New(map[string]pool.Credential{acc.UID: catalogOffline{acc.Mgr}}, "")
+	s.o.wb.Catalog = models.NewWithCatalogClient(s.o.wb.Pool, s.o.db, &http.Client{Transport: catalogTransport{}})
+	s.o.wb.Catalog.Refresh()
 	id, err := s.o.db.CreateContribution(owner.ID, acc.UID, "workbuddy", "codebuddy", "active")
 	if err != nil {
 		t.Fatal(err)
@@ -217,7 +218,7 @@ func TestPersonalAccountAccessSurvivesWithdrawalWithoutGroup(t *testing.T) {
 	}
 	p := portalKeyPrincipal(t, s, key)
 	if err := s.prepareModel(p, map[string]any{"model": "test-model"}); err != nil {
-		t.Fatal(err.body)
+		t.Fatal(err.Body)
 	}
 	if !p.AccountScope[acc.UID] || len(p.AccountScope) != 1 || !p.OwnedModels["test-model"] || p.SharedModels["test-model"] {
 		t.Fatal(p)
@@ -238,7 +239,7 @@ func TestPersonalAccountAccessSurvivesWithdrawalWithoutGroup(t *testing.T) {
 	otherPrincipal := portalKeyPrincipal(t, s, otherKey)
 	payload := map[string]any{"model": "test-model"}
 	if err := s.prepareModel(otherPrincipal, payload); err != nil {
-		t.Fatal(err.body)
+		t.Fatal(err.Body)
 	}
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 	req.Header.Set("Authorization", "Bearer "+otherKey)
@@ -312,11 +313,11 @@ func TestPersonalAccountAccessSurvivesWithdrawalWithoutGroup(t *testing.T) {
 
 func TestPlatformAccountSharingRechecksPrivateDispatch(t *testing.T) {
 	s, u := portalFixture(t)
-	acc := s.o.pool.Accounts()[0]
-	s.o.pool = pool.New(map[string]pool.Credential{acc.UID: catalogOffline{acc.Mgr}}, "")
-	s.o.models = models.NewWithCatalogClient(s.o.pool, s.o.db, &http.Client{Transport: catalogTransport{}})
-	s.o.models.Refresh()
-	if _, err := s.o.db.UpsertAccount(map[string]any{"auth": map[string]any{"access_token": "test-token"}, "account": map[string]any{"uid": acc.UID, "nickname": "platform"}}); err != nil {
+	acc := s.o.wb.Pool.Accounts()[0]
+	s.o.wb.Pool = pool.New(map[string]pool.Credential{acc.UID: catalogOffline{acc.Mgr}}, "")
+	s.o.wb.Catalog = models.NewWithCatalogClient(s.o.wb.Pool, s.o.db, &http.Client{Transport: catalogTransport{}})
+	s.o.wb.Catalog.Refresh()
+	if _, err := wbruntime.PersistAccount(s.o.db, map[string]any{"auth": map[string]any{"access_token": "test-token"}, "account": map[string]any{"uid": acc.UID, "nickname": "platform"}}); err != nil {
 		t.Fatal(err)
 	}
 	g := portalGrant(t, s, u, "platform-pool", acc.UID, []string{"test-model"})
@@ -343,7 +344,7 @@ func TestPlatformAccountSharingRechecksPrivateDispatch(t *testing.T) {
 	}
 	userPrincipal := &Principal{UserID: u.ID, AllowedModels: []string{"test-model"}}
 	if err := s.o.attachPortalScope(userPrincipal); err != nil {
-		t.Fatal(err.body)
+		t.Fatal(err.Body)
 	}
 	if err := s.prepareModel(userPrincipal, map[string]any{"model": "test-model"}); err != nil || !userPrincipal.AccountScope[acc.UID] {
 		t.Fatal("shared user could not access supplied platform account", err)
@@ -353,7 +354,7 @@ func TestPlatformAccountSharingRechecksPrivateDispatch(t *testing.T) {
 	}
 	userPrincipal = &Principal{UserID: u.ID, AllowedModels: []string{"test-model"}}
 	if err := s.o.attachPortalScope(userPrincipal); err != nil {
-		t.Fatal(err.body)
+		t.Fatal(err.Body)
 	}
 	if err := s.prepareModel(userPrincipal, map[string]any{"model": "test-model"}); err == nil {
 		t.Fatal("private conversion left shared access")
@@ -400,7 +401,7 @@ func portalKeyPrincipal(t *testing.T, s *Server, key string) *Principal {
 	t.Helper()
 	p, e := s.o.checkAPIKey("Bearer "+key, "")
 	if e != nil {
-		t.Fatal(e.body)
+		t.Fatal(e.Body)
 	}
 	return p
 }
@@ -411,7 +412,7 @@ func TestPortalAuthorizationKeepsPerModelGroupScope(t *testing.T) {
 	for model, uid := range map[string]string{"model-a": "test-account", "model-b": "second-account"} {
 		p := portalKeyPrincipal(t, s, key)
 		if err := s.prepareModel(p, map[string]any{"model": model}); err != nil {
-			t.Fatal(err.body)
+			t.Fatal(err.Body)
 		}
 		if len(p.AccountScope) != 1 || !p.AccountScope[uid] {
 			t.Fatalf("%s widened to %+v", model, p.AccountScope)
@@ -446,7 +447,7 @@ func TestPortalCanonicalAliasDisabledDangerousAndEmptyKeyPolicies(t *testing.T) 
 	p = portalKeyPrincipal(t, s, key)
 	payload := map[string]any{}
 	if err := s.prepareModel(p, payload); err != nil {
-		t.Fatal("unique canonical group/key intersection rejected", err.body)
+		t.Fatal("unique canonical group/key intersection rejected", err.Body)
 	}
 	if payload["model"] != "model-a" {
 		t.Fatal(payload)
@@ -458,7 +459,7 @@ func TestPortalQueuedRequestRefreshesAfterAdmission(t *testing.T) {
 	p := portalKeyPrincipal(t, s, key)
 	payload := map[string]any{"model": "model-a"}
 	if err := s.prepareModel(p, payload); err != nil {
-		t.Fatal(err.body)
+		t.Fatal(err.Body)
 	}
 	s.modelsAdmission.capacity = 1
 	held, err := s.modelsAdmission.acquire(context.Background(), "held")
@@ -515,7 +516,7 @@ func TestPortalRunOnceRechecksAfterAccountThrottle(t *testing.T) {
 	p := portalKeyPrincipal(t, s, key)
 	payload := map[string]any{"model": "model-a"}
 	if err := s.prepareModel(p, payload); err != nil {
-		t.Fatal(err.body)
+		t.Fatal(err.Body)
 	}
 	r := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 	r.Header.Set("Authorization", "Bearer "+key)
@@ -535,10 +536,10 @@ func TestPortalRunOnceRechecksAfterAccountThrottle(t *testing.T) {
 	if !limit.Try() {
 		t.Fatal("first grant")
 	}
-	s.o.limiters = map[string]*ratelimit.Limiter{"test-account": limit}
+	s.o.wb.Limiters = map[string]*ratelimit.Limiter{"test-account": limit}
 	done := make(chan error, 1)
 	go func() {
-		_, err := s.o.runOnce(r.Context(), s.o.pool.Get("test-account"), payload, func(string) error { return nil })
+		_, err := s.o.runOnce(r.Context(), s.o.wb.Pool.Get("test-account"), payload, func(string) error { return nil })
 		done <- err
 	}()
 	deadline := time.Now().Add(time.Second)
@@ -565,7 +566,7 @@ func TestPortalRunOnceRechecksAfterAccountThrottle(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("throttled request stuck")
 	}
-	if s.o.upstreamClient.(*failingUpstream).calls != 0 {
+	if s.o.wb.UpstreamClient.(*failingUpstream).calls != 0 {
 		t.Fatal("upstream called after revoke")
 	}
 }
@@ -679,7 +680,7 @@ func TestPortalDispatchRejectsAliasTargetChangeAfterValidation(t *testing.T) {
 	p := portalKeyPrincipal(t, s, key)
 	payload := map[string]any{"model": "friendly"}
 	if err := s.prepareModel(p, payload); err != nil {
-		t.Fatal(err.body)
+		t.Fatal(err.Body)
 	}
 	r := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 	r.Header.Set("Authorization", "Bearer "+key)
@@ -691,11 +692,11 @@ func TestPortalDispatchRejectsAliasTargetChangeAfterValidation(t *testing.T) {
 	if err := s.o.db.SaveSettings(map[string]string{"model_aliases": "friendly=model-b"}); err != nil {
 		t.Fatal(err)
 	}
-	_, err := s.o.runOnce(r.Context(), s.o.pool.Get("test-account"), map[string]any{"model": "model-a"}, func(string) error { return nil })
+	_, err := s.o.runOnce(r.Context(), s.o.wb.Pool.Get("test-account"), map[string]any{"model": "model-a"}, func(string) error { return nil })
 	if _, ok := err.(*apiError); !ok {
 		t.Fatal("stale alias target dispatched", err)
 	}
-	if s.o.upstreamClient.(*failingUpstream).calls != 0 {
+	if s.o.wb.UpstreamClient.(*failingUpstream).calls != 0 {
 		t.Fatal("stale model reached upstream")
 	}
 }

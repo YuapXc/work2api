@@ -16,6 +16,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -51,6 +52,7 @@ const fallbackContextWindow = 180000
 // expensive to build (session bootstrap + jobToken exchange), so one is cached
 // per account id.
 type Runtime struct {
+	modelRefresh         provider.RefreshGate
 	checkinFlight        *checkinFlight
 	maintenanceMu        sync.Mutex
 	autoWindow           string
@@ -347,6 +349,9 @@ func (r *Runtime) RefreshModels(ctx context.Context) error {
 		return err
 	}
 	key := modelCatalogKey(acct, secret)
+	return r.modelRefresh.Do(ctx, fmt.Sprintf("%x", key), func(ctx context.Context) error { return r.refreshAccountModels(ctx, acct, secret, key) })
+}
+func (r *Runtime) refreshAccountModels(ctx context.Context, acct *account.Account, secret string, key [32]byte) error {
 	b, err := r.bridgeFor(ctx, acct, secret)
 	if err != nil {
 		r.markCatalogStale(key)
@@ -594,3 +599,9 @@ func writeServeError(req provider.ServeRequest, err error) {
 }
 
 var _ provider.Runtime = (*Runtime)(nil)
+
+func (r *Runtime) StateSources() []provider.StateSource {
+	return []provider.StateSource{{Path: account.DataRoot()}}
+}
+
+func LockPaths() []string { return []string{filepath.Join(account.DataRoot(), ".instance.lock")} }

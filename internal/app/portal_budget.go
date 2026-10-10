@@ -80,7 +80,7 @@ type portalQuotaReservation struct {
 	settled                   bool
 }
 
-func (q *portalQuotaReservation) observe(usage map[string]any) {
+func (q *portalQuotaReservation) Observe(usage map[string]any) {
 	if q == nil {
 		return
 	}
@@ -144,7 +144,7 @@ func (s *Server) reservePortalBudget(w http.ResponseWriter, p *Principal, payloa
 		writeAPIErr(w, errBody(400, "共享请求体无效", "invalid_request_error"))
 		return false
 	}
-	output := s.o.models.MaxOutputTokens(s.o.resolveModel(strOr(payload["model"], "")))
+	output := s.o.wb.Catalog.MaxOutputTokens(s.o.resolveModel(strOr(payload["model"], "")))
 	for _, key := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
 		if v, present := payload[key]; present {
 			n, ok := v.(float64)

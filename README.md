@@ -77,6 +77,8 @@ CGO_ENABLED=0 go build -o work2api.exe ./cmd/server
 
 Windows 上也可用脚本一键构建并运行：
 
+双击 `scripts/run.cmd` 即可启动并打开管理面板；兼容 Windows PowerShell 5.1，报错时窗口会保留错误信息。终端中也可使用以下命令：
+
 ```powershell
 pwsh -File scripts/run.ps1          # 构建 work2api.exe 并运行
 pwsh -File scripts/run.ps1 -NoRun   # 只构建

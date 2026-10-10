@@ -21,29 +21,8 @@ func (s *Server) mountCredentialExport(mux *http.ServeMux) {
 // gate, same as the config-edit endpoints that already expose keys.
 func (s *Server) adminExportCredentials(w http.ResponseWriter, r *http.Request) {
 	exported := map[string]any{}
-	// workbuddy: from the live managers so refreshed tokens are included.
-	wbAccounts := []map[string]any{}
-	for _, acc := range s.o.pool.Accounts() {
-		mgr := s.o.manager(acc.UID)
-		if mgr == nil {
-			continue
-		}
-		session, err := mgr.RawSession()
-		if err != nil {
-			continue
-		}
-		entry := map[string]any{"uid": acc.UID, "session": map[string]any{
-			"auth": session.Auth, "account": session.Account,
-		}}
-		wbAccounts = append(wbAccounts, entry)
-	}
-	exported["workbuddy"] = map[string]any{
-		"accounts": wbAccounts,
-		"note":     "每个 entry 存为 auths/workbuddy-<uid>.info（session 原样落盘）即可在目标项目导入",
-	}
-
 	// Optional runtimes implementing provider.CredentialExporter.
-	for _, rt := range provider.Runtimes() {
+	for _, rt := range s.o.runtimes.Runtimes() {
 		ce, ok := rt.(provider.CredentialExporter)
 		if !ok {
 			continue

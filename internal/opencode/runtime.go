@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"work2api/internal/core/provider"
@@ -21,17 +22,20 @@ const (
 // found it stays inert: Ready() is false, Models() is empty, and Serve()
 // returns an error.
 type Runtime struct {
-	cfg        Config
-	logger     *slog.Logger
-	path       string // resolved config path (for display + hot-reload writes)
-	cancel     context.CancelFunc
-	transports *transportPool
-	zenNodes   *nodePool
-	goNodes    *nodePool
-	anonymous  *anonymousPool
-	catalog    *Catalog
-	pricing    *PricingStore
-	ready      bool
+	modelRefresh provider.RefreshGate
+	lifecycleCtx context.Context
+	registry     atomic.Pointer[provider.Registry]
+	cfg          Config
+	logger       *slog.Logger
+	path         string // resolved config path (for display + hot-reload writes)
+	cancel       context.CancelFunc
+	transports   *transportPool
+	zenNodes     *nodePool
+	goNodes      *nodePool
+	anonymous    *anonymousPool
+	catalog      *Catalog
+	pricing      *PricingStore
+	ready        bool
 }
 
 // compile-time assertion that Runtime satisfies the shared contract.
@@ -160,6 +164,7 @@ func newConfigured(cfg Config, path string, logger *slog.Logger) (*Runtime, erro
 	// old instance's loops instead of leaking a goroutine set per config save.
 	ctx, cancel := context.WithCancel(context.Background())
 	rt.cancel = cancel
+	rt.lifecycleCtx = ctx
 	pricing.Start(ctx)
 	rt.StartModelRefresh(ctx)
 	rt.StartProxyHealthChecks(ctx)
@@ -190,12 +195,14 @@ func (rt *Runtime) Models(ctx context.Context) []provider.CatalogModel {
 	if !rt.Ready() {
 		return nil
 	}
-	routes, _ := rt.catalog.AvailableModels(rt.zenNodes.Len() > 0, rt.goNodes.Len() > 0, rt.cfg.Anonymous)
+	routes, snapshot := rt.catalog.AvailableModels(rt.zenNodes.Len() > 0, rt.goNodes.Len() > 0, rt.cfg.Anonymous)
 	out := make([]provider.CatalogModel, 0, len(routes))
 	for _, route := range routes {
 		md := rt.catalog.MetadataForTier(route.ID, route.Tier)
 		decision := rt.catalog.anonymousDecision(route.ID)
 		extra := map[string]any{
+			"catalog_source":  snapshot.CacheSource,
+			"catalog_stale":   snapshot.Stale,
 			"free":            decision.Allowed,
 			"tier":            string(route.Tier),
 			"native_protocol": string(route.Protocol),
@@ -230,4 +237,18 @@ func hasImageModality(modalities []string) bool {
 		}
 	}
 	return false
+}
+
+// BindRegistry is called once, before exposing this runtime to requests.
+func (rt *Runtime) BindRegistry(registry *provider.Registry) { rt.registry.Store(registry) }
+
+func (rt *Runtime) Close() error {
+	if rt.cancel != nil {
+		rt.cancel()
+	}
+	return nil
+}
+
+func (r *Runtime) StateSources() []provider.StateSource {
+	return []provider.StateSource{{Path: r.path, Required: os.Getenv("OPENCODE_CONFIG") != ""}}
 }

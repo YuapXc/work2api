@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"work2api/internal/config"
+	"work2api/internal/core/provider"
 	"work2api/internal/streamwatch"
 	"work2api/internal/workbuddy/models"
 	"work2api/internal/workbuddy/pool"
@@ -329,13 +331,13 @@ func TestRealSSEHandlersRespectAccountAndGlobalLimits(t *testing.T) {
 		t.Run(fmt.Sprint(accountLimit), func(t *testing.T) {
 			o, _ := newDNSFailoverOrch(t, &failingUpstream{})
 			o.cfg.WorkBuddyAccountConcurrency = accountLimit
-			acc := o.pool.Accounts()[0]
-			o.pool = pool.New(map[string]pool.Credential{acc.UID: catalogOffline{acc.Mgr}}, "")
-			o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: catalogTransport{}})
-			o.models.Refresh() // Catalog transport returns fixture JSON without network access.
+			acc := o.wb.Pool.Accounts()[0]
+			o.wb.Pool = pool.New(map[string]pool.Credential{acc.UID: catalogOffline{acc.Mgr}}, "")
+			o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+			o.wb.Catalog.Refresh() // Catalog transport returns fixture JSON without network access.
 
 			h := &hangingUpstream{started: make(chan struct{}, 4)}
-			o.upstreamClient = h
+			o.wb.UpstreamClient = h
 			s := NewServer(o)
 			done := make(chan struct{}, 4)
 			if _, err := o.db.CreateApp("test", o.hashKey("test-private-key"), "", "", "", "", 0); err != nil {
@@ -423,7 +425,7 @@ func TestLocalResponseLimitDoesNotPunishAccount(t *testing.T) {
 	o, acc := newDNSFailoverOrch(t, &failingUpstream{emit: true})
 	ctx := streamwatch.WithResponseLimit(context.Background(), 1)
 	_, err := o.openUpstream(ctx, acc, map[string]any{}, "test-model", "", func(string) error { return nil }, nil)
-	if !errors.Is(err, streamwatch.ErrResponseTooLarge) || o.pool.Get(acc.UID).FailureCount != 0 {
+	if !errors.Is(err, streamwatch.ErrResponseTooLarge) || o.wb.Pool.Get(acc.UID).FailureCount != 0 {
 		t.Fatal("local output limit punished upstream account", err)
 	}
 }
@@ -435,7 +437,7 @@ func TestDownstreamWriteFailureCancelsWithoutAccountPenalty(t *testing.T) {
 		t.Fatal("flusher lost")
 	}
 	_, err := o.openUpstream(context.Background(), acc, map[string]any{}, "test-model", "", send, nil)
-	if !errors.Is(err, context.Canceled) || o.pool.Get(acc.UID).FailureCount != 0 {
+	if !errors.Is(err, context.Canceled) || o.wb.Pool.Get(acc.UID).FailureCount != 0 {
 		t.Fatal("downstream failure punished account", err)
 	}
 }
@@ -530,7 +532,7 @@ func TestAccountAdmissionUIDIsolationAlternativesAndCancellation(t *testing.T) {
 		t.Fatal("busy UID consumed execution slot", a.snapshot())
 	}
 	alternative := bind("portal-user-3", "model-a", choose(first, second))
-	if alternative.t.account.UID != "two" {
+	if alternative.t.account.LocalID != "two" {
 		t.Fatal("idle alternative not used")
 	}
 	cancel()
@@ -585,11 +587,11 @@ func TestFairAdmissionPrefersUserWithoutExecution(t *testing.T) {
 
 func TestAccountSelectorUsesSameSiteAccountsAndLiveAuthorizedReadiness(t *testing.T) {
 	o, original := newDNSFailoverOrch(t, &failingUpstream{})
-	o.pool = pool.New(map[string]pool.Credential{"one": catalogOffline{original.Mgr}, "two": catalogOffline{original.Mgr}}, "")
-	o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: catalogTransport{}})
-	o.models.Refresh()
+	o.wb.Pool = pool.New(map[string]pool.Credential{"one": catalogOffline{original.Mgr}, "two": catalogOffline{original.Mgr}}, "")
+	o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+	o.wb.Catalog.Refresh()
 	zero := 0.0
-	o.pool.SetCredits("one", &zero, nil, nil, nil)
+	o.wb.Pool.SetCredits("one", &zero, nil, nil, nil)
 	exhausted, e := o.accountSelector("test-model", "one", nil, map[string]bool{"one": true, "two": true})
 	if e != nil {
 		t.Fatal(e)
@@ -597,7 +599,7 @@ func TestAccountSelectorUsesSameSiteAccountsAndLiveAuthorizedReadiness(t *testin
 	if acc, e := exhausted(nil); e != nil || acc == nil || acc.UID != "two" {
 		t.Fatal("preferred cooldown grace revived exhausted account", acc, e)
 	}
-	o.pool.SetCredits("one", nil, nil, nil, nil)
+	o.wb.Pool.SetCredits("one", nil, nil, nil, nil)
 	selector, err := o.accountSelector("test-model", "one", nil, map[string]bool{"one": true, "two": true})
 	if err != nil {
 		t.Fatal(err)
@@ -619,8 +621,8 @@ func TestAccountSelectorUsesSameSiteAccountsAndLiveAuthorizedReadiness(t *testin
 	if acc, err := restricted(map[string]bool{"one": true}); acc != nil || err != nil {
 		t.Fatal("scope escaped instead of waiting", acc, err)
 	}
-	o.modelCooldowns["two|test-model"] = cdEntry{until: nowSec() + 60}
-	o.pool.OnFailure("one", 60)
+	o.wb.Cooldowns["two|test-model"] = cdEntry{Until: nowSec() + 60}
+	o.wb.Pool.OnFailure("one", 60)
 	if acc, err := selector(nil); acc != nil || err == nil {
 		t.Fatal("cooling accounts admitted", acc, err)
 	}
@@ -719,11 +721,11 @@ func TestFiveSlotCapacityNonstreamNearResponseLimit(t *testing.T) {
 	// ceiling. Production 4+1 spans at least two distinct accounts.
 	o.cfg.WorkBuddyAccountConcurrency = 5
 	o.cfg.UsageContentMaxBytes = 32768
-	o.pool = pool.New(map[string]pool.Credential{acc.UID: catalogOffline{acc.Mgr}}, "")
-	o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: catalogTransport{}})
-	o.models.Refresh()
+	o.wb.Pool = pool.New(map[string]pool.Credential{acc.UID: catalogOffline{acc.Mgr}}, "")
+	o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+	o.wb.Catalog.Refresh()
 	upstream := &capacityUpstream{started: make(chan struct{}, 5), finish: make(chan struct{})}
-	o.upstreamClient = upstream
+	o.wb.UpstreamClient = upstream
 	s := NewServer(o)
 	if _, err := o.db.CreateApp("capacity", o.hashKey("capacity-key"), "", "", "", "", 0); err != nil {
 		t.Fatal(err)
@@ -879,11 +881,11 @@ func TestAdaptiveProtocolCapacity(t *testing.T) {
 				// server-capacity test; real multitenant UID limits are tested separately.
 				o.cfg.WorkBuddyAccountConcurrency = 13
 				o.cfg.UsageContentMaxBytes = 32768
-				o.pool = pool.New(map[string]pool.Credential{acc.UID: catalogOffline{acc.Mgr}}, "")
-				o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: catalogTransport{}})
-				o.models.Refresh()
+				o.wb.Pool = pool.New(map[string]pool.Credential{acc.UID: catalogOffline{acc.Mgr}}, "")
+				o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+				o.wb.Catalog.Refresh()
 				c := &capacityUpstream{started: make(chan struct{}, n), finish: make(chan struct{})}
-				o.upstreamClient = c
+				o.wb.UpstreamClient = c
 				s := NewServer(o)
 				if _, err := o.db.CreateApp("capacity", o.hashKey("capacity-key"), "", "", "", "", 0); err != nil {
 					t.Fatal(err)
@@ -1017,14 +1019,14 @@ func (tr *refreshCatalogTransport) RoundTrip(r *http.Request) (*http.Response, e
 }
 func TestCatalogPartialFailurePreservesOnlyConfirmedMappings(t *testing.T) {
 	o, original := newDNSFailoverOrch(t, &failingUpstream{})
-	o.pool = pool.New(map[string]pool.Credential{"one": catalogOffline{original.Mgr}, "two": catalogOffline{original.Mgr}}, "")
+	o.wb.Pool = pool.New(map[string]pool.Credential{"one": catalogOffline{original.Mgr}, "two": catalogOffline{original.Mgr}}, "")
 	tr := &refreshCatalogTransport{}
-	o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: tr})
-	o.models.Refresh()
+	o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: tr})
+	o.wb.Catalog.Refresh()
 	tr.stage, tr.calls = 1, 0
-	o.models.Refresh()
+	o.wb.Catalog.Refresh()
 	var found map[string]any
-	for _, model := range o.models.ListCached() {
+	for _, model := range o.wb.Catalog.ListCached() {
 		if model["id"] == "test-model" {
 			found = model
 		}
@@ -1033,13 +1035,13 @@ func TestCatalogPartialFailurePreservesOnlyConfirmedMappings(t *testing.T) {
 		t.Fatal("partial refresh lost verified account mapping or fresh metadata", found)
 	}
 	tr.stage, tr.calls = 2, 0
-	o.models.Refresh()
+	o.wb.Catalog.Refresh()
 	// 双路语义下的「模型被撤销」判定：空目录是合法响应、覆盖成功快照，但单路
 	// 失败会让另一来源的快照继续供应该模型——只有两路同时给空目录才算撤销。
 	// 逐个账号清快照再刷新，等价于「两路从此都返回空」。
-	o.models.ClearCatalogSnapshots()
-	o.models.Refresh()
-	for _, model := range o.models.ListCached() {
+	o.wb.Catalog.ClearCatalogSnapshots()
+	o.wb.Catalog.Refresh()
+	for _, model := range o.wb.Catalog.ListCached() {
 		if model["id"] == "test-model" {
 			t.Fatal("valid empty catalog retained revoked model", model)
 		}
@@ -1048,7 +1050,7 @@ func TestCatalogPartialFailurePreservesOnlyConfirmedMappings(t *testing.T) {
 
 func TestAdmissionSnapshotExplainsWaitWithoutSelectingAccounts(t *testing.T) {
 	a := newModelAdmission(&config.Config{MaxConcurrentRequests: 4})
-	a.queue = []*modelTicket{{key: "paced", limit: 4}, {key: "limited", limit: 1, ready: true}, {key: "buffer", limit: 4, ready: true, bufferBytes: a.bufferBudget + 1}, {key: "account", limit: 4, ready: true, chooseAccount: func(map[string]bool) (*pool.Account, *apiError) {
+	a.queue = []*modelTicket{{key: "paced", limit: 4}, {key: "limited", limit: 1, ready: true}, {key: "buffer", limit: 4, ready: true, bufferBytes: a.bufferBudget + 1}, {key: "account", limit: 4, ready: true, chooseAccount: func(map[string]bool) (*provider.AccountRef, *apiError) {
 		t.Fatal("snapshot invoked account selection")
 		return nil, nil
 	}}}
@@ -1061,5 +1063,424 @@ func TestAdmissionSnapshotExplainsWaitWithoutSelectingAccounts(t *testing.T) {
 	reasons = a.snapshot()["waiting_reasons"].(map[string]int)
 	if reasons["execution_limit"] != 1 || reasons["account_busy"] != 0 {
 		t.Fatal(reasons)
+	}
+}
+
+// Registry probes have no credentials or network work.
+type registryProbe struct {
+	name, prefix string
+	closed       int
+}
+
+func (r *registryProbe) Name() string                                 { return r.name }
+func (r *registryProbe) Prefix() string                               { return r.prefix }
+func (*registryProbe) Ready() bool                                    { return false }
+func (*registryProbe) Models(context.Context) []provider.CatalogModel { return nil }
+func (*registryProbe) Serve(context.Context, provider.ServeRequest) (provider.UsageReport, error) {
+	return provider.UsageReport{}, nil
+}
+func (r *registryProbe) Close() error { r.closed++; return nil }
+
+func TestRuntimeRegistryIsolationAndReplacement(t *testing.T) {
+	a, b := provider.NewRegistry(), provider.NewRegistry()
+	old := &registryProbe{name: "channel", prefix: "channel/"}
+	other := &registryProbe{name: "channel", prefix: "channel/"}
+	if err := a.Register(old); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Register(other); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Register(&registryProbe{name: "nested", prefix: "channel/sub/"}); err == nil {
+		t.Fatal("ambiguous namespace accepted")
+	}
+	held, ok := a.ForModel("channel/model")
+	if !ok || held != old {
+		t.Fatal("route mismatch")
+	}
+	next := &registryProbe{name: "channel", prefix: "channel/"}
+	if err := a.Replace(old, next); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Replace(old, old); err == nil {
+		t.Fatal("stale runtime replaced current")
+	}
+	if a.IsCurrent(old) || !a.IsCurrent(next) {
+		t.Fatal("replacement ownership mismatch")
+	}
+	if got, _ := b.ByName("channel"); got != other {
+		t.Fatal("replacement leaked across instances")
+	}
+	if held != old {
+		t.Fatal("in-flight runtime changed")
+	}
+	if _, ok := a.ForModel("plain-model"); ok {
+		t.Fatal("namespace claimed bare model")
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if next.closed != 1 || old.closed != 0 || other.closed != 0 {
+		t.Fatal("shutdown crossed ownership boundary")
+	}
+}
+
+func TestProviderInvocationCancellationAndDispatchChecks(t *testing.T) {
+	checks := 0
+	denied := errors.New("account authorization changed")
+	call := provider.Invocation{Caller: provider.Caller{AppID: 17, UserID: 9}, Check: func(ctx context.Context, ref provider.AccountRef, model string) error {
+		checks++
+		if ref.Provider != "workbuddy" || ref.LocalID != "one" || model != "model" {
+			t.Fatal("dispatch identity changed")
+		}
+		if checks == 2 {
+			return denied
+		}
+		return nil
+	}}
+	ctx := provider.WithInvocation(context.Background(), call)
+	ref := provider.AccountRef{Provider: "workbuddy", LocalID: "one"}
+	if err := provider.CheckDispatch(ctx, ref, "model"); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.CheckDispatch(ctx, ref, "model"); !errors.Is(err, denied) {
+		t.Fatal("earlier permission success bypassed recheck")
+	}
+	if provider.CurrentInvocation(ctx).Caller.AppID != 17 {
+		t.Fatal("caller identity missing")
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := provider.CheckDispatch(cancelled, ref, "model"); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	if checks != 2 {
+		t.Fatal("cancelled dispatch consulted provider")
+	}
+}
+
+func TestRegistryDefaultAndNamespaceCoexist(t *testing.T) {
+	r := provider.NewRegistry()
+	def := &registryProbe{name: "default"}
+	other := &registryProbe{name: "named", prefix: "named/"}
+	if err := r.Register(def); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Register(other); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Register(&registryProbe{name: "another-default"}); err == nil {
+		t.Fatal("second default accepted")
+	}
+	if got, _ := r.Resolve("bare-model"); got != def {
+		t.Fatal("default missing")
+	}
+	if got, _ := r.Resolve("named/model"); got != other {
+		t.Fatal("default shadowed namespace")
+	}
+	if _, ok := r.ForModel("bare-model"); ok {
+		t.Fatal("namespace-only lookup changed")
+	}
+}
+
+type completedProviderStream struct{}
+
+func (*completedProviderStream) StreamUpstream(ctx context.Context, _ map[string]string, _ map[string]any, _ string, yield upstream.LineFunc) error {
+	if err := yield(`data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}`); err != nil {
+		return err
+	}
+	return yield("data: [DONE]")
+}
+func TestDefaultRuntimeNativeProtocolsLogOnce(t *testing.T) {
+	for _, proto := range []provider.Protocol{provider.ProtocolChat, provider.ProtocolAnthropic, provider.ProtocolResponses} {
+		t.Run(string(proto), func(t *testing.T) {
+			o, acc := newDNSFailoverOrch(t, &failingUpstream{})
+			o.wb.Pool = pool.New(map[string]pool.Credential{acc.UID: catalogOffline{acc.Mgr}}, "")
+			o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+			o.wb.Catalog.Refresh()
+			o.wb.UpstreamClient = &completedProviderStream{}
+			s := NewServer(o)
+			payload := map[string]any{"model": "test-model", "stream": false}
+			if proto == provider.ProtocolResponses {
+				payload["input"] = "hello"
+			} else {
+				payload["messages"] = []any{map[string]any{"role": "user", "content": "hello"}}
+			}
+			w := httptest.NewRecorder()
+			if !s.dispatchRuntimeTo(w, httptest.NewRequest("POST", "/", nil), proto, payload, &Principal{AppID: 7, AppName: "fixture"}) {
+				t.Fatal("default runtime not dispatched")
+			}
+			if w.Code != 200 {
+				t.Fatal(w.Code, w.Body.String())
+			}
+			var doc map[string]any
+			if json.Unmarshal(w.Body.Bytes(), &doc) != nil {
+				t.Fatal(w.Body.String())
+			}
+			if proto == provider.ProtocolResponses && doc["object"] != "response" {
+				t.Fatal(doc)
+			}
+			if proto == provider.ProtocolAnthropic && doc["type"] != "message" {
+				t.Fatal(doc)
+			}
+			rows, err := o.db.UsageRecent(10, "", "", nil, "", false, 0, "")
+			if err != nil || len(rows) != 1 || rows[0]["protocol"] != string(proto) {
+				t.Fatal("usage duplicated or protocol lost", rows, err)
+			}
+			health := httptest.NewRecorder()
+			s.adminHealth(health, httptest.NewRequest("GET", "/", nil))
+			var snapshot map[string]any
+			_ = json.Unmarshal(health.Body.Bytes(), &snapshot)
+			if snapshot["total_providers"] != float64(1) {
+				t.Fatal("default health duplicated", snapshot)
+			}
+		})
+	}
+}
+
+func TestAccountLeasesDoNotMixProviderLocalIDs(t *testing.T) {
+	a := newModelAdmission(&config.Config{MaxConcurrentRequests: 2, WorkBuddyAccountConcurrency: 1})
+	first, err := a.acquire(context.Background(), "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.release()
+	ref1 := provider.AccountRef{Provider: "workbuddy", LocalID: "same"}
+	if _, err := first.bindProviderAccount(context.Background(), func(map[string]bool) (*provider.AccountRef, *apiError) { return &ref1, nil }); err != nil {
+		t.Fatal(err)
+	}
+	second, err := a.acquire(context.Background(), "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.release()
+	ref2 := provider.AccountRef{Provider: "other", LocalID: "same"}
+	if _, err := second.bindProviderAccount(context.Background(), func(busy map[string]bool) (*provider.AccountRef, *apiError) {
+		if provider.LocalBusy(busy, "other")["same"] {
+			t.Fatal("other channel inherited WB occupancy")
+		}
+		return &ref2, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	counts := a.snapshot()["account_running"].(map[string]int)
+	if counts["same"] != 1 || counts["other/same"] != 1 {
+		t.Fatal(counts)
+	}
+}
+
+type nativeProtocolProbe struct {
+	registryProbe
+	seen provider.ServeRequest
+}
+
+func (*nativeProtocolProbe) Ready() bool { return true }
+func (p *nativeProtocolProbe) Serve(ctx context.Context, req provider.ServeRequest) (provider.UsageReport, error) {
+	p.seen = req
+	writeJSON(req.Writer, 200, map[string]any{"ok": true})
+	return provider.UsageReport{Status: "ok"}, nil
+}
+func TestNamespacedNativeRequestWorksWithoutWorkBuddyAccounts(t *testing.T) {
+	o, _ := newDNSFailoverOrch(t, &failingUpstream{})
+	o.wb.Pool = pool.New(map[string]pool.Credential{}, "")
+	o.wb.Catalog = models.New(o.wb.Pool, o.db)
+	rt := &nativeProtocolProbe{registryProbe: registryProbe{name: "native", prefix: "native/"}}
+	if err := o.runtimes.Register(rt); err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(o)
+	appID, err := o.db.CreateApp("native-caller", o.hashKey("native-fixture-key"), "", "", "", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"native/model","system":"original system","messages":[{"role":"user","content":"hello"}],"tools":[{"name":"native_tool","input_schema":{"type":"object"}}],"n":2,"opaque":{"keep":true}}`
+	r := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+	r.Header.Set("X-Claude-Code-Session-Id", "original-id")
+	r.Header.Set("Authorization", "Bearer native-fixture-key")
+	r = r.WithContext(context.WithValue(r.Context(), principalContextKey{}, &Principal{AppID: appID, AppName: "native-caller"}))
+	w := httptest.NewRecorder()
+	s.handleMessages(w, r)
+	if w.Code != 200 || rt.seen.Protocol != provider.ProtocolAnthropic || rt.seen.Caller.AppID != appID || rt.seen.Headers.Get("X-Claude-Code-Session-Id") != "original-id" || rt.seen.Payload["system"] != "original system" || rt.seen.Payload["n"] != float64(2) || rt.seen.Payload["opaque"] == nil {
+		t.Fatal("native protocol changed or WB credentials required", w.Code, w.Body.String(), rt.seen)
+	}
+	if state := s.modelsAdmission.snapshot(); state["running"] != 0 || state["queued"] != 0 || state["buffer_reserved_bytes"] != int64(0) {
+		t.Fatal("native request leaked resources", state)
+	}
+}
+
+// Three slow providers must start together; one failure cannot erase another
+// provider's success or expose the upstream's sensitive diagnostic.
+type catalogRefreshProbe struct {
+	registryProbe
+	mu      sync.Mutex
+	ids     []string
+	started chan string
+	finish  <-chan struct{}
+	err     error
+}
+
+func (*catalogRefreshProbe) Ready() bool { return true }
+func (p *catalogRefreshProbe) Models(context.Context) []provider.CatalogModel {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := []provider.CatalogModel{}
+	for _, id := range p.ids {
+		out = append(out, provider.CatalogModel{ID: id})
+	}
+	return out
+}
+func (p *catalogRefreshProbe) RefreshModels(ctx context.Context) error {
+	p.started <- p.name
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.finish:
+	}
+	if p.err != nil {
+		return p.err
+	}
+	p.mu.Lock()
+	p.ids = []string{p.name + "/new"}
+	p.mu.Unlock()
+	return nil
+}
+func TestParallelCatalogRefreshAndSafePartialFeedback(t *testing.T) {
+	started := make(chan string, 3)
+	finish := make(chan struct{})
+	registry := provider.NewRegistry()
+	for _, name := range []string{"one", "two", "three"} {
+		p := &catalogRefreshProbe{registryProbe: registryProbe{name: name, prefix: name + "/"}, ids: []string{name + "/old"}, started: started, finish: finish}
+		if name == "two" {
+			p.err = fmt.Errorf("upstream SECRET_CREDENTIAL")
+		}
+		if name == "three" {
+			p.err = provider.ErrPartialRefresh
+		}
+		if err := registry.Register(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	o := &Orchestrator{runtimes: registry}
+	done := make(chan []modelRefreshResult, 1)
+	go func() { done <- o.refreshModelCatalogs(context.Background(), "") }()
+	for range 3 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			close(finish)
+			t.Fatal("refreshes serialized")
+		}
+	}
+	close(finish)
+	results := <-done
+	statuses := map[string]string{}
+	for _, r := range results {
+		statuses[r.Provider] = r.Status
+		if strings.Contains(r.Message, "SECRET") {
+			t.Fatal("raw error leaked")
+		}
+		if r.Provider == "one" && (r.Added != 1 || r.Removed != 1 || r.Count != 1) {
+			t.Fatal("change counts incorrect", r)
+		}
+		if r.Provider != "one" && !r.Stale {
+			t.Fatal("failed snapshot not marked stale")
+		}
+	}
+	if statuses["one"] != "ok" || statuses["two"] != "error" || statuses["three"] != "partial" {
+		t.Fatal(statuses)
+	}
+	if len(modelRefreshWarnings(results)) != 2 {
+		t.Fatal("failure hidden")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	selected := o.refreshModelCatalogs(ctx, "one")
+	if len(selected) != 1 || selected[0].Status != "error" {
+		t.Fatal("cancellation ignored", selected)
+	}
+}
+func TestRefreshSingleFlightSeparatesSelectedProviders(t *testing.T) {
+	s := NewServer(&Orchestrator{cfg: &config.Config{HeavyAdminConcurrency: 2}})
+	started := make(chan string, 2)
+	finish := make(chan struct{})
+	done := make(chan *httptest.ResponseRecorder, 2)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := r.URL.Query().Get("provider")
+		started <- name
+		<-finish
+		writeJSON(w, 200, map[string]any{"provider": name})
+	})
+	for _, name := range []string{"workbuddy", "qoder"} {
+		go func(name string) {
+			w := httptest.NewRecorder()
+			s.serveRefresh(w, httptest.NewRequest("POST", "/admin/models/refresh?provider="+name, nil), handler)
+			done <- w
+		}(name)
+	}
+	names := map[string]bool{}
+	for range 2 {
+		select {
+		case name := <-started:
+			names[name] = true
+		case <-time.After(time.Second):
+			close(finish)
+			t.Fatal("provider refresh merged incorrectly")
+		}
+	}
+	close(finish)
+	for range 2 {
+		w := <-done
+		if w.Code != 200 {
+			t.Fatal(w.Code)
+		}
+	}
+	if !names["workbuddy"] || !names["qoder"] {
+		t.Fatal(names)
+	}
+}
+
+type observedRefreshContext struct {
+	context.Context
+	joined chan struct{}
+	once   sync.Once
+}
+
+func (c *observedRefreshContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.joined) })
+	return c.Context.Done()
+}
+
+func TestProviderRefreshGateCanceledWaiterAndIdentityChange(t *testing.T) {
+	var gate provider.RefreshGate
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- gate.Do(context.Background(), "old", func(context.Context) error { close(started); <-finish; return provider.ErrPartialRefresh })
+	}()
+	<-started
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := gate.Do(ctx, "old", func(context.Context) error { t.Error("canceled waiter ran"); return nil }); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	same := make(chan error, 1)
+	observer := &observedRefreshContext{Context: context.Background(), joined: make(chan struct{})}
+	go func() { same <- gate.Do(observer, "old", func(context.Context) error { calls.Add(1); return nil }) }()
+	<-observer.joined
+	next := make(chan error, 1)
+	go func() {
+		next <- gate.Do(context.Background(), "new", func(context.Context) error { calls.Add(1); return nil })
+	}()
+	close(finish)
+	if err := <-done; !errors.Is(err, provider.ErrPartialRefresh) {
+		t.Fatal(err)
+	}
+	if err := <-same; !errors.Is(err, provider.ErrPartialRefresh) {
+		t.Fatal("same identity did not share refresh outcome", err)
+	}
+	if err := <-next; err != nil || calls.Load() != 1 {
+		t.Fatal("changed identity shared old result", err)
 	}
 }

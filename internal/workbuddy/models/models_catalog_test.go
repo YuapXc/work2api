@@ -2,11 +2,13 @@ package models
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"work2api/internal/workbuddy/pool"
 )
@@ -277,4 +279,56 @@ func TestRefreshPreservesPublishedSnapshotAndSourceRestrictions(t *testing.T) {
 	if boolOf(r.catalogCache[[3]string{"cn-cli", first, sources[0]}][0].reasoning["onlyReasoning"]) {
 		t.Fatal("source snapshot polluted")
 	}
+}
+
+func TestRefreshFeedbackPartialFailureRevocationAndCancellableLock(t *testing.T) {
+	phase := 0
+	p := pool.New(map[string]pool.Credential{"uid": catalogTestCredential{profile: "cn-cli"}}, "")
+	tr := isolatedCatalogTransport(func(req *http.Request) (*http.Response, error) {
+		if phase == 3 || phase == 1 && req.URL.Path != "/v3/config" {
+			return catalogResponse(req, 503, `{}`), nil
+		}
+		body := catalogBody()
+		if phase < 2 {
+			body = `{"data":{"models":[{"id":"test-model"}],"agents":[{"name":"cli","models":["test-model"]}]}}`
+		}
+		return catalogResponse(req, 200, body), nil
+	})
+	r := NewWithCatalogClient(p, nil, &http.Client{Transport: tr})
+	initial, err := r.RefreshWithStatus(context.Background())
+	if err != nil || r.Stale() || len(initial) < 2 {
+		t.Fatal(initial, err)
+	}
+	phase = 1
+	if _, err = r.RefreshWithStatus(context.Background()); !errors.Is(err, ErrPartialRefresh) || !r.Stale() {
+		t.Fatal("partial failure hidden", err)
+	}
+	phase = 2
+	current, err := r.RefreshWithStatus(context.Background())
+	if err != nil || r.Stale() {
+		t.Fatal(err)
+	}
+	for _, m := range current {
+		if m["id"] == "test-model" {
+			t.Fatal("revoked model retained")
+		}
+	}
+	phase = 3
+	if _, err = r.RefreshWithStatus(context.Background()); !errors.Is(err, ErrRefreshFailed) || !r.Stale() {
+		t.Fatal("failure reported as success", err)
+	}
+	r.refreshMu.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	done := make(chan error, 1)
+	go func() { _, err := r.RefreshWithStatus(ctx); done <- err }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Error(err)
+		}
+	case <-time.After(time.Second):
+		t.Error("lock ignored cancellation")
+	}
+	cancel()
+	r.refreshMu.Unlock()
 }

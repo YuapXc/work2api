@@ -220,7 +220,7 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := readJSON(r)
 	if err != nil && err != io.EOF {
-		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").Body)
 		return
 	}
 	// No ADMIN_TOKEN configured: the whole admin surface is loopback-only and

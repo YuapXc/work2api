@@ -6,8 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-
-	"work2api/internal/core/provider"
 )
 
 // saveMu serializes config saves so two concurrent WebUI writes can't both
@@ -43,6 +41,10 @@ func (rt *Runtime) SaveConfigDoc(patch map[string]any) error {
 	saveMu.Lock()
 	defer saveMu.Unlock()
 
+	registry := rt.registry.Load()
+	if registry == nil || !registry.IsCurrent(rt) {
+		return fmt.Errorf("运行时配置已变更，请刷新后保存")
+	}
 	cfg := rt.baseConfig()
 	if v, ok := patch["zen_keys"]; ok {
 		cfg.ZenKeys = toStringSlice(v)
@@ -75,10 +77,12 @@ func (rt *Runtime) SaveConfigDoc(patch map[string]any) error {
 	if rt.ready && rt.catalog != nil {
 		newRt.catalog.CopyState(rt.catalog)
 	}
-	if rt.cancel != nil {
-		rt.cancel() // stop the old instance's background loops
+	newRt.BindRegistry(registry)
+	if err := registry.Replace(rt, newRt); err != nil {
+		_ = newRt.Close()
+		return err
 	}
-	provider.ReplaceRuntime(newRt)
+	_ = rt.Close()
 	return nil
 }
 

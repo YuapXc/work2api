@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"work2api/internal/core/provider"
+	wbruntime "work2api/internal/workbuddy/runtime"
 )
 
 func roundN(v float64, places int) float64 {
@@ -77,45 +78,10 @@ func (s *Server) mountAdmin(mux *http.ServeMux) {
 	s.mountProviderAdmin(mux)
 }
 
-func (s *Server) accountsForDisplay() []map[string]any {
-	accounts := s.o.pool.AllAccounts()
-	dates, _ := s.o.db.CheckinDates()
-	today := time.Now().Format("2006-01-02")
-	for _, a := range accounts {
-		uid, _ := a["uid"].(string)
-		// 前端读取的是 checkin_today（见 webui Accounts.vue / types）——
-		// 曾误写成 checked_in_today，导致签到成功后页面状态永不同步。
-		a["checkin_today"] = dates[uid] == today
-		a["label"] = accountLabel(a)
-	}
-	return accounts
-}
+func (s *Server) accountsForDisplay() []map[string]any { return s.o.wb.AccountsForDisplay() }
 
-// siteLabel maps the internal site id to a Chinese display name. Kept on the
-// backend so the frontend needn't maintain a duplicate mapping (upstream had
-// this translation copy-pasted in three places).
-func siteLabel(site string) string {
-	switch site {
-	case "domestic":
-		return "国内"
-	case "international":
-		return "国际"
-	case "qoder-cn":
-		return "Qoder 国内"
-	case "qoder-global":
-		return "Qoder 国际"
-	case "":
-		return ""
-	default:
-		return site
-	}
-}
+var siteLabel = wbruntime.SiteLabel
 
-// decorateByAccount enriches usage["by_account"] rows with display label / site
-// so the Usage page "按账号统计" can render names directly. Must be applied by
-// every endpoint returning by_account (overview + usage summary), else that
-// column is blank. Accounts deleted since the log was written fall back to a
-// uid short code and are flagged removed. Modifies usage in place.
 func decorateByAccount(usage map[string]any, accounts []map[string]any) map[string]any {
 	byUID := map[string]map[string]any{}
 	for _, a := range accounts {
@@ -156,31 +122,9 @@ func decorateByAccount(usage map[string]any, accounts []map[string]any) map[stri
 	return usage
 }
 
-func accountLabel(a map[string]any) string {
-	if alias, ok := a["alias"].(string); ok && strings.TrimSpace(alias) != "" {
-		return strings.TrimSpace(alias)
-	}
-	if nick, ok := a["nickname"].(string); ok && readableLabel(nick) {
-		return nick
-	}
-	uid, _ := a["uid"].(string)
-	if len(uid) > 8 {
-		return uid[:8]
-	}
-	return uid
-}
+var accountLabel = wbruntime.AccountLabel
 
-func readableLabel(text string) bool {
-	if strings.TrimSpace(text) == "" {
-		return false
-	}
-	for _, ch := range text {
-		if ch < 0x20 || ch == 0x7F || (ch >= 0xE000 && ch <= 0xF8FF) || ch == 0xFFFD {
-			return false
-		}
-	}
-	return true
-}
+var readableLabel = wbruntime.ReadableLabel
 
 func (s *Server) adminOverview(w http.ResponseWriter, r *http.Request) {
 	accounts := s.accountsForDisplay()
@@ -195,8 +139,8 @@ func (s *Server) adminOverview(w http.ResponseWriter, r *http.Request) {
 		"usage":              decorateByAccount(summary, accounts),
 		"recent":             s.recentLight(),
 		"prediction":         s.creditPrediction(accounts),
-		"model_count":        len(s.o.models.ListCached()),
-		"model_source":       s.o.models.Source(),
+		"model_count":        len(s.o.wb.Catalog.ListCached()),
+		"model_source":       s.o.wb.Catalog.Source(),
 	})
 }
 
@@ -208,21 +152,7 @@ func (s *Server) recentLight() []map[string]any {
 	return rows
 }
 
-func accountFloat(a map[string]any, key string) float64 {
-	switch v := a[key].(type) {
-	case float64:
-		return v
-	case int64:
-		return float64(v)
-	case *float64:
-		// billing.summarizePackages 的内存态 expire_at 先是 *float64，JSON 归一化
-		// 才解引用；creditAlerts 走内存路径（pool.AllAccounts）必须接住指针形态。
-		if v != nil {
-			return *v
-		}
-	}
-	return 0
-}
+var accountFloat = wbruntime.AccountFloat
 
 func accountString(a map[string]any, key string) string {
 	if s, ok := a[key].(string); ok {
@@ -355,7 +285,7 @@ func (s *Server) adminAccounts(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) adminEnable(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	s.o.pool.SetEnabled(uid, true, "")
+	s.o.wb.Pool.SetEnabled(uid, true, "")
 	_ = s.o.db.SetAccountState(uid, map[string]any{"enabled": 1, "disabled_reason": ""})
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
@@ -367,7 +297,7 @@ func (s *Server) adminDisable(w http.ResponseWriter, r *http.Request) {
 	if reason == "" {
 		reason = "手动停用"
 	}
-	s.o.pool.SetEnabled(uid, false, reason)
+	s.o.wb.Pool.SetEnabled(uid, false, reason)
 	_ = s.o.db.SetAccountState(uid, map[string]any{"enabled": 0, "disabled_reason": reason})
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
@@ -376,7 +306,7 @@ func (s *Server) adminPriority(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	body, _ := readJSON(r)
 	p := intOf(body["priority"])
-	s.o.pool.SetPriority(uid, p)
+	s.o.wb.Pool.SetPriority(uid, p)
 	_ = s.o.db.SetAccountState(uid, map[string]any{"priority": p})
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
@@ -385,7 +315,7 @@ func (s *Server) adminAlias(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	body, _ := readJSON(r)
 	alias, _ := body["alias"].(string)
-	s.o.pool.SetAlias(uid, alias)
+	s.o.wb.Pool.SetAlias(uid, alias)
 	_ = s.o.db.SetAccountState(uid, map[string]any{"alias": strings.TrimSpace(alias)})
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
@@ -393,7 +323,7 @@ func (s *Server) adminAlias(w http.ResponseWriter, r *http.Request) {
 func (s *Server) adminDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	if err := s.o.deleteAccount(uid); err != nil {
-		writeJSON(w, 500, errBody(500, err.Error(), "server_error").body)
+		writeJSON(w, 500, errBody(500, err.Error(), "server_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "uid": uid})
@@ -405,21 +335,21 @@ func (s *Server) adminUpload(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
 		f, _, ferr := r.FormFile("file")
 		if ferr != nil {
-			writeJSON(w, 400, errBody(400, "缺少 file 字段", "invalid_request_error").body)
+			writeJSON(w, 400, errBody(400, "缺少 file 字段", "invalid_request_error").Body)
 			return
 		}
 		defer f.Close()
 		var err error
 		data, err = io.ReadAll(io.LimitReader(f, 4*1024*1024))
 		if err != nil {
-			writeJSON(w, 400, errBody(400, "read failed", "invalid_request_error").body)
+			writeJSON(w, 400, errBody(400, "read failed", "invalid_request_error").Body)
 			return
 		}
 	} else {
 		var err error
 		data, err = io.ReadAll(io.LimitReader(r.Body, 4*1024*1024))
 		if err != nil {
-			writeJSON(w, 400, errBody(400, "read failed", "invalid_request_error").body)
+			writeJSON(w, 400, errBody(400, "read failed", "invalid_request_error").Body)
 			return
 		}
 	}
@@ -455,7 +385,7 @@ func (s *Server) adminBenchmarks(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) adminBenchmarksRefresh(w http.ResponseWriter, r *http.Request) {
 	if !s.o.bench.Configured() {
-		writeJSON(w, 400, errBody(400, "未配置 Artificial Analysis API Key", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "未配置 Artificial Analysis API Key", "invalid_request_error").Body)
 		return
 	}
 	s.o.bench.Refresh()
@@ -465,7 +395,7 @@ func (s *Server) adminBenchmarksRefresh(w http.ResponseWriter, r *http.Request) 
 func (s *Server) adminApps(w http.ResponseWriter, r *http.Request) {
 	apps, err := s.o.db.ListApps()
 	if err != nil {
-		writeJSON(w, 500, errBody(500, err.Error(), "server_error").body)
+		writeJSON(w, 500, errBody(500, err.Error(), "server_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"apps": apps})
@@ -475,13 +405,13 @@ func (s *Server) adminCreateApp(w http.ResponseWriter, r *http.Request) {
 	body, _ := readJSON(r)
 	name, _ := body["name"].(string)
 	if strings.TrimSpace(name) == "" {
-		writeJSON(w, 400, errBody(400, "name is required", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "name is required", "invalid_request_error").Body)
 		return
 	}
 	note, _ := body["note"].(string)
 	allowed, err := normalizeAllowedModels(body["allowed_models"])
 	if err != nil {
-		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").Body)
 		return
 	}
 	key := s.o.genAPIKey()
@@ -492,7 +422,7 @@ func (s *Server) adminCreateApp(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := s.o.db.CreateApp(name, s.o.hashKey(key), key[:min(10, len(key))]+"…", note, enc, allowed, 0)
 	if err != nil {
-		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"id": id, "app_id": id, "name": name, "key": key, "ok": true})
@@ -547,7 +477,7 @@ func (s *Server) adminToggleApp(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	enabled, err := s.o.db.ToggleApp(id)
 	if err != nil {
-		writeJSON(w, 404, errBody(404, "not found", "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, "not found", "invalid_request_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "enabled": enabled})
@@ -568,7 +498,7 @@ func (s *Server) adminSetAppModels(w http.ResponseWriter, r *http.Request) {
 	body, _ := readJSON(r)
 	allowed, err := normalizeAllowedModels(body["allowed_models"])
 	if err != nil {
-		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").Body)
 		return
 	}
 	// 预校验：目录里是否真有这个模型，给配置人即时反馈。仅警告不阻断：目录是
@@ -586,12 +516,12 @@ func (s *Server) adminSetAppModels(w http.ResponseWriter, r *http.Request) {
 		if _, isAlias := aliases[m]; isAlias {
 			continue
 		}
-		if !known[m] && !isNamespacedModel(m) {
+		if !known[m] && !s.isNamespacedModel(m) {
 			warnings = append(warnings, "模型 "+m+" 不在当前模型目录中，请确认拼写")
 		}
 	}
 	if err := s.o.db.SetAppModels(id, allowed); err != nil {
-		writeJSON(w, 404, errBody(404, err.Error(), "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, err.Error(), "invalid_request_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "allowed_models": decodeAllowedModels(allowed), "warnings": warnings})
@@ -600,13 +530,9 @@ func (s *Server) adminSetAppModels(w http.ResponseWriter, r *http.Request) {
 // isNamespacedModel reports whether the id carries a runtime namespace prefix
 // (e.g. "qoder/claude-…", "opencode/gpt-…"); those live in runtime catalogs,
 // not the workbuddy model cache.
-func isNamespacedModel(id string) bool {
-	for _, rt := range provider.Runtimes() {
-		if strings.HasPrefix(id, rt.Name()+"/") {
-			return true
-		}
-	}
-	return false
+func (s *Server) isNamespacedModel(id string) bool {
+	_, ok := s.o.runtimes.ForModel(id)
+	return ok
 }
 
 // decodeAllowedModels parses the stored JSON back to a list for responses.
@@ -642,7 +568,7 @@ func (s *Server) adminCheckinHistory(w http.ResponseWriter, r *http.Request) {
 	since := time.Now().AddDate(0, 0, -(days - 1)).Format("2006-01-02")
 	history, err := s.o.db.CheckinHistory(since)
 	if err != nil {
-		writeJSON(w, 500, errBody(500, "读取签到历史失败: "+err.Error(), "internal_error").body)
+		writeJSON(w, 500, errBody(500, "读取签到历史失败: "+err.Error(), "internal_error").Body)
 		return
 	}
 	if history == nil {
@@ -651,7 +577,7 @@ func (s *Server) adminCheckinHistory(w http.ResponseWriter, r *http.Request) {
 	today := time.Now().Format("2006-01-02")
 	calendars := map[string]provider.CheckinCalendar{"workbuddy": {History: history, Today: today, WindowDate: today, Timezone: time.Now().Location().String()}}
 	var warnings []string
-	for _, rt := range provider.Runtimes() {
+	for _, rt := range s.o.runtimes.Runtimes() {
 		if historian, ok := rt.(provider.CheckinHistorian); ok {
 			cal, err := historian.CheckinHistory(r.Context(), days)
 			if err != nil {
@@ -714,7 +640,7 @@ func (s *Server) adminUsageDetail(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(r.PathValue("id"))
 	rec, _ := s.o.db.GetUsage(id)
 	if rec == nil {
-		writeJSON(w, 404, errBody(404, "not found", "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, "not found", "invalid_request_error").Body)
 		return
 	}
 	// 前端 usageDetail 读的是 {record: ...}；此前直接返回 rec 顶层字段，
@@ -723,9 +649,9 @@ func (s *Server) adminUsageDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) adminModels(w http.ResponseWriter, r *http.Request) {
-	entries := s.o.models.ListCached()
+	entries := s.o.wb.Catalog.ListCached()
 	s.attachModelAccounts(entries)
-	writeJSON(w, 200, map[string]any{"models": entries, "source": s.o.models.Source()})
+	writeJSON(w, 200, map[string]any{"models": entries, "source": s.o.wb.Catalog.Source()})
 }
 
 func (s *Server) adminModelCatalog(w http.ResponseWriter, r *http.Request) {
@@ -733,124 +659,48 @@ func (s *Server) adminModelCatalog(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) adminHealth(w http.ResponseWriter, r *http.Request) {
-	healthy := s.o.pool.HealthyCount(nil)
-	providers := []map[string]any{{"name": "workbuddy", "ready": healthy > 0, "callable_accounts": healthy, "model_count": len(s.o.models.ListCached()), "model_source": s.o.models.Source()}}
-	if healthy == 0 {
-		providers[0]["reason"] = "没有启用且有额度的非冷却账号"
-	}
+	providers := []map[string]any{}
 	available := 0
-	if healthy > 0 {
-		available++
-	}
-	total := 1
-	for _, rt := range provider.Runtimes() {
-		total++
-		ready := rt.Ready()
-		row := map[string]any{"name": rt.Name(), "ready": ready}
-		if !ready {
+	for _, rt := range s.o.runtimes.Runtimes() {
+		row := map[string]any{"name": rt.Name(), "ready": rt.Ready()}
+		if reporter, ok := rt.(provider.HealthReporter); ok {
+			row = reporter.HealthSnapshot()
+		}
+		ready, _ := row["ready"].(bool)
+		if ready {
+			available++
+		} else if row["reason"] == nil {
 			row["reason"] = "未配置可用凭据或渠道未启用"
 		}
 		providers = append(providers, row)
-		if ready {
-			available++
-		}
 	}
-	writeJSON(w, 200, map[string]any{"status": "ok", "available_providers": available, "total_providers": total, "providers": providers, "upstream_probe": "not_performed"})
+	writeJSON(w, 200, map[string]any{"status": "ok", "available_providers": available, "total_providers": len(providers), "providers": providers, "upstream_probe": "not_performed"})
 }
 
 // attachModelAccounts enriches each model entry with an "accounts" array: the
 // exact accounts that returned this model (from account_uids), joined with live
 // pool state (enabled / healthy / cooldown) so the WebUI "可用账号" tags render.
 // Without this the frontend always saw "暂无可用账号". Modifies entries in place.
-func (s *Server) attachModelAccounts(entries []map[string]any) {
-	now := float64(time.Now().UnixNano()) / 1e9
-	accounts := s.accountsForDisplay()
-	byProfile := map[string][]map[string]any{}
-	for _, a := range accounts {
-		p, _ := a["profile"].(string)
-		byProfile[p] = append(byProfile[p], a)
-	}
-	// (uid, model) → cooldown_until for per-model daily-limit cooldowns
-	mcd := map[string]float64{}
-	if rows, err := s.o.db.ActiveModelCooldowns(now); err == nil {
-		for _, row := range rows {
-			uid, _ := row["account_uid"].(string)
-			model, _ := row["model"].(string)
-			until, _ := row["cooldown_until"].(float64)
-			mcd[uid+"\x00"+model] = until
-		}
-	}
-	for _, e := range entries {
-		id, _ := e["id"].(string)
-		var profiles []string
-		switch pv := e["profiles"].(type) {
-		case []string:
-			profiles = pv
-		case []any:
-			for _, x := range pv {
-				if s, ok := x.(string); ok {
-					profiles = append(profiles, s)
-				}
-			}
-		}
-		if len(profiles) == 0 {
-			if p, _ := e["profile"].(string); p != "" {
-				profiles = []string{p}
-			}
-		}
-		allowed := map[string]struct{}{}
-		hasAllowed := false
-		switch uv := e["account_uids"].(type) {
-		case []string:
-			hasAllowed = true
-			for _, u := range uv {
-				allowed[u] = struct{}{}
-			}
-		case []any:
-			hasAllowed = true
-			for _, x := range uv {
-				if u, ok := x.(string); ok {
-					allowed[u] = struct{}{}
-				}
-			}
-		}
-		supporters := []map[string]any{}
-		for _, p := range profiles {
-			for _, a := range byProfile[p] {
-				uid, _ := a["uid"].(string)
-				if hasAllowed {
-					if _, ok := allowed[uid]; !ok {
-						continue
-					}
-				}
-				modelCd := mcd[uid+"\x00"+id]
-				healthy, _ := a["healthy"].(bool)
-				coolUntil, _ := a["cooldown_until"].(float64)
-				if modelCd > coolUntil {
-					coolUntil = modelCd
-				}
-				site, _ := a["site"].(string)
-				supporters = append(supporters, map[string]any{
-					"uid":            uid,
-					"label":          accountLabel(a),
-					"profile":        a["profile"],
-					"site":           site,
-					"site_label":     siteLabel(site),
-					"enabled":        a["enabled"],
-					"healthy":        healthy && modelCd <= now,
-					"cooldown_until": coolUntil,
-					"model_cooldown": modelCd > now,
-				})
-			}
-		}
-		e["accounts"] = supporters
-	}
-}
+func (s *Server) attachModelAccounts(entries []map[string]any) { s.o.wb.AttachModelAccounts(entries) }
 
 func (s *Server) adminRefreshModels(w http.ResponseWriter, r *http.Request) {
-	models := s.o.models.RefreshContext(r.Context())
-	warnings := s.o.refreshRuntimeModels(r.Context())
-	writeJSON(w, 200, map[string]any{"ok": true, "models": models, "source": s.o.models.Source(), "count": len(models), "warnings": warnings})
+	selected := r.URL.Query().Get("provider")
+	if selected != "" {
+		if _, ok := s.o.runtimes.ByName(selected); !ok {
+			writeAPIErr(w, errBody(400, "未知模型渠道", "invalid_request_error"))
+			return
+		}
+	}
+	results := s.o.refreshModelCatalogs(r.Context(), selected)
+	warnings := modelRefreshWarnings(results)
+	models := s.o.wb.Catalog.ListCached()
+	ok := false
+	for _, result := range results {
+		if result.Status == "ok" || result.Status == "partial" {
+			ok = true
+		}
+	}
+	writeJSON(w, 200, map[string]any{"ok": ok, "models": models, "source": s.o.wb.Catalog.Source(), "count": len(models), "warnings": warnings, "providers": results})
 }
 
 func (s *Server) adminGetSettings(w http.ResponseWriter, r *http.Request) {
@@ -896,7 +746,7 @@ func (s *Server) adminSaveSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	delete(kv, "clear_aa_api_key")
 	if err := s.o.db.SaveSettings(kv); err != nil {
-		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").Body)
 		return
 	}
 	settings, _ := s.o.db.GetSettings()

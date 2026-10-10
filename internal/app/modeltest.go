@@ -38,12 +38,12 @@ func (s *Server) adminModelTest(w http.ResponseWriter, r *http.Request) {
 		Prompt string `json:"prompt"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").Body)
 		return
 	}
 	model := strings.TrimSpace(body.Model)
 	if model == "" {
-		writeJSON(w, 400, errBody(400, "缺少 model", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "缺少 model", "invalid_request_error").Body)
 		return
 	}
 	prompt := strings.TrimSpace(body.Prompt)
@@ -58,13 +58,13 @@ func (s *Server) adminModelTest(w http.ResponseWriter, r *http.Request) {
 	testMu.Lock()
 	if testRunning {
 		testMu.Unlock()
-		writeJSON(w, 429, errBody(429, "已有测试在进行，请稍候", "rate_limit_error").body)
+		writeJSON(w, 429, errBody(429, "已有测试在进行，请稍候", "rate_limit_error").Body)
 		return
 	}
 	if since := time.Since(testLastDone); since < testMinInterval {
 		wait := int((testMinInterval - since).Seconds()) + 1
 		testMu.Unlock()
-		writeJSON(w, 429, errBody(429, fmt.Sprintf("测试过于频繁，请 %d 秒后再试", wait), "rate_limit_error").body)
+		writeJSON(w, 429, errBody(429, fmt.Sprintf("测试过于频繁，请 %d 秒后再试", wait), "rate_limit_error").Body)
 		return
 	}
 	testRunning = true

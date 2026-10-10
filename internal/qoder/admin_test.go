@@ -280,3 +280,27 @@ func TestPrivateFailoverEligibilityAndAffinityInvalidation(t *testing.T) {
 		}
 	}
 }
+
+func TestClaudeSessionAffinityUsesCallerScope(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-Claude-Code-Session-Id", "cc-session")
+	req := provider.ServeRequest{Caller: provider.Caller{AppID: 1, AppName: "same-name"}, Headers: h, Payload: map[string]any{"model": "qoder/qfmodel"}}
+	first, ok := requestAffinityKey(req)
+	if !ok {
+		t.Fatal("CC session ignored")
+	}
+	h.Set("X-Request-Id", "new-request")
+	h.Set("X-Claude-Code-Agent-Id", "child-agent")
+	if next, _ := requestAffinityKey(req); next != first {
+		t.Fatal("request/agent ID changed conversation")
+	}
+	req.Caller.AppID = 2
+	if next, _ := requestAffinityKey(req); next == first {
+		t.Fatal("conversation crosses authenticated keys")
+	}
+	req.Caller.AppID = 1
+	req.Payload["model"] = "qoder/other"
+	if next, _ := requestAffinityKey(req); next == first {
+		t.Fatal("conversation crosses models")
+	}
+}

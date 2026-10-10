@@ -19,8 +19,6 @@ import (
 
 	"work2api/internal/app"
 	"work2api/internal/config"
-	"work2api/internal/qoder/account"
-	"work2api/internal/workbuddy/credentials"
 )
 
 // version is set at build time via -ldflags "-X main.version=...".
@@ -41,14 +39,7 @@ func main() {
 		cfg.DBPath = resolved
 	}
 	paths := []string{filepath.Join(cfg.DataDir, ".instance.lock"), cfg.DBPath + ".instance.lock"}
-	paths = append(paths, filepath.Join(account.DataRoot(), ".instance.lock"))
-	for _, dir := range credentials.AuthDirs("", filepath.Join(config.PackageRoot, "auths")) {
-		if info, err := os.Stat(dir); err == nil && info.IsDir() {
-			paths = append(paths, filepath.Join(dir, ".instance.lock"))
-		}
-	}
-	// The project credential directory must be reserved even before its creation.
-	paths = append(paths, filepath.Join(config.PackageRoot, "auths", ".instance.lock"))
+	paths = append(paths, app.ProviderStateLockPaths()...)
 	identity, err := instanceIdentity(paths)
 	if err != nil {
 		log.Fatal(err)
@@ -85,6 +76,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("init: %v", err)
 	}
+	defer orch.Close()
 
 	// Start background scheduler (checkin / credit refresh / model refresh /
 	// token keepalive / usage cleanup). Non-blocking: warming runs inside the

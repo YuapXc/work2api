@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 	"work2api/internal/config"
-	"work2api/internal/qoder/account"
+	"work2api/internal/core/provider"
 	"work2api/internal/statebackup"
 )
 
@@ -171,21 +171,25 @@ func (o *Orchestrator) runBackup(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	roots := []string{o.cfg.DataDir, o.projectAuths, account.DataRoot(), executable, filepath.Join(config.PackageRoot, ".env")}
-	o.managerMu.RLock()
-	for _, m := range o.managers {
-		roots = append(roots, m.Path())
-	}
-	o.managerMu.RUnlock()
-	// An explicitly configured OpenCode file may live outside DATA_DIR.
+
+	roots := []string{o.cfg.DataDir, executable, filepath.Join(config.PackageRoot, ".env")}
 	required := map[string]bool{}
-	if path := os.Getenv("OPENCODE_CONFIG"); path != "" {
-		roots = append(roots, path)
-		abs, e := filepath.Abs(path)
-		if e != nil {
-			return e
+	for _, rt := range o.runtimes.Runtimes() {
+		if owner, ok := rt.(provider.StateOwner); ok {
+			for _, source := range owner.StateSources() {
+				if source.Path == "" {
+					continue
+				}
+				roots = append(roots, source.Path)
+				if source.Required {
+					abs, e := filepath.Abs(source.Path)
+					if e != nil {
+						return e
+					}
+					required[abs] = true
+				}
+			}
 		}
-		required[abs] = true
 	}
 	if path := os.Getenv("ENV_FILE"); path != "" {
 		roots = append(roots, path)

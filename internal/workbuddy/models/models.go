@@ -6,6 +6,7 @@ package models
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -76,6 +77,7 @@ type Registry struct {
 	reasoning map[string]map[string]any
 	fetchedAt float64
 	lastFail  float64
+	stale     bool
 	source    string
 	// catalogCache 按 (profile, uid, url) 保存各来源的成功快照：单一路失败
 	// 不砍掉另一来源的专属模型（上游 0.6.3 _catalog_cache 同款）。
@@ -116,7 +118,9 @@ func (r *Registry) ttl() int {
 func nowSec() float64 { return float64(time.Now().UnixNano()) / 1e9 }
 
 // List returns current models (OpenAI /v1/models entries), refreshing if stale.
-func (r *Registry) List() []map[string]any {
+func (r *Registry) List() []map[string]any { return r.ListContext(context.Background()) }
+
+func (r *Registry) ListContext(ctx context.Context) []map[string]any {
 	now := nowSec()
 	ttl := float64(r.ttl())
 	r.mu.Lock()
@@ -130,7 +134,7 @@ func (r *Registry) List() []map[string]any {
 	if inFailCooldown {
 		return withStandardAll(r.fallback())
 	}
-	return r.Refresh()
+	return r.RefreshContext(ctx)
 }
 
 // ListCached returns a read-only snapshot without triggering network refresh.
@@ -192,25 +196,57 @@ func (r *Registry) Refresh() []map[string]any {
 	return r.RefreshContext(context.Background())
 }
 
+var ErrRefreshFailed = errors.New("模型目录刷新失败，保留现有目录")
+var ErrPartialRefresh = errors.New("部分模型目录来源刷新失败")
+
+type catalogFailureKey struct{}
+
+func noteCatalogFailure(ctx context.Context) {
+	if failures, _ := ctx.Value(catalogFailureKey{}).(*int); failures != nil {
+		(*failures)++
+	}
+}
+
+func (r *Registry) Stale() bool { r.mu.Lock(); defer r.mu.Unlock(); return r.stale }
+
 func (r *Registry) RefreshContext(ctx context.Context) []map[string]any {
-	r.refreshMu.Lock()
+	out, _ := r.RefreshWithStatus(ctx)
+	return out
+}
+
+// Return explicit failure information without losing last confirmed access.
+func (r *Registry) RefreshWithStatus(ctx context.Context) ([]map[string]any, error) {
+	for !r.refreshMu.TryLock() {
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return withStandardAll(r.fallback()), ctx.Err()
+		case <-timer.C:
+		}
+	}
 	defer r.refreshMu.Unlock()
-	fetched := r.fetchFromUpstreamContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return withStandardAll(r.fallback()), err
+	}
+	failures := 0
+	fetched := r.fetchFromUpstreamContext(context.WithValue(ctx, catalogFailureKey{}, &failures))
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if ctx.Err() != nil {
-		return withStandardAll(r.fallback())
+		r.stale = true
+		return withStandardAll(r.models), ctx.Err()
 	}
 	if fetched == nil {
-		r.mu.Lock()
 		r.lastFail = nowSec()
+		r.stale = true
 		if len(r.models) > 0 {
 			r.source = "dynamic"
 		} else {
 			r.source = "empty"
 		}
-		r.mu.Unlock()
-		return r.fallback()
+		return withStandardAll(r.models), ErrRefreshFailed
 	}
-	r.mu.Lock()
 	r.models = nil
 	r.reasoning = map[string]map[string]any{}
 	for _, f := range fetched {
@@ -222,10 +258,13 @@ func (r *Registry) RefreshContext(ctx context.Context) []map[string]any {
 	r.fetchedAt = nowSec()
 	r.lastFail = 0
 	r.source = "dynamic"
+	r.stale = failures > 0
 	out := withStandardAll(r.models)
-	r.mu.Unlock()
 	log.Printf("模型列表已刷新: %d 个", len(fetched))
-	return out
+	if failures > 0 {
+		return out, ErrPartialRefresh
+	}
+	return out, nil
 }
 
 // ReasoningEfforts returns supported effort levels for a model (nil if unknown).
@@ -578,14 +617,17 @@ func (r *Registry) fetchOneContext(ctx context.Context, account *pool.Account) [
 	}
 	cc, ok := account.Mgr.(catalogClient)
 	if !ok {
+		noteCatalogFailure(ctx)
 		return nil
 	}
 	headers, err := cc.CatalogHeaders()
 	if err != nil {
+		noteCatalogFailure(ctx)
 		return nil
 	}
 	sources, err := catalogSources(account.Profile)
 	if err != nil {
+		noteCatalogFailure(ctx)
 		return nil
 	}
 	merged := map[string]fetchedModel{}
@@ -593,6 +635,9 @@ func (r *Registry) fetchOneContext(ctx context.Context, account *pool.Account) [
 	freshAny := false
 	for _, url := range sources {
 		fetched := r.fetchCatalogURL(ctx, url, headers, account)
+		if fetched == nil {
+			noteCatalogFailure(ctx)
+		}
 		key := [3]string{account.Profile, account.UID, url}
 		r.mu.Lock()
 		if fetched != nil {

@@ -85,7 +85,7 @@ func TestStoreRoundTrip(t *testing.T) {
 		"auth":    map[string]any{"domain": "www.codebuddy.cn", "accessToken": "x"},
 		"account": map[string]any{"uid": "u1", "nickname": "nick"},
 	}
-	if _, err := db.UpsertAccount(auth); err != nil {
+	if _, err := db.UpsertProviderAccount(ProviderAccount{UID: "u1", Provider: "workbuddy", Nickname: "nick", Domain: "www.codebuddy.cn", Profile: "cn-cli", Auth: auth}); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 	accs, err := db.ListAccounts()
@@ -213,5 +213,38 @@ func TestUsageRowCap(t *testing.T) {
 	// 已在上限内：再次截断不删
 	if n, _ := db.CleanupUsageRows(2); n != 0 {
 		t.Fatalf("second cleanup = %d, want 0", n)
+	}
+}
+
+func TestProviderAccountCollisionDoesNotTransferOwnership(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "accounts.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	record := ProviderAccount{UID: "same-id", Provider: "workbuddy", Nickname: "original", Profile: "cn-cli", Auth: map[string]any{"original": true}}
+	if _, err := db.UpsertProviderAccount(record); err != nil {
+		t.Fatal(err)
+	}
+	record.Provider = "qoder"
+	record.Nickname = "replacement"
+	if _, err := db.UpsertProviderAccount(record); err == nil {
+		t.Fatal("foreign provider replaced account")
+	}
+	row, err := db.GetAccount("same-id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row["provider"] != "workbuddy" || row["nickname"] != "original" {
+		t.Fatal("account ownership or metadata changed")
+	}
+	record.Provider = "workbuddy"
+	record.Nickname = "new alias source"
+	if _, err := db.UpsertProviderAccount(record); err != nil {
+		t.Fatal(err)
+	}
+	row, err = db.GetAccount("same-id")
+	if err != nil || row["nickname"] != "new alias source" {
+		t.Fatal("same-provider update failed", err)
 	}
 }

@@ -7,6 +7,7 @@ import type {
   AppInfo,
   CheckinResponse,
   ModelInfo,
+  ModelRefreshResult,
   OAuthOption,
   Overview,
   ProviderDetail,
@@ -152,8 +153,8 @@ export const api = {
     }>('/admin/usage/filters'),
   models: () => http.get<unknown, { models: ModelInfo[]; source?: 'dynamic' | 'static' }>('/admin/models'),
   modelCatalog: () => http.get<unknown, { models: ModelInfo[] }>('/admin/models/catalog'),
-  modelsRefresh: () =>
-    http.post<unknown, { ok: boolean; models: ModelInfo[]; source?: 'dynamic' | 'static'; warnings?: string[] }>('/admin/models/refresh'),
+  modelsRefresh: (provider?: string) =>
+    http.post<unknown, { ok: boolean; models: ModelInfo[]; source?: 'dynamic' | 'static'; warnings?: string[]; providers?: ModelRefreshResult[] }>('/admin/models/refresh', {}, { params: provider ? { provider } : undefined }),
   // AA（Artificial Analysis）评测：按带命名空间的模型 id 返回智能/编码/数学指数
   benchmarks: () =>
     http.get<unknown, { configured: boolean; models: Record<string, AABenchmark> }>('/admin/models/benchmarks'),

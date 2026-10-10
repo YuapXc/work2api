@@ -21,7 +21,7 @@ func portalFixture(t *testing.T) (*Server, *store.User) {
 	o, _ := newDNSFailoverOrch(t, &failingUpstream{})
 	o.cfg.PortalEnabled = true
 	o.cfg.PortalMaxTasksPerUser = 1
-	o.projectAuths = t.TempDir()
+	o.wb.ProjectAuths = t.TempDir()
 	id, err := portalauth.CreateUser(o.db, "portal-user", "oldpassword", "user")
 	if err != nil {
 		t.Fatal(err)
@@ -36,7 +36,7 @@ func portalFixture(t *testing.T) (*Server, *store.User) {
 func TestContributionCollisionCannotOverwriteOnRetry(t *testing.T) {
 	s, user := portalFixture(t)
 	uid := "collision/uid"
-	path := filepath.Join(s.o.projectAuths, "workbuddy-"+safeUID(uid)+".info")
+	path := filepath.Join(s.o.wb.ProjectAuths, "workbuddy-"+safeUID(uid)+".info")
 	original := []byte(`{"auth":{"accessToken":"original"},"account":{"uid":"collision:uid"}}`)
 	if err := os.WriteFile(path, original, 0600); err != nil {
 		t.Fatal(err)

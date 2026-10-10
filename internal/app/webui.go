@@ -33,7 +33,7 @@ func (s *Server) mountWebUI(mux *http.ServeMux) {
 		// 匹配更具体的模式）。未知 API 路径也不会被 SPA 吞掉。
 		if strings.HasPrefix(r.URL.Path, "/portal/api/") || strings.HasPrefix(r.URL.Path, "/admin/") || strings.HasPrefix(r.URL.Path, "/v1/") {
 			h.Set("Cache-Control", "no-store")
-			writeJSON(w, 404, errBody(404, "接口不存在", "not_found").body)
+			writeJSON(w, 404, errBody(404, "接口不存在", "not_found").Body)
 			return
 		}
 		if r.URL.Path == "/" || r.URL.Path == "/index.html" || r.URL.Path == "/portal" || strings.HasPrefix(r.URL.Path, "/portal/") {

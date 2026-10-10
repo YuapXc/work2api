@@ -259,8 +259,8 @@ func FetchModels(ctx context.Context, client *http.Client, baseURL, key string) 
 			models = append(models, item.ID)
 		}
 	}
-	if len(models) == 0 {
-		return nil, resp.StatusCode, errors.New("models endpoint returned an empty list")
+	if payload.Data == nil || len(payload.Data) > 0 && len(models) == 0 {
+		return nil, resp.StatusCode, errors.New("models endpoint returned an invalid list")
 	}
 	return models, resp.StatusCode, nil
 }

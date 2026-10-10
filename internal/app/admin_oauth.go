@@ -1,10 +1,7 @@
 package app
 
 import (
-	"encoding/json"
 	"net/http"
-
-	"work2api/internal/workbuddy/oauth"
 )
 
 // adminOAuthBegin starts a browser device-authorization login and returns
@@ -12,9 +9,9 @@ import (
 func (s *Server) adminOAuthBegin(w http.ResponseWriter, r *http.Request) {
 	body, _ := readJSON(r)
 	site, _ := body["site"].(string)
-	res, err := oauth.Begin(site)
+	res, err := s.o.wb.BeginLogin(site)
 	if err != nil {
-		writeJSON(w, 502, errBody(502, "发起登录失败："+err.Error(), "upstream_error").body)
+		writeJSON(w, 502, errBody(502, "发起登录失败："+err.Error(), "upstream_error").Body)
 		return
 	}
 	writeJSON(w, 200, res)
@@ -28,31 +25,22 @@ func (s *Server) adminOAuthPoll(w http.ResponseWriter, r *http.Request) {
 	state, _ := body["state"].(string)
 	site, _ := body["site"].(string)
 	if state == "" {
-		writeJSON(w, 400, errBody(400, "缺少 state", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "缺少 state", "invalid_request_error").Body)
 		return
 	}
-	res, err := oauth.Poll(state, site)
+	res, err := s.o.wb.PollLogin(state, site)
 	if err != nil {
-		writeJSON(w, 400, errBody(400, "登录失败："+err.Error(), "auth_error").body)
+		writeJSON(w, 400, errBody(400, "登录失败："+err.Error(), "auth_error").Body)
 		return
 	}
 	if res["status"] != "ready" {
 		writeJSON(w, 200, res)
 		return
 	}
-	// ready: persist {auth, account} exactly like an uploaded auth file.
-	session := map[string]any{"auth": res["auth"], "account": res["account"]}
-	data, _ := json.Marshal(session)
-	reg, aerr := s.o.registerAuthUpload(data)
-	if aerr != nil {
-		writeAPIErr(w, aerr)
-		return
-	}
-	reg["status"] = "ready"
-	writeJSON(w, 200, reg)
+	writeJSON(w, 200, res)
 }
 
 // adminOAuthSites lists the supported login sites for the WebUI dropdown.
 func (s *Server) adminOAuthSites(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"sites": oauth.Sites()})
+	writeJSON(w, 200, map[string]any{"sites": s.o.wb.LoginSites()})
 }

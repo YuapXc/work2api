@@ -29,11 +29,11 @@ func (s *Server) adminSessions(w http.ResponseWriter, r *http.Request) {
 		labels[uid] = accountLabel(a)
 	}
 	rows := []map[string]any{}
-	for _, v := range s.o.sessions.views() {
+	for _, v := range s.o.sessions.Views() {
 		rows = append(rows, map[string]any{"id": v.ID, "session": v, "account_label": labels[v.UID], "target_label": labels[v.Target], "last_success_label": labels[v.LastSuccess], "last_attempt_label": labels[v.LastAttempt]})
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, 200, map[string]any{"sessions": rows, "memory_only": true, "capacity": s.o.sessions.max})
+	writeJSON(w, 200, map[string]any{"sessions": rows, "memory_only": true, "capacity": s.o.sessions.Max})
 }
 func (s *Server) sessionOptions(v sessionView) ([]sessionAccountOption, *apiError) {
 	allowed, aerr := s.o.modelAccountUIDs(v.Model)
@@ -47,7 +47,7 @@ func (s *Server) sessionOptions(v sessionView) ([]sessionAccountOption, *apiErro
 		}
 		scope := principal.ModelScopes[v.Model]
 		for uid := range allowed {
-			if !scope[uid] || !v.scope[uid] {
+			if !scope[uid] || !v.Scope[uid] {
 				delete(allowed, uid)
 			}
 		}
@@ -81,7 +81,7 @@ func (s *Server) sessionOptions(v sessionView) ([]sessionAccountOption, *apiErro
 	}
 	out := []sessionAccountOption{}
 	now := nowSec()
-	for _, a := range s.o.pool.Accounts() {
+	for _, a := range s.o.wb.Pool.Accounts() {
 		if !allowed[a.UID] {
 			continue
 		}
@@ -127,7 +127,7 @@ func (s *Server) sessionOptions(v sessionView) ([]sessionAccountOption, *apiErro
 	return out, nil
 }
 func (s *Server) adminSessionOptions(w http.ResponseWriter, r *http.Request) {
-	v, ok := s.o.sessions.view(r.PathValue("id"))
+	v, ok := s.o.sessions.View(r.PathValue("id"))
 	if !ok {
 		writeAPIErr(w, errBody(404, "会话已过期或不存在", "not_found"))
 		return
@@ -156,7 +156,7 @@ func (s *Server) adminSessionControl(w http.ResponseWriter, r *http.Request) {
 		writeAPIErr(w, errBody(400, "请求格式错误", "invalid_request_error"))
 		return
 	}
-	v, ok := s.o.sessions.view(r.PathValue("id"))
+	v, ok := s.o.sessions.View(r.PathValue("id"))
 	if !ok {
 		writeAPIErr(w, errBody(404, "会话已过期或不存在", "not_found"))
 		return
@@ -184,7 +184,7 @@ func (s *Server) adminSessionControl(w http.ResponseWriter, r *http.Request) {
 	} else {
 		body.UID = ""
 	}
-	if !s.o.sessions.control(v.ID, body.Version, body.Action, body.UID) {
+	if !s.o.sessions.Control(v.ID, body.Version, body.Action, body.UID) {
 		writeAPIErr(w, errBody(409, "会话状态已变化，请刷新后重新选择", "session_version_conflict"))
 		return
 	}

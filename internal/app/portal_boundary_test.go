@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"work2api/internal/config"
+	"work2api/internal/core/provider"
 	appcrypto "work2api/internal/crypto"
 	"work2api/internal/portal/portalauth"
 	"work2api/internal/qoder/account"
@@ -68,7 +69,7 @@ func TestCompleteBackupRestoresDatabaseAndSecrets(t *testing.T) {
 	oldPackageRoot := config.PackageRoot
 	config.PackageRoot = t.TempDir()
 	defer func() { config.PackageRoot = oldPackageRoot }()
-	for _, mgr := range o.managers {
+	for _, mgr := range o.wb.Managers {
 		o.cfg.DataDir = filepath.Dir(mgr.Path())
 		break
 	}
@@ -76,6 +77,9 @@ func TestCompleteBackupRestoresDatabaseAndSecrets(t *testing.T) {
 	oldRoot := account.DataRoot()
 	account.SetDataRoot(t.TempDir())
 	defer account.SetDataRoot(oldRoot)
+	if err := o.runtimes.Register(&backupSourceProbe{path: account.DataRoot()}); err != nil {
+		t.Fatal(err)
+	}
 	for _, key := range []string{"BACKUP_EXTRA_PATHS", "OPENCODE_CONFIG", "ENV_FILE"} {
 		t.Setenv(key, "")
 	}
@@ -378,7 +382,7 @@ func TestSharedAdmissionReservesPrivateCapacityAndRecovers(t *testing.T) {
 
 func TestPortalUsageOmitsBodiesAndMarksMissingUsage(t *testing.T) {
 	s, u := portalFixture(t)
-	s.o.logUsage(logArgs{userID: u.ID, appID: 42, appName: "key", status: "ok", t0: time.Now(), input: "private prompt", output: "private answer", reasoning: "private reasoning"})
+	s.o.logUsage(logArgs{UserID: u.ID, AppID: 42, AppName: "key", Status: "ok", T0: time.Now(), Input: "private prompt", Output: "private answer", Reasoning: "private reasoning"})
 	rows, err := s.o.db.UsageRecent(10, "", "", nil, "", false, 0, "")
 	if err != nil || len(rows) != 1 {
 		t.Fatal(rows, err)
@@ -429,11 +433,11 @@ func TestIncompleteResponseRetainsUsageWithoutAccountPenalty(t *testing.T) {
 	if !s.reservePortalBudget(httptest.NewRecorder(), p, map[string]any{"model": "model-a", "max_tokens": float64(50)}) {
 		t.Fatal("reservation failed")
 	}
-	acc := s.o.pool.Get("test-account")
-	s.o.pool.OnFailure(acc.UID, 60)
+	acc := s.o.wb.Pool.Get("test-account")
+	s.o.wb.Pool.OnFailure(acc.UID, 60)
 	cooldown := acc.CooldownUntil
-	s.o.logUsage(logArgs{userID: u.ID, acc: acc, updatePool: true, status: "incomplete", t0: time.Now(), quota: p.quota,
-		usage: map[string]any{"prompt_tokens": float64(10), "completion_tokens": float64(7), "prompt_cache_hit_tokens": float64(4)}})
+	s.o.logUsage(logArgs{UserID: u.ID, Acc: acc, UpdatePool: true, Status: "incomplete", T0: time.Now(), Quota: p.quota,
+		Usage: map[string]any{"prompt_tokens": float64(10), "completion_tokens": float64(7), "prompt_cache_hit_tokens": float64(4)}})
 	p.quota.settle()
 	_, input, output, err := s.o.db.UserDailyQuota(u.ID, p.quota.day)
 	if err != nil || input != 10 || output != 7 {
@@ -474,4 +478,17 @@ func TestStalePasswordChangeCannotOverwriteReset(t *testing.T) {
 	if session, err := s.o.db.GetUserSession("fresh-session"); err != nil || session == nil {
 		t.Fatal("stale change revoked new session", session, err)
 	}
+}
+
+type backupSourceProbe struct{ path string }
+
+func (*backupSourceProbe) Name() string                                   { return "fixture-source" }
+func (*backupSourceProbe) Prefix() string                                 { return "fixture-source/" }
+func (*backupSourceProbe) Ready() bool                                    { return false }
+func (*backupSourceProbe) Models(context.Context) []provider.CatalogModel { return nil }
+func (*backupSourceProbe) Serve(context.Context, provider.ServeRequest) (provider.UsageReport, error) {
+	return provider.UsageReport{}, provider.ErrUnsupported
+}
+func (p *backupSourceProbe) StateSources() []provider.StateSource {
+	return []provider.StateSource{{Path: p.path, Required: true}}
 }

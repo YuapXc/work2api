@@ -10,11 +10,7 @@ import (
 	"work2api/internal/streamwatch"
 )
 
-// dispatchRuntime routes a request whose (alias-resolved) model belongs to a
-// non-default provider Runtime (qoder/*, opencode/*). It writes the client
-// response itself and logs a usage row, then returns true. Returns false when
-// the model is not namespaced to any runtime, leaving the default (workbuddy)
-// path to handle it.
+// dispatchRuntime executes the registered default or namespaced provider.
 func (s *Server) dispatchRuntime(w http.ResponseWriter, r *http.Request, proto provider.Protocol, payload map[string]any, principal *Principal) bool {
 	return s.dispatchRuntimeTo(w, r, proto, payload, principal)
 }
@@ -27,11 +23,16 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 		return false
 	}
 	resolved := s.o.resolveModel(rawModel)
-	rt, ok := provider.RuntimeForModel(resolved)
+	rt, ok := s.o.runtimes.Resolve(resolved)
+	if !ok {
+		rt = s.o.wb
+		ok = rt != nil
+	}
 	if !ok {
 		return false
 	}
-	if principal.UserID > 0 {
+	portal, eligible := rt.(provider.PortalProvider)
+	if principal.UserID > 0 && (!eligible || !portal.SupportsPortal()) {
 		writeAPIErr(w, errBody(403, "当前共享服务仅支持 WorkBuddy 模型", "model_not_allowed"))
 		return true
 	}
@@ -41,11 +42,21 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 	t0 := time.Now()
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	call := provider.CurrentInvocation(ctx)
+	call.Provider = rt.Name()
+	call.Caller = principal.SessionCaller()
+	call.UsageObserver = principal.quota
+	ctx = s.o.invocationContext(provider.WithInvocation(ctx, call))
 	writer := &cancelWriter{ResponseWriter: w, cancel: cancel}
+	var output http.ResponseWriter = writer
+	if _, ok := w.(http.Flusher); ok {
+		output = &flushCancelWriter{writer}
+	}
 	report, err := rt.Serve(ctx, provider.ServeRequest{
+		Caller:   call.Caller,
 		Protocol: proto,
 		Payload:  payload,
-		Writer:   writer,
+		Writer:   output,
 		AppName:  principal.AppName,
 		Headers:  r.Header,
 	})
@@ -55,8 +66,12 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 			writeAPIErr(writer, errBody(502, "供应商未完成请求，请检查渠道配置后重试", "upstream_error"))
 		}
 	}
-	s.o.logRuntimeUsage(report, string(proto), resolved, t0, principal.AppName, principal.UserID, principal.AppID)
-	streamwatch.Outcome(r.Context(), report.Status)
+	if !report.Recorded {
+		s.o.logRuntimeUsage(report, string(proto), resolved, t0, principal.AppName, principal.UserID, principal.AppID)
+	}
+	if !report.Recorded {
+		streamwatch.Outcome(r.Context(), report.Status)
+	}
 	return true
 }
 
@@ -108,8 +123,8 @@ func (o *Orchestrator) logRuntimeUsage(rep provider.UsageReport, protocol, model
 // /v1/models already consume.
 func (o *Orchestrator) runtimeModels(ctx context.Context) []map[string]any {
 	var out []map[string]any
-	for _, rt := range provider.Runtimes() {
-		if !rt.Ready() {
+	for _, rt := range o.runtimes.Runtimes() {
+		if !rt.Ready() && rt.Prefix() != "" {
 			continue
 		}
 		for _, m := range rt.Models(ctx) {
@@ -138,15 +153,7 @@ func (o *Orchestrator) runtimeModels(ctx context.Context) []map[string]any {
 }
 
 func (o *Orchestrator) refreshRuntimeModels(ctx context.Context) []string {
-	var warnings []string
-	for _, rt := range provider.Runtimes() {
-		if refresh, ok := rt.(provider.ModelRefresher); ok && rt.Ready() {
-			if err := refresh.RefreshModels(ctx); err != nil {
-				warnings = append(warnings, rt.Name()+": "+err.Error())
-			}
-		}
-	}
-	return warnings
+	return modelRefreshWarnings(o.refreshModelCatalogs(ctx, ""))
 }
 
 // benchTarget is one (provider, namespaced id, display name) the benchmarks
@@ -158,13 +165,6 @@ type benchTarget struct{ provider, id, name string }
 // runtime's namespaced models.
 func (o *Orchestrator) benchTargets(ctx context.Context) []benchTarget {
 	var out []benchTarget
-	for _, m := range o.models.ListCached() {
-		id := toStrLoose(m["id"])
-		if id == "" {
-			continue
-		}
-		out = append(out, benchTarget{"workbuddy", id, toStrLoose(m["name"])})
-	}
 	for _, m := range o.runtimeModels(ctx) {
 		id := toStrLoose(m["id"])
 		if id == "" {
@@ -198,11 +198,21 @@ func (w *cancelWriter) Write(p []byte) (int, error) {
 	}
 	return n, err
 }
-func (w *cancelWriter) Flush() {
+
+type flushCancelWriter struct{ *cancelWriter }
+
+func (w *flushCancelWriter) Flush() {
 	w.committed = true
 	controller := http.NewResponseController(w.ResponseWriter)
 	_ = controller.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	if err := controller.Flush(); err != nil {
 		w.cancel()
+	}
+}
+
+// The legacy model-test endpoint uses the same registry and execution boundary.
+func (s *Server) dispatchWorkBuddy(w http.ResponseWriter, r *http.Request, proto provider.Protocol, payload map[string]any, p *Principal) {
+	if !s.dispatchRuntimeTo(w, r, proto, payload, p) {
+		writeAPIErr(w, errBody(503, "模型渠道未就绪", "model_unavailable"))
 	}
 }

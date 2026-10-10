@@ -1,0 +1,151 @@
+// Package app wires the shared HTTP surface: the three OpenAI/Anthropic
+// inference endpoints and the /admin/* management API. Ported from
+// workbuddy_one/app.py (single-user all-in-one; multi-user portal deferred).
+package runtime
+
+import (
+	"encoding/json"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Cooldown durations (seconds) used outside the error classifier (token-refresh
+// failure, mid-stream break, non-HTTP errors). Status-based cooldown selection
+// now lives in the error classifier (errclass.go).
+const (
+	CooldownSoft = 60.0
+	CooldownHard = 1800.0
+
+	// SessionStickyMaxCooldown bounds how much residual account cooldown still
+	// counts as "usable now" for both session-sticky reuse and the final pick
+	// guard: an account cooling down for <= this many seconds is treated as
+	// immediately serviceable, anything more means the pool is rate-limited.
+	SessionStickyMaxCooldown = 30.0
+)
+
+var LimitResetRe = regexp.MustCompile(`(?i)(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*UTC\+8`)
+
+// DailyModelLimit detects the upstream per-day model limit (code=6004) and
+// returns its explicit UTC+8 reset time.
+func DailyModelLimit(raw []byte, now float64) (float64, string, bool) {
+	var data map[string]any
+	if json.Unmarshal(raw, &data) != nil {
+		return 0, "", false
+	}
+	if ToStr(data["code"]) != "6004" {
+		return 0, "", false
+	}
+	message := ToStr(data["msg"])
+	m := LimitResetRe.FindStringSubmatch(message)
+	if m == nil {
+		return 0, "", false
+	}
+	loc := time.FixedZone("UTC+8", 8*3600)
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", m[1], loc)
+	if err != nil {
+		return 0, "", false
+	}
+	reset := float64(t.Unix())
+	if now == 0 {
+		now = float64(time.Now().UnixNano()) / 1e9
+	}
+	if reset <= now || reset > now+48*3600 {
+		return 0, "", false
+	}
+	return reset, message, true
+}
+
+// UpstreamErrorText extracts a searchable error summary for usage logs.
+func UpstreamErrorText(status int, raw []byte) string {
+	var data map[string]any
+	if json.Unmarshal(raw, &data) == nil {
+		code := data["code"]
+		msg := data["msg"]
+		if msg == nil {
+			msg = data["message"]
+		}
+		if code != nil || msg != nil {
+			return strings.TrimSpace("HTTP " + Itoa(status) + " code=" + OrDash(code) + " " + ToStr(msg))
+		}
+	}
+	return "HTTP " + Itoa(status)
+}
+
+// ParseModelAliases parses "alias=real" lines.
+func ParseModelAliases(raw string) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.Contains(line, "=") {
+			continue
+		}
+		alias, real, _ := strings.Cut(line, "=")
+		alias, real = strings.TrimSpace(alias), strings.TrimSpace(real)
+		if alias != "" && real != "" {
+			out[alias] = real
+		}
+	}
+	return out
+}
+
+func JsonError(status int, message string) string {
+	b, _ := json.Marshal(map[string]any{"error": map[string]any{
+		"message": message, "type": "upstream_error", "code": status}})
+	return string(b)
+}
+
+// ErrAnthropic formats an Anthropic-style SSE error event.
+func ErrAnthropic(status int, message string) string {
+	b, _ := json.Marshal(map[string]any{
+		"type":  "error",
+		"error": map[string]any{"type": "upstream_error", "message": message},
+	})
+	return "event: error\ndata: " + string(b) + "\n\n"
+}
+
+// SafeErr builds an error detail body from a raw upstream error.
+func SafeErr(raw []byte, status int) map[string]any {
+	var data any
+	if json.Unmarshal(raw, &data) == nil {
+		if m, ok := data.(map[string]any); ok {
+			if _, has := m["error"]; has {
+				return m
+			}
+		}
+	}
+	msg := string(raw)
+	if msg == "" {
+		msg = "upstream error"
+	}
+	return map[string]any{"error": map[string]any{"message": msg, "type": "upstream_error", "code": status}}
+}
+
+// ConvUsage maps converter usage (prompt/completion or input/output) to a
+// usage map for logging.
+func ConvUsage(u map[string]any) map[string]any { return u }
+
+func ToStr(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case float64:
+		if x == float64(int64(x)) {
+			return Itoa(int(x))
+		}
+	}
+	return ""
+}
+
+func OrDash(v any) string {
+	s := ToStr(v)
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+func Itoa(n int) string {
+	return strconv.Itoa(n)
+}

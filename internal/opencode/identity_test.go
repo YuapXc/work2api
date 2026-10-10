@@ -3,8 +3,10 @@ package opencode
 import (
 	"hash/fnv"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
+	"work2api/internal/core/provider"
 )
 
 // E2 回归：会话亲和信号按上游优先级取请求头，回落 body 信号。
@@ -89,5 +91,36 @@ func TestNodePoolCursorForIsDeterministicPerSession(t *testing.T) {
 	other := pool.CursorFor("ses_ffffffffffffZZZZZZZZZZZZZZ")
 	if other.next == first.next {
 		t.Logf("note: distinct sessions collided on node %d (acceptable, hash-dependent)", first.next)
+	}
+}
+
+func TestClaudeSessionHeaderAndAuthenticatedIsolation(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-Claude-Code-Session-Id", "cc-session")
+	h.Set("X-Session-Id", "legacy-session")
+	if ids := deriveRequestIDs(map[string]any{}, h); ids.Session != CanonicalSessionID("cc-session") {
+		t.Fatal("CC session ignored")
+	}
+	h.Set("X-Opencode-Session", "native-session")
+	if ids := deriveRequestIDs(map[string]any{}, h); ids.Session != CanonicalSessionID("native-session") {
+		t.Fatal("native priority changed")
+	}
+	req := provider.ServeRequest{Caller: provider.Caller{AppID: 1, AppName: "same-name"}, Headers: h, Payload: map[string]any{"model": "opencode/model", "metadata": map[string]any{"parent_session_id": "native-session"}}}
+	first := deriveCallerRequestIDs(req)
+	if !canonicalSessionPattern.MatchString(first.Session) || first.ParentSession != first.Session {
+		t.Fatal("canonical parent/session mapping differs", first)
+	}
+	h.Set("X-Request-Id", "another-request")
+	if deriveCallerRequestIDs(req).Session != first.Session {
+		t.Fatal("request ID changed affinity")
+	}
+	req.Caller.AppID = 2
+	if deriveCallerRequestIDs(req).Session == first.Session {
+		t.Fatal("affinity crosses keys")
+	}
+	h.Del("X-Opencode-Session")
+	h.Set("X-Claude-Code-Session-Id", strings.Repeat("x", 513))
+	if provider.HeaderSessionID(h) != "legacy-session" {
+		t.Fatal("unbounded session accepted")
 	}
 }

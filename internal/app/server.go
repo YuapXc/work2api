@@ -164,7 +164,7 @@ func (s *Server) requestGuard(next http.Handler) http.Handler {
 		if r.URL.Path == "/admin/login" {
 			sessionOK, headerOK := s.adminAuth(r)
 			if !sessionOK && !headerOK && !s.loginLimiter.allow(s.rateLimitIP(r)) {
-				writeJSON(w, 429, errBody(429, "尝试次数过多，请 10 分钟后再试", "rate_limit_error").body)
+				writeJSON(w, 429, errBody(429, "尝试次数过多，请 10 分钟后再试", "rate_limit_error").Body)
 				return
 			}
 		}
@@ -181,7 +181,7 @@ func (s *Server) requestGuard(next http.Handler) http.Handler {
 				limit = 8 * 1024
 			}
 			if r.ContentLength > limit {
-				writeJSON(w, 413, errBody(413, "请求体过大", "invalid_request_error").body)
+				writeJSON(w, 413, errBody(413, "请求体过大", "invalid_request_error").Body)
 				return
 			}
 			select {
@@ -234,11 +234,11 @@ func (s *Server) requestGuard(next http.Handler) http.Handler {
 				} else if errors.As(err, &timeout) && timeout.Timeout() {
 					status = http.StatusRequestTimeout
 				}
-				writeJSON(w, status, errBody(status, "请求体读取失败或超过限制", "invalid_request_error").body)
+				writeJSON(w, status, errBody(status, "请求体读取失败或超过限制", "invalid_request_error").Body)
 				return
 			}
 			if !jsonWithinComplexity(body, positiveOr(s.o.cfg.MaxJSONItems, 100000), positiveOr(s.o.cfg.MaxJSONDepth, 128)) {
-				writeJSON(w, 400, errBody(400, "JSON 结构过于复杂或嵌套过深", "invalid_request_error").body)
+				writeJSON(w, 400, errBody(400, "JSON 结构过于复杂或嵌套过深", "invalid_request_error").Body)
 				return
 			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
@@ -273,7 +273,7 @@ func (s *Server) adminGuard(next http.Handler) http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		if r.URL.Path == "/admin/login" || r.URL.Path == "/admin/logout" {
 			if !s.adminOriginAllowed(r, false) {
-				writeJSON(w, 403, errBody(403, "拒绝跨源管理请求", "forbidden").body)
+				writeJSON(w, 403, errBody(403, "拒绝跨源管理请求", "forbidden").Body)
 				return
 			}
 			next.ServeHTTP(w, r)
@@ -383,7 +383,7 @@ func isLoopbackHost(host string) bool {
 // a public listener (they key cooldowns and display in logs, not secrets, but
 // there is no reason to publish them).
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	accounts := s.o.pool.Accounts()
+	accounts := s.o.wb.Pool.Accounts()
 	healthy := 0
 	for _, a := range accounts {
 		if a.Healthy(float64(time.Now().UnixNano()) / 1e9) {
@@ -392,7 +392,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status": "ok", "account_count": len(accounts), "healthy_accounts": healthy,
-		"model_source": s.o.models.Source(),
+		"model_source": s.o.wb.Catalog.Source(),
 	})
 }
 
@@ -433,9 +433,8 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) modelCatalog(ctx context.Context) []map[string]any {
-	data := s.o.models.ListCached()
-	// Merge all providers before adding aliases and applying the key's policy.
-	data = append(data, s.o.runtimeModels(ctx)...)
+	// Merge all providers before aliases and key policy.
+	data := s.o.runtimeModels(ctx)
 	settings, _ := s.o.db.GetSettings()
 	aliases := parseModelAliases(settings["model_aliases"])
 	if len(aliases) > 0 {
@@ -468,7 +467,7 @@ func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := readJSON(r)
 	if err != nil {
-		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").Body)
 		return
 	}
 	// Compatibility estimate, not a provider tokenizer or quota settlement.
@@ -538,7 +537,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func writeAPIErr(w http.ResponseWriter, e *apiError) {
-	writeJSON(w, e.status, e.body)
+	writeJSON(w, e.Status, e.Body)
 }
 
 func readJSON(r *http.Request) (map[string]any, error) {

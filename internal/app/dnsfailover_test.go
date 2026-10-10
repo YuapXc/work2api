@@ -15,12 +15,14 @@ import (
 	"testing"
 	"time"
 	"work2api/internal/config"
+	"work2api/internal/core/provider"
 	"work2api/internal/store"
 	"work2api/internal/streamwatch"
 	"work2api/internal/workbuddy/adapters"
 	"work2api/internal/workbuddy/credentials"
 	"work2api/internal/workbuddy/models"
 	"work2api/internal/workbuddy/pool"
+	wbruntime "work2api/internal/workbuddy/runtime"
 	"work2api/internal/workbuddy/upstream"
 )
 
@@ -61,7 +63,13 @@ func newDNSFailoverOrch(t *testing.T, client *failingUpstream) (*Orchestrator, *
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	p := pool.New(map[string]pool.Credential{uid: mgr}, "")
-	o := &Orchestrator{db: db, cfg: &config.Config{MaxConcurrentRequests: 4, PortalUserConcurrency: 2}, pool: p, models: models.New(p, db), managers: map[string]*credentials.Manager{uid: mgr}, modelCooldowns: map[string]cdEntry{}, sessions: newSessionRouter(), upstreamClient: client}
+	o := &Orchestrator{db: db, cfg: &config.Config{MaxConcurrentRequests: 4, PortalUserConcurrency: 2}, wb: &wbruntime.Runtime{Pool: p, Catalog: models.New(p, db), Managers: map[string]*credentials.Manager{uid: mgr}, UpstreamClient: client}, sessions: newSessionRouter()}
+	o.wb.Configure(o.cfg, o.db, o.sessions)
+	o.wb.RecordUsage = o.recordUsage
+	o.runtimes = provider.NewRegistry()
+	if err := o.runtimes.Register(o.wb); err != nil {
+		t.Fatal(err)
+	}
 	acc := p.Get(uid)
 	if acc == nil || acc.Profile == "" {
 		t.Fatal("fixture must contain a routable pooled account")
@@ -96,7 +104,7 @@ func TestOpenUpstreamFailureAccounting(t *testing.T) {
 			if client.calls != 1 {
 				t.Fatalf("want one upstream call, got %d", client.calls)
 			}
-			got := o.pool.Get(acc.UID)
+			got := o.wb.Pool.Get(acc.UID)
 			if got == nil {
 				t.Fatal("pooled account disappeared")
 			}
@@ -123,7 +131,7 @@ func TestUsageTimingFinalizedAfterResponseAndRetainedAfterRestart(t *testing.T) 
 		streamwatch.StartAttempt(r.Context())
 		streamwatch.AttemptHeaders(r.Context(), 200)
 		for i := 0; i < 2; i++ {
-			o.logUsage(logArgs{ctx: r.Context(), t0: time.Now(), status: "ok", model: "test", protocol: "chat"})
+			o.logUsage(logArgs{Ctx: r.Context(), T0: time.Now(), Status: "ok", Model: "test", Protocol: "chat"})
 		}
 		_, _ = w.Write([]byte("complete")) // Usage was inserted before the first write.
 	}))
@@ -164,16 +172,16 @@ func (f *regionRetryUpstream) StreamUpstream(ctx context.Context, h map[string]s
 }
 func TestRegionFailoverPreservesClientCapabilities(t *testing.T) {
 	o, first := newDNSFailoverOrch(t, &failingUpstream{})
-	mgr := o.managers[first.UID]
-	o.pool = pool.New(map[string]pool.Credential{first.UID: mgr, "alternate": mgr}, "")
-	first = o.pool.Get(first.UID)
+	mgr := o.wb.Managers[first.UID]
+	o.wb.Pool = pool.New(map[string]pool.Credential{first.UID: mgr, "alternate": mgr}, "")
+	first = o.wb.Pool.Get(first.UID)
 	first.Profile = "cn-cli"
-	o.pool.Get("alternate").Profile = "intl-cli"
-	o.managers["alternate"] = mgr
-	o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: catalogTransport{}})
-	o.models.Refresh()
+	o.wb.Pool.Get("alternate").Profile = "intl-cli"
+	o.wb.Managers["alternate"] = mgr
+	o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+	o.wb.Catalog.Refresh()
 	client := &regionRetryUpstream{}
-	o.upstreamClient = client
+	o.wb.UpstreamClient = client
 	original := "You are Claude Code.\n# Harness\n" + strings.Repeat("Session guidance. ", 100) + "\n<skills_instructions>### Available skills\nfind-skills: skill://find-skills/SKILL.md</skills_instructions>\nAvailable agent types for the Agent tool:\nreviewer: read CLAUDE.md\n## MCP Server Instructions\nUse mcp__docs__search."
 	input := map[string]any{
 		"model": "test-model", "system": original,
@@ -261,26 +269,26 @@ func TestChannelIdentityCompatibilityPreservesCapabilitiesAndBounds(t *testing.T
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			o, first := newDNSFailoverOrch(t, &failingUpstream{})
-			mgr := o.managers[first.UID]
+			mgr := o.wb.Managers[first.UID]
 			managers := map[string]pool.Credential{first.UID: mgr}
 			for i := 0; i < 6; i++ {
 				uid := fmt.Sprintf("alternate-%d", i)
 				managers[uid] = mgr
-				o.managers[uid] = mgr
+				o.wb.Managers[uid] = mgr
 			}
-			o.pool = pool.New(managers, "")
-			first = o.pool.Get(first.UID)
+			o.wb.Pool = pool.New(managers, "")
+			first = o.wb.Pool.Get(first.UID)
 			first.Profile = tc.profile
-			for _, a := range o.pool.Accounts() {
+			for _, a := range o.wb.Pool.Accounts() {
 				if a.UID != first.UID {
 					a.Profile = "intl-cli"
 				}
 			}
-			o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: catalogTransport{}})
-			o.models.Refresh()
+			o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+			o.wb.Catalog.Refresh()
 			o.cfg.ChannelIdentityCompat = !tc.disabled
 			client := &channelRetryUpstream{body: tc.errorBody, partial: tc.partial, always: tc.always}
-			o.upstreamClient = client
+			o.wb.UpstreamClient = client
 			body := map[string]any{"model": "test-model", "messages": []any{map[string]any{"role": "system", "content": tc.prompt}, map[string]any{"role": "user", "content": "<system-reminder>Plan mode: read only.</system-reminder>"}}, "tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": "Skill", "description": "Use find-skills", "parameters": map[string]any{"type": "object"}}}}}
 			original, _ := json.Marshal(body)
 			admission := newModelAdmission(o.cfg)
@@ -298,12 +306,12 @@ func TestChannelIdentityCompatibilityPreservesCapabilitiesAndBounds(t *testing.T
 					return nil
 				})
 			}
-			o.sessions.bind("sticky", first.UID)
+			o.sessions.Bind("sticky", first.UID)
 			served, err := o.openUpstream(ctx, first, body, "test-model", "sticky", func(string) error { return nil }, nil)
 			if client.calls != tc.wantCalls {
 				t.Fatalf("calls=%d, want %d, error=%v", client.calls, tc.wantCalls, err)
 			}
-			if tc.name == "domestic" && (err != nil || served.UID != first.UID || o.modelCooldownUntil(first.UID, "test-model") > nowSec() || o.sessions.lookup("sticky") != first.UID) {
+			if tc.name == "domestic" && (err != nil || served.UID != first.UID || o.modelCooldownUntil(first.UID, "test-model") > nowSec() || o.sessions.Lookup("sticky") != first.UID) {
 				t.Fatal("successful banner compatibility penalized/rotated account", err)
 			}
 			for i, attempt := range client.bodies {
@@ -385,20 +393,20 @@ func TestChannelCompatibilityProgressionAndSessionMemory(t *testing.T) {
 		t.Run(fmt.Sprintf("metadata=%t", metadata), func(t *testing.T) {
 			client := &channelRetryUpstream{body: denial, denyCalls: 2}
 			o, first := newDNSFailoverOrch(t, &failingUpstream{})
-			o.upstreamClient = client
+			o.wb.UpstreamClient = client
 			first.Profile = "cn-cli"
-			o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: catalogTransport{}})
-			o.models.Refresh()
+			o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+			o.wb.Catalog.Refresh()
 			o.cfg.ChannelIdentityCompat = true
 			o.cfg.ChannelMetadataCompat = metadata
 			body := makeBody("x-anthropic-billing-header: cc_version=2.1.0; cch=aaa;")
 			before, _ := json.Marshal(body)
-			ctx, finish := o.sessions.begin(context.Background(), "memory", "test-model", nil, body)
+			ctx, finish := o.sessions.Begin(context.Background(), "memory", "test-model", nil, body)
 			defer finish()
-			o.sessions.bind("memory", first.UID)
+			o.sessions.Bind("memory", first.UID)
 			_, err := o.openUpstreamScoped(ctx, first, body, "test-model", "memory", func(string) error { return nil }, nil, map[string]bool{first.UID: true})
 			if !metadata {
-				if err == nil || client.calls != 2 || o.sessions.lookup("memory") != "" {
+				if err == nil || client.calls != 2 || o.sessions.Lookup("memory") != "" {
 					t.Fatal("disabled metadata retry or failed binding", client.calls, err)
 				}
 				return
@@ -416,7 +424,7 @@ func TestChannelCompatibilityProgressionAndSessionMemory(t *testing.T) {
 			}
 			body = makeBody("x-anthropic-billing-header: cc_version=2.1.0; cch=bbb;")
 			fingerprint := compatibilityFingerprint(body)
-			if o.sessions.compatibility("memory", first.UID, fingerprint) != 2 {
+			if o.sessions.Compatibility("memory", first.UID, fingerprint) != 2 {
 				t.Fatal("memory missed changing attribution")
 			}
 			_, err = o.openUpstreamScoped(ctx, first, body, "test-model", "memory", func(string) error { return nil }, nil, map[string]bool{first.UID: true})
@@ -424,11 +432,11 @@ func TestChannelCompatibilityProgressionAndSessionMemory(t *testing.T) {
 				t.Fatal("successful compatibility not reused", err)
 			}
 			body["tools"] = []any{map[string]any{"type": "function", "function": map[string]any{"name": "Other"}}}
-			if o.sessions.compatibility("memory", first.UID, compatibilityFingerprint(body)) != 0 || o.sessions.compatibility("other", first.UID, fingerprint) != 0 || o.sessions.compatibility("memory", "other", fingerprint) != 0 {
+			if o.sessions.Compatibility("memory", first.UID, compatibilityFingerprint(body)) != 0 || o.sessions.Compatibility("other", first.UID, fingerprint) != 0 || o.sessions.Compatibility("memory", "other", fingerprint) != 0 {
 				t.Fatal("memory scope too broad")
 			}
-			o.sessions.unbindMatching("memory", first.UID)
-			if o.sessions.compatibility("memory", first.UID, fingerprint) != 0 {
+			o.sessions.UnbindMatching("memory", first.UID)
+			if o.sessions.Compatibility("memory", first.UID, fingerprint) != 0 {
 				t.Fatal("failed binding kept compatibility")
 			}
 		})
@@ -439,8 +447,8 @@ func TestUsageDiagnosticsPreservesRequestAndUpstreamFacts(t *testing.T) {
 	req := withRequestSessionIdentity(httptest.NewRequest("POST", "/v1/messages", nil), map[string]any{"max_tokens": 1200})
 	d := diagnostic(req.Context())
 	d.EffectiveLimits = outputLimits(map[string]any{"max_tokens": 1000})
-	d.observe(`data: {"choices":[{"finish_reason":"length"}]}`)
-	d.observe(`data: {"choices":[{"finish_reason":null}],"usage":{"completion_tokens":1000}}`)
+	d.Observe(`data: {"choices":[{"finish_reason":"length"}]}`)
+	d.Observe(`data: {"choices":[{"finish_reason":null}],"usage":{"completion_tokens":1000}}`)
 	facts := usageDiagnostics(req.Context())
 	if facts.RequestedLimits["max_tokens"] != 1200 || facts.EffectiveLimits["max_tokens"] != 1000 || facts.FinishReason != "length" || !facts.Started {
 		t.Fatal(facts)
@@ -496,17 +504,17 @@ func TestChannelDenialRotatesWithinScopeAndDoesNotReplayOutput(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			o, first := newDNSFailoverOrch(t, &failingUpstream{})
-			mgr := o.managers[first.UID]
-			o.pool = pool.New(map[string]pool.Credential{first.UID: mgr, "alternate": mgr}, "")
-			first = o.pool.Get(first.UID)
-			o.managers["alternate"] = mgr
-			o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: catalogTransport{}})
-			o.models.Refresh()
+			mgr := o.wb.Managers[first.UID]
+			o.wb.Pool = pool.New(map[string]pool.Credential{first.UID: mgr, "alternate": mgr}, "")
+			first = o.wb.Pool.Get(first.UID)
+			o.wb.Managers["alternate"] = mgr
+			o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+			o.wb.Catalog.Refresh()
 			client := &channelRetryUpstream{partial: tc.partial, body: `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`}
 			if tc.content {
 				client.body = `{"msg":"blocked by security policy"}`
 			}
-			o.upstreamClient = client
+			o.wb.UpstreamClient = client
 			var scope map[string]bool
 			if tc.scoped {
 				scope = map[string]bool{first.UID: true}
@@ -514,23 +522,23 @@ func TestChannelDenialRotatesWithinScopeAndDoesNotReplayOutput(t *testing.T) {
 					scope["alternate"] = true
 				}
 			}
-			o.sessions.bind("sticky", first.UID)
+			o.sessions.Bind("sticky", first.UID)
 			served, err := o.openUpstreamScoped(context.Background(), first, map[string]any{}, "test-model", "sticky", func(string) error { return nil }, nil, scope)
 			if client.calls != tc.wantCalls || (err == nil) != (tc.wantCalls == 2) {
 				t.Fatal(client.calls, err)
 			}
-			if tc.wantCalls == 2 && (served.UID != "alternate" || o.sessions.lookup("sticky") != "alternate") {
+			if tc.wantCalls == 2 && (served.UID != "alternate" || o.sessions.Lookup("sticky") != "alternate") {
 				t.Fatal("fallback did not bind alternate", served.UID)
 			}
 			if !tc.partial && !tc.content {
 				if o.modelCooldownUntil(first.UID, "test-model") > nowSec() || o.modelCooldownUntil(first.UID, "other-model") > nowSec() {
 					t.Fatal("cooldown scope incorrect")
 				}
-				if !o.pool.Get(first.UID).Enabled || o.pool.Get(first.UID).CooldownUntil > nowSec() {
+				if !o.wb.Pool.Get(first.UID).Enabled || o.wb.Pool.Get(first.UID).CooldownUntil > nowSec() {
 					t.Fatal("account unnecessarily disabled/cooled")
 				}
 			}
-			if (tc.exhausted || tc.partial) && o.sessions.lookup("sticky") != "" {
+			if (tc.exhausted || tc.partial) && o.sessions.Lookup("sticky") != "" {
 				t.Fatal("failed sticky binding survived exhausted scope")
 			}
 			if tc.content && o.modelCooldownUntil(first.UID, "test-model") > nowSec() {
@@ -542,14 +550,14 @@ func TestChannelDenialRotatesWithinScopeAndDoesNotReplayOutput(t *testing.T) {
 
 func TestRegionBiasPreservesExistingInternationalSession(t *testing.T) {
 	o, first := newDNSFailoverOrch(t, &failingUpstream{})
-	mgr := o.managers[first.UID]
-	o.pool = pool.New(map[string]pool.Credential{first.UID: mgr, "international": mgr}, "")
-	o.managers["international"] = mgr
-	o.pool.Get(first.UID).Profile = "cn-cli"
-	o.pool.Get("international").Profile = "intl-cli"
-	o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: catalogTransport{}})
-	o.models.Refresh()
-	o.sessions.bind("existing-session", "international")
+	mgr := o.wb.Managers[first.UID]
+	o.wb.Pool = pool.New(map[string]pool.Credential{first.UID: mgr, "international": mgr}, "")
+	o.wb.Managers["international"] = mgr
+	o.wb.Pool.Get(first.UID).Profile = "cn-cli"
+	o.wb.Pool.Get("international").Profile = "intl-cli"
+	o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+	o.wb.Catalog.Refresh()
+	o.sessions.Bind("existing-session", "international")
 	selected, e := o.pickAccount("test-model", "existing-session")
 	if e != nil || selected == nil || selected.UID != "international" {
 		t.Fatal("healthy sticky international session replaced", selected, e)
@@ -640,14 +648,14 @@ func TestWorkBuddyPreambleFailover(t *testing.T) {
 	for _, content := range []bool{false, true} {
 		t.Run(fmt.Sprint(content), func(t *testing.T) {
 			o, first := newDNSFailoverOrch(t, &failingUpstream{})
-			mgr := o.managers[first.UID]
-			o.pool = pool.New(map[string]pool.Credential{first.UID: mgr, "alternate": mgr}, "")
-			first = o.pool.Get(first.UID)
-			o.managers["alternate"] = mgr
-			o.models = models.NewWithCatalogClient(o.pool, o.db, &http.Client{Transport: catalogTransport{}})
-			o.models.Refresh()
+			mgr := o.wb.Managers[first.UID]
+			o.wb.Pool = pool.New(map[string]pool.Credential{first.UID: mgr, "alternate": mgr}, "")
+			first = o.wb.Pool.Get(first.UID)
+			o.wb.Managers["alternate"] = mgr
+			o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+			o.wb.Catalog.Refresh()
 			client := &preambleFailureUpstream{content: content}
-			o.upstreamClient = client
+			o.wb.UpstreamClient = client
 			var lines []string
 			_, err := o.openUpstream(context.Background(), first, map[string]any{"model": "test-model"}, "test-model", "", func(line string) error { lines = append(lines, line); return nil }, nil)
 			if content {

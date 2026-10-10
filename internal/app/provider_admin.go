@@ -4,10 +4,8 @@ import (
 	"context"
 	"net/http"
 	"sort"
-	"time"
 
 	"work2api/internal/core/provider"
-	"work2api/internal/workbuddy/siterouting"
 )
 
 func (s *Server) mountProviderAdmin(mux *http.ServeMux) {
@@ -28,14 +26,14 @@ func (s *Server) mountProviderAdmin(mux *http.ServeMux) {
 
 // configRuntime resolves a provider to its ConfigRuntime, or writes an error.
 func (s *Server) configRuntime(w http.ResponseWriter, name string) (provider.ConfigRuntime, bool) {
-	rt, ok := provider.RuntimeByName(name)
+	rt, ok := s.o.runtimes.ByName(name)
 	if !ok {
-		writeJSON(w, 404, errBody(404, "未知供应商："+name, "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, "未知供应商："+name, "invalid_request_error").Body)
 		return nil, false
 	}
 	cr, ok := rt.(provider.ConfigRuntime)
 	if !ok {
-		writeJSON(w, 400, errBody(400, name+" 不支持配置编辑", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, name+" 不支持配置编辑", "invalid_request_error").Body)
 		return nil, false
 	}
 	return cr, true
@@ -48,7 +46,7 @@ func (s *Server) adminProviderGetConfig(w http.ResponseWriter, r *http.Request) 
 	}
 	doc, err := cr.ConfigDoc()
 	if err != nil {
-		writeJSON(w, 500, errBody(500, err.Error(), "internal_error").body)
+		writeJSON(w, 500, errBody(500, err.Error(), "internal_error").Body)
 		return
 	}
 	writeJSON(w, 200, doc)
@@ -61,11 +59,11 @@ func (s *Server) adminProviderSaveConfig(w http.ResponseWriter, r *http.Request)
 	}
 	body, _ := readJSON(r)
 	if err := cr.SaveConfigDoc(body); err != nil {
-		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").Body)
 		return
 	}
 	// 返回刷新后的配置视图（由可能已被替换的新运行时提供）
-	if rt, ok := provider.RuntimeByName(r.PathValue("name")); ok {
+	if rt, ok := s.o.runtimes.ByName(r.PathValue("name")); ok {
 		if ncr, ok := rt.(provider.ConfigRuntime); ok {
 			if doc, err := ncr.ConfigDoc(); err == nil {
 				writeJSON(w, 200, map[string]any{"ok": true, "config": doc})
@@ -78,14 +76,14 @@ func (s *Server) adminProviderSaveConfig(w http.ResponseWriter, r *http.Request)
 
 // accountManager resolves a provider to its AccountManager, or writes an error.
 func (s *Server) accountManager(w http.ResponseWriter, name string) (provider.AccountManager, bool) {
-	rt, ok := provider.RuntimeByName(name)
+	rt, ok := s.o.runtimes.ByName(name)
 	if !ok {
-		writeJSON(w, 404, errBody(404, "未知供应商："+name, "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, "未知供应商："+name, "invalid_request_error").Body)
 		return nil, false
 	}
 	am, ok := rt.(provider.AccountManager)
 	if !ok {
-		writeJSON(w, 400, errBody(400, name+" 不支持账号管理", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, name+" 不支持账号管理", "invalid_request_error").Body)
 		return nil, false
 	}
 	return am, true
@@ -97,7 +95,7 @@ func (s *Server) adminProviderActivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := am.ActivateAccount(r.PathValue("id")); err != nil {
-		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -111,7 +109,7 @@ func (s *Server) adminProviderRename(w http.ResponseWriter, r *http.Request) {
 	body, _ := readJSON(r)
 	name, _ := body["name"].(string)
 	if err := am.RenameAccount(r.PathValue("id"), name); err != nil {
-		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -123,7 +121,7 @@ func (s *Server) adminProviderDeleteAccount(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if err := am.DeleteAccount(r.PathValue("id")); err != nil {
-		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, err.Error(), "invalid_request_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -133,30 +131,30 @@ func (s *Server) adminProviderDeleteAccount(w http.ResponseWriter, r *http.Reque
 // token (the headless-server path; qoder PAT). The token is validated against
 // the upstream before anything is persisted.
 func (s *Server) adminProviderImportAccount(w http.ResponseWriter, r *http.Request) {
-	rt, ok := provider.RuntimeByName(r.PathValue("name"))
+	rt, ok := s.o.runtimes.ByName(r.PathValue("name"))
 	if !ok {
-		writeJSON(w, 404, errBody(404, "未知供应商："+r.PathValue("name"), "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, "未知供应商："+r.PathValue("name"), "invalid_request_error").Body)
 		return
 	}
 	imp, ok := rt.(provider.AccountImporter)
 	if !ok {
-		writeJSON(w, 400, errBody(400, r.PathValue("name")+" 不支持凭 token 添加账号", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, r.PathValue("name")+" 不支持凭 token 添加账号", "invalid_request_error").Body)
 		return
 	}
 	body, err := readJSON(r)
 	if err != nil {
-		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").Body)
 		return
 	}
 	token, _ := body["token"].(string)
 	if token == "" {
-		writeJSON(w, 400, errBody(400, "token 不能为空", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, "token 不能为空", "invalid_request_error").Body)
 		return
 	}
 	delete(body, "token")
 	acct, err := imp.AddAccountByToken(r.Context(), token, body)
 	if err != nil {
-		writeJSON(w, 502, errBody(502, err.Error(), "upstream_error").body)
+		writeJSON(w, 502, errBody(502, err.Error(), "upstream_error").Body)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "account": acct})
@@ -164,14 +162,14 @@ func (s *Server) adminProviderImportAccount(w http.ResponseWriter, r *http.Reque
 
 // oauthRuntime resolves a provider name to its OAuthRuntime, or writes an error.
 func (s *Server) oauthRuntime(w http.ResponseWriter, name string) (provider.OAuthRuntime, bool) {
-	rt, ok := provider.RuntimeByName(name)
+	rt, ok := s.o.runtimes.ByName(name)
 	if !ok {
-		writeJSON(w, 404, errBody(404, "未知供应商："+name, "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, "未知供应商："+name, "invalid_request_error").Body)
 		return nil, false
 	}
 	or, ok := rt.(provider.OAuthRuntime)
 	if !ok {
-		writeJSON(w, 400, errBody(400, name+" 不支持扫码登录", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, name+" 不支持扫码登录", "invalid_request_error").Body)
 		return nil, false
 	}
 	return or, true
@@ -193,7 +191,7 @@ func (s *Server) adminProviderOAuthBegin(w http.ResponseWriter, r *http.Request)
 	body, _ := readJSON(r)
 	res, err := or.OAuthBegin(body)
 	if err != nil {
-		writeJSON(w, 502, errBody(502, err.Error(), "upstream_error").body)
+		writeJSON(w, 502, errBody(502, err.Error(), "upstream_error").Body)
 		return
 	}
 	writeJSON(w, 200, res)
@@ -208,7 +206,7 @@ func (s *Server) adminProviderOAuthPoll(w http.ResponseWriter, r *http.Request) 
 	loginID, _ := body["login_id"].(string)
 	res, err := or.OAuthPoll(loginID)
 	if err != nil {
-		writeJSON(w, 502, errBody(502, err.Error(), "upstream_error").body)
+		writeJSON(w, 502, errBody(502, err.Error(), "upstream_error").Body)
 		return
 	}
 	writeJSON(w, 200, res)
@@ -216,8 +214,8 @@ func (s *Server) adminProviderOAuthPoll(w http.ResponseWriter, r *http.Request) 
 
 // adminProviders returns a cross-provider summary for the overview cards.
 func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
-	list := []map[string]any{s.workbuddyAdmin(false)}
-	rts := provider.Runtimes()
+	list := []map[string]any{}
+	rts := s.o.runtimes.Runtimes()
 	sort.Slice(rts, func(i, j int) bool { return rts[i].Name() < rts[j].Name() })
 	for _, rt := range rts {
 		if ar, ok := rt.(provider.AdminRuntime); ok {
@@ -230,13 +228,9 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 // adminProviderDetail returns one provider's full accounts + models + status.
 func (s *Server) adminProviderDetail(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if name == "workbuddy" {
-		writeJSON(w, 200, s.workbuddyAdmin(true))
-		return
-	}
-	rt, ok := provider.RuntimeByName(name)
+	rt, ok := s.o.runtimes.ByName(name)
 	if !ok {
-		writeJSON(w, 404, errBody(404, "未知供应商："+name, "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, "未知供应商："+name, "invalid_request_error").Body)
 		return
 	}
 	ar, ok := rt.(provider.AdminRuntime)
@@ -249,23 +243,19 @@ func (s *Server) adminProviderDetail(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) adminProviderCheckin(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if name == "workbuddy" {
-		writeJSON(w, 200, s.runWorkbuddyCheckin(context.Background()))
-		return
-	}
-	rt, ok := provider.RuntimeByName(name)
+	rt, ok := s.o.runtimes.ByName(name)
 	if !ok {
-		writeJSON(w, 404, errBody(404, "未知供应商："+name, "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, "未知供应商："+name, "invalid_request_error").Body)
 		return
 	}
 	ci, ok := rt.(provider.Checkiner)
 	if !ok {
-		writeJSON(w, 400, errBody(400, name+" 不支持签到", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, name+" 不支持签到", "invalid_request_error").Body)
 		return
 	}
 	res, err := ci.AdminCheckin(r.Context())
 	if err != nil {
-		writeJSON(w, 502, errBody(502, err.Error(), "upstream_error").body)
+		writeJSON(w, 502, errBody(502, err.Error(), "upstream_error").Body)
 		return
 	}
 	writeJSON(w, 200, res)
@@ -273,24 +263,19 @@ func (s *Server) adminProviderCheckin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) adminProviderCredits(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if name == "workbuddy" {
-		s.o.refreshAllCredits(context.Background())
-		writeJSON(w, 200, map[string]any{"ok": true, "accounts": s.accountsForDisplay()})
-		return
-	}
-	rt, ok := provider.RuntimeByName(name)
+	rt, ok := s.o.runtimes.ByName(name)
 	if !ok {
-		writeJSON(w, 404, errBody(404, "未知供应商："+name, "invalid_request_error").body)
+		writeJSON(w, 404, errBody(404, "未知供应商："+name, "invalid_request_error").Body)
 		return
 	}
 	cr, ok := rt.(provider.CreditRefresher)
 	if !ok {
-		writeJSON(w, 400, errBody(400, name+" 不支持额度查询", "invalid_request_error").body)
+		writeJSON(w, 400, errBody(400, name+" 不支持额度查询", "invalid_request_error").Body)
 		return
 	}
 	res, err := cr.AdminRefreshCredits(r.Context())
 	if err != nil {
-		writeJSON(w, 502, errBody(502, err.Error(), "upstream_error").body)
+		writeJSON(w, 502, errBody(502, err.Error(), "upstream_error").Body)
 		return
 	}
 	writeJSON(w, 200, res)
@@ -317,68 +302,13 @@ func adminDataToMap(name string, d provider.AdminData) map[string]any {
 // detail (detail=true) from the existing pool + models, matching the AdminData
 // shape the runtimes emit so the frontend treats all providers uniformly.
 func (s *Server) workbuddyAdmin(detail bool) map[string]any {
-	accounts := s.accountsForDisplay()
-	var remain, total float64
-	healthy := 0
-	for _, a := range accounts {
-		remain += accountFloat(a, "credits_remaining")
-		total += accountFloat(a, "credits_total")
-		if h, _ := a["healthy"].(bool); h {
-			healthy++
-		}
-	}
-	status := map[string]any{
-		"account_count":     len(accounts),
-		"healthy_count":     healthy,
-		"model_count":       len(s.o.models.ListCached()),
-		"credits_remaining": round2(remain),
-		"credits_total":     round2(total),
-	}
-	m := map[string]any{
-		"name": "workbuddy", "display_name": "WorkBuddy", "ready": len(accounts) > 0,
-		"default": true, "status": status,
-		"capabilities": []string{"accounts", "models", "checkin", "credits", "oauth", "upload"},
-	}
+	d := s.o.wb.AdminData(context.Background())
 	if detail {
-		entries := s.o.models.ListCached()
-		s.attachModelAccounts(entries)
-		m["accounts"] = accounts
-		m["models"] = entries
+		return adminDataToMap("workbuddy", d)
 	}
-	return m
+	return runtimeSummary("workbuddy", d)
 }
-
-// runWorkbuddyCheckin performs the workbuddy checkin loop (shared by the legacy
-// /admin/checkin and the per-provider endpoint). International WorkBuddy accounts
-// have no checkin activity and already-checked accounts are skipped.
 func (s *Server) runWorkbuddyCheckin(ctx context.Context) map[string]any {
-	results := []map[string]any{}
-	skipped := []string{}
-	today := time.Now().Format("2006-01-02")
-	dates, _ := s.o.db.CheckinDates()
-	for _, a := range s.o.pool.Accounts() {
-		mgr := s.o.manager(a.UID)
-		if mgr == nil {
-			continue
-		}
-		if a.Provider == "workbuddy" && siterouting.ProfileSite(a.Profile) == "international" {
-			continue
-		}
-		if dates[a.UID] == today {
-			skipped = append(skipped, a.UID)
-			results = append(results, map[string]any{"uid": a.UID, "ok": false, "message": "今日已签到", "already": true})
-			continue
-		}
-		res, err := billingCheckin(ctx, mgr)
-		if err == nil && (res.OK || res.Already) {
-			_ = s.o.db.RecordCheckin(a.UID, today, "manual")
-		}
-		msg := res.Message
-		if err != nil && msg == "" {
-			msg = err.Error()
-		}
-		results = append(results, map[string]any{"uid": a.UID, "ok": res.OK, "message": msg, "already": res.Already})
-	}
-	s.o.refreshAllCredits(ctx)
-	return map[string]any{"ok": true, "results": results, "skipped": skipped, "accounts": s.accountsForDisplay()}
+	res, _ := s.o.wb.AdminCheckin(ctx)
+	return res
 }

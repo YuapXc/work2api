@@ -50,19 +50,15 @@ type accountAffinity struct {
 }
 
 func requestAffinityKey(req provider.ServeRequest) ([32]byte, bool) {
-	session := ""
-	for _, name := range []string{"X-Session-ID", "Session-ID", "X-Conversation-ID", "Conversation-ID"} {
-		if value := strings.TrimSpace(req.Headers.Get(name)); value != "" {
-			session = value
-			break
-		}
-	}
+	session := provider.ExplicitSessionID(req.Headers, req.Payload)
 	if session == "" {
 		return [32]byte{}, false
 	}
-	// Scope untrusted session names to their authenticated key and model.
-	scope := req.Headers.Get("Authorization") + "\x00" + req.Headers.Get("x-api-key") + "\x00" + req.AppName
-	return sha256.Sum256([]byte(scope + "\x00" + str(req.Payload["model"]) + "\x00" + session)), true
+	caller := req.Caller
+	if caller.AppName == "" {
+		caller.AppName = req.AppName
+	}
+	return sha256.Sum256([]byte(provider.ScopedSessionID(caller, req.Headers, runtimeName, str(req.Payload["model"]), session))), true
 }
 func (r *Runtime) rememberAffinity(key [32]byte, enabled bool, preferred [32]byte, acct *account.Account, secret string) {
 	if !enabled {

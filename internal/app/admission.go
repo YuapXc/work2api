@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"work2api/internal/config"
+	"work2api/internal/core/provider"
 	"work2api/internal/streamwatch"
-	"work2api/internal/workbuddy/pool"
 )
 
 type modelTicket struct {
@@ -25,8 +25,8 @@ type modelTicket struct {
 	shared         bool
 	model          string
 	// Reserve the account and execution slot together; busy accounts park in queue.
-	chooseAccount func(map[string]bool) (*pool.Account, *apiError)
-	account       *pool.Account
+	chooseAccount func(map[string]bool) (*provider.AccountRef, *apiError)
+	account       *provider.AccountRef
 	accountHeld   bool
 	selectionErr  *apiError
 	bufferBytes   int64
@@ -119,7 +119,7 @@ func newModelAdmission(c *config.Config) *modelAdmission {
 
 func localOverload(code string) *apiError {
 	e := errBody(429, "本地容量暂时不足，请稍后重试", "local_overload")
-	e.body["error"].(map[string]any)["code"] = code
+	e.Body["error"].(map[string]any)["code"] = code
 	return e
 }
 
@@ -156,7 +156,7 @@ func (a *modelAdmission) dispatchLocked() {
 		t.running = true
 		a.reserveBufferLocked(t)
 		if t.account != nil && !t.accountHeld {
-			a.byAccount[t.account.UID]++
+			a.byAccount[t.account.ResourceKey()]++
 			t.accountHeld = true
 		}
 		a.active++
@@ -313,7 +313,7 @@ func copyCounts(src map[string]int) map[string]int {
 
 func (l *modelLease) releaseAccountLocked() {
 	if l.t.accountHeld {
-		uid := l.t.account.UID
+		uid := l.t.account.ResourceKey()
 		l.a.byAccount[uid]--
 		if l.a.byAccount[uid] == 0 {
 			delete(l.a.byAccount, uid)
@@ -325,7 +325,7 @@ func (l *modelLease) releaseAccountLocked() {
 // bindAccount returns both permits to the fair queue, then atomically reserves
 // a free authorized account and an execution slot. The same wait budget covers
 // initial admission, account contention, start pacing and retry admission.
-func (l *modelLease) bindAccount(ctx context.Context, choose func(map[string]bool) (*pool.Account, *apiError)) (*pool.Account, error) {
+func (l *modelLease) bindProviderAccount(ctx context.Context, choose func(map[string]bool) (*provider.AccountRef, *apiError)) (*provider.AccountRef, error) {
 	a := l.a
 	a.mu.Lock()
 	if l.t.released || !l.t.running {
@@ -365,7 +365,7 @@ func (l *modelLease) bindAccount(ctx context.Context, choose func(map[string]boo
 		}
 		if l.t.account != nil {
 			l.t.accountHeld = true
-			a.byAccount[l.t.account.UID]++
+			a.byAccount[l.t.account.ResourceKey()]++
 			l.t.running = true
 			a.reserveBufferLocked(l.t)
 			a.active++
@@ -560,7 +560,7 @@ func (a *modelAdmission) snapshot() map[string]any {
 	for model, count := range a.byModel {
 		byModel[model] = count
 	}
-	return map[string]any{"waiting_reasons": waitingReasons, "buffer_reserved_bytes": a.buffers, "buffer_budget_bytes": a.bufferBudget, "shared_buffer_reserved_bytes": a.sharedBuffers, "shared_buffer_budget_bytes": a.sharedBufferBudget, "memory_high_bytes": a.memoryHigh, "memory_pressure": a.memoryUsage != nil && a.memoryUsage() >= a.memoryHigh, "account_capacity": a.accountLimit, "account_running": copyCounts(a.byAccount), "portal_model_running": byModel, "shared_running": a.sharedActive, "shared_capacity": a.sharedCapacity, "shared_queued": sharedQueued, "shared_queue_capacity": a.sharedQueue, "user_queue_capacity": a.userQueue, "running": a.active, "queued": len(a.queue), "capacity": a.capacity, "queue_capacity": a.queueSize, "wait_limit_ms": a.wait.Milliseconds(), "oldest_wait_ms": oldest.Milliseconds(), "rejected": rejected}
+	return map[string]any{"waiting_reasons": waitingReasons, "buffer_reserved_bytes": a.buffers, "buffer_budget_bytes": a.bufferBudget, "shared_buffer_reserved_bytes": a.sharedBuffers, "shared_buffer_budget_bytes": a.sharedBufferBudget, "memory_high_bytes": a.memoryHigh, "memory_pressure": a.memoryUsage != nil && a.memoryUsage() >= a.memoryHigh, "account_capacity": a.accountLimit, "account_running": provider.DisplayAccountCounts(a.byAccount, "workbuddy"), "portal_model_running": byModel, "shared_running": a.sharedActive, "shared_capacity": a.sharedCapacity, "shared_queued": sharedQueued, "shared_queue_capacity": a.sharedQueue, "user_queue_capacity": a.userQueue, "running": a.active, "queued": len(a.queue), "capacity": a.capacity, "queue_capacity": a.queueSize, "wait_limit_ms": a.wait.Milliseconds(), "oldest_wait_ms": oldest.Milliseconds(), "rejected": rejected}
 }
 
 func (s *Server) admitModel(w http.ResponseWriter, r *http.Request, p *Principal) (*http.Request, func(), bool) {

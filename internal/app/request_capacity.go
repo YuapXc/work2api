@@ -120,6 +120,11 @@ func (s *Server) serveRefresh(w http.ResponseWriter, r *http.Request, next http.
 	if key == "/admin/models" {
 		key = "/admin/models/refresh"
 	}
+	if key == "/admin/models/refresh" {
+		if selected := r.URL.Query().Get("provider"); selected != "" {
+			key += "?provider=" + selected
+		}
+	}
 	s.refreshMu.Lock()
 	if f := s.refreshes[key]; f != nil {
 		f.waiters++

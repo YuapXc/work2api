@@ -19,8 +19,6 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
-
-	"work2api/internal/workbuddy/siterouting"
 )
 
 // SchemaVersion is the Go store's schema version. v12 matches the Python
@@ -399,34 +397,39 @@ func (d *DB) hasTable(name string) (bool, error) {
 
 // --- accounts ---
 
-// UpsertAccount writes a workbuddy auth file's content. auth is the full
-// {auth:{...}, account:{...}} blob.
-func (d *DB) UpsertAccount(auth map[string]any) (string, error) {
-	account, _ := auth["account"].(map[string]any)
-	authData, _ := auth["auth"].(map[string]any)
-	if authData == nil {
-		authData = auth
+// ProviderAccount carries already validated provider metadata. Storage does
+// not infer upstream endpoints or interpret credentials.
+type ProviderAccount struct {
+	UID, Provider, Nickname, EnterpriseID, Domain, Profile string
+	Auth                                                   map[string]any
+}
+
+func (d *DB) UpsertProviderAccount(account ProviderAccount) (string, error) {
+	if account.UID == "" || account.Provider == "" {
+		return "", fmt.Errorf("missing provider account identity")
 	}
-	uid := str(account["uid"])
-	nickname := str(account["nickname"])
-	ent := str(account["enterpriseId"])
-	domain := str(authData["domain"])
-	profile, err := siterouting.ProfileForAuth(authData)
+	blob, err := json.Marshal(account.Auth)
 	if err != nil {
-		profile = siterouting.DefaultProfile
+		return "", err
 	}
-	blob, _ := json.Marshal(auth)
 	now := float64(time.Now().UnixNano()) / 1e9
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	_, err = d.db.Exec(
-		`INSERT INTO accounts (uid, nickname, enterprise_id, domain, auth_json, profile, provider, created_at, updated_at)
-		 VALUES (?,?,?,?,?,?,?,?,?)
-		 ON CONFLICT(uid) DO UPDATE SET nickname=excluded.nickname, enterprise_id=excluded.enterprise_id,
-		   domain=excluded.domain, auth_json=excluded.auth_json, profile=excluded.profile,
-		   provider=excluded.provider, updated_at=excluded.updated_at`,
-		uid, nickname, ent, domain, string(blob), profile, "workbuddy", now, now)
-	return uid, err
+	result, err := d.db.Exec(`INSERT INTO accounts (uid,nickname,enterprise_id,domain,auth_json,profile,provider,created_at,updated_at)
+ VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(uid) DO UPDATE SET nickname=excluded.nickname,enterprise_id=excluded.enterprise_id,
+ domain=excluded.domain,auth_json=excluded.auth_json,profile=excluded.profile,updated_at=excluded.updated_at
+ WHERE accounts.provider=excluded.provider`, account.UID, account.Nickname, account.EnterpriseID, account.Domain, string(blob), account.Profile, account.Provider, now, now)
+	if err != nil {
+		return "", err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if n == 0 {
+		return "", fmt.Errorf("account identity belongs to another provider")
+	}
+	return account.UID, nil
 }
 
 // ListAccounts returns all accounts ordered by priority desc, id asc.

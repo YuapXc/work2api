@@ -1,18 +1,4 @@
-// This file extends the provider package with an inference-runtime contract.
-//
-// The original Provider interface above models a "prepare one HTTP call" seam.
-// That fits workbuddy (which speaks an OpenAI-ish upstream directly) but not the
-// two Go upstreams we port next:
-//   - qoder always streams a custom SSE envelope and must splice the prompt into
-//     a request template, so a single prepared request/response does not capture it;
-//   - opencode routes per-tier (zen/go), applies session affinity + anonymous
-//     shaping, and can use a different wire protocol per tier for the same model.
-//
-// So non-default providers implement Runtime instead: a self-contained inference
-// core that owns its own accounts/signing/upstream and writes the client response
-// directly. The unified server dispatches <namespace>/<model> requests to the
-// matching Runtime and logs usage from the returned UsageReport. workbuddy keeps
-// its existing in-app pipeline and is the default (un-namespaced) provider.
+// Runtime describes protocol-aware channels owned by one gateway instance.
 package provider
 
 import (
@@ -44,6 +30,7 @@ type CatalogModel struct {
 
 // UsageReport is what Serve returns for the shared usage logger + pool bookkeeping.
 type UsageReport struct {
+	Recorded     bool // runtime emitted attempt and final records through the shared logger
 	TokensKnown  *bool
 	AccountUID   string
 	InputTokens  int
@@ -60,6 +47,7 @@ type UsageReport struct {
 
 // ServeRequest carries a single inference call to a Runtime.
 type ServeRequest struct {
+	Caller   Caller
 	Protocol Protocol
 	Payload  map[string]any // parsed client body; Payload["model"] is still namespaced
 	Writer   http.ResponseWriter
@@ -70,15 +58,14 @@ type ServeRequest struct {
 	Headers http.Header
 }
 
-// Runtime is the inference contract each non-default provider implements so the
-// unified server can route "<namespace>/<model>" requests to it. Implementations
+// Runtime is the inference contract for default and namespaced channels. Implementations
 // own their own credential source, signing, upstream and streaming; they convert
 // to/from the client Protocol themselves (reusing core/protocol where useful).
 type Runtime interface {
-	// Name is the registry key ("qoder" | "opencode").
+	// Name is the stable registry key.
 	Name() string
 	// Prefix is the model namespace this runtime owns, incl. trailing slash
-	// (e.g. "qoder/"). A model id starting with Prefix routes here.
+	// (e.g. "qoder/"). Empty prefix declares the single default channel.
 	Prefix() string
 	// Ready reports whether the runtime has at least one usable credential.
 	Ready() bool
@@ -107,59 +94,6 @@ type CheckinCalendar struct {
 
 type CheckinHistorian interface {
 	CheckinHistory(context.Context, int) (CheckinCalendar, error)
-}
-
-// runtimes holds registered inference runtimes by name.
-var runtimeRegistry = map[string]Runtime{}
-
-// RegisterRuntime adds an inference runtime. Panics on duplicate (startup bug).
-func RegisterRuntime(rt Runtime) {
-	regMu.Lock()
-	defer regMu.Unlock()
-	if _, dup := runtimeRegistry[rt.Name()]; dup {
-		panic("runtime already registered: " + rt.Name())
-	}
-	runtimeRegistry[rt.Name()] = rt
-}
-
-// ReplaceRuntime swaps the registered runtime for its name (used for hot-reload
-// after a config edit). In-flight requests keep the old instance; new lookups
-// get the replacement. No-op semantics if the name was not registered before.
-func ReplaceRuntime(rt Runtime) {
-	regMu.Lock()
-	defer regMu.Unlock()
-	runtimeRegistry[rt.Name()] = rt
-}
-
-// Runtimes returns all registered runtimes (unordered snapshot).
-func Runtimes() []Runtime {
-	regMu.RLock()
-	defer regMu.RUnlock()
-	out := make([]Runtime, 0, len(runtimeRegistry))
-	for _, rt := range runtimeRegistry {
-		out = append(out, rt)
-	}
-	return out
-}
-
-// RuntimeForModel returns the runtime owning a namespaced model id, if any.
-func RuntimeForModel(model string) (Runtime, bool) {
-	regMu.RLock()
-	defer regMu.RUnlock()
-	for _, rt := range runtimeRegistry {
-		if p := rt.Prefix(); p != "" && len(model) >= len(p) && model[:len(p)] == p {
-			return rt, true
-		}
-	}
-	return nil, false
-}
-
-// RuntimeByName returns a registered runtime by its Name(), if any.
-func RuntimeByName(name string) (Runtime, bool) {
-	regMu.RLock()
-	defer regMu.RUnlock()
-	rt, ok := runtimeRegistry[name]
-	return rt, ok
 }
 
 // AdminData is a provider's self-describing management snapshot. Each provider
@@ -252,3 +186,26 @@ type CredentialExporter interface {
 	// credential in a form the target project can import, or an error.
 	ExportCredentials() (map[string]any, error)
 }
+
+// RequestPreparer validates provider-specific inputs and observes sessions before
+// common admission. It must not dispatch upstream or acquire execution slots.
+type RequestPreparer interface {
+	PrepareRequest(context.Context, ServeRequest) (context.Context, func(), error)
+}
+
+// PortalProvider declares eligibility for existing portal keys. Unsupported
+// providers remain inaccessible until ownership/permissions are implemented.
+type PortalProvider interface{ SupportsPortal() bool }
+
+// StateSource declares provider-owned files for coordinated online snapshots.
+type StateSource struct {
+	Path     string
+	Required bool
+}
+type StateOwner interface{ StateSources() []StateSource }
+
+// WarmMaintainer performs provider initialization in the cancellable scheduler.
+type WarmMaintainer interface{ Warm(context.Context) }
+
+// HealthReporter returns a read-only local health snapshot, never an upstream probe.
+type HealthReporter interface{ HealthSnapshot() map[string]any }

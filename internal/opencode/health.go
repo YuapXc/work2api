@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sync"
 	"time"
+	"work2api/internal/core/provider"
 )
 
 const (
@@ -122,48 +123,73 @@ func (rt *Runtime) applyProxyHealthResult(result proxyHealthResult, source strin
 	}
 }
 
-func (rt *Runtime) StartModelRefresh(ctx context.Context) {
-	// unchanged refreshes stay at debug so a steady catalog doesn't spam the
-	// info log every refresh interval; the fingerprint covers tier model sets,
-	// native protocols and the unsupported map, so any real change is caught.
-	prevFingerprint := rt.catalog.Fingerprint()
-	refresh := func() {
-		var zen, goModels []string
-		var capabilities Capabilities
-		var capabilitiesErr error
-		var wg sync.WaitGroup
-		wg.Add(3)
-		go func() { defer wg.Done(); zen = rt.refreshZen(ctx) }()
-		go func() { defer wg.Done(); goModels = rt.refreshTier(ctx, rt.cfg.Upstream.Go, rt.goNodes) }()
-		go func() {
-			defer wg.Done()
-			capabilityCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			defer cancel()
-			capabilities, capabilitiesErr = rt.refreshProtocolCapabilities(capabilityCtx)
-		}()
-		wg.Wait()
-		if ctx.Err() != nil {
-			return
-		}
-		if capabilitiesErr != nil {
-			rt.logger.Warn("OpenCode capability catalog refresh failed", "component", "opencode.models", "error", capabilitiesErr)
-		}
-		if zen != nil || goModels != nil {
-			rt.catalog.ReplaceWithCapabilities(zen, goModels, capabilities.Protocols, capabilities.Unsupported, capabilities.Metadata)
-			if ctx.Err() == nil {
-				if err := rt.catalog.SaveCache(); err != nil {
-					rt.logger.Warn("model catalog cache write failed", "component", "opencode.models", "error", err)
-				}
-			}
-			if fp := rt.catalog.Fingerprint(); fp != prevFingerprint {
-				prevFingerprint = fp
-				rt.logger.Info("model catalog refreshed", "component", "opencode.models", "models", len(rt.catalog.List()))
-			} else {
-				rt.logger.Debug("model catalog refresh: no change", "component", "opencode.models", "models", len(rt.catalog.List()))
-			}
+// Explicit and background refreshes share one cancellable task per runtime.
+func (rt *Runtime) RefreshModels(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+	if rt.lifecycleCtx != nil {
+		stop := context.AfterFunc(rt.lifecycleCtx, cancel)
+		defer stop()
+		if err := rt.lifecycleCtx.Err(); err != nil {
+			return err
 		}
 	}
+	if registry := rt.registry.Load(); registry != nil && !registry.IsCurrent(rt) {
+		return errors.New("渠道配置已变更")
+	}
+	return rt.modelRefresh.Do(ctx, "catalog", rt.refreshModels)
+}
+func (rt *Runtime) refreshModels(ctx context.Context) error {
+	previous := rt.catalog.Fingerprint()
+	var zen, goModels []string
+	var capabilities Capabilities
+	var capabilitiesErr error
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { defer wg.Done(); zen = rt.refreshZen(ctx) }()
+	go func() { defer wg.Done(); goModels = rt.refreshTier(ctx, rt.cfg.Upstream.Go, rt.goNodes) }()
+	go func() { defer wg.Done(); capabilities, capabilitiesErr = rt.refreshProtocolCapabilities(ctx) }()
+	wg.Wait()
+	saveMu.Lock()
+	defer saveMu.Unlock()
+	if registry := rt.registry.Load(); registry != nil && !registry.IsCurrent(rt) {
+		return errors.New("渠道配置已变更")
+	}
+	if ctx.Err() != nil {
+		rt.catalog.mu.Lock()
+		rt.catalog.stale = true
+		rt.catalog.mu.Unlock()
+		return ctx.Err()
+	}
+	if zen == nil && goModels == nil {
+		rt.catalog.mu.Lock()
+		rt.catalog.stale = true
+		rt.catalog.mu.Unlock()
+		return errors.New("OpenCode 模型目录刷新失败，保留现有目录")
+	}
+	partial := capabilitiesErr != nil || (zen == nil && (rt.zenNodes.Len() > 0 || rt.cfg.Anonymous)) || (goModels == nil && rt.goNodes.Len() > 0)
+	rt.catalog.ReplaceWithCapabilities(zen, goModels, capabilities.Protocols, capabilities.Unsupported, capabilities.Metadata)
+	rt.catalog.mu.Lock()
+	rt.catalog.stale = partial
+	rt.catalog.mu.Unlock()
+	if err := rt.catalog.SaveCache(); err != nil && rt.logger != nil {
+		rt.logger.Warn("model catalog cache write failed", "error", err)
+	}
+	if rt.logger != nil && previous != rt.catalog.Fingerprint() {
+		rt.logger.Info("model catalog refreshed", "component", "opencode.models", "models", len(rt.catalog.List()))
+	}
+	if partial {
+		return provider.ErrPartialRefresh
+	}
+	return nil
+}
+func (rt *Runtime) StartModelRefresh(ctx context.Context) {
 	go func() {
+		refresh := func() {
+			if err := rt.RefreshModels(ctx); err != nil && ctx.Err() == nil && rt.logger != nil {
+				rt.logger.Warn("model catalog refresh failed", "component", "opencode.models", "error", err)
+			}
+		}
 		refresh()
 		ticker := time.NewTicker(time.Duration(rt.cfg.Models.RefreshSeconds) * time.Second)
 		defer ticker.Stop()

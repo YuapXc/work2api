@@ -62,7 +62,7 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provid
 	}
 
 	stream := jsonutil.BoolAt(payload, "stream")
-	ids := deriveRequestIDs(payload, req.Headers)
+	ids := deriveCallerRequestIDs(req)
 
 	// System One decision payloads share no shape with the message bridge, so
 	// they are relayed verbatim to every tier.

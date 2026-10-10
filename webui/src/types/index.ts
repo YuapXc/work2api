@@ -356,3 +356,14 @@ export interface SessionAccountOption {
  uid: string; label: string; site: string; remaining: number | null; cost: number | null
  running: number; selectable: boolean; reason: string; cost_relation: string
 }
+
+export interface ModelRefreshResult {
+  provider: string
+  status: 'ok' | 'partial' | 'error' | 'skipped'
+  count: number
+  added: number
+  removed: number
+  source: string
+  stale: boolean
+  message?: string
+}

@@ -18,6 +18,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+try {
+Add-Type -AssemblyName System.Net.Http
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
@@ -26,13 +28,17 @@ function Get-BuildFingerprint {
   $hash = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
   try {
     $inputs = @('go.mod', 'go.sum')
-    $inputs += Get-ChildItem cmd, internal -Recurse -File | Where-Object { $_.Extension -eq '.go' -and $_.Name -notlike '*_test.go' -or $_.FullName.StartsWith((Join-Path $root 'internal\app\webui') + '\') } | ForEach-Object { [IO.Path]::GetRelativePath($root, $_.FullName).Replace('\', '/') }
-    foreach ($inputFile in ($inputs | Sort-Object -Unique)) {
+    $inputs += Get-ChildItem cmd, internal -Recurse -File | Where-Object { $_.Extension -eq '.go' -and $_.Name -notlike '*_test.go' -or $_.FullName.StartsWith((Join-Path $root 'internal\app\webui') + '\') } | ForEach-Object { $_.FullName.Substring($root.Length + 1).Replace('\', '/') }
+    # .NET Framework and modern .NET use different culture sorting rules.
+    # Build identity must remain identical across both PowerShell hosts.
+    [string[]]$orderedInputs = $inputs
+    [Array]::Sort($orderedInputs, [StringComparer]::Ordinal)
+    foreach ($inputFile in $orderedInputs) {
       $hash.AppendData([Text.Encoding]::UTF8.GetBytes($inputFile + "`n"))
       $hash.AppendData([IO.File]::ReadAllBytes((Join-Path $root $inputFile)))
       $hash.AppendData([byte[]]@(0))
     }
-    return [Convert]::ToHexString($hash.GetHashAndReset()).ToLowerInvariant()
+    return [BitConverter]::ToString($hash.GetHashAndReset()).Replace('-', '').ToLowerInvariant()
   } finally { $hash.Dispose() }
 }
 $fingerprint = Get-BuildFingerprint
@@ -88,7 +94,8 @@ if ($existing) {
     return
   }
   Write-Host '检测到代码变化或已请求重启。将先构建，再等待已有请求结束；期间新请求需稍后重试。' -ForegroundColor Yellow
-  if ((Read-Host '现在平滑更新/重启？输入 Y 确认，其他输入继续复用旧服务') -notmatch '^[Yy]$') {
+  $updateAnswer = Read-Host '现在平滑更新/重启？输入 Y 确认，其他输入继续复用旧服务'
+  if ($updateAnswer -notin @('Y', 'y')) {
     if (-not $NoBrowser) { & $exePath -reuse-only -open-browser }
     return
   }
@@ -163,4 +170,12 @@ if (-not $NoRun) {
   if (-not $NoBrowser) { $runArgs += '-open-browser' }
   & $exePath @runArgs
   if ($LASTEXITCODE -ne 0) { throw '服务启动失败；未自动回滚数据库，请查看报错。' }
+}
+} catch {
+  Write-Host ("启动失败：" + $_.Exception.Message) -ForegroundColor Red
+  Write-Host $_.InvocationInfo.PositionMessage -ForegroundColor DarkGray
+  if (-not $NoRun -and $env:WORK2API_LAUNCHER -ne 'cmd' -and -not [Console]::IsInputRedirected) {
+    Read-Host '按 Enter 关闭窗口' | Out-Null
+  }
+  exit 1
 }

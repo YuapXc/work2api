@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"regexp"
 
+	"work2api/internal/core/provider"
 	"work2api/internal/jsonutil"
 )
 
@@ -25,8 +26,8 @@ type RequestIDs struct {
 // priority), then in-body signals, then the first user turn so a growing
 // conversation stays stable.
 //
-// Header priority (1:1 with upstream): x-opencode-session, x-session-affinity,
-// X-Session-Id, x-session-id, conversation-id. These let a client explicitly
+// Header priority: x-opencode-session, x-session-affinity, then the shared
+// Claude Code/common session headers. These let a client explicitly
 // separate independent conversations (e.g. Zen free tier needs a canonical
 // ses_ id per conversation); body-only signals can't express "same user, new
 // conversation".
@@ -37,13 +38,7 @@ func deriveRequestIDs(body map[string]any, headers ...Header) RequestIDs {
 	}
 	signal := ""
 	if h != nil {
-		signal = firstNonEmpty(
-			h.Get("x-opencode-session"),
-			h.Get("x-session-affinity"),
-			h.Get("X-Session-Id"),
-			h.Get("x-session-id"),
-			h.Get("conversation-id"),
-		)
+		signal = firstNonEmpty(provider.BoundedSessionID(h.Get("x-opencode-session")), provider.BoundedSessionID(h.Get("x-session-affinity")), provider.HeaderSessionID(h))
 	}
 	if signal == "" {
 		signal = jsonutil.FirstString(
@@ -72,6 +67,21 @@ func deriveRequestIDs(body map[string]any, headers ...Header) RequestIDs {
 		Project:       StableID("prj", projectSignal),
 		ParentSession: parentSession,
 	}
+}
+
+// Scope upstream affinity to the authenticated key while keeping the required
+// canonical ses_ wire format. Native session headers retain routing precedence.
+func deriveCallerRequestIDs(req provider.ServeRequest) RequestIDs {
+	ids := deriveRequestIDs(req.Payload, req.Headers)
+	caller := req.Caller
+	if caller.AppName == "" {
+		caller.AppName = req.AppName
+	}
+	ids.Session = CanonicalSessionID(provider.ScopedSessionID(caller, req.Headers, runtimeName, "", ids.Session))
+	if ids.ParentSession != "" {
+		ids.ParentSession = CanonicalSessionID(provider.ScopedSessionID(caller, req.Headers, runtimeName, "", CanonicalSessionID(ids.ParentSession)))
+	}
+	return ids
 }
 
 func conversationSeed(body map[string]any) string {

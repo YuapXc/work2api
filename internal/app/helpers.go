@@ -1,151 +1,20 @@
-// Package app wires the shared HTTP surface: the three OpenAI/Anthropic
-// inference endpoints and the /admin/* management API. Ported from
-// workbuddy_one/app.py (single-user all-in-one; multi-user portal deferred).
 package app
 
-import (
-	"encoding/json"
-	"regexp"
-	"strconv"
-	"strings"
-	"time"
-)
+import wbruntime "work2api/internal/workbuddy/runtime"
 
-// Cooldown durations (seconds) used outside the error classifier (token-refresh
-// failure, mid-stream break, non-HTTP errors). Status-based cooldown selection
-// now lives in the error classifier (errclass.go).
-const (
-	cooldownSoft = 60.0
-	cooldownHard = 1800.0
+var dailyModelLimit = wbruntime.DailyModelLimit
+var upstreamErrorText = wbruntime.UpstreamErrorText
+var parseModelAliases = wbruntime.ParseModelAliases
+var jsonError = wbruntime.JsonError
+var errAnthropic = wbruntime.ErrAnthropic
+var safeErr = wbruntime.SafeErr
+var convUsage = wbruntime.ConvUsage
+var toStr = wbruntime.ToStr
+var orDash = wbruntime.OrDash
+var itoa = wbruntime.Itoa
 
-	// sessionStickyMaxCooldown bounds how much residual account cooldown still
-	// counts as "usable now" for both session-sticky reuse and the final pick
-	// guard: an account cooling down for <= this many seconds is treated as
-	// immediately serviceable, anything more means the pool is rate-limited.
-	sessionStickyMaxCooldown = 30.0
-)
+const cooldownSoft = wbruntime.CooldownSoft
+const cooldownHard = wbruntime.CooldownHard
+const sessionStickyMaxCooldown = wbruntime.SessionStickyMaxCooldown
 
-var limitResetRe = regexp.MustCompile(`(?i)(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*UTC\+8`)
-
-// dailyModelLimit detects the upstream per-day model limit (code=6004) and
-// returns its explicit UTC+8 reset time.
-func dailyModelLimit(raw []byte, now float64) (float64, string, bool) {
-	var data map[string]any
-	if json.Unmarshal(raw, &data) != nil {
-		return 0, "", false
-	}
-	if toStr(data["code"]) != "6004" {
-		return 0, "", false
-	}
-	message := toStr(data["msg"])
-	m := limitResetRe.FindStringSubmatch(message)
-	if m == nil {
-		return 0, "", false
-	}
-	loc := time.FixedZone("UTC+8", 8*3600)
-	t, err := time.ParseInLocation("2006-01-02 15:04:05", m[1], loc)
-	if err != nil {
-		return 0, "", false
-	}
-	reset := float64(t.Unix())
-	if now == 0 {
-		now = float64(time.Now().UnixNano()) / 1e9
-	}
-	if reset <= now || reset > now+48*3600 {
-		return 0, "", false
-	}
-	return reset, message, true
-}
-
-// upstreamErrorText extracts a searchable error summary for usage logs.
-func upstreamErrorText(status int, raw []byte) string {
-	var data map[string]any
-	if json.Unmarshal(raw, &data) == nil {
-		code := data["code"]
-		msg := data["msg"]
-		if msg == nil {
-			msg = data["message"]
-		}
-		if code != nil || msg != nil {
-			return strings.TrimSpace("HTTP " + itoa(status) + " code=" + orDash(code) + " " + toStr(msg))
-		}
-	}
-	return "HTTP " + itoa(status)
-}
-
-// parseModelAliases parses "alias=real" lines.
-func parseModelAliases(raw string) map[string]string {
-	out := map[string]string{}
-	for _, line := range strings.Split(raw, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || !strings.Contains(line, "=") {
-			continue
-		}
-		alias, real, _ := strings.Cut(line, "=")
-		alias, real = strings.TrimSpace(alias), strings.TrimSpace(real)
-		if alias != "" && real != "" {
-			out[alias] = real
-		}
-	}
-	return out
-}
-
-func jsonError(status int, message string) string {
-	b, _ := json.Marshal(map[string]any{"error": map[string]any{
-		"message": message, "type": "upstream_error", "code": status}})
-	return string(b)
-}
-
-// errAnthropic formats an Anthropic-style SSE error event.
-func errAnthropic(status int, message string) string {
-	b, _ := json.Marshal(map[string]any{
-		"type":  "error",
-		"error": map[string]any{"type": "upstream_error", "message": message},
-	})
-	return "event: error\ndata: " + string(b) + "\n\n"
-}
-
-// safeErr builds an error detail body from a raw upstream error.
-func safeErr(raw []byte, status int) map[string]any {
-	var data any
-	if json.Unmarshal(raw, &data) == nil {
-		if m, ok := data.(map[string]any); ok {
-			if _, has := m["error"]; has {
-				return m
-			}
-		}
-	}
-	msg := string(raw)
-	if msg == "" {
-		msg = "upstream error"
-	}
-	return map[string]any{"error": map[string]any{"message": msg, "type": "upstream_error", "code": status}}
-}
-
-// convUsage maps converter usage (prompt/completion or input/output) to a
-// usage map for logging.
-func convUsage(u map[string]any) map[string]any { return u }
-
-func toStr(v any) string {
-	switch x := v.(type) {
-	case string:
-		return x
-	case float64:
-		if x == float64(int64(x)) {
-			return itoa(int(x))
-		}
-	}
-	return ""
-}
-
-func orDash(v any) string {
-	s := toStr(v)
-	if s == "" {
-		return "-"
-	}
-	return s
-}
-
-func itoa(n int) string {
-	return strconv.Itoa(n)
-}
+var limitResetRe = wbruntime.LimitResetRe
