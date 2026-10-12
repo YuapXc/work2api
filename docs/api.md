@@ -55,6 +55,8 @@ WorkBuddy 会修复客户端上下文压缩后损坏的工具历史：清理缺�
 
 WorkBuddy 国内渠道遇到明确的 `11128` 渠道验证拒绝时，可在输出开始前有限重试：仅替换已验证的 Claude Code/SDK 或旧版 Codex CLI 固定身份开头，以及 ZCode 等客户端的固定分支说明行。分支说明仅将 `Main branch (you will usually use this for PRs):` 改为 `Default branch (you will usually use this for PRs):`，实际分支值、其余指令、skills、工具和权限说明均保留。首次请求保留原文；成功的兼容方式会按账号和指令指纹在当前会话复用。普通内容审核拒绝不会触发这项清洗，未知客户端模板也不会被整段裁剪。此兼容不能保证所有上游拒绝都恢复调用；可用 `CHANNEL_IDENTITY_COMPAT=false` 关闭。
 
+- 第二级兼容（`CHANNEL_METADATA_COMPAT`）在移除归因行之外，还会把同一批固定模板从历史消息、reasoning、工具参数与工具结果里一并改写：这些位置同样会出站，而只清洗开头 system 会漏掉它们。除这些已知模板外不改动任何内容。
+
 - **密钥模型白名单**：`/v1/models` 只展示该密钥获准调用的模型及别名。省略 `model`（含 `null`、空字符串）时，不限模型的密钥默认使用 `auto`，仅允许一个模型的密钥默认使用该模型，允许多个模型的密钥需明确指定，否则返回 400。显式指定 `auto` 仍需获得授权；它会交给上游选择，并不表示在密钥白名单内自动选择。
 
 `/v1/messages/count_tokens` 当前提供文本及工具内容的粗估（含 system、工具定义和结果），不使用供应商 tokenizer；图片和音频未计入，不能作为精确计费或上下文容量依据。

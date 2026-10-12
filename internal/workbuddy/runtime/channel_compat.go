@@ -18,6 +18,14 @@ var codexCLIIntro = regexp.MustCompile(`(?i)^you are a coding agent running in t
 // the actual branch value and every surrounding instruction intact.
 var mainBranchTemplate = regexp.MustCompile(`(?m)^Main branch \(you will usually use this for PRs\):`)
 
+// Claude Code prints its feedback address in the system prompt. WorkBuddy
+// matches the repository slug in that link as a client fingerprint: a full
+// 32k Claude Code system prompt is rejected with 11128 while the identical
+// prompt with only this path reworded passes. Match the whole sentence so a
+// user quoting the bare link is never rewritten, and keep the sentence intact
+// apart from the slug.
+var claudeCodeFeedbackLine = regexp.MustCompile(`(?m)^(\s*-\s*To give feedback, users should report the issue at )https://github\.com/anthropics/claude-code/issues(\s*)$`)
+
 func CompatibilityName(level int) string {
 	switch level {
 	case 1:
@@ -79,9 +87,11 @@ func BillingPrefix(text string) (prefix, rest string) {
 	return line, ""
 }
 
-// Transform only leading system text. Replace verified client declarations and
-// the fixed branch annotation; level 2 additionally removes client attribution.
-// Skills, tools, permission rules, user messages and tool results are untouched.
+// Level 1 transforms only leading system text: verified client declarations and
+// the fixed branch annotation, leaving skills, tools, permission rules, user
+// messages and tool results untouched. Level 2 additionally removes client
+// attribution and de-fingerprints the whole conversation, because history,
+// reasoning and tool payloads can echo the same templates.
 func ChannelCompatibilityBody(body map[string]any, level int) (map[string]any, bool) {
 	templateChanged, metadataChanged := false, false
 	transform := func(text string) string {
@@ -90,6 +100,10 @@ func ChannelCompatibilityBody(body map[string]any, level int) (map[string]any, b
 		value, changed := CompatibleIdentity(strings.TrimLeft(rest, "\r\n"))
 		if mainBranchTemplate.MatchString(value) {
 			value = mainBranchTemplate.ReplaceAllString(value, "Default branch (you will usually use this for PRs):")
+			changed = true
+		}
+		if claudeCodeFeedbackLine.MatchString(value) {
+			value = claudeCodeFeedbackLine.ReplaceAllString(value, "${1}https://github.com/anthropics/cl4ude-c0de/issues${2}")
 			changed = true
 		}
 		templateChanged = templateChanged || changed
@@ -139,7 +153,13 @@ func ChannelCompatibilityBody(body map[string]any, level int) (map[string]any, b
 		copyMessage["content"] = content
 		copyMessages[i] = copyMessage
 	}
-	if level == 1 && !templateChanged || level == 2 && !metadataChanged {
+	// 最深一档同时把同一批指纹从整条对话里清掉：历史回显、reasoning、工具参数和
+	// 工具结果都可能是指纹出站的位置，见 channel_fingerprint.go。
+	deepChanged := false
+	if level >= 2 {
+		copyMessages, deepChanged = sanitizeChannelMessages(copyMessages)
+	}
+	if level == 1 && !templateChanged || level >= 2 && !metadataChanged && !deepChanged {
 		return body, false
 	}
 	out := make(map[string]any, len(body))

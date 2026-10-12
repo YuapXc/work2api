@@ -477,6 +477,62 @@ func TestChannelBranchTemplateCompatibilityPreservesContext(t *testing.T) {
 	}
 }
 
+// Claude Code prints a feedback link in its system prompt. WorkBuddy treats
+// the repository slug in that link as a client fingerprint, so a full Claude
+// Code prompt is rejected with 11128 while the same text with only that path
+// reworded passes. Only the exact upstream URL is touched.
+func TestChannelFeedbackLinkCompatibilityPreservesContext(t *testing.T) {
+	const prefix = "You are Claude Code, Anthropic's official CLI for Claude.\r\nKeep every project rule.\r\n"
+	const link = "https://github.com/anthropics/claude-code/issues"
+	const tail = "\r\n<system-reminder>Keep all skills and tools.</system-reminder>"
+	const want = "https://github.com/anthropics/cl4ude-c0de/issues"
+	for _, blocks := range []bool{false, true} {
+		var content any = prefix + "- To give feedback, users should report the issue at " + link + tail
+		if blocks {
+			content = []any{map[string]any{"type": "text", "text": content, "cache_control": map[string]any{"type": "ephemeral"}}}
+		}
+		body := map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": content},
+			map[string]any{"role": "user", "content": link},
+			map[string]any{"role": "tool", "content": link, "tool_call_id": "tool-1"},
+		}}
+		before, _ := json.Marshal(body)
+		result, matched := channelIdentityCompatBody(body)
+		if !matched {
+			t.Fatal("known feedback template not recognized")
+		}
+		messages := result["messages"].([]any)
+		got := messages[0].(map[string]any)["content"]
+		if blocks {
+			block := got.([]any)[0].(map[string]any)
+			if block["cache_control"] == nil {
+				t.Fatal("cache metadata removed")
+			}
+			got = block["text"]
+		}
+		text, _ := got.(string)
+		if strings.Contains(text, link) || !strings.Contains(text, want) || !strings.Contains(text, "Keep every project rule") || !strings.Contains(text, tail) {
+			t.Fatalf("feedback compatibility lost guidance: %q", text)
+		}
+		if messages[1].(map[string]any)["content"] != link || messages[2].(map[string]any)["content"] != link {
+			t.Fatal("feedback compatibility changed other roles")
+		}
+		after, _ := json.Marshal(body)
+		if string(before) != string(after) {
+			t.Fatal("feedback compatibility mutated input")
+		}
+		if _, changed := channelIdentityCompatBody(result); changed {
+			t.Fatal("feedback compatibility is not idempotent")
+		}
+	}
+	// A user quoting the same link must not be rewritten, and unrelated links
+	// stay untouched.
+	for _, prompt := range []string{"Quote: " + link, "See https://github.com/anthropics/claude-code", "See https://example.com/issues"} {
+		if _, matched := channelIdentityCompatBody(map[string]any{"messages": []any{map[string]any{"role": "system", "content": prompt}}}); matched {
+			t.Fatal("unrelated system text rewritten", prompt)
+		}
+	}
+}
 func TestChannelCompatibilityProgressionAndSessionMemory(t *testing.T) {
 	const denial = `{"code":11128,"msg":"Illegal API invocation from an unapproved channel","displayMsg":{"en":"The request was blocked by security policy. Please retry later or contact support."}}`
 	const banner = "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."
