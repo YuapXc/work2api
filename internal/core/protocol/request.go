@@ -405,10 +405,15 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 				return request, fmt.Errorf("messages[%d] has unsupported role %q", i, role)
 			}
 		}
-		for i, raw := range jsonutil.SliceAt(input, "tools") {
+		for _, raw := range jsonutil.SliceAt(input, "tools") {
 			tool, ok := raw.(map[string]any)
 			if !ok || jsonutil.StringAt(tool, "type") != "function" {
-				return request, fmt.Errorf("tools[%d] must be a function tool", i)
+				// Chat clients may advertise tools this lane cannot express
+				// (for example Codex's namespace and web_search entries).
+				// Skipping them keeps the request convertible; the surviving
+				// function tools still work, and the client sees the missing
+				// tool only if the model tries to call it.
+				continue
 			}
 			function := jsonutil.MapAt(tool, "function")
 			request.Tools = append(request.Tools, bridgeTool{
@@ -485,10 +490,14 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 		default:
 			return request, fmt.Errorf("input must be a string or array")
 		}
-		for i, raw := range jsonutil.SliceAt(input, "tools") {
+		for _, raw := range jsonutil.SliceAt(input, "tools") {
 			tool, ok := raw.(map[string]any)
 			if !ok || jsonutil.StringAt(tool, "type") != "function" {
-				return request, fmt.Errorf("tools[%d] must be a function tool", i)
+				// Responses clients may advertise tools this lane cannot
+				// express (Codex sends namespace groups and web_search
+				// alongside its function tools). Skipping them keeps the
+				// request convertible instead of failing the whole turn.
+				continue
 			}
 			request.Tools = append(request.Tools, bridgeTool{
 				Name:        jsonutil.StringAt(tool, "name"),
@@ -695,7 +704,7 @@ func encodeChatRequest(request bridgeRequest) (map[string]any, error) {
 		if budget := reasoningBudget(request.Reasoning); budget <= 0 {
 			return
 		}
-		encoded := map[string]any{"role": "assistant", "content": nil}
+		encoded := map[string]any{"role": "assistant", "content": ""}
 		carryBudget(encoded)
 		if encoded["reasoning_budget_tokens"] == nil {
 			return
@@ -724,7 +733,7 @@ func encodeChatRequest(request bridgeRequest) (map[string]any, error) {
 			if len(results) > 0 {
 				return nil, fmt.Errorf("messages[%d]: assistant message contains tool results", i)
 			}
-			encoded := map[string]any{"role": "assistant", "content": nil}
+			encoded := map[string]any{"role": "assistant", "content": ""}
 			carryBudget(encoded)
 			if value, ok := bridgeReasoningText(reasoning); ok {
 				encoded["reasoning_content"] = value

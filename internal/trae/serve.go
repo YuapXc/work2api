@@ -364,7 +364,10 @@ func (r *Runtime) coolWithDelay(id string, kind upstream.ErrKind, delay time.Dur
 }
 
 func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent, model string, initialUsage map[string]any) error {
-	id := fmt.Sprintf("chatcmpl-trae-%d", time.Now().UnixNano())
+	// The bridge re-prefixes this id per downstream protocol. Emitting a bare
+	// provider-scoped token keeps that rewrite honest; a "chatcmpl-" prefix
+	// here used to survive into Responses ids as "resp_chatcmpl-trae-...".
+	id := fmt.Sprintf("trae-%d", time.Now().UnixNano())
 	emit := func(delta map[string]any, finish any, usage map[string]any) error {
 		chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}}}
 		if usage != nil {

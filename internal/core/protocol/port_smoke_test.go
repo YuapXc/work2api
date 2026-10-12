@@ -256,18 +256,95 @@ func TestCacheUnknownAndObservedZeroRemainDistinct(t *testing.T) {
 			response := bridgeResponse{Usage: Usage{Input: 10, Output: 2, Total: 12, CachedKnown: known}}
 			doc := encodeBridgeResponse(target, response)
 			usage := doc["usage"].(map[string]any)
+			// Every detail object here is optional and describes an observation.
+			// An unreported count omits the object instead of claiming zero:
+			// Codex decodes the Responses detail objects as complete structures
+			// and rejects one without cached_tokens.
+			container, key := "prompt_tokens_details", "cached_tokens"
+			switch target {
+			case Anthropic:
+				container, key = "", "cache_read_input_tokens"
+			case Responses:
+				container = "input_tokens_details"
+			}
 			var cached any
-			if target == Anthropic {
-				cached = usage["cache_read_input_tokens"]
-			} else if target == Chat {
-				cached = usage["prompt_tokens_details"].(map[string]any)["cached_tokens"]
+			if container == "" {
+				cached = usage[key]
 			} else {
-				cached = usage["input_tokens_details"].(map[string]any)["cached_tokens"]
+				details, present := usage[container].(map[string]any)
+				if present != known {
+					t.Fatalf("%s cache known=%v, details=%v", target, known, usage[container])
+				}
+				cached = details[key]
 			}
 			if (cached != nil) != known {
 				t.Fatalf("%s cached known=%v, value=%v", target, known, cached)
 			}
 		}
+	}
+}
+
+// Codex advertises tool groups the Chat/Anthropic lanes cannot express
+// (namespace bundles and web_search) next to its function tools. Those entries
+// must be skipped so the request stays convertible, while every function tool
+// survives with its schema intact.
+func TestConvertRequestSkipsUnsupportedToolTypes(t *testing.T) {
+	body := map[string]any{
+		"model": "trae/m",
+		"input": []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "hi"}}}},
+		"tools": []any{
+			map[string]any{"type": "function", "name": "exec_command", "description": "run", "parameters": map[string]any{"type": "object", "properties": map[string]any{"cmd": map[string]any{"type": "string"}}}},
+			map[string]any{"type": "namespace", "name": "multi_agent_v1", "description": "agents", "tools": []any{
+				map[string]any{"type": "function", "name": "spawn_agent", "parameters": map[string]any{"type": "object"}},
+			}},
+			map[string]any{"type": "web_search", "external_web_access": false},
+			map[string]any{"type": "function", "name": "view_image", "parameters": map[string]any{"type": "object"}},
+		},
+		"tool_choice": "auto",
+	}
+	out, err := ConvertRequest(Responses, Chat, body)
+	if err != nil {
+		t.Fatalf("Codex tool set rejected: %v", err)
+	}
+	tools, _ := out["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("expected only function tools to survive, got %v", tools)
+	}
+	names := []string{}
+	for _, raw := range tools {
+		tool, _ := raw.(map[string]any)
+		function, _ := tool["function"].(map[string]any)
+		names = append(names, jsonutil.StringAt(function, "name"))
+	}
+	if len(names) != 2 || names[0] != "exec_command" || names[1] != "view_image" {
+		t.Fatalf("function tools lost or reordered: %v", names)
+	}
+}
+
+// Codex aborts the whole turn with "failed to parse ResponseCompleted: missing
+// field `cached_tokens`" when Responses usage carries an empty
+// input_tokens_details, which is exactly what an upstream without cache
+// reporting (Trae) used to produce. Unreported detail objects must be absent.
+func TestResponsesUsageOmitsUnreportedDetails(t *testing.T) {
+	doc := encodeBridgeResponse(Responses, bridgeResponse{Usage: Usage{Input: 5, Output: 2, Total: 7}})
+	usage := doc["usage"].(map[string]any)
+	if _, present := usage["input_tokens_details"]; present {
+		t.Fatalf("empty input_tokens_details emitted: %v", usage)
+	}
+	if _, present := usage["output_tokens_details"]; present {
+		t.Fatalf("unreported reasoning detail emitted: %v", usage)
+	}
+	if usage["input_tokens"] != 5 || usage["output_tokens"] != 2 || usage["total_tokens"] != 7 {
+		t.Fatalf("token totals changed: %v", usage)
+	}
+
+	observed := encodeBridgeResponse(Responses, bridgeResponse{Usage: Usage{Input: 5, Output: 2, Total: 7, CachedKnown: true, ReasoningKnown: true}})
+	observedUsage := observed["usage"].(map[string]any)
+	if observedUsage["input_tokens_details"].(map[string]any)["cached_tokens"] != 0 {
+		t.Fatalf("observed zero cache dropped: %v", observedUsage)
+	}
+	if observedUsage["output_tokens_details"].(map[string]any)["reasoning_tokens"] != 0 {
+		t.Fatalf("observed zero reasoning dropped: %v", observedUsage)
 	}
 }
 

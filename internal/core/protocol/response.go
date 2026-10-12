@@ -238,15 +238,7 @@ func encodeBridgeResponse(protocol Protocol, response bridgeResponse) map[string
 			"output":             output,
 			"error":              nil,
 			"incomplete_details": incomplete,
-			"usage": map[string]any{
-				"input_tokens":         response.Usage.Input,
-				"output_tokens":        response.Usage.Output,
-				"total_tokens":         response.Usage.Total,
-				"input_tokens_details": cacheDetails(response.Usage),
-				"output_tokens_details": map[string]any{
-					"reasoning_tokens": response.Usage.Reasoning,
-				},
-			},
+			"usage":              responsesUsage(response.Usage),
 		}
 	case Anthropic:
 		content := make([]any, 0, len(response.Reasoning)+len(response.Tools)+1)
@@ -325,15 +317,43 @@ func decodeAnthropicUsage(usage map[string]any) Usage {
 }
 
 func openAIUsage(usage Usage) map[string]any {
-	return map[string]any{
-		"prompt_tokens":         usage.Input,
-		"completion_tokens":     usage.Output,
-		"total_tokens":          usage.Total,
-		"prompt_tokens_details": cacheDetails(usage),
-		"completion_tokens_details": map[string]any{
-			"reasoning_tokens": usage.Reasoning,
-		},
+	out := map[string]any{
+		"prompt_tokens":     usage.Input,
+		"completion_tokens": usage.Output,
+		"total_tokens":      usage.Total,
 	}
+	// Both detail objects are optional and describe observations. Emitting an
+	// invented zero would claim an upstream measurement that never happened,
+	// and a Chat document that invents one re-enters the bridge as a real
+	// observation when it is converted again for Responses.
+	if details := cacheDetails(usage); len(details) > 0 {
+		out["prompt_tokens_details"] = details
+	}
+	if usage.ReasoningKnown {
+		out["completion_tokens_details"] = map[string]any{"reasoning_tokens": usage.Reasoning}
+	}
+	return out
+}
+
+// responsesUsage renders the Responses usage object. Codex decodes
+// input_tokens_details and output_tokens_details as complete structures, so a
+// detail object is emitted only when the upstream actually reported its
+// contents. Trae, for example, never sends cache or reasoning counters; an
+// empty input_tokens_details used to fail the whole response.completed parse
+// with "missing field `cached_tokens`".
+func responsesUsage(usage Usage) map[string]any {
+	out := map[string]any{
+		"input_tokens":  usage.Input,
+		"output_tokens": usage.Output,
+		"total_tokens":  usage.Total,
+	}
+	if details := cacheDetails(usage); len(details) > 0 {
+		out["input_tokens_details"] = details
+	}
+	if usage.ReasoningKnown {
+		out["output_tokens_details"] = map[string]any{"reasoning_tokens": usage.Reasoning}
+	}
+	return out
 }
 
 func cacheDetails(usage Usage) map[string]any {

@@ -63,9 +63,19 @@ func ParseSOLOLine(eventName, dataLine string) (*SOLOEvent, error) {
 	if dataLine == "" {
 		return ev, nil
 	}
-	var raw map[string]any
-	if err := json.Unmarshal([]byte(dataLine), &raw); err != nil {
+	var decoded any
+	if err := json.Unmarshal([]byte(dataLine), &decoded); err != nil {
 		return nil, err
+	}
+	// The upstream interleaves progress_notice heartbeats whose payload is a
+	// bare JSON string ("Processing_...") instead of an object. Nothing below
+	// can read such a frame, and failing here aborted the whole turn with a 502
+	// even though the answer arrived normally. Skip non-object frames; corrupt
+	// JSON still fails above, and real upstream failures arrive as an explicit
+	// error event.
+	raw, ok := decoded.(map[string]any)
+	if !ok {
+		return ev, nil
 	}
 	switch ev.Event {
 	case "output":
