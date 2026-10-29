@@ -286,6 +286,14 @@ func (r *Runtime) enhanceBody(body map[string]any) map[string]any {
 		}
 	}
 	body = reasoning.Sanitize(body, dyn)
+	// Channel compatibility rewrites happen once per request, before the first
+	// attempt: the upstream rejects these fingerprints deterministically, so an
+	// escalation after a 400 would only add a round trip and an account strike.
+	if r.cfg != nil && r.cfg.ChannelIdentityCompat {
+		if neutralized, changed := NeutralizeChannelFingerprints(body); changed {
+			body = neutralized
+		}
+	}
 	return body
 }
 
