@@ -206,6 +206,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: read
     steps:
       - name: Check out source and release history
         uses: actions/checkout@v4
