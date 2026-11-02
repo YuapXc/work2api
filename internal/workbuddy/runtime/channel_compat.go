@@ -20,6 +20,9 @@ var mainBranchTemplate = regexp.MustCompile(`(?m)^Main branch \(you will usually
 
 var fileReferenceTemplate = regexp.MustCompile(`(?im)(^|\n)(Tokens prefixed with @ are paths) (the user explicitly referenced\.)`)
 
+// CPA's fixed GUI phrase is also confirmed by a domestic two-model replay.
+var harnessWebGUI = regexp.MustCompile(`(?i)\bDeepSeek Harness Web GUI\b`)
+
 func CompatibilityName(level int) string {
 	switch level {
 	case 1:
@@ -115,7 +118,7 @@ func NeutralizeChannelFingerprints(body map[string]any) (map[string]any, bool) {
 		var content any
 		switch value := message["content"].(type) {
 		case string:
-			rewritten := neutralizeFileReference(value)
+			rewritten := neutralizeClientTemplates(value)
 			if rewritten == value {
 				continue
 			}
@@ -132,7 +135,7 @@ func NeutralizeChannelFingerprints(body map[string]any) (map[string]any, bool) {
 				if !ok {
 					continue
 				}
-				rewritten := neutralizeFileReference(text)
+				rewritten := neutralizeClientTemplates(text)
 				if rewritten == text {
 					continue
 				}
@@ -170,11 +173,9 @@ func NeutralizeChannelFingerprints(body map[string]any) (map[string]any, bool) {
 	return out, true
 }
 
-// neutralizeFileReference rewrites every occurrence of the rejected sentence
-// pair. The window is matched whole so unrelated prompts that happen to say
-// "relative paths resolve from the workspace root" are never touched.
-func neutralizeFileReference(text string) string {
-	return strings.ReplaceAll(text, fileReferenceFingerprint, fileReferenceRewritten)
+func neutralizeClientTemplates(text string) string {
+	text = strings.ReplaceAll(text, fileReferenceFingerprint, fileReferenceRewritten)
+	return harnessWebGUI.ReplaceAllString(text, "web interface")
 }
 
 func BillingPrefix(text string) (prefix, rest string) {
@@ -205,6 +206,9 @@ func ChannelCompatibilityBody(body map[string]any, level int) (map[string]any, b
 		prefix, rest := BillingPrefix(text)
 		padding := rest[:len(rest)-len(strings.TrimLeft(rest, "\r\n"))]
 		value, changed := CompatibleIdentity(strings.TrimLeft(rest, "\r\n"))
+		if rewritten := harnessWebGUI.ReplaceAllString(value, "web interface"); rewritten != value {
+			value, changed = rewritten, true
+		}
 		if fileReferenceTemplate.MatchString(value) {
 			value = fileReferenceTemplate.ReplaceAllString(value, "${1}${2} that ${3}")
 			changed = true

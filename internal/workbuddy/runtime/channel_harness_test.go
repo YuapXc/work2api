@@ -128,3 +128,77 @@ func TestFileReferenceTemplateCompatibility(t *testing.T) {
 		t.Fatal("rewrote embedded quotation")
 	}
 }
+
+func TestHarnessGUICompatibilityPreservesConversation(t *testing.T) {
+	const phrase = "DeepSeek Harness Web GUI"
+	const template = "The user is accessing the " + phrase + ". References to this GUI refer to the current interface.\nAvailable skills: keep. Never run unauthorized tools."
+	body := map[string]any{"messages": []any{
+		map[string]any{"role": "system", "content": template},
+		map[string]any{"role": "user", "content": phrase},
+		map[string]any{"role": "assistant", "content": phrase, "tool_calls": []any{map[string]any{"id": "c1", "function": map[string]any{"name": "read", "arguments": `{"text":"DeepSeek Harness Web GUI"}`}}}},
+		map[string]any{"role": "tool", "tool_call_id": "c1", "content": phrase},
+		map[string]any{"role": "developer", "content": []any{map[string]any{"type": "text", "text": template, "cache_control": map[string]any{"type": "ephemeral"}}, map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://example.invalid/image.png"}}}},
+	}, "tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": "read", "description": phrase}}}}
+	before, _ := json.Marshal(body)
+	out, changed := NeutralizeChannelFingerprints(body)
+	if !changed {
+		t.Fatal("GUI template not rewritten before first attempt")
+	}
+	messages := out["messages"].([]any)
+	original := body["messages"].([]any)
+	if messages[0].(map[string]any)["content"] != strings.ReplaceAll(template, phrase, "web interface") {
+		t.Fatal("system instructions changed beyond GUI phrase")
+	}
+	for _, i := range []int{1, 2, 3} {
+		if !reflect.DeepEqual(messages[i], original[i]) {
+			t.Fatal("conversation or tool arguments changed")
+		}
+	}
+	blocks := messages[4].(map[string]any)["content"].([]any)
+	oldBlocks := original[4].(map[string]any)["content"].([]any)
+	if blocks[0].(map[string]any)["text"] != strings.ReplaceAll(template, phrase, "web interface") || !reflect.DeepEqual(blocks[0].(map[string]any)["cache_control"], oldBlocks[0].(map[string]any)["cache_control"]) || !reflect.DeepEqual(blocks[1], oldBlocks[1]) || !reflect.DeepEqual(out["tools"], body["tools"]) {
+		t.Fatal("metadata or tool definitions changed")
+	}
+	after, _ := json.Marshal(body)
+	if string(before) != string(after) {
+		t.Fatal("source mutated")
+	}
+	if _, again := NeutralizeChannelFingerprints(out); again {
+		t.Fatal("rewrite not idempotent")
+	}
+	for _, negative := range []string{"DeepSeek Harness Web GUIExtension", "deepseek-harness/web/gui", "deepseek_harness_web_gui", "DeepSeek Harness", "Web GUI"} {
+		untouched := map[string]any{"messages": []any{map[string]any{"role": "system", "content": negative}}}
+		if _, changed := NeutralizeChannelFingerprints(untouched); changed {
+			t.Fatal("unrelated name rewritten")
+		}
+	}
+}
+
+func TestHarnessGUICompatibilityAcrossProtocols(t *testing.T) {
+	const text = "Runtime: DEEPSEEK HARNESS WEB GUI. Available skills: keep."
+	chat := upstream.BuildUpstreamBody(map[string]any{"messages": []any{map[string]any{"role": "developer", "content": text}}})
+	responses, err := adapters.ResponsesRequestToChat(map[string]any{"instructions": text, "input": []any{map[string]any{"role": "user", "content": "hello"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages, err := adapters.AnthropicRequestToChat(map[string]any{"system": text, "messages": []any{map[string]any{"role": "user", "content": "hello"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []map[string]any{chat, responses, messages} {
+		first, changed := NeutralizeChannelFingerprints(body)
+		if !changed {
+			t.Fatal("initial template preparation missed")
+		}
+		fallback, matched := ChannelCompatibilityBody(body, 1)
+		if !matched {
+			t.Fatal("compatibility fallback missed")
+		}
+		for _, out := range []map[string]any{first, fallback} {
+			raw, _ := json.Marshal(out)
+			if strings.Contains(string(raw), "DEEPSEEK HARNESS WEB GUI") || !strings.Contains(string(raw), "web interface. Available skills: keep.") {
+				t.Fatal("protocol lost GUI replacement or skills")
+			}
+		}
+	}
+}
