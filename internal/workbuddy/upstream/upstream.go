@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/http"
@@ -78,6 +79,7 @@ func Shared() *Client {
 			// short connect timeout: fail fast when upstream is unreachable
 			// instead of holding a connection/goroutine.
 			DialContext:         (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			ForceAttemptHTTP2:   true,
 			MaxIdleConns:        50,
 			MaxIdleConnsPerHost: 20,
 			IdleConnTimeout:     90 * time.Second,
@@ -148,6 +150,10 @@ func (c *Client) StreamUpstream(ctx context.Context, headers map[string]string, 
 	if err := ValidateChoiceCount(body); err != nil {
 		return err
 	}
+	body, toolNames, err := prepareToolNames(body)
+	if err != nil {
+		return err
+	}
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -158,6 +164,15 @@ func (c *Client) StreamUpstream(ctx context.Context, headers map[string]string, 
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
+	}
+	wire, err := encodeRequestBody(ctx, req.Header, payload)
+	if err != nil {
+		return err
+	}
+	if len(wire) != len(payload) {
+		req.Body = io.NopCloser(bytes.NewReader(wire))
+		req.ContentLength = int64(len(wire))
+		req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(wire)), nil }
 	}
 	resp, err := c.hc.Do(req)
 	streamwatch.AttemptHTTP(ctx, resp)
@@ -176,10 +191,10 @@ func (c *Client) StreamUpstream(ctx context.Context, headers map[string]string, 
 
 	// Upstream sometimes answers a stream request with a single JSON object.
 	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "json") {
-		return c.handleJSONResponse(resp, yield)
+		return c.handleJSONResponse(resp, restoreToolNameLines(yield, toolNames))
 	}
 
-	return streamSSE(resp, yield)
+	return streamSSE(resp, yield, toolNames)
 }
 
 // handleJSONResponse deals with a non-streaming JSON body returned for a stream
@@ -230,7 +245,7 @@ func (c *Client) handleJSONResponse(resp *http.Response, yield LineFunc) error {
 }
 
 // streamSSE consumes and validates a real SSE stream.
-func streamSSE(resp *http.Response, yield LineFunc) error {
+func streamSSE(resp *http.Response, yield LineFunc, names ...map[string]string) error {
 	watch := streamwatch.NewWatch(resp.Body, resp.Request.Context(), 0, 0)
 	defer watch.Close()
 	scanner := bufio.NewScanner(watch.Reader(resp.Body))
@@ -241,12 +256,23 @@ func streamSSE(resp *http.Response, yield LineFunc) error {
 	var terminal []string
 	terminalBytes := 0
 	done := false
+	var restored string
+	var restore LineFunc
+	if len(names) > 0 && len(names[0]) > 0 {
+		restore = restoreToolNameLines(func(line string) error { restored = line; return nil }, names[0])
+	}
 	process := func() error {
 		if event.Len() == 0 {
 			return nil
 		}
 		data := strings.TrimSuffix(event.String(), "\n")
 		event.Reset()
+		if restore != nil {
+			if err := restore("data: " + data); err != nil {
+				return err
+			}
+			data = strings.TrimSpace(strings.TrimPrefix(restored, "data:"))
+		}
 		if strings.TrimSpace(data) == "[DONE]" {
 			if err := state.complete(true); err != nil {
 				return err

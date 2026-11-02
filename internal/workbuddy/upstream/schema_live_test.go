@@ -1,9 +1,15 @@
 package upstream_test
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -152,4 +158,179 @@ func TestLiveKimiObjectUnionCompatibility(t *testing.T) {
 		t.Fatal("live-schema: incomplete final answer")
 	}
 	t.Logf("live-schema: tool contract and result round trip verified; baseline_success=%t", baselineErr == nil)
+}
+
+func TestToolNamesTransportRoundTrip(t *testing.T) {
+	for _, name := range []string{"report.status", "报告/状态", strings.Repeat("x", 65), "report_status"} {
+		t.Run(name, func(t *testing.T) {
+			const arguments = `{"name":"report.status","number":9007199254740993}`
+			body := map[string]any{"model": "test", "tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": name, "parameters": map[string]any{"type": "object", "default": json.Number("9007199254740993")}}}}, "tool_choice": name, "messages": []any{map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{"id": "old", "function": map[string]any{"name": name, "arguments": arguments}}}}, map[string]any{"role": "tool", "tool_call_id": "old", "name": name, "content": "report.status"}}}
+			original, _ := json.Marshal(body)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var got map[string]any
+				dec := json.NewDecoder(r.Body)
+				dec.UseNumber()
+				if err := dec.Decode(&got); err != nil {
+					t.Error(err)
+					return
+				}
+				fn := got["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)
+				alias := fn["name"].(string)
+				if alias == "" || len(alias) > 64 || strings.ContainsAny(alias, "./报告状态") {
+					t.Error("invalid alias")
+				}
+				if name == "report_status" && alias != name {
+					t.Error("valid name changed")
+				}
+				history := got["messages"].([]any)
+				call := history[0].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+				if got["tool_choice"] != alias || call["name"] != alias || call["arguments"] != arguments || history[1].(map[string]any)["name"] != alias || history[1].(map[string]any)["content"] != "report.status" {
+					t.Error("request contract changed")
+				}
+				if fn["parameters"].(map[string]any)["default"] != json.Number("9007199254740993") {
+					t.Error("schema precision lost")
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				parts := []string{alias[:2], alias[2:]}
+				if name == "report_status" {
+					parts = []string{"", alias}
+				}
+				for i, part := range parts {
+					delta := map[string]any{"tool_calls": []any{map[string]any{"index": 0, "id": "new", "type": "function", "function": map[string]any{"name": part, "arguments": ""}}}}
+					if i == 1 {
+						delta["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)["arguments"] = arguments
+					}
+					raw, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"index": 0, "delta": delta}}})
+					fmt.Fprintf(w, "data: %s\n\n", raw)
+				}
+				fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n")
+			}))
+			defer server.Close()
+			reply, err := upstream.CollectStream("test", func(y upstream.LineFunc) error {
+				return upstream.NewClient(server.Client()).StreamUpstream(context.Background(), nil, body, server.URL, y)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fn := reply["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+			if fn["name"] != name || fn["arguments"] != arguments {
+				t.Fatal("response contract lost", fn)
+			}
+			after, _ := json.Marshal(body)
+			if string(after) != string(original) {
+				t.Fatal("input mutated")
+			}
+		})
+	}
+}
+
+func TestInvalidToolDeclarationsFailBeforeTransport(t *testing.T) {
+	for _, names := range [][]string{{""}, {" "}} {
+		tools := []any{}
+		for _, name := range names {
+			tools = append(tools, map[string]any{"type": "function", "function": map[string]any{"name": name}})
+		}
+		err := upstream.NewClient(&http.Client{}).StreamUpstream(context.Background(), nil, map[string]any{"model": "test", "tools": tools}, "http://127.0.0.1:1", func(string) error { return nil })
+		var remote *upstream.UpstreamError
+		if !errors.As(err, &remote) || remote.StatusCode != 400 {
+			t.Fatalf("expected actionable local 400, got %v", err)
+		}
+	}
+}
+
+func TestRequestGzipPreservesBodyAndIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name, identity    string
+		large, compressed bool
+	}{{"large-cli", "CLI", true, true}, {"small-cli", "CLI", false, false}, {"desktop", "WorkBuddy", true, false}, {"unknown", "", true, false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			text := "small"
+			if tc.large {
+				text = strings.Repeat("synthetic text with tool examples and exact whitespace\n", 3000)
+			}
+			body := map[string]any{"model": "test", "messages": []any{map[string]any{"role": "user", "content": text}}, "stream": true}
+			want, _ := json.Marshal(body)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if (r.Header.Get("Content-Encoding") == "gzip") != tc.compressed {
+					t.Error("wrong compression policy")
+				}
+				if r.ContentLength != int64(len(raw)) {
+					t.Error("incorrect content length")
+				}
+				if tc.compressed {
+					if len(raw) >= len(want)/2 {
+						t.Error("no meaningful size reduction")
+					}
+					reader, e := gzip.NewReader(bytes.NewReader(raw))
+					if e != nil {
+						t.Error(e)
+						return
+					}
+					raw, err = io.ReadAll(reader)
+					reader.Close()
+					if err != nil {
+						t.Error(err)
+					}
+				}
+				if !bytes.Equal(raw, want) {
+					t.Error("request content changed")
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+			}))
+			defer server.Close()
+			err := upstream.NewClient(server.Client()).StreamUpstream(context.Background(), map[string]string{"X-IDE-Type": tc.identity}, body, server.URL, func(string) error { return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestAliasedToolJSONResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+			return
+		}
+		alias := body["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["name"]
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{"id": "call_1", "type": "function", "function": map[string]any{"name": alias, "arguments": `{"name":"unchanged.value"}`}}}}, "finish_reason": "tool_calls"}}})
+	}))
+	defer server.Close()
+	body := map[string]any{"model": "test", "tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": "read.file", "parameters": map[string]any{"type": "object"}}}}}
+	reply, err := upstream.CollectStream("test", func(y upstream.LineFunc) error {
+		return upstream.NewClient(server.Client()).StreamUpstream(context.Background(), nil, body, server.URL, y)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fn := reply["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	if fn["name"] != "read.file" || fn["arguments"] != `{"name":"unchanged.value"}` {
+		t.Fatal("JSON tool contract changed")
+	}
+}
+
+func TestCanceledLargeRequestDoesNotDispatch(t *testing.T) {
+	called := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called <- struct{}{} }))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	body := map[string]any{"model": "test", "messages": []any{map[string]any{"role": "user", "content": strings.Repeat("cancel this synthetic request ", 5000)}}}
+	err := upstream.NewClient(server.Client()).StreamUpstream(ctx, map[string]string{"X-IDE-Type": "CLI"}, body, server.URL, func(string) error { return nil })
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected cancellation, got %v", err)
+	}
+	select {
+	case <-called:
+		t.Fatal("canceled request reached transport")
+	default:
+	}
 }
