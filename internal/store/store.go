@@ -32,7 +32,8 @@ import (
 // v18 adds bounded, content-free request diagnostics to usage records.
 // v19 adds owner identity, credential epochs, temporary passwords and identity audit.
 // v23 adds indexed diagnostic-content byte accounting, lazily backfilled.
-const SchemaVersion = 23
+// v24 adds an expression index for content-free request grouping.
+const SchemaVersion = 24
 
 // DB wraps the SQLite connection.
 type DB struct {
@@ -46,6 +47,10 @@ type DB struct {
 	settingsCache map[string]string
 	routesCache   []ModelRoute
 	usageRuntime  usageRuntime
+	analyticsDB   *sql.DB
+	summaryCache  analyticsCache[map[string]any]
+	budgetCache   analyticsCache[[]BudgetSample]
+	filterCache   analyticsCache[map[string]any]
 }
 
 // DefaultSettings mirror db.py DEFAULT_SETTINGS.
@@ -138,11 +143,17 @@ func New(path string) (*DB, error) {
 	if _, err := d.CleanupOldDailyQuota(); err != nil {
 		log.Printf("清理过期日额度失败，稍后由日维护重试: %v", err)
 	}
+	d.openAnalytics(path)
 	return d, nil
 }
 
 // Close closes the underlying database.
-func (d *DB) Close() error { return d.db.Close() }
+func (d *DB) Close() error {
+	if d.analyticsDB != nil {
+		_ = d.analyticsDB.Close()
+	}
+	return d.db.Close()
+}
 
 func HiddenAccountKey(uid string) string {
 	return fmt.Sprintf("hidden_workbuddy_%x", sha256.Sum256([]byte(uid)))
@@ -286,6 +297,11 @@ CREATE INDEX IF NOT EXISTS idx_usage_protocol ON usage_logs(protocol);
 		return err
 	}
 	if _, err := tx.Exec("CREATE INDEX IF NOT EXISTS idx_usage_app ON usage_logs(app_id)"); err != nil {
+		return err
+	}
+	// Match the grouping expression exactly so legacy rows and owner/key scopes
+	// retain their semantics without parsing every diagnostics JSON on page load.
+	if _, err := tx.Exec("CREATE INDEX IF NOT EXISTS idx_usage_request_group ON usage_logs(" + requestGroupExpression + ")"); err != nil {
 		return err
 	}
 	// Historical name-based attribution is safe only for a unique current owner.

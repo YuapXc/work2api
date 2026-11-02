@@ -246,7 +246,7 @@ func TestUsageDiagnosticsMigrationAndRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Reconstruct the previous schema to exercise an actual additive migration.
-	if _, err = db.db.Exec("ALTER TABLE usage_logs DROP COLUMN diagnostics; PRAGMA user_version=17"); err != nil {
+	if _, err = db.db.Exec("DROP INDEX idx_usage_request_group; ALTER TABLE usage_logs DROP COLUMN diagnostics; PRAGMA user_version=17"); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()

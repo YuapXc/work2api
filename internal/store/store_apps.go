@@ -40,8 +40,22 @@ type AppChannelCost struct {
 	Partial  bool     `json:"partial,omitempty"`
 }
 
-func (d *DB) appChannelCostsLocked(app *App) error {
-	rows, err := d.db.Query(`SELECT CASE
+func appChannelCosts(db *sql.DB, apps []App) error {
+	if len(apps) == 0 {
+		return nil
+	}
+	byID := map[int64]*App{}
+	ids := []any{}
+	marks := []string{}
+	for i := range apps {
+		app := &apps[i]
+		app.ChannelCosts = []AppChannelCost{}
+		app.TokensKnown, app.CreditsKnown = true, true
+		byID[app.ID] = app
+		ids = append(ids, app.ID)
+		marks = append(marks, "?")
+	}
+	rows, err := db.Query(`SELECT app_id, CASE
 		WHEN physical LIKE 'qoder/%' THEN 'qoder'
 		WHEN physical LIKE 'trae/%' THEN 'trae'
 		WHEN physical LIKE 'opencode/%' THEN 'opencode'
@@ -49,25 +63,25 @@ func (d *DB) appChannelCostsLocked(app *App) error {
 		ELSE 'unknown' END AS provider,
 		COALESCE(SUM(credits),0), COUNT(CASE WHEN credits IS NULL THEN 1 END)=0,
 		COUNT(*), COALESCE(SUM(total_tokens),0), COUNT(CASE WHEN tokens_known=0 THEN 1 END)=0, COUNT(credits)
-		FROM (SELECT COALESCE(NULLIF(json_extract(diagnostics,'$.physical_model'),''),model) AS physical, credits, total_tokens, tokens_known
-		FROM usage_logs WHERE app_id=? AND COALESCE(user_id,0)=?)
-		GROUP BY provider ORDER BY provider`, app.ID, app.UserID)
+		FROM (SELECT u.app_id, COALESCE(NULLIF(json_extract(diagnostics,'$.physical_model'),''),model) AS physical, credits, total_tokens, tokens_known
+		FROM apps a JOIN usage_logs u ON u.app_id=a.id AND COALESCE(u.user_id,0)=COALESCE(a.user_id,0) WHERE a.id IN (`+strings.Join(marks, ",")+`))
+		GROUP BY app_id,provider ORDER BY app_id,provider`, ids...)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	app.ChannelCosts = []AppChannelCost{}
-	app.TokensKnown, app.CreditsKnown = true, true
 	for rows.Next() {
+		var id int64
 		var item AppChannelCost
 		var value float64
 		var known bool
 		var count, tokens int64
 		var reported int64
 		var tokensKnown bool
-		if err := rows.Scan(&item.Provider, &value, &known, &count, &tokens, &tokensKnown, &reported); err != nil {
+		if err := rows.Scan(&id, &item.Provider, &value, &known, &count, &tokens, &tokensKnown, &reported); err != nil {
 			return err
 		}
+		app := byID[id]
 		item.Partial = !known
 		if reported > 0 {
 			item.Credits = &value
@@ -79,8 +93,10 @@ func (d *DB) appChannelCostsLocked(app *App) error {
 		app.TokensKnown = app.TokensKnown && tokensKnown
 		app.CreditsKnown = app.CreditsKnown && known && item.Provider != "unknown"
 	}
-	if len(app.ChannelCosts) > 1 {
-		app.CreditsKnown = false
+	for i := range apps {
+		if len(apps[i].ChannelCosts) > 1 {
+			apps[i].CreditsKnown = false
+		}
 	}
 	return rows.Err()
 }
@@ -96,9 +112,9 @@ func (d *DB) HasEncryptedAppKeys() (bool, error) {
 // ListApps returns applications with cumulative usage. No ciphertext is
 // returned. (Single-user: no user join.)
 func (d *DB) ListApps() ([]App, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	rows, err := d.db.Query("SELECT id, name, key_prefix, note, enabled, created_at, allowed_models, COALESCE(user_id,0), model_policy, COALESCE((SELECT username FROM users WHERE users.id=apps.user_id),'') FROM apps ORDER BY id ASC")
+	db, release := d.analyticsReader()
+	defer release()
+	rows, err := db.Query("SELECT id, name, key_prefix, note, enabled, created_at, allowed_models, COALESCE(user_id,0), model_policy, COALESCE((SELECT username FROM users WHERE users.id=apps.user_id),'') FROM apps ORDER BY id ASC")
 	if err != nil {
 		return nil, err
 	}
@@ -123,8 +139,9 @@ func (d *DB) ListApps() ([]App, error) {
 		return nil, err
 	}
 	// per-app usage stats
-	for i := range apps {
-		if err := d.appChannelCostsLocked(&apps[i]); err != nil {
+	for start := 0; start < len(apps); start += 200 {
+		end := min(start+200, len(apps))
+		if err := appChannelCosts(db, apps[start:end]); err != nil {
 			return nil, err
 		}
 	}
@@ -307,9 +324,9 @@ func (d *DB) DeleteApp(appID int64) (bool, error) {
 
 // UserApps lists one user's keys with usage stats.
 func (d *DB) UserApps(userID int64) ([]App, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	rows, err := d.db.Query("SELECT id, name, key_prefix, note, enabled, created_at, allowed_models, COALESCE(user_id,0), model_policy, COALESCE((SELECT username FROM users WHERE users.id=apps.user_id),'') FROM apps WHERE user_id=? ORDER BY id ASC", userID)
+	db, release := d.analyticsReader()
+	defer release()
+	rows, err := db.Query("SELECT id, name, key_prefix, note, enabled, created_at, allowed_models, COALESCE(user_id,0), model_policy, COALESCE((SELECT username FROM users WHERE users.id=apps.user_id),'') FROM apps WHERE user_id=? ORDER BY id ASC", userID)
 	if err != nil {
 		return nil, err
 	}
@@ -333,8 +350,9 @@ func (d *DB) UserApps(userID int64) ([]App, error) {
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	for i := range apps {
-		if err := d.appChannelCostsLocked(&apps[i]); err != nil {
+	for start := 0; start < len(apps); start += 200 {
+		end := min(start+200, len(apps))
+		if err := appChannelCosts(db, apps[start:end]); err != nil {
 			return nil, err
 		}
 	}

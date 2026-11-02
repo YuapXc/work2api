@@ -280,6 +280,7 @@ export interface ResourceMetrics {
 }
 
 export interface Overview {
+  providers?: ProviderSummary[]
   resource_metrics?: ResourceMetrics
   display_accounts?: AccountInfo[]
   call_metrics?: { recent?: { request_id: string; attempts: number; http_status: number; attempt_stages?: { number: number; header_wait_ms: number; http_status: number; headers_finished: boolean; upstream_request_id?: string }[] }[]; requests: number; errors: number; incomplete: number; attempts: number; upstream_429: number; wait_p95_ms: number | null; queue_p95_ms: number | null; account_wait_p95_ms: number | null; execution_p95_ms: number | null; first_byte_p95_ms: number | null; total_p95_ms: number | null }
@@ -293,7 +294,7 @@ export interface Overview {
   model_count?: number
   /** 模型目录来源：dynamic=上游实时 / static=内置 */
   model_source?: string
-  usage: UsageSummary
+  usage: Pick<UsageSummary, 'today_requests' | 'today_tokens'> & Partial<UsageSummary>
   recent: UsageRecord[]
   prediction?: {
     predicted_tokens: number | null

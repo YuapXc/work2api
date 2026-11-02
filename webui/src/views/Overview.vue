@@ -25,12 +25,12 @@ let timer: ReturnType<typeof setInterval> | null = null
 const refreshFailed = ref(false)
 let refreshing = false
 async function load() {
-  if (refreshing) return
+  if (refreshing || document.hidden) return
   refreshing = true
   try {
-    const [o, p, ts] = await Promise.all([api.overview(), api.getProviders(), api.usageTimeseries('hour', 24)])
+    const [o, ts] = await Promise.all([api.overview(), api.usageTimeseries('hour', 24)])
     ov.value = o
-    providers.value = p.providers || []
+    providers.value = o.providers || []
     points.value = ts.data || []
     refreshFailed.value = false
   } catch {
@@ -76,11 +76,19 @@ const recent = computed(() => (ov.value?.recent || []).slice(0, 8))
 const labelMap = computed(() => buildLabelMap(ov.value?.display_accounts || ov.value?.accounts || []))
 const acctLabel = (uid?: string | null) => (uid ? labelMap.value[uid] || uid.slice(0, 8) : '—')
 
+function onVisibilityChange() {
+  if (!document.hidden) void load()
+}
+
 onMounted(() => {
+  document.addEventListener('visibilitychange', onVisibilityChange)
   load()
   timer = setInterval(load, 20000)
 })
-onUnmounted(() => timer && clearInterval(timer))
+onUnmounted(() => {
+  if (timer) clearInterval(timer)
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+})
 </script>
 
 <template>

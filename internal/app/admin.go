@@ -140,10 +140,12 @@ func (s *Server) adminOverview(w http.ResponseWriter, r *http.Request) {
 	accounts := s.accountsForDisplay()
 	labels := []map[string]any{}
 	budgetData := map[string]provider.AdminData{}
+	providerSummaries := []map[string]any{}
 	for _, rt := range s.o.runtimes.Runtimes() {
 		if ar, ok := rt.(provider.AdminRuntime); ok {
 			data := ar.AdminData(r.Context())
 			budgetData[rt.Name()] = data
+			providerSummaries = append(providerSummaries, runtimeSummary(rt.Name(), data))
 			for _, a := range data.Accounts {
 				uid := str2(a["uid"])
 				if uid == "" {
@@ -159,7 +161,12 @@ func (s *Server) adminOverview(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	summary, _ := s.o.db.UsageSummary()
+	var summary map[string]any
+	if r.URL.Query().Get("compact") == "1" {
+		summary, _ = s.o.db.UsageToday()
+	} else {
+		summary, _ = s.o.db.UsageSummary()
+	}
 	writeJSON(w, 200, map[string]any{
 		"admission":          s.modelsAdmission.snapshot(),
 		"call_metrics":       s.calls.snapshot(),
@@ -168,6 +175,7 @@ func (s *Server) adminOverview(w http.ResponseWriter, r *http.Request) {
 		"request_body_bytes": s.bodies.usage(),
 		"accounts":           accounts,
 		"display_accounts":   labels,
+		"providers":          providerSummaries,
 		"alerts":             s.creditAlerts(accounts),
 		"usage":              decorateByAccount(summary, accounts),
 		"recent":             s.recentLight(),

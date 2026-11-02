@@ -110,7 +110,7 @@ export const api = {
   portalWrite: (path: string, body: unknown) => http.post<unknown, Record<string, unknown>>('/admin/portal/' + path, body),
   portalDelete: (path: string) => http.delete<unknown, { ok: boolean }>('/admin/portal/' + path),
   health: () => http.get<unknown, { available_providers: number; total_providers: number }>('/admin/health'),
-  overview: () => http.get<unknown, Overview>('/admin/overview'),
+  overview: () => http.get<unknown, Overview>('/admin/overview?compact=1'),
   accounts: () => http.get<unknown, { accounts: AccountInfo[] }>('/admin/accounts'),
   setEnabled: (uid: string, enabled: boolean) =>
     http.post<unknown, { ok: boolean }>(`/admin/accounts/${uid}/${enabled ? 'enable' : 'disable'}`),

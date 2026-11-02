@@ -622,9 +622,10 @@ async function runMaintenance(kind: 'checkin' | 'credits') {
         const result = kind === 'checkin' ? await api.providerCheckin(p.name) : await api.providerCredits(p.name)
         const items = Array.isArray(result.results) ? result.results as Record<string, unknown>[] : []
         const failed = items.filter(item => item.ok === false && !item.already && item.status !== 'unsupported' || item.status === 'error' || item.status === 'failed').length
+        const pending = items.filter(item => item.status === 'pending').length
         const unsupported = result.unsupported === true
         const ok = (result.ok !== false || unsupported) && failed === 0
-        taskResults.value.push({ provider: p.name, ok, message: unsupported ? '此账号暂不支持该操作' : ok ? '任务已完成' : `任务存在失败${failed ? '（' + failed + ' 项）' : ''}，请查看账号状态` })
+        taskResults.value.push({ provider: p.name, ok, message: unsupported ? '此账号暂不支持该操作' : pending ? `领取已发起，${pending} 个账号待上游确认` : ok ? '任务已完成' : `任务存在失败${failed ? '（' + failed + ' 项）' : ''}，请查看账号状态` })
       } catch { taskResults.value.push({ provider: p.name, ok: false, message: '执行失败，其余渠道继续处理' }) }
     }
     if (!targets.length) toast.info('所选渠道不支持此操作')
@@ -1038,9 +1039,10 @@ async function saveConfig() {
               @click="openCalendar(row, $event)"
               @mouseleave="closeCalendar"
               @blur="closeCalendar"
-              title="悬停查看 35 天签到记录"
+              :title="row.raw.checkin_pending ? '今日已发起领取，上游尚未确认签到；后续仅刷新状态' : '悬停查看 35 天签到记录'"
             >
               <WTag v-if="row.raw.checkin_today" class="whitespace-nowrap" tone="live" dot>今日已签</WTag>
+              <WTag v-else-if="row.raw.checkin_pending" class="whitespace-nowrap" tone="warn" dot>待确认</WTag>
               <WTag v-else-if="hasCheckin(row)" class="whitespace-nowrap" tone="warn" dot>未签</WTag>
               <span v-else class="text-faint">—</span>
               <div v-if="row.raw.streak_days" class="text-micro text-faint">连签 {{ row.raw.streak_days }} 天</div>
@@ -1284,6 +1286,7 @@ async function saveConfig() {
           <span class="shrink-0 font-medium text-ink">签到记录 · 近 {{ calDays }} 天</span>
           <span class="min-w-0 break-words text-right text-micro leading-snug text-faint">{{ label(r) }}</span>
         </div>
+        <p v-if="r.raw.checkin_pending" class="mb-3 text-small text-warn">今日已发起领取，上游尚未确认签到；后续仅刷新状态。</p>
         <div class="grid grid-cols-7 gap-1">
           <div
             v-for="c in calGrid(calDatesOf(r), r)"

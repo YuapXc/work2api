@@ -27,9 +27,13 @@ type BudgetSample struct {
 // marked reference estimate; explicitly unknown tokens are never promoted.
 // Reported zero consumption is kept separate from unknown consumption.
 func (d *DB) UsageBudgetSamples(now float64) ([]BudgetSample, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	rows, err := d.db.Query(`SELECT COALESCE(account_uid,''),COALESCE(model,''),ts>=?,
+	return d.budgetCache.get(time.Minute, now, func() ([]BudgetSample, error) { return d.usageBudgetSamples(now) }, cloneBudgetSamples)
+}
+
+func (d *DB) usageBudgetSamples(now float64) ([]BudgetSample, error) {
+	db, release := d.analyticsReader()
+	defer release()
+	rows, err := db.Query(`SELECT COALESCE(account_uid,''),COALESCE(model,''),ts>=?,
 	 COALESCE(SUM(CASE WHEN credits>0 THEN credits ELSE 0 END),0),
 	 COALESCE(SUM(CASE WHEN credits>0 THEN total_tokens ELSE 0 END),0),
 	 COUNT(CASE WHEN credits>0 THEN 1 END),
@@ -303,54 +307,88 @@ func (d *DB) CleanupUsageRows(maxRows int) (int64, error) {
 	return n, nil
 }
 
-// UsageSummary returns aggregate stats.
+// UsageSummary returns full historical stats with a 10-second shared snapshot.
+// Fresh today counters use UsageToday; continuous writes do not bust this cache.
 func (d *DB) UsageSummary() (map[string]any, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	return d.summaryCache.get(10*time.Second, float64(localMidnight()), d.usageSummary, cloneAnalyticsMap)
+}
+
+func (d *DB) usageSummary() (map[string]any, error) {
+	db, release := d.analyticsReader()
+	defer release()
+	tx, err := db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
 	out := map[string]any{}
 	var tc, tt int64
-	_ = d.db.QueryRow("SELECT COUNT(*), COALESCE(SUM(total_tokens),0) FROM usage_logs").Scan(&tc, &tt)
+	if err := tx.QueryRow("SELECT COUNT(*), COALESCE(SUM(total_tokens),0) FROM usage_logs").Scan(&tc, &tt); err != nil {
+		return nil, err
+	}
 	out["total_requests"], out["total_tokens"] = tc, tt
 	todayStart := localMidnight()
 	var dc, dt int64
-	_ = d.db.QueryRow("SELECT COUNT(*), COALESCE(SUM(total_tokens),0) FROM usage_logs WHERE ts >= ?", todayStart).Scan(&dc, &dt)
+	if err := tx.QueryRow("SELECT COUNT(*), COALESCE(SUM(total_tokens),0) FROM usage_logs WHERE ts >= ?", todayStart).Scan(&dc, &dt); err != nil {
+		return nil, err
+	}
 	out["today_requests"], out["today_tokens"] = dc, dt
 
-	byProtocol, _ := d.groupCount("SELECT protocol, COUNT(*), COALESCE(SUM(total_tokens),0) FROM usage_logs GROUP BY protocol", "protocol")
+	byProtocol, err := groupCount(tx, "SELECT protocol, COUNT(*), COALESCE(SUM(total_tokens),0) FROM usage_logs GROUP BY protocol", "protocol")
+	if err != nil {
+		return nil, err
+	}
 	out["by_protocol"] = byProtocol
-	byModel, _ := d.groupCount("SELECT model, COUNT(*), COALESCE(SUM(total_tokens),0) FROM usage_logs GROUP BY model ORDER BY 2 DESC LIMIT 20", "model")
+	byModel, err := groupCount(tx, "SELECT model, COUNT(*), COALESCE(SUM(total_tokens),0) FROM usage_logs GROUP BY model ORDER BY 2 DESC LIMIT 20", "model")
+	if err != nil {
+		return nil, err
+	}
 	out["by_model"] = byModel
-	byApp, _ := d.groupCount("SELECT COALESCE(NULLIF(app_name,''),'(未命名)'), COUNT(*), COALESCE(SUM(total_tokens),0) FROM usage_logs GROUP BY app_name ORDER BY 2 DESC", "app")
+	byApp, err := groupCount(tx, "SELECT COALESCE(NULLIF(app_name,''),'(未命名)'), COUNT(*), COALESCE(SUM(total_tokens),0) FROM usage_logs GROUP BY app_name ORDER BY 2 DESC", "app")
+	if err != nil {
+		return nil, err
+	}
 	out["by_app"] = byApp
 
 	out["by_account"] = []map[string]any{}
-	rows, err := d.db.Query(`SELECT account_uid, COUNT(*), COALESCE(SUM(total_tokens),0),
+	rows, err := tx.Query(`SELECT account_uid, COUNT(*), COALESCE(SUM(total_tokens),0),
 		COALESCE(SUM(credits),0), SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END),
 		SUM(CASE WHEN status IN ('ok','incomplete') AND credits IS NULL THEN 1 ELSE 0 END)
 		FROM usage_logs GROUP BY account_uid ORDER BY 2 DESC`)
-	if err == nil {
+	if err != nil {
+		return nil, err
+	}
+	{
 		defer rows.Close()
 		byAccount := []map[string]any{}
 		for rows.Next() {
 			var uid sql.NullString
 			var c, t, okc, unk int64
 			var cr float64
-			_ = rows.Scan(&uid, &c, &t, &cr, &okc, &unk)
+			if err := rows.Scan(&uid, &c, &t, &cr, &okc, &unk); err != nil {
+				return nil, err
+			}
 			byAccount = append(byAccount, map[string]any{
 				"account_uid": uid.String, "count": c, "tokens": t,
 				"credits": round2(cr), "ok_count": okc, "unknown_count": unk,
 			})
 		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		rows.Close()
 		out["by_account"] = byAccount
 	}
 
 	// 缓存命中聚合：只统计上游确实上报过的行（cached_tokens IS NOT NULL），
 	// cached 输入 + 未命中输入 = 可命中输入总量，命中率 = cached / (cached + miss)。
 	var knownRows, cachedSum, missSum int64
-	_ = d.db.QueryRow(`SELECT COUNT(*),
+	if err := tx.QueryRow(`SELECT COUNT(*),
 		COALESCE(SUM(cached_tokens),0),
 		COALESCE(SUM(CASE WHEN cached_tokens IS NOT NULL THEN input_tokens - cached_tokens ELSE 0 END),0)
-		FROM usage_logs WHERE cached_tokens IS NOT NULL AND cached_tokens >= 0 AND input_tokens >= cached_tokens AND status IN ('ok','incomplete')`).Scan(&knownRows, &cachedSum, &missSum)
+		FROM usage_logs WHERE cached_tokens IS NOT NULL AND cached_tokens >= 0 AND input_tokens >= cached_tokens AND status IN ('ok','incomplete')`).Scan(&knownRows, &cachedSum, &missSum); err != nil {
+		return nil, err
+	}
 	out["cache"] = map[string]any{
 		"known_rows": knownRows, "cached_tokens": cachedSum, "uncached_tokens": missSum,
 		"hit_rate": func() any {
@@ -367,8 +405,10 @@ func (d *DB) UsageSummary() (map[string]any, error) {
 	return out, nil
 }
 
-func (d *DB) groupCount(query, keyName string) ([]map[string]any, error) {
-	rows, err := d.db.Query(query)
+func groupCount(db interface {
+	Query(string, ...any) (*sql.Rows, error)
+}, query, keyName string) ([]map[string]any, error) {
+	rows, err := db.Query(query)
 	if err != nil {
 		return nil, err
 	}
@@ -382,7 +422,7 @@ func (d *DB) groupCount(query, keyName string) ([]map[string]any, error) {
 		}
 		out = append(out, map[string]any{keyName: key.String, "count": c, "tokens": t})
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // usageWhere builds the shared WHERE clause. app_name "" (non-nil) matches
@@ -427,9 +467,9 @@ func (d *DB) UsageRecent(limit int, protocol, model string, appName *string, sta
 	if light {
 		cols = usageLightCols
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	rows, err := d.db.Query("SELECT "+cols+" FROM usage_logs "+where+" ORDER BY id DESC LIMIT ? OFFSET ?", params...)
+	db, release := d.analyticsReader()
+	defer release()
+	rows, err := db.Query("SELECT "+cols+" FROM usage_logs "+where+" ORDER BY id DESC LIMIT ? OFFSET ?", params...)
 	if err != nil {
 		return nil, err
 	}
@@ -449,18 +489,18 @@ func (d *DB) UsageRecent(limit int, protocol, model string, appName *string, sta
 // UsageCount returns the count matching filters.
 func (d *DB) UsageCount(protocol, model string, appName *string, status, search string) (int, error) {
 	where, params := usageWhere(protocol, model, appName, status, search)
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	db, release := d.analyticsReader()
+	defer release()
 	var c int
-	err := d.db.QueryRow("SELECT COUNT(*) FROM usage_logs "+where, params...).Scan(&c)
+	err := db.QueryRow("SELECT COUNT(*) FROM usage_logs "+where, params...).Scan(&c)
 	return c, err
 }
 
 // GetUsage returns one full usage record by id.
 func (d *DB) GetUsage(id int) (map[string]any, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	rows, err := d.db.Query("SELECT * FROM usage_logs WHERE id = ?", id)
+	db, release := d.analyticsReader()
+	defer release()
+	rows, err := db.Query("SELECT * FROM usage_logs WHERE id = ?", id)
 	if err != nil {
 		return nil, err
 	}
@@ -489,55 +529,78 @@ func decodeUsageDiagnostics(row map[string]any) {
 
 // UsageFilters returns distinct filter values.
 func (d *DB) UsageFilters() (map[string]any, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	col := func(field string) []string {
-		rows, err := d.db.Query("SELECT DISTINCT " + field + " FROM usage_logs WHERE " + field + " IS NOT NULL AND " + field + " != '' ORDER BY " + field)
+	historical, err := d.filterCache.get(30*time.Second, 0, d.usageFilterValues, cloneAnalyticsMap)
+	if err != nil {
+		return nil, err
+	}
+	db, release := d.analyticsReader()
+	defer release()
+	currentApps := []string{}
+	rows, err := db.Query("SELECT name FROM apps ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		currentApps = append(currentApps, name)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	usedApps := historical["apps_history"].([]string)
+	currentSet := map[string]bool{}
+	for _, name := range currentApps {
+		currentSet[name] = true
+	}
+	history := []string{}
+	for _, name := range usedApps {
+		if !currentSet[name] {
+			history = append(history, name)
+		}
+	}
+	historical["apps"], historical["apps_history"] = currentApps, history
+	return historical, nil
+}
+
+func (d *DB) usageFilterValues() (map[string]any, error) {
+	db, release := d.analyticsReader()
+	defer release()
+	col := func(field string) ([]string, error) {
+		rows, err := db.Query("SELECT DISTINCT " + field + " FROM usage_logs WHERE " + field + " IS NOT NULL AND " + field + " != '' ORDER BY " + field)
 		if err != nil {
-			return []string{}
+			return nil, err
 		}
 		defer rows.Close()
 		out := []string{}
 		for rows.Next() {
-			var v sql.NullString
-			_ = rows.Scan(&v)
-			out = append(out, v.String)
+			var v string
+			if err := rows.Scan(&v); err != nil {
+				return nil, err
+			}
+			out = append(out, v)
 		}
-		return out
+		return out, rows.Err()
 	}
-	currentApps := []string{}
-	if rows, err := d.db.Query("SELECT name FROM apps ORDER BY id"); err == nil {
-		for rows.Next() {
-			var n string
-			_ = rows.Scan(&n)
-			currentApps = append(currentApps, n)
+	out := map[string]any{}
+	for _, item := range []struct{ key, column string }{{"protocols", "protocol"}, {"models", "model"}, {"apps_history", "app_name"}, {"statuses", "status"}} {
+		values, err := col(item.column)
+		if err != nil {
+			return nil, err
 		}
-		rows.Close()
+		out[item.key] = values
 	}
-	usedApps := col("app_name")
-	currentSet := map[string]struct{}{}
-	for _, a := range currentApps {
-		currentSet[a] = struct{}{}
+	var unnamed bool
+	if err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM usage_logs WHERE app_name IS NULL OR app_name='')").Scan(&unnamed); err != nil {
+		return nil, err
 	}
-	var history []string = []string{}
-	for _, a := range usedApps {
-		if _, ok := currentSet[a]; !ok {
-			history = append(history, a)
-		}
-	}
-	var hasUnnamed bool
-	var n int
-	if err := d.db.QueryRow("SELECT COUNT(*) FROM usage_logs WHERE app_name IS NULL OR app_name = ''").Scan(&n); err == nil {
-		hasUnnamed = n > 0
-	}
-	return map[string]any{
-		"protocols":    col("protocol"),
-		"models":       col("model"),
-		"apps":         currentApps,
-		"apps_history": history,
-		"has_unnamed":  hasUnnamed,
-		"statuses":     col("status"),
-	}, nil
+	out["has_unnamed"] = unnamed
+	return out, nil
 }
 
 // UsageTimeseries returns bucketed call trend.
@@ -565,9 +628,9 @@ func (d *DB) UsageTimeseries(granularity string, points int, model string) ([]ma
 		args = append(args, model)
 	}
 	query += " GROUP BY bucket_ts"
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	rows, err := d.db.Query(query, args...)
+	db, release := d.analyticsReader()
+	defer release()
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
