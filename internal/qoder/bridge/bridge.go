@@ -16,6 +16,7 @@ import (
 	"work2api/internal/qoder/account"
 	"work2api/internal/qoder/logger"
 	"work2api/internal/streamwatch"
+	"work2api/internal/toolschema"
 )
 
 func qoderChatStreamURL(region account.Region) string {
@@ -523,7 +524,7 @@ func (b *Bridge) callQoderWithOpts(ctx context.Context, agent string, messages [
 
 	body["messages"] = messages
 	if tools != nil {
-		body["tools"] = tools
+		body["tools"] = toolschema.Tools(tools)
 	}
 
 	mcSource := "system"

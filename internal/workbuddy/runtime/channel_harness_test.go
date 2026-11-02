@@ -5,6 +5,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"work2api/internal/workbuddy/adapters"
+	"work2api/internal/workbuddy/upstream"
 )
 
 func TestHarnessIdentityCompatibilityIsNarrow(t *testing.T) {
@@ -60,5 +62,69 @@ func TestHarnessCompatibilityPreservesToolsAndHistory(t *testing.T) {
 	}
 	if _, again := ChannelCompatibilityBody(got, 1); again {
 		t.Fatal("compatibility is not idempotent")
+	}
+}
+
+func TestHarnessCaseAndRoleCompatibilityAcrossProtocols(t *testing.T) {
+	intro := "YOU ARE AN AI AGENT POWERED BY DEEPSEEK HARNESS.\nAvailable skills: keep. MCP: keep. Never run unauthorized tools."
+	chat := upstream.BuildUpstreamBody(map[string]any{"messages": []any{map[string]any{"role": "developer", "content": intro}, map[string]any{"role": "user", "content": intro}}})
+	responses, e := adapters.ResponsesRequestToChat(map[string]any{"input": []any{map[string]any{"role": "developer", "content": intro}, map[string]any{"role": "user", "content": "hi"}}})
+	if e != nil {
+		t.Fatal(e)
+	}
+	messages, e := adapters.AnthropicRequestToChat(map[string]any{"system": intro, "messages": []any{map[string]any{"role": "user", "content": "hi"}}})
+	if e != nil {
+		t.Fatal(e)
+	}
+	for _, body := range []map[string]any{chat, responses, messages} {
+		before, _ := json.Marshal(body)
+		out, changed := ChannelCompatibilityBody(body, 1)
+		if !changed {
+			t.Fatal("lost known identity")
+		}
+		text := out["messages"].([]any)[0].(map[string]any)["content"].(string)
+		if !strings.HasPrefix(text, "You are a coding assistant.") || !strings.Contains(text, "Available skills: keep. MCP: keep.") {
+			t.Fatal(text)
+		}
+		after, _ := json.Marshal(body)
+		if string(before) != string(after) {
+			t.Fatal("input mutated")
+		}
+	}
+	out, _ := ChannelCompatibilityBody(chat, 1)
+	if out["messages"].([]any)[1].(map[string]any)["content"] != intro {
+		t.Fatal("user content changed")
+	}
+	for _, text := range []string{"Quoted: " + intro, "YOU ARE AN AI AGENT POWERED BY DEEPSEEK HARNESS.example"} {
+		if _, changed := CompatibleIdentity(text); changed {
+			t.Fatal("false positive")
+		}
+	}
+}
+
+func TestFileReferenceTemplateCompatibility(t *testing.T) {
+	original := "Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root."
+	for _, role := range []string{"system", "developer"} {
+		body := map[string]any{"messages": []any{map[string]any{"role": role, "content": original}, map[string]any{"role": "user", "content": original}, map[string]any{"role": "assistant", "content": original}}}
+		out, changed := ChannelCompatibilityBody(body, 1)
+		if !changed {
+			t.Fatal("template not adapted")
+		}
+		messages := out["messages"].([]any)
+		if messages[0].(map[string]any)["content"] != strings.Replace(original, "paths the", "paths that the", 1) {
+			t.Fatal("template semantics changed")
+		}
+		if messages[1].(map[string]any)["content"] != original || messages[2].(map[string]any)["content"] != original {
+			t.Fatal("history changed")
+		}
+		if body["messages"].([]any)[0].(map[string]any)["content"] != original {
+			t.Fatal("source mutated")
+		}
+		if _, again := ChannelCompatibilityBody(out, 1); again {
+			t.Fatal("not idempotent")
+		}
+	}
+	if fileReferenceTemplate.MatchString("Quoted: " + original) {
+		t.Fatal("rewrote embedded quotation")
 	}
 }

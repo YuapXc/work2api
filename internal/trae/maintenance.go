@@ -220,6 +220,21 @@ func (r *Runtime) refreshBlockedQuotas(ctx context.Context, req provider.ServeRe
 	}
 }
 func (r *Runtime) AdminCheckin(ctx context.Context) (map[string]any, error) {
+	// Serialize manual/scheduled claim batches without blocking inference or
+	// trapping a canceled waiter behind the maintenance network operation.
+	r.mu.Lock()
+	if r.checkinPermit == nil {
+		r.checkinPermit = make(chan struct{}, 1)
+	}
+	permit := r.checkinPermit
+	r.mu.Unlock()
+	select {
+	case permit <- struct{}{}:
+		defer func() { <-permit }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
 	r.mu.Lock()
 	ids := []string{}
 	for id := range r.accounts {
@@ -271,17 +286,56 @@ func (r *Runtime) AdminCheckin(ctx context.Context) (map[string]any, error) {
 					result["status"] = "device_checked"
 					result["message"] = "设备已参与，未确认该账号签到成功"
 				} else {
-					fingerprint := a.Auth.MaintenanceIdentity()
-					_, err = c.CheckinClaim(a.Auth)
-					r.observeMaintenance(a.Auth, "checkin", fingerprint, err)
-					if err == nil {
-						result["status"] = "ok"
+					sent, markerErr := r.checkinSent(id, today)
+					if markerErr != nil {
+						err = markerErr
+					} else if sent {
+						result["status"] = "pending"
+						result["message"] = "今日已发起领取，上游尚未确认签到；仅刷新状态"
+					} else if markerErr = r.markCheckinSent(id, today); markerErr != nil {
+						err = markerErr
+					} else {
+						r.mu.Lock()
+						if r.accounts[id] == a {
+							a.CheckinPending = today
+						}
+						r.mu.Unlock()
+						fingerprint := a.Auth.MaintenanceIdentity()
+						_, err = c.CheckinClaim(a.Auth)
+						r.observeMaintenance(a.Auth, "checkin", fingerprint, err)
+						if err != nil {
+							var rejection *upstream.Error
+							if errors.As(err, &rejection) && (rejection.BizCode != 0 || rejection.Status == 401 || rejection.Status == 403) {
+								if clearErr := r.clearCheckinSent(id); clearErr != nil {
+									result["message"] = "领取被拒绝，领取状态记录清理失败"
+								} else {
+									r.mu.Lock()
+									if r.accounts[id] == a {
+										a.CheckinPending = ""
+									}
+									r.mu.Unlock()
+								}
+							} else {
+								result["status"] = "pending"
+							}
+						} else {
+							// code:0 acknowledges the claim, not the day's check-in status.
+							result["status"] = "pending"
+							result["message"] = "领取已受理，等待上游确认签到"
+							after, readErr := c.CheckinStatus(a.Auth)
+							r.observeMaintenance(a.Auth, "checkin", fingerprint, readErr)
+							if readErr == nil && after.CheckedIn {
+								result["status"] = "ok"
+								delete(result, "message")
+							}
+						}
 					}
+
 				}
 			}
 		}
 		if err != nil {
-			result["message"] = "上游未确认签到成功，请稍后重试"
+			result["message"] = "上游未确认签到成功，请刷新状态核实"
 			if errors.Is(err, provider.ErrMaintenanceLogin) {
 				result["status"] = "reauthorize"
 				result["message"] = err.Error()
@@ -295,6 +349,9 @@ func (r *Runtime) AdminCheckin(ctx context.Context) (map[string]any, error) {
 			}
 		}
 		r.mu.Lock()
+		if r.accounts[id] == a && result["status"] == "pending" {
+			a.CheckinPending = today
+		}
 		valid := r.accounts[id] == a && a.Auth.MaintenanceIdentity() == fingerprint
 		r.mu.Unlock()
 		if !valid {

@@ -74,7 +74,7 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 		return rt.serveSystemOne(ctx, w, external, payload, route, ids)
 	}
 
-	payload, toolNames := aliasClientTools(payload, external)
+	payload, toolNames := aliasClientTools(payload, external, route.Anonymous)
 	compatibilityTools := route.Anonymous || rt.catalog.IsFreeModel(model)
 	payload = describeClientTools(payload, external, toolNames, compatibilityTools)
 	if len(toolNames) > 0 || compatibilityTools {

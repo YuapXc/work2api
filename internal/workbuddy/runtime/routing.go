@@ -303,11 +303,16 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 			if ue, ok := callErr.(*upstream.UpstreamError); ok {
 				copyErr := *ue
 				copyErr.Raw = []byte(`{"error":{"message":"共享上游暂不可用，请稍后重试","type":"upstream_error"}}`)
+				if IsChannelDenied(ue.StatusCode, string(ue.Raw)) {
+					copyErr.Raw = []byte(`{"code":11128,"error":{"message":"上游未接受本次请求，兼容恢复未成功，请调整请求或稍后重试","type":"channel_rejected","code":11128}}`)
+				}
+
 				callErr = &copyErr
 			}
 		}
 	}()
 	const maxFailoverAttempts = 5
+	ctx = context.WithValue(ctx, recoveryBudgetKey{}, &recoveryBudget{remaining: maxFailoverAttempts})
 	tried := map[string]bool{}
 	compatTries := 0
 	compatUID := ""
@@ -512,13 +517,13 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 		}
 		// Recover only explicit 11135 errors before any output. Never penalize an
 		// account or cache this request-local, lossy fallback.
-		if imageRecoveryStage < 2 && ue.StatusCode == 400 && BusinessCode(string(ue.Raw), "11135") && attempt+1 < maxFailoverAttempts {
+		if imageRecoveryStage < 2 && ue.StatusCode == 400 && BusinessCode(string(ue.Raw), "11135") && attempt+1 < maxFailoverAttempts && recoveryAvailable(ctx) {
 			var reduced map[string]any
 			fixed, count := 0, 0
 			mode := "partial"
 			// Reserve room for the full fallback rather than spend the final
 			// dispatch on a partial repair that cannot recover unknown bad URLs.
-			if imageRecoveryStage == 0 && attempt+2 < maxFailoverAttempts {
+			if imageRecoveryStage == 0 && attempt+2 < maxFailoverAttempts && recoveryAvailable(ctx, 2) {
 				reduced, fixed, count = locallyCompatibleImages(body, ue.Raw)
 				imageRecoveryStage = 1
 			}
@@ -548,7 +553,7 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 			_, metadataMatch := compatibleBody(2)
 			log.Printf("渠道拒绝诊断: profile=%s model=%s compatibility=%s compat_enabled=%t metadata_enabled=%t identity_match=%t metadata_match=%t started=%t attempt=%d", acc.Profile, model, CompatibilityName(level), o.cfg.ChannelIdentityCompat, o.cfg.ChannelMetadataCompat, identityMatch, metadataMatch, started, attempt+1)
 		}
-		if denied && o.cfg.ChannelIdentityCompat && compatTries < 2 && attempt+1 < maxFailoverAttempts {
+		if denied && o.cfg.ChannelIdentityCompat && compatTries < 2 && attempt+1 < maxFailoverAttempts && recoveryAvailable(ctx) {
 			maxLevel := 1
 			if o.cfg.ChannelMetadataCompat {
 				maxLevel = 2
@@ -575,7 +580,7 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 		if sessionKey != "" {
 			o.Sessions.UnbindMatching(sessionKey, acc.UID)
 		}
-		if attempt+1 >= maxFailoverAttempts {
+		if attempt+1 >= maxFailoverAttempts || !recoveryAvailable(ctx) {
 			return acc, err
 		}
 		alt, aerr := o.PickAccountExcludingIn(model, sessionKey, tried, scope)

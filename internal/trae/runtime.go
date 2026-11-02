@@ -45,6 +45,7 @@ type accountState struct {
 	QuotaProbeDone           chan struct{}
 	CreditPackages           []map[string]any
 	CheckinDate              string
+	CheckinPending           string
 }
 
 type Runtime struct {
@@ -63,6 +64,7 @@ type Runtime struct {
 	affinityClock     uint64
 	logins            map[string]*loginState
 	lastMaintenance   time.Time
+	checkinPermit     chan struct{}
 }
 
 // One upstream UID is one ownership/quota/concurrency resource. Product
@@ -160,6 +162,9 @@ func New(dataDir string, db *store.DB) (*Runtime, error) {
 			state.Priority = int(number(row["priority"]))
 			state.CheckinDate = text(row["last_checkin_date"])
 			state.PreferredProduct = text(row["profile"])
+		}
+		if sent, e := r.checkinSent(id, time.Now().In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02")); e == nil && sent {
+			state.CheckinPending = time.Now().In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02")
 		}
 		r.accounts[id] = state
 	}
@@ -479,6 +484,7 @@ func (r *Runtime) importAccount(ctx context.Context, token string, opts map[stri
 		for product, catalog := range previous.Catalogs {
 			state.Catalogs[product] = catalog
 		}
+		state.CheckinDate, state.CheckinPending = previous.CheckinDate, previous.CheckinPending
 		state.Enabled = previous.Enabled
 		state.Alias = previous.Alias
 		state.Priority = previous.Priority
@@ -578,6 +584,9 @@ func (r *Runtime) DeleteAccount(id string) error {
 			return err
 		}
 	}
+	if err := os.Remove(r.checkinMarker(id)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
 	if _, err := r.db.DeleteAccount(id); err != nil {
 		return err
 	}
@@ -597,7 +606,7 @@ func (r *Runtime) AdminData(context.Context) provider.AdminData {
 			label = a.Auth.Nickname
 		}
 		healthy := a.Enabled && !time.Now().Before(a.Cooldown)
-		row := map[string]any{"id": id, "uid": id, "provider": "trae", "label": label, "nickname": a.Auth.Nickname, "alias": a.Alias, "source": "import", "product": a.Auth.Variant, "site": "domestic", "enabled": a.Enabled, "healthy": healthy, "priority": a.Priority, "credits_remaining": a.Remaining, "credits_total": a.Total, "credits_expire_at": a.Expiry, "quota_stale": time.Since(a.QuotaAt) > 30*time.Minute, "quota_refresh_failed": a.QuotaFailed, "last_checkin_date": a.CheckinDate, "quota_unit": "credits", "credit_packages": a.CreditPackages, "catalog_stale": catalogStale(a)}
+		row := map[string]any{"checkin_pending": a.CheckinPending == time.Now().In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02") && a.CheckinDate != a.CheckinPending, "id": id, "uid": id, "provider": "trae", "label": label, "nickname": a.Auth.Nickname, "alias": a.Alias, "source": "import", "product": a.Auth.Variant, "site": "domestic", "enabled": a.Enabled, "healthy": healthy, "priority": a.Priority, "credits_remaining": a.Remaining, "credits_total": a.Total, "credits_expire_at": a.Expiry, "quota_stale": time.Since(a.QuotaAt) > 30*time.Minute, "quota_refresh_failed": a.QuotaFailed, "last_checkin_date": a.CheckinDate, "quota_unit": "credits", "credit_packages": a.CreditPackages, "catalog_stale": catalogStale(a)}
 		pending := []map[string]any{}
 		for _, product := range []string{"cn", "solo", "intl"} {
 			identity := a.Identities[product]

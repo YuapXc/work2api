@@ -18,6 +18,8 @@ var codexCLIIntro = regexp.MustCompile(`(?i)^you are a coding agent running in t
 // the actual branch value and every surrounding instruction intact.
 var mainBranchTemplate = regexp.MustCompile(`(?m)^Main branch \(you will usually use this for PRs\):`)
 
+var fileReferenceTemplate = regexp.MustCompile(`(?im)(^|\n)(Tokens prefixed with @ are paths) (the user explicitly referenced\.)`)
+
 func CompatibilityName(level int) string {
 	switch level {
 	case 1:
@@ -40,7 +42,11 @@ func CompatibleIdentity(text string) (string, bool) {
 	// introduction succeeds. Other Harness introductions passed the same replay;
 	// do not generalize to arbitrary brands, model names or quoted history.
 	const harnessIntro = "You are an AI agent powered by DeepSeek Harness."
-	if tail, found := strings.CutPrefix(text, harnessIntro); found && (tail == "" || strings.ContainsRune(" \t\r\n", rune(tail[0]))) {
+	if len(text) >= len(harnessIntro) && strings.EqualFold(text[:len(harnessIntro)], harnessIntro) {
+		tail := text[len(harnessIntro):]
+		if tail != "" && !strings.ContainsRune(" \t\r\n", rune(tail[0])) {
+			return text, false
+		}
 		return "You are a coding assistant." + tail, true
 	}
 	if match := codexCLIIntro.FindStringIndex(text); match != nil {
@@ -199,6 +205,10 @@ func ChannelCompatibilityBody(body map[string]any, level int) (map[string]any, b
 		prefix, rest := BillingPrefix(text)
 		padding := rest[:len(rest)-len(strings.TrimLeft(rest, "\r\n"))]
 		value, changed := CompatibleIdentity(strings.TrimLeft(rest, "\r\n"))
+		if fileReferenceTemplate.MatchString(value) {
+			value = fileReferenceTemplate.ReplaceAllString(value, "${1}${2} that ${3}")
+			changed = true
+		}
 		if mainBranchTemplate.MatchString(value) {
 			value = mainBranchTemplate.ReplaceAllString(value, "Default branch (you will usually use this for PRs):")
 			changed = true
@@ -214,7 +224,7 @@ func ChannelCompatibilityBody(body map[string]any, level int) (map[string]any, b
 	copyMessages := append([]any(nil), messages...)
 	for i, item := range messages {
 		message, ok := item.(map[string]any)
-		if !ok || message["role"] != "system" {
+		if !ok || message["role"] != "system" && message["role"] != "developer" {
 			break
 		}
 		var content any
@@ -267,7 +277,7 @@ func CompatibilityFingerprint(body map[string]any) string {
 	var system []any
 	for _, item := range messages {
 		message, ok := item.(map[string]any)
-		if !ok || message["role"] != "system" {
+		if !ok || message["role"] != "system" && message["role"] != "developer" {
 			break
 		}
 		system = append(system, message["content"])

@@ -5,6 +5,7 @@ package credentials
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 	"work2api/internal/core/provider"
@@ -78,15 +80,18 @@ type Session struct {
 
 // Manager manages one account's credentials: read, expiry, refresh, write-back.
 type Manager struct {
-	authGuard *provider.MaintenanceGuard
-	authKey   string
-	path      string
-	client    *http.Client
-	mu        sync.Mutex
-	cached    *Session
-	mtime     time.Time
-	retired   bool
-	flight    *refreshTask
+	authGuard   *provider.MaintenanceGuard
+	authKey     string
+	path        string
+	client      *http.Client
+	mu          sync.Mutex
+	cached      *Session
+	mtime       time.Time
+	retired     bool
+	flight      *refreshTask
+	deniedToken [32]byte
+	deniedAt    time.Time
+	deniedErr   error
 }
 
 type refreshTask struct {
@@ -370,7 +375,7 @@ func encryptedToken(auth map[string]any) bool {
 
 // ensureFresh shares a bounded refresh, while each waiter retains its own
 // cancellation. The task owns a backup lease until its atomic write completes.
-func (m *Manager) ensureFresh(ctx context.Context, force bool) error {
+func (m *Manager) ensureFresh(ctx context.Context, force bool, rejected ...string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -394,6 +399,20 @@ func (m *Manager) ensureFresh(ctx context.Context, force bool) error {
 		return ErrLoginRequired
 	}
 	task := m.flight
+	var rejectedHash [32]byte
+	if len(rejected) > 0 {
+		token, _ := s.Auth["accessToken"].(string)
+		if token != rejected[0] {
+			m.mu.Unlock()
+			return nil
+		}
+		rejectedHash = sha256.Sum256([]byte(rejected[0] + "\x00" + identity))
+		if task == nil && m.deniedToken == rejectedHash && time.Since(m.deniedAt) < 30*time.Second {
+			err := m.deniedErr
+			m.mu.Unlock()
+			return err
+		}
+	}
 	if task == nil && !force && !m.isExpired() {
 		m.mu.Unlock()
 		return nil
@@ -402,6 +421,11 @@ func (m *Manager) ensureFresh(ctx context.Context, force bool) error {
 		sharedCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		task = &refreshTask{done: make(chan struct{}), cancel: cancel}
 		m.flight = task
+		if len(rejected) > 0 {
+			m.deniedToken = rejectedHash
+			m.deniedAt = time.Now()
+			m.deniedErr = errors.New("凭据续期暂不可用")
+		}
 		leave := statebackup.Enter()
 		go func() {
 			defer leave()
@@ -414,6 +438,9 @@ func (m *Manager) ensureFresh(ctx context.Context, force bool) error {
 				}
 			}
 			task.err = err
+			if len(rejected) > 0 && m.deniedToken == rejectedHash {
+				m.deniedErr = err
+			}
 			m.flight = nil
 			close(task.done)
 			m.mu.Unlock()
@@ -567,4 +594,14 @@ func itoa(n int) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+// RecoverChatAuthorization refreshes only the generation rejected by a real
+// chat HTTP401. Concurrent callers join the shared billing/chat refresh flight.
+func (m *Manager) RecoverChatAuthorization(ctx context.Context, rejectedBearer string) error {
+	token := strings.TrimPrefix(rejectedBearer, "Bearer ")
+	if token == "" {
+		return errors.New("缺少被拒绝的凭据")
+	}
+	return m.ensureFresh(ctx, true, token)
 }

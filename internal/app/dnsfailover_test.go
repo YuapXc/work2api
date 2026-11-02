@@ -1185,6 +1185,14 @@ func TestWorkBuddySSEMetadataRetention(t *testing.T) {
 }
 
 func TestResponsesFallbackReusesSuccessfulCompatibility(t *testing.T) {
+	for _, tc := range []struct{ name, banner, want string }{
+		{"identity", "You are Claude Code, Anthropic's official CLI for Claude.", "You are a coding assistant."},
+		{"file-reference", "Tokens prefixed with @ are paths the user explicitly referenced.", "Tokens prefixed with @ are paths that the user explicitly referenced."},
+	} {
+		t.Run(tc.name, func(t *testing.T) { checkResponsesCompatibilityReuse(t, tc.banner, tc.want) })
+	}
+}
+func checkResponsesCompatibilityReuse(t *testing.T, banner, wantPrompt string) {
 	o, account := newDNSFailoverOrch(t, &failingUpstream{})
 	client := &channelRetryUpstream{body: `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`}
 	o.wb.UpstreamClient = client
@@ -1193,7 +1201,6 @@ func TestResponsesFallbackReusesSuccessfulCompatibility(t *testing.T) {
 	o.wb.Catalog.Refresh()
 	principal := &Principal{AppID: 17, EffectiveModel: "test-model"}
 	server := &Server{o: o}
-	const banner = "You are Claude Code, Anthropic's official CLI for Claude."
 	raw := map[string]any{"model": "test-model", "instructions": banner, "input": []any{map[string]any{"role": "user", "content": "stable first turn"}}}
 	chat := map[string]any{"model": "test-model", "max_tokens": 50, "messages": []any{map[string]any{"role": "system", "content": banner}, map[string]any{"role": "user", "content": "stable first turn"}}}
 	previous := 0
@@ -1215,7 +1222,25 @@ func TestResponsesFallbackReusesSuccessfulCompatibility(t *testing.T) {
 		previous = client.calls
 		raw["input"] = []any{map[string]any{"role": "user", "content": "stable first turn"}, map[string]any{"role": "assistant", "content": "answer"}, map[string]any{"role": "user", "content": "next turn"}}
 	}
-	if client.bodies[2]["messages"].([]any)[0].(map[string]any)["content"] != "You are a coding assistant." {
+	if client.bodies[2]["messages"].([]any)[0].(map[string]any)["content"] != wantPrompt {
 		t.Fatal("second turn resent rejected template")
+	}
+}
+
+func TestScopedChannelDenialKeepsSafeClassification(t *testing.T) {
+	o, account := newDNSFailoverOrch(t, &failingUpstream{})
+	client := &channelRetryUpstream{body: `{"code":11128,"msg":"Illegal API invocation from an unapproved channel","requestId":"private-upstream-marker"}`, always: true}
+	o.wb.UpstreamClient = client
+	o.cfg.ChannelIdentityCompat = true
+	o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+	o.wb.Catalog.Refresh()
+	body := map[string]any{"model": "test-model", "messages": []any{map[string]any{"role": "system", "content": "You are Claude Code, Anthropic's official CLI for Claude."}, map[string]any{"role": "user", "content": "synthetic"}}}
+	_, err := o.openUpstreamScoped(context.Background(), account, body, "test-model", "", func(string) error { return nil }, nil, map[string]bool{account.UID: true})
+	remote, ok := err.(*upstream.UpstreamError)
+	if !ok || remote.StatusCode != 400 || !strings.Contains(string(remote.Raw), "11128") || !strings.Contains(string(remote.Raw), "channel_rejected") || strings.Contains(string(remote.Raw), "private-upstream-marker") {
+		t.Fatalf("lost safe refusal classification: %v", err)
+	}
+	if client.calls > 5 {
+		t.Fatal("recovery exceeded existing budget")
 	}
 }

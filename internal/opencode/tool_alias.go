@@ -34,14 +34,14 @@ var officialTools = func() map[string]struct {
 
 // Alias only declared conflicting client tools. Schemas and tool argument
 // strings are opaque; never rewrite them or replace them with official schemas.
-func aliasClientTools(input map[string]any, proto protocol.Protocol) (map[string]any, map[string]string) {
+func aliasClientTools(input map[string]any, proto protocol.Protocol, anonymous ...bool) (map[string]any, map[string]string) {
 	forward, reverse := map[string]string{}, map[string]string{}
 	used := map[string]bool{}
 	for _, raw := range jsonutil.SliceAt(input, "tools") {
 		used[anonymousToolName(proto, raw)] = true
 	}
 	for name := range used {
-		if _, known := officialTools[name]; !known && name != "bash" {
+		if _, known := officialTools[name]; !known && name != "bash" && !(len(anonymous) > 0 && anonymous[0]) {
 			continue
 		}
 		sum := sha256.Sum256([]byte("opencode-client-tool\x00" + name))

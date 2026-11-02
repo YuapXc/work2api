@@ -27,6 +27,11 @@ func TestResourceErrorsAcrossCompleteFrames(t *testing.T) {
 		status, want     int
 	}{
 		{"nested_envelope", outer, "upstream_queued", 403, 429},
+		{"call_count_queue", `{"code":10605,"subCode":"CALL_COUNT_LIMIT","message":"{\"isQueued\":true,\"retryAfterSeconds\":17}"}`, "upstream_queued", 200, 429},
+		{"call_count_only", `{"code":10605,"subCode":"CALL_COUNT_LIMIT"}`, ErrTypeCallCount, 200, 429},
+		{"explicit_not_queued", `{"code":10605,"subCode":"CALL_COUNT_LIMIT","isQueued":false,"retryAfterSeconds":17}`, ErrTypeCallCount, 200, 429},
+		{"unrelated_queue", `{"code":10605,"error":{"subCode":"RESOURCE_LIMIT"},"details":{"isQueued":true}}`, "resource_limit", 200, 403},
+
 		{"business_string", business, "upstream_queued", 200, 429},
 		{"business_number", `{"code":10605,"subCode":"RESOURCE_LIMIT","isQueued":true}`, "upstream_queued", 200, 429},
 		{"details_string", fmt.Sprintf(`{"code":"10605","details":%q}`, ticket), "upstream_queued", 200, 429},

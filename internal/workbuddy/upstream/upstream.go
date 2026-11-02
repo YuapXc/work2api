@@ -63,6 +63,14 @@ var (
 	shared     *Client
 )
 
+// NewClient uses the supplied reusable HTTP client for provider transports.
+func NewClient(client *http.Client) *Client {
+	if client == nil {
+		return Shared()
+	}
+	return &Client{hc: client}
+}
+
 // Shared returns the process-wide upstream client (reuses TCP/TLS conns).
 func Shared() *Client {
 	sharedOnce.Do(func() {

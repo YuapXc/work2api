@@ -104,6 +104,7 @@ func (o *Runtime) serveChat(w http.ResponseWriter, r *http.Request, payload map[
 		}, principal.AccountScope)
 		if err != nil {
 			if !opened {
+				setRetryHints(w, err)
 				st, detail := ErrToHTTP(err)
 				if st == 429 && IsLocalOverload(detail) {
 					w.Header().Set("Retry-After", "2")
@@ -146,6 +147,7 @@ func (o *Runtime) serveChat(w http.ResponseWriter, r *http.Request, payload map[
 		return callErr
 	})
 	if err != nil {
+		setRetryHints(w, err)
 		st, detail := ErrToHTTP(err)
 		if ue, ok := err.(*upstream.UpstreamError); ok {
 			o.LogUsage(LogArgs{Ctx: r.Context(), Protocol: "chat", Model: model, Acc: served, T0: t0, Status: "error", ErrStr: UpstreamErrorText(ue.StatusCode, ue.Raw), Input: input, AppName: principal.AppName, UserID: principal.UserID, AppID: principal.AppID, Quota: provider.CurrentInvocation(r.Context()).UsageObserver, Effort: effort, UpdatePool: false})
@@ -267,6 +269,7 @@ func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload
 		o.LogUsage(LogArgs{Ctx: r.Context(), Protocol: protocol, Model: model, Acc: fa, T0: t0, Status: "error", ErrStr: UpstreamErrorText(e.StatusCode, e.Raw), Input: input, AppName: principal.AppName, UserID: principal.UserID, AppID: principal.AppID, Quota: provider.CurrentInvocation(r.Context()).UsageObserver, UpdatePool: false})
 	}, principal.AccountScope)
 	if err != nil {
+		setRetryHints(w, err)
 		st, detail := ErrToHTTP(err)
 		errStr := err.Error()
 		if ue, ok := err.(*upstream.UpstreamError); ok {

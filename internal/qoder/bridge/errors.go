@@ -25,6 +25,7 @@ const (
 	ErrTypeTransient      = "upstream_transient_error"
 	ErrTypeUpstream       = "upstream_error"
 	ErrTypeWorkspaceQuota = "workspace_quota"
+	ErrTypeCallCount      = "call_count_limit"
 )
 
 // TransientMaxRetries 同账号瞬时故障额外重试次数（退避时长见 RetryBackoff）。
@@ -176,6 +177,9 @@ func FriendlyUpstreamError(code int, detail string) (string, string) {
 		if kind == "upstream_queued" {
 			return "上游模型正在排队，请稍后重试或选择其他模型", kind
 		}
+		if kind == ErrTypeCallCount {
+			return "上游调用次数受限，请稍后重试", kind
+		}
 		if kind == ErrTypeWorkspaceQuota {
 			return "上游工作区分配额度已用尽，请检查工作区配额或稍后重试", kind
 		}
@@ -212,7 +216,7 @@ func NewStreamBusinessError(detail string) *UpstreamError {
 	if kind := resourceFailure(detail, 0); kind != "" {
 		msg, _ := FriendlyUpstreamError(0, detail)
 		status := 403
-		if kind == "upstream_queued" || kind == ErrTypeWorkspaceQuota {
+		if kind == "upstream_queued" || kind == ErrTypeWorkspaceQuota || kind == ErrTypeCallCount {
 			status = 429
 		}
 		return &UpstreamError{Status: status, Detail: detail, ErrType: kind, Message: msg}
@@ -241,10 +245,10 @@ func resourceFailure(detail string, depth int) string {
 	if len(detail) > 65536 {
 		return ""
 	}
-	resource, queued, workspace := false, false, false
+	resource, countLimited, queued, workspace := false, false, false, false
 	nodes := 64
-	var walk func(string, int)
-	walk = func(text string, level int) {
+	var walk func(string, int, bool)
+	walk = func(text string, level int, inLimit bool) {
 		if level > 4 || nodes <= 0 || len(text) > 65536 {
 			return
 		}
@@ -259,12 +263,16 @@ func resourceFailure(detail string, depth int) string {
 		}
 		var sub string
 		_ = json.Unmarshal(m["subCode"], &sub)
-		resource = resource || strings.EqualFold(strings.TrimSpace(sub), "RESOURCE_LIMIT")
-		var q bool
+		isResource := strings.EqualFold(strings.TrimSpace(sub), "RESOURCE_LIMIT")
+		isCount := strings.EqualFold(strings.TrimSpace(sub), "CALL_COUNT_LIMIT")
+		resource = resource || isResource
+		countLimited = countLimited || isCount
+		inLimit = inLimit || isResource || isCount
+		var q *bool
 		var wait float64
 		_ = json.Unmarshal(m["isQueued"], &q)
 		_ = json.Unmarshal(m["retryAfterSeconds"], &wait)
-		queued = queued || q || wait > 0
+		queued = queued || inLimit && (q != nil && *q || q == nil && wait > 0)
 		for _, key := range []string{"error", "message", "body", "data", "details"} {
 			raw := m[key]
 			if len(raw) == 0 {
@@ -277,15 +285,18 @@ func resourceFailure(detail string, depth int) string {
 			if key == "message" && strings.EqualFold(strings.TrimSpace(child), "Workspace allocated quota exceeded") {
 				workspace = true
 			}
-			walk(child, level+1)
+			walk(child, level+1, inLimit)
 		}
 	}
-	walk(detail, depth)
-	if resource && queued {
+	walk(detail, depth, false)
+	if (resource || countLimited) && queued {
 		return "upstream_queued"
 	}
 	if workspace {
 		return ErrTypeWorkspaceQuota
+	}
+	if countLimited {
+		return ErrTypeCallCount
 	}
 	if resource {
 		return "resource_limit"
@@ -332,7 +343,7 @@ func ErrorStatus(err error) int {
 			return 400
 		case ErrTypeTransient:
 			return 502
-		case "upstream_queued", ErrTypeWorkspaceQuota:
+		case "upstream_queued", ErrTypeWorkspaceQuota, ErrTypeCallCount:
 			return 429
 		case "resource_limit":
 			return 403
