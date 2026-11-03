@@ -69,7 +69,7 @@ func (s *Server) routeCatalog(ctx context.Context) []map[string]any {
 		contextKnown, outputKnown := true, true
 		for _, member := range route.Members {
 			m := catalog[member]
-			if m == nil {
+			if m == nil || m["model_type"] == "image" || m["model_type"] == "video" || m["model_type"] == "audio" {
 				continue
 			}
 			known++
@@ -134,7 +134,7 @@ func (s *Server) routeCandidates(p *Principal, route store.ModelRoute, payload m
 	out := []string{}
 	for _, member := range route.Members {
 		entry := catalog[member]
-		if entry == nil {
+		if entry == nil || entry["model_type"] == "image" || entry["model_type"] == "video" || entry["model_type"] == "audio" {
 			continue
 		}
 		resolved := s.o.resolveModel(member)
@@ -209,6 +209,9 @@ func (s *Server) adminModelRoutes(w http.ResponseWriter, r *http.Request) {
 	catalog := s.physicalCatalog()
 	models := []map[string]any{}
 	for id, entry := range catalog {
+		if entry["model_type"] == "image" || entry["model_type"] == "video" || entry["model_type"] == "audio" {
+			continue
+		}
 		models = append(models, map[string]any{"id": id, "name": entry["name"], "provider": entry["provider"], "vision": entry["vision"], "context_length": entry["context_length"], "max_output_tokens": entry["max_output_tokens"]})
 	}
 	sort.Slice(models, func(i, j int) bool { return str2(models[i]["id"]) < str2(models[j]["id"]) })
@@ -264,6 +267,10 @@ func (s *Server) adminSaveModelRoute(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		seen[m] = true
+		if entry := catalog[m]; entry != nil && (entry["model_type"] == "image" || entry["model_type"] == "video" || entry["model_type"] == "audio") {
+			writeAPIErr(w, errBody(400, "聊天合并路由不支持媒体生成模型", "invalid_request_error"))
+			return
+		}
 		// Keep previously configured temporarily unavailable members during edits.
 		retained := false
 		if existing != nil {

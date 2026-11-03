@@ -14,6 +14,7 @@ const (
 	ProtocolChat      Protocol = "chat"
 	ProtocolAnthropic Protocol = "anthropic"
 	ProtocolResponses Protocol = "responses"
+	ProtocolSystemOne Protocol = "systemone"
 )
 
 // CatalogModel is one namespaced model a provider contributes to /v1/models.

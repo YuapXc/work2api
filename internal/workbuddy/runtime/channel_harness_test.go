@@ -202,3 +202,78 @@ func TestHarnessGUICompatibilityAcrossProtocols(t *testing.T) {
 		}
 	}
 }
+
+func TestMediaVideoParametersPreserveInputAndRespectCatalog(t *testing.T) {
+	entry := map[string]any{"video_generation": map[string]any{"minSeconds": float64(3), "maxSeconds": float64(15), "defaultSeconds": float64(5), "defaultResolution": "720P", "resolutions": []any{"720P", "1080P"}, "aspectRatios": []any{"16:9", "1:1"}, "defaultAspectRatio": "16:9"}}
+	p := map[string]any{"prompt": "test", "seconds": "3", "resolution": "720p", "image_url": "https://example.invalid/frame.png"}
+	before, _ := json.Marshal(p)
+	body, err := buildMediaBody("video", "movie", p, entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extra := body["extra_parameters"].(map[string]any)
+	if body["seconds"] != float64(3) || extra["resolution"] != "720P" || extra["aspect_ratio"] != nil || body["watermark"] != true {
+		t.Fatal(body)
+	}
+	after, _ := json.Marshal(p)
+	if string(before) != string(after) {
+		t.Fatal("caller payload mutated")
+	}
+	p["seconds"] = float64(2)
+	if _, err := buildMediaBody("video", "movie", p, entry); err == nil {
+		t.Fatal("unsupported duration accepted")
+	}
+	p["seconds"] = float64(3)
+	p["resolution"] = "4K"
+	if _, err := buildMediaBody("video", "movie", p, entry); err == nil {
+		t.Fatal("unsupported resolution accepted")
+	}
+	if _, err := buildMediaBody("image-edit", "hunyuan-image-alpha-edit", map[string]any{"prompt": "test", "image": []any{"file:///private/image.png"}}, nil); err == nil {
+		t.Fatal("server file reference accepted")
+	}
+	if _, err := buildMediaBody("image", "hunyuan-image-alpha", map[string]any{"prompt": "test", "response_format": "b64_json"}, nil); err == nil {
+		t.Fatal("unsupported output format silently accepted")
+	}
+}
+
+func TestMediaImageModelBranchesMatchReference(t *testing.T) {
+	for _, name := range []string{"hunyuan-image-alpha", "gemini-image", "hy-image-3.5"} {
+		b, err := buildMediaBody("image", name, map[string]any{"prompt": "test", "quality": "high"}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if name == "hy-image-3.5" {
+			if b["response_format"] != "b64_json" || b["quality"] != "high" {
+				t.Fatal(b)
+			}
+		} else if b["quality"] != nil || b["response_format"] != nil {
+			t.Fatal("model branch contaminated", b)
+		}
+	}
+}
+
+func TestMediaVideoReferenceMaterialsFollowOfficialWire(t *testing.T) {
+	entry := map[string]any{"video_generation": map[string]any{"minSeconds": float64(4), "maxSeconds": float64(15), "maxReferenceImages": float64(9), "maxReferenceVideos": float64(3), "maxReferenceAudios": float64(3), "maxReferenceMaterials": float64(12), "allowMixedReferenceMaterials": true, "framesExclusiveWithReferenceMaterials": true, "referenceAudioRequiresVisualMaterial": true, "audioMode": "always-on"}}
+	p := map[string]any{"prompt": "", "seconds": float64(4), "reference_images": []any{"https://example.invalid/a.png"}, "reference_audios": []any{"https://example.invalid/a.wav"}}
+	b, err := buildMediaBody("video", "minimax-video-h3", p, entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs := b["reference_images"].([]any)
+	if refs[0].(map[string]any)["image_url"] != "https://example.invalid/a.png" {
+		t.Fatal(b)
+	}
+	if b["extra_parameters"].(map[string]any)["enable_audio"] != true {
+		t.Fatal(b)
+	}
+	p["image_url"] = "https://example.invalid/frame.png"
+	if _, err = buildMediaBody("video", "minimax-video-h3", p, entry); err == nil {
+		t.Fatal("incompatible frames and references accepted")
+	}
+	delete(p, "image_url")
+	delete(p, "reference_images")
+	p["prompt"] = "test"
+	if _, err = buildMediaBody("video", "minimax-video-h3", p, entry); err == nil {
+		t.Fatal("reference audio without visual material accepted")
+	}
+}

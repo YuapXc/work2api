@@ -21,6 +21,9 @@ async function copyModelName() {
   }
 }
 const pm = computed(() => providerMeta(props.provider))
+const media = computed(() => ['image', 'video', 'audio'].includes(m.value.model_type))
+const video = computed(() => m.value.video_generation || {})
+const mediaTags = computed(() => (m.value.media_tags || []).map((t: string) => ({'text-to-image':'文生图','image-to-image':'图片编辑','text-to-video':'文生视频','image-to-video':'图生视频','audio-to-text':'音频转写'} as Record<string,string>)[t]).filter(Boolean))
 const multimodal = computed(() => m.value.modality === 'multimodal' || m.value.vision || m.value.supports_image)
 const reasoning = computed(() => {
   const value = m.value.reasoning
@@ -61,6 +64,8 @@ const displayCredits = computed(() => {
 })
 
 const costMetric = computed(() => {
+  if (media.value) return { value: '-', label: '实际消费', title: '按生成结果返回的实际积分记录，不将未知价格当作免费。' }
+
   if (props.provider === 'qoder') return {
     value: finiteCost(m.value.price_factor) ? `×${m.value.price_factor}` : '-',
     label: '成本系数',
@@ -130,7 +135,8 @@ const systemOne = computed(() => String(m.value.native_protocol || '').toLowerCa
     </div>
 
     <div class="model-card-section model-card-capabilities flex flex-wrap content-start items-start gap-1.5">
-      <WTag :tone="multimodal ? 'route' : 'muted'">{{ multimodal ? '多模态' : m.vision === false && m.vision_verified !== false ? '文本' : '图片能力待确认' }}</WTag>
+      <WTag v-for="tag in mediaTags" :key="tag" tone="route">{{ tag }}</WTag>
+      <WTag v-if="!media" :tone="multimodal ? 'route' : 'muted'">{{ multimodal ? '多模态' : m.vision === false && m.vision_verified !== false ? '文本' : '图片能力待确认' }}</WTag>
       <WTag v-if="reasoningTag" :tone="reasoningTag.tone">{{ reasoningTag.text }}</WTag>
       <WTag v-if="m.supportsToolCall === true || m.tool_call === true" tone="live">工具调用</WTag>
       <WTag v-if="m.tool_response_multimodal === true" tone="route" title="上游目录声明支持包含图片的工具结果">工具结果图片</WTag>
@@ -139,7 +145,7 @@ const systemOne = computed(() => String(m.value.native_protocol || '').toLowerCa
       <WTag v-if="m.catalog_source === 'fallback'" tone="warn" title="尚未获取当前账号的可用模型目录，仅列出保守候选；实际权限以上游为准">目录待验证</WTag>
       <WTag v-else-if="m.catalog_stale" tone="warn" title="目录刷新失败，暂时保留当前账号上次成功获取的结果">目录缓存过期</WTag>
       <WTag v-if="m.pricing_stale" tone="warn" title="参考价格缓存已过期，实际计费以上游账单为准">价格缓存过期</WTag>
-      <WTag v-if="systemOne" tone="warn" title="仅 SystemOne 决策协议，不能用普通聊天/消息/Responses 接口调用">SystemOne</WTag>
+      <WTag v-if="systemOne" tone="warn" title="仅支持原生 SystemOne 决策结构，建议使用 /v1/systemone 专用入口">SystemOne</WTag>
     </div>
 
     <div v-if="efforts.length" class="model-card-section model-card-efforts flex flex-wrap content-start items-center gap-1">
@@ -153,7 +159,13 @@ const systemOne = computed(() => String(m.value.native_protocol || '').toLowerCa
       >{{ e }}</span>
     </div>
 
-    <div class="model-card-section model-card-metrics">
+    <div v-if="media" class="model-card-section model-card-metrics border-t border-line pt-2.5 text-micro text-muted space-y-1.5">
+      <div v-if="video.resolutions?.length">分辨率 <span class="mono text-ink">{{ video.resolutions.join(' / ') }}</span></div>
+      <div v-if="video.minSeconds && video.maxSeconds">时长 <span class="mono text-ink">{{ video.minSeconds }}–{{ video.maxSeconds }} 秒</span><span v-if="video.defaultSeconds"> · 默认 {{ video.defaultSeconds }} 秒</span></div>
+      <div v-if="video.aspectRatios?.length">画幅 <span class="mono">{{ video.aspectRatios.join(' / ') }}</span></div>
+      <div>实际消费 <span class="mono text-ink">—</span></div>
+    </div>
+    <div v-else class="model-card-section model-card-metrics">
       <div class="grid grid-cols-3 items-start gap-2 border-t border-line pt-2.5 text-center">
         <div>
           <div class="mono text-small font-semibold text-ink">{{ ctx ? int(ctx) : '—' }}</div>
@@ -177,7 +189,7 @@ const systemOne = computed(() => String(m.value.native_protocol || '').toLowerCa
       <!-- SystemOne 模型用法提示：这类模型只接受结构化决策 payload，普通聊天/消息/
            Responses 调用会被上游 400，明确标注避免误用。 -->
       <div v-if="systemOne" class="rounded-lg border border-warn/30 bg-warn/5 px-2.5 py-1.5 text-micro leading-relaxed text-warn">
-        仅 <span class="mono">SystemOne</span> 决策协议模型：无法用聊天 / 消息 / Responses 接口调用（会返回 400），需按 SystemOne 结构化 payload 请求。
+        仅 <span class="mono">SystemOne</span> 决策协议模型：请使用 /v1/systemone 提交原生 state 和 questions；普通聊天消息不能转换成决策请求。
       </div>
 
       <div v-if="provider === 'opencode' && (finiteCost(m.input_cost) || finiteCost(m.output_cost))" class="text-micro leading-relaxed text-faint">Zen 参考价 · USD / 百万 tokens<span v-if="m.tier === 'go'">；Go 订阅额度另计</span></div>

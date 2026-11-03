@@ -8,6 +8,7 @@ import { toast } from '@/lib/toast'
 const props = defineProps<{ model: Record<string, any>; provider: string }>()
 const m = computed(() => props.model)
 const accounts = computed(() => (m.value.accounts || []) as any[])
+const media = computed(() => ['image', 'video', 'audio'].includes(m.value.model_type))
 const systemOne = computed(() => String(m.value.native_protocol || '').toLowerCase() === 'systemone')
 // ---- 一键测试（单模型单次）----
 // 不做批量：一次只测一个模型，prompt 可编辑（默认 hi），max_tokens 上限 64。
@@ -24,7 +25,7 @@ const testing = ref(false)
 const testPrompt = ref('')
 
 async function runTest() {
-  if (testing.value || systemOne.value) return
+  if (testing.value || systemOne.value || media.value) return
   testing.value = true
   testResult.value = null
   try {
@@ -43,8 +44,10 @@ async function runTest() {
 <template>
   <ModelInfoCard v-bind="props">
     <template #actions>
+      <div v-if="systemOne" class="border-t border-line pt-2.5 text-right"><RouterLink :to="{path:'/media',query:{mode:'decision',model:m.id}}" class="text-small text-brand">打开决策工作台</RouterLink></div>
+      <div v-if="media" class="border-t border-line pt-2.5 flex items-center justify-between gap-3"><span class="text-micro text-muted">按生成结果结算</span><RouterLink :to="{path:'/media',query:{mode:m.model_type==='audio'?'transcription':m.model_type==='video'?'video':(m.media_tags || []).includes('text-to-image')?'image':'edit',model:m.id}}" class="text-small text-brand whitespace-nowrap">打开工作台</RouterLink></div>
       <!-- 一键测试：SystemOne 模型不支持聊天调用，不提供按钮。结果显示在下方。 -->
-      <div v-if="!systemOne" class="border-t border-line pt-2.5">
+      <div v-if="!systemOne && !media" class="border-t border-line pt-2.5">
         <div class="flex items-center gap-2">
           <WButton size="sm" variant="ghost" :loading="testing" @click="runTest">
             <WIcon v-if="!testing" name="bolt" :size="14" /> 测试

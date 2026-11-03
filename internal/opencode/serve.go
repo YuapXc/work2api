@@ -21,6 +21,8 @@ func externalProtocol(p provider.Protocol) protocol.Protocol {
 	switch p {
 	case provider.ProtocolAnthropic:
 		return protocol.Anthropic
+	case provider.ProtocolSystemOne:
+		return protocol.SystemOne
 	case provider.ProtocolResponses:
 		return protocol.Responses
 	default:
@@ -62,6 +64,11 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 		return provider.UsageReport{Status: "error", Error: err.Error()}, nil
 	}
 
+	if external == protocol.SystemOne && route.Protocol != protocol.SystemOne {
+		msg := "该模型不使用 SystemOne 决策协议"
+		protocol.WriteError(w, external, http.StatusBadRequest, msg, "invalid_request_error", "model")
+		return provider.UsageReport{Status: "error", Error: msg}, nil
+	}
 	stream := jsonutil.BoolAt(payload, "stream")
 	ids := deriveCallerRequestIDs(req)
 	accountUID := ""

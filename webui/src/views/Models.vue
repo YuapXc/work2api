@@ -128,9 +128,11 @@ const providerOptions = computed(() => {
 const filtered = computed(() =>
   entries.value.filter((e) => {
     if (providerFilter.value && e.provider !== providerFilter.value) return false
-    const isMulti = e.model.modality === 'multimodal' || e.model.vision || e.model.supports_image
+    const media = ['image', 'video', 'audio'].includes(e.model.model_type)
+    if (['image', 'video', 'audio'].includes(modalityFilter.value) && e.model.model_type !== modalityFilter.value) return false
+    const isMulti = !media && e.model.modality === 'multimodal' || e.model.vision || e.model.supports_image
     if (modalityFilter.value === 'multimodal' && !isMulti) return false
-    if (modalityFilter.value === 'text' && (isMulti || e.model.vision_verified === false)) return false
+    if (modalityFilter.value === 'text' && (media || isMulti || e.model.vision_verified === false)) return false
     if (modalityFilter.value === 'unknown' && e.model.vision_verified !== false) return false
     const q = search.value.trim().toLowerCase()
     if (q) {
@@ -193,7 +195,7 @@ onBeforeUnmount(() => { loadVersion++ })
         <WSelect v-model="providerFilter" :options="providerOptions" placeholder="全部供应商" class="w-40" />
         <WSelect
           v-model="modalityFilter"
-          :options="[{ value: 'text', label: '纯文本' }, { value: 'multimodal', label: '多模态' }, { value: 'unknown', label: '能力待确认' }]"
+          :options="[{ value: 'text', label: '纯文本' }, { value: 'multimodal', label: '多模态' }, { value: 'unknown', label: '能力待确认' }, { value: 'image', label: '图片生成' }, { value: 'video', label: '视频生成' }, { value: 'audio', label: '音频转写' }]"
           placeholder="全部模态"
           class="w-32"
         />

@@ -560,3 +560,28 @@ func TestRefreshFeedbackPartialFailureRevocationAndCancellableLock(t *testing.T)
 	cancel()
 	r.refreshMu.Unlock()
 }
+
+func TestMediaModelsOutsideChatWhitelistRemainTypedAndUnpriced(t *testing.T) {
+	p := pool.New(map[string]pool.Credential{"a": catalogTestCredential{profile: "cn-cli"}}, "")
+	r := NewWithCatalogClient(p, nil, &http.Client{Transport: isolatedCatalogTransport(func(req *http.Request) (*http.Response, error) {
+		return catalogResponse(req, 200, `{"code":0,"data":{"agents":[{"name":"cli","models":["chat"]}],"models":[{"id":"chat","credits":0},{"id":"draw","tags":["text-to-image"]},{"id":"movie","tags":["text-to-video"],"videoGeneration":{"minSeconds":3,"maxSeconds":15,"resolutions":["720P"]}}]}}`), nil
+	})})
+	r.Refresh()
+	for id, kind := range map[string]string{"draw": "image", "movie": "video"} {
+		m, _ := r.CachedModel(id)
+		if m == nil || m["model_type"] != kind || m["vision"] != false || m["credits"] != nil {
+			t.Fatalf("invalid media metadata: %#v", m)
+		}
+		if len(r.CreditsByRegion(id)) != 0 {
+			t.Fatal("unknown media price became free")
+		}
+		own := r.AccountMedia("a", id)
+		if own == nil {
+			t.Fatal("missing account capability")
+		}
+		own["model_type"] = "mutated"
+		if r.AccountMedia("a", id)["model_type"] != kind {
+			t.Fatal("shared account metadata mutated")
+		}
+	}
+}

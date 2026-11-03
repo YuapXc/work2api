@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"work2api/internal/config"
 	"work2api/internal/core/provider"
 	"work2api/internal/workbuddy/credentials"
@@ -36,6 +37,9 @@ func (r *Runtime) RefreshModels(ctx context.Context) error {
 	})
 }
 func (r *Runtime) PrepareRequest(ctx context.Context, req provider.ServeRequest) (context.Context, func(), error) {
+	if model, _ := r.Catalog.CachedModel(strings.TrimPrefix(ToStr(req.Payload["model"]), "workbuddy/")); model != nil && (model["model_type"] == "image" || model["model_type"] == "video" || model["model_type"] == "audio") {
+		return ctx, func() {}, errBody(400, "该模型用于媒体生成，请使用图片或视频接口", "invalid_request_error")
+	}
 	if err := upstream.ValidateChoiceCount(req.Payload); err != nil {
 		return ctx, func() {}, errBody(400, "WorkBuddy 仅支持 n=1；并行 Agent 请分别发送独立请求", "invalid_request_error")
 	}

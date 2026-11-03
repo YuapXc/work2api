@@ -63,7 +63,7 @@ func appChannelCosts(db *sql.DB, apps []App) error {
 		ELSE 'unknown' END AS provider,
 		COALESCE(SUM(credits),0), COUNT(CASE WHEN credits IS NULL THEN 1 END)=0,
 		COUNT(*), COALESCE(SUM(total_tokens),0), COUNT(CASE WHEN tokens_known=0 THEN 1 END)=0, COUNT(credits)
-		FROM (SELECT u.app_id, COALESCE(NULLIF(json_extract(diagnostics,'$.physical_model'),''),model) AS physical, credits, total_tokens, tokens_known
+		FROM (SELECT u.app_id, COALESCE(NULLIF(json_extract(diagnostics,'$.physical_model'),''),model) AS physical, credits, total_tokens, CASE WHEN protocol IN ('image','video','audio') THEN 1 ELSE tokens_known END AS tokens_known
 		FROM apps a JOIN usage_logs u ON u.app_id=a.id AND COALESCE(u.user_id,0)=COALESCE(a.user_id,0) WHERE a.id IN (`+strings.Join(marks, ",")+`))
 		GROUP BY app_id,provider ORDER BY app_id,provider`, ids...)
 	if err != nil {
@@ -607,6 +607,6 @@ func (d *DB) UserDailyUsageKnown(userID int64, since float64) (bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	var known bool
-	err := d.db.QueryRow("SELECT NOT EXISTS(SELECT 1 FROM usage_logs WHERE user_id=? AND ts>=? AND tokens_known=0)", userID, since).Scan(&known)
+	err := d.db.QueryRow("SELECT NOT EXISTS(SELECT 1 FROM usage_logs WHERE user_id=? AND ts>=? AND tokens_known=0 AND protocol NOT IN ('image','video','audio'))", userID, since).Scan(&known)
 	return known, err
 }

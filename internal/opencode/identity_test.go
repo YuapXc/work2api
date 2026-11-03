@@ -187,3 +187,9 @@ func TestClaudeSessionHeaderAndAuthenticatedIsolation(t *testing.T) {
 		t.Fatal("unbounded session accepted")
 	}
 }
+
+func TestSystemOneExternalProtocolIsNotChat(t *testing.T) {
+	if externalProtocol(provider.ProtocolSystemOne) != protocol.SystemOne {
+		t.Fatal("decision protocol downgraded to chat")
+	}
+}

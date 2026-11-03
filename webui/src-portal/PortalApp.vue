@@ -4,6 +4,7 @@
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, PortalAPIError, type Me } from './api'
+import WConfirm from '../src/components/ui/WConfirm.vue'
 import WToaster from '../src/components/ui/WToaster.vue'
 import WButton from '../src/components/ui/WButton.vue'
 import WInput from '../src/components/ui/WInput.vue'
@@ -100,6 +101,7 @@ async function logout() {
 
 const nav = [
   { key: '/', label: '首页' },
+  { key: '/media', label: '工作台' },
   { key: '/keys', label: 'API 密钥' },
   { key: '/models', label: '可用模型' },
   { key: '/contribute', label: '我的账号' },
@@ -217,5 +219,6 @@ onUnmounted(() => { disposed = true; window.removeEventListener('focus', refresh
     <main class="mx-auto w-full max-w-4xl flex-1 px-4 py-6"><p v-if="connectionError" class="mb-4 text-micro text-fault">{{ connectionError }} <button class="text-brand hover:underline" @click="probe">重试连接</button></p><section v-if="me.user.must_change_password" class="glass mx-auto max-w-md rounded-xl p-6 space-y-4"><h1 class="font-semibold">设置个人密码</h1><PasswordChangeForm :change="api.changePassword" forced @done="probe" /></section><router-view v-else :me="me" @refresh="probe" /></main>
   </div>
 
+  <WConfirm />
   <WToaster />
 </template>

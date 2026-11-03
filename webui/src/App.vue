@@ -20,6 +20,7 @@ const nav = [
   { key: '/overview', label: '概览', icon: 'overview' },
   { key: '/accounts', label: '账号', icon: 'accounts' },
   { key: '/models', label: '模型', icon: 'models' },
+  { key: '/media', label: '工作台', icon: 'models' },
   { key: '/keys', label: 'API 密钥', icon: 'keys' },
   { key: '/traffic', label: '流量', icon: 'traffic' },
   { key: '/settings', label: '设置', icon: 'settings' },

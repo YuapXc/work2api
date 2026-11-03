@@ -129,3 +129,51 @@ func TestReadOnlyCheckReusesFreshBillingWithoutEnablingAccount(t *testing.T) {
 		t.Fatal("fresh check made extra requests or enabled account", result)
 	}
 }
+
+func TestMediaLostResponseIsNotReplayedAndDispatchIsRechecked(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "media.info")
+	raw := fmt.Sprintf(`{"auth":{"accessToken":"fixture","domain":"www.codebuddy.cn","expiresAt":%d},"account":{"uid":"media"}}`, time.Now().Add(time.Hour).UnixMilli())
+	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mgr := credentials.NewManager(path)
+	calls := 0
+	r := &Runtime{Managers: map[string]*credentials.Manager{"media": mgr}, Pool: pool.New(map[string]pool.Credential{"media": mgr}, "")}
+	r.MediaClient = &http.Client{Transport: maintenanceTransport(func(req *http.Request) (*http.Response, error) { calls++; return nil, io.ErrUnexpectedEOF })}
+	request := provider.MediaRequest{Operation: "video", Model: "movie", AccountID: "media", Payload: map[string]any{"model": "movie", "prompt": "test"}}
+	if _, err := r.CallMedia(context.Background(), request); err == nil || calls != 1 {
+		t.Fatal("submission replayed", err, calls)
+	}
+	ctx := provider.WithInvocation(context.Background(), provider.Invocation{Check: func(context.Context, provider.AccountRef, string) error { return errors.New("revoked") }})
+	if _, err := r.CallMedia(ctx, request); err == nil || calls != 1 {
+		t.Fatal("revoked request reached network", err, calls)
+	}
+}
+
+func TestTranscriptionUploadSeparatesStorageAuthorization(t *testing.T) {
+	r := &Runtime{}
+	calls := []string{}
+	r.MediaClient = &http.Client{Transport: maintenanceTransport(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, req.Method+" "+req.URL.Host+req.URL.Path)
+		body := `{"code":0,"data":{"items":[{"upload_url":"https://bucket.cos.ap-beijing.myqcloud.com/upload","download_url":"https://bucket.cos.ap-beijing.myqcloud.com/audio.wav"}]}}`
+		if req.Method == "PUT" {
+			if req.Header.Get("Authorization") != "" || req.Header.Get("X-User-Id") != "" {
+				t.Fatal("account credential leaked to object storage")
+			}
+			body = ""
+		} else if req.Header.Get("Authorization") != "Bearer fixture" {
+			t.Fatal("presign missing auth")
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}, nil
+	})}
+	u, err := r.uploadMediaInput(context.Background(), "https://copilot.tencent.com", map[string]string{"Authorization": "Bearer fixture"}, map[string]any{"data": "UklGRg==", "mime": "audio/wav"})
+	if err != nil || !strings.HasSuffix(u, "audio.wav") || len(calls) != 2 {
+		t.Fatal(u, calls, err)
+	}
+	r.MediaClient = &http.Client{Transport: maintenanceTransport(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"code":0,"data":{"items":[{"upload_url":"https://127.0.0.1/upload","download_url":"https://127.0.0.1/file"}]}}`))}, nil
+	})}
+	if _, err = r.uploadMediaInput(context.Background(), "https://copilot.tencent.com", nil, map[string]any{"data": "UklGRg==", "mime": "audio/wav"}); err == nil {
+		t.Fatal("unsafe storage origin accepted")
+	}
+}

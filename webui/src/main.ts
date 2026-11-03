@@ -23,6 +23,7 @@ const router = createRouter({
     { path: '/accounts', component: () => import('./views/Accounts.vue'), meta: { title: '账号' } },
     { path: '/models/routes', component: () => import('./views/ModelRoutes.vue'), meta: { title: '统一模型' } },
     { path: '/models', component: () => import('./views/Models.vue'), meta: { title: '模型' } },
+    { path: '/media', component: () => import('./views/Media.vue'), meta: { title: '非聊天工作台' } },
     { path: '/keys', component: () => import('./views/Keys.vue'), meta: { title: 'API 密钥' } },
     { path: '/traffic', component: () => import('./views/Traffic.vue'), meta: { title: '流量' } },
     { path: '/settings', component: () => import('./views/Settings.vue'), meta: { title: '设置' } },

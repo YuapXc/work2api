@@ -74,17 +74,18 @@ type Registry struct {
 	db          Settings
 	client      *http.Client
 
-	refreshMu    sync.Mutex
-	mu           sync.Mutex
-	models       []map[string]any
-	modelIndex   map[string]map[string]any
-	accountCosts map[[2]string]map[string]float64
-	promotions   map[[2]string]promotionSnapshot
-	reasoning    map[string]map[string]any
-	fetchedAt    float64
-	lastFail     float64
-	stale        bool
-	source       string
+	refreshMu     sync.Mutex
+	mu            sync.Mutex
+	models        []map[string]any
+	modelIndex    map[string]map[string]any
+	accountCosts  map[[2]string]map[string]float64
+	mediaAccounts map[string]map[string]map[string]any
+	promotions    map[[2]string]promotionSnapshot
+	reasoning     map[string]map[string]any
+	fetchedAt     float64
+	lastFail      float64
+	stale         bool
+	source        string
 	// catalogCache 按 (profile, uid, url) 保存各来源的成功快照：单一路失败
 	// 不砍掉另一来源的专属模型（上游 0.6.3 _catalog_cache 同款）。
 	catalogCache map[[3]string][]fetchedModel
@@ -758,6 +759,23 @@ func (r *Registry) fetchOneContext(ctx context.Context, account *pool.Account) [
 	for _, id := range order {
 		out = append(out, merged[id])
 	}
+	if capable, ok := account.Mgr.(interface{ SupportsTranscription() bool }); ok && capable.SupportsTranscription() {
+		builtin := entry("wb-asr", "音频转写", 0, 0)
+		builtin["model_type"] = "audio"
+		builtin["media_tags"] = []any{"audio-to-text"}
+		builtin["capability_source"] = "official_cli_protocol"
+		builtin["profile"] = account.Profile
+		builtin["reasoning"] = map[string]any{}
+		found := false
+		for _, m := range out {
+			if m.id == "wb-asr" {
+				found = true
+			}
+		}
+		if !found {
+			out = append(out, fetchedModel{id: "wb-asr", entry: builtin, reasoning: map[string]any{}, fresh: true})
+		}
+	}
 	costs := map[string]float64{}
 	for _, model := range out {
 		if cost, ok := model.entry["credits"].(float64); ok && cost >= 0 && !math.IsNaN(cost) && !math.IsInf(cost, 0) {
@@ -769,6 +787,16 @@ func (r *Registry) fetchOneContext(ctx context.Context, account *pool.Account) [
 		r.accountCosts = map[[2]string]map[string]float64{}
 	}
 	r.accountCosts[[2]string{account.Profile, account.UID}] = costs
+	if r.mediaAccounts == nil {
+		r.mediaAccounts = map[string]map[string]map[string]any{}
+	}
+	media := map[string]map[string]any{}
+	for _, m := range out {
+		if m.entry["model_type"] != nil {
+			media[m.id] = cloneModelEntry(m.entry)
+		}
+	}
+	r.mediaAccounts[account.UID] = media
 	r.mu.Unlock()
 	return out
 }
@@ -804,6 +832,18 @@ func (r *Registry) fetchCatalogURL(ctx context.Context, url string, headers map[
 			}
 		}
 	}
+	// Media capabilities are independent of the chat agent whitelist.
+	seenIDs := map[string]bool{}
+	for _, mid := range cliIDs {
+		seenIDs[str(mid)] = true
+	}
+	for _, raw := range modelsRaw {
+		m, _ := raw.(map[string]any)
+		if MediaKind(m) != "" && !seenIDs[str(m["id"])] {
+			cliIDs = append(cliIDs, m["id"])
+			seenIDs[str(m["id"])] = true
+		}
+	}
 	out := []fetchedModel{}
 	for _, midAny := range cliIDs {
 		mid := str(midAny)
@@ -820,6 +860,16 @@ func (r *Registry) fetchCatalogURL(ctx context.Context, url string, headers map[
 		for k, v := range extractCaps(m) {
 			e[k] = v
 		}
+		if kind := MediaKind(m); kind != "" {
+			e["model_type"] = kind
+			e["media_tags"] = m["tags"]
+			e["video_generation"] = cloneCatalogValue(m["videoGeneration"])
+			e["image_generation"] = cloneCatalogValue(m["imageGeneration"])
+			e["supportsToolCall"] = false
+			e["reasoning"] = map[string]any{}
+			reasoning = map[string]any{}
+		}
+		e = withStandardFields(e)
 		e["profile"] = account.Profile
 		out = append(out, fetchedModel{id: mid, entry: e, reasoning: reasoning})
 	}
@@ -895,6 +945,24 @@ func entry(mid, name string, ctx, maxtok int) map[string]any {
 }
 
 func withStandardFields(e map[string]any) map[string]any {
+	if kind, _ := e["model_type"].(string); kind == "image" || kind == "video" || kind == "audio" {
+		e["vision"], e["image"], e["supports_image"] = false, false, false
+		e["modalities"] = []string{"text"}
+		e["input_modalities"] = []string{"text"}
+		if tags, ok := e["media_tags"].([]any); ok {
+			for _, tag := range tags {
+				if tag == "image-to-image" || tag == "image-to-video" {
+					e["input_modalities"] = []string{"text", "image"}
+				}
+			}
+		}
+		e["output_modalities"] = []string{kind}
+		if kind == "audio" {
+			e["input_modalities"] = []string{"audio", "video"}
+			e["output_modalities"] = []string{"text"}
+		}
+		return e
+	}
 	multimodal := e["modality"] == "multimodal"
 	if si, ok := e["supportsImages"].(bool); ok && si {
 		multimodal = true
@@ -1108,4 +1176,26 @@ func cloneCatalogValue(v any) any {
 	default:
 		return v
 	}
+}
+
+func MediaKind(m map[string]any) string {
+	tags, _ := m["tags"].([]any)
+	for _, value := range tags {
+		switch value {
+		case "text-to-video", "image-to-video":
+			return "video"
+		case "text-to-image", "image-to-image":
+			return "image"
+		}
+	}
+	return ""
+}
+
+func (r *Registry) AccountMedia(uid, model string) map[string]any {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if m := r.mediaAccounts[uid][model]; m != nil {
+		return cloneModelEntry(m)
+	}
+	return nil
 }

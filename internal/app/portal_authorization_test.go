@@ -7,11 +7,15 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"work2api/internal/workbuddy/credentials"
 	wbruntime "work2api/internal/workbuddy/runtime"
 
+	"work2api/internal/core/provider"
 	"work2api/internal/portal/portalauth"
 	"work2api/internal/store"
 	"work2api/internal/workbuddy/models"
@@ -744,4 +748,200 @@ func (portalCatalogTransport) RoundTrip(r *http.Request) (*http.Response, error)
 	}
 	body, _ := json.Marshal(map[string]any{"data": map[string]any{"models": items, "agents": []map[string]any{{"name": "cli", "models": ids}}}})
 	return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(string(body))), Request: r}, nil
+}
+
+type mediaAppTransport func(*http.Request) (*http.Response, error)
+
+func (f mediaAppTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestMediaHTTPTaskOwnershipAndSingleSubmit(t *testing.T) {
+	s, user := portalFixture(t)
+	path := filepath.Join(t.TempDir(), "account.info")
+	raw := fmt.Sprintf(`{"auth":{"accessToken":"fixture","domain":"www.codebuddy.cn","expiresAt":%d},"account":{"uid":"media-account"}}`, time.Now().Add(time.Hour).UnixMilli())
+	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mgr := credentials.NewManager(path)
+	s.o.wb.SetManager("media-account", mgr)
+	s.o.wb.Pool = pool.New(map[string]pool.Credential{"media-account": mgr}, "")
+	submissions, queries := 0, 0
+	transport := mediaAppTransport(func(r *http.Request) (*http.Response, error) {
+		body := `{"code":0,"data":{"agents":[{"name":"cli","models":[]}],"models":[{"id":"movie","tags":["text-to-video"],"videoGeneration":{"defaultSeconds":3,"minSeconds":3,"maxSeconds":15}},{"id":"draw","tags":["text-to-image"]},{"id":"edit","tags":["image-to-image"]}]}}`
+		switch r.URL.Path {
+		case "/v2/videos/generations":
+			submissions++
+			body = `{"code":0,"data":{"id":"upstream-task"}}`
+		case "/v2/images/generations", "/v2/images/edits":
+			var p map[string]any
+			json.NewDecoder(r.Body).Decode(&p)
+			if r.URL.Path == "/v2/images/edits" {
+				images, ok := p["image"].([]any)
+				if !ok || len(images) != 1 {
+					t.Fatal("edit images lost", p)
+				}
+			}
+			body = `{"code":0,"data":{"created":1,"data":[{"url":"https://example.invalid/image.png"}],"usage":{"credit":5.71}}}`
+		case "/v2/async/tasks/create":
+			body = `{"code":0,"data":{"task_id":"audio-upstream"}}`
+		case "/v2/async/tasks/query":
+			body = `{"code":0,"data":{"status":"completed","audio_transcription":{"text":"hello"},"usage":{"credit":0.01}}}`
+		case "/v2/videos/tasks":
+			queries++
+			var p map[string]any
+			json.NewDecoder(r.Body).Decode(&p)
+			if p["task_id"] != "upstream-task" {
+				t.Fatal(p)
+			}
+			body = `{"code":0,"data":{"status":"completed","data":[{"url":"https://example.invalid/video.mp4"}],"usage":{"credit":9.5,"output_tokens":180000}}}`
+		}
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	s.o.wb.Catalog = models.NewWithCatalogClient(s.o.wb.Pool, s.o.db, &http.Client{Transport: transport})
+	s.o.wb.Catalog.Refresh()
+	s.o.wb.MediaClient = &http.Client{Transport: transport}
+	defaults, _ := s.o.defaultModelAccess(map[string]string{})
+	if defaults["movie"] {
+		t.Fatal("unpriced movie auto-authorized")
+	}
+	for _, key := range []string{"media-owner", "media-other"} {
+		if _, err := s.o.db.CreateApp(key, s.o.hashKey(key), "", "", "", `["movie","draw","edit","wb-asr"]`, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.o.db.CreateApp("portal-media", s.o.hashKey("portal-media"), "", "", "", `["movie","wb-asr"]`, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	h := s.Handler()
+	request := func(method, path, body, key string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, "http://127.0.0.1"+path, strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer "+key)
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	w := request("POST", "/v1/videos", `{"model":"movie","prompt":"test"}`, "portal-media")
+	if w.Code != 403 {
+		t.Fatal("unowned model accepted", w.Code, w.Body.String())
+	}
+	w = request("POST", "/v1/chat/completions", `{"model":"movie","messages":[]}`, "media-owner")
+	if w.Code != 400 || submissions != 0 {
+		t.Fatal("media sent through chat", w.Code, w.Body.String())
+	}
+	w = request("POST", "/v1/videos", `{"model":"movie","prompt":"test"}`, "media-owner")
+	if w.Code != 202 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	var accepted map[string]any
+	json.Unmarshal(w.Body.Bytes(), &accepted)
+	id := accepted["id"].(string)
+	if w = request("GET", "/v1/videos/"+id, "", "media-other"); w.Code != 404 {
+		t.Fatal("task leaked across keys", w.Code)
+	}
+	for i := 0; i < 2; i++ {
+		w = request("GET", "/v1/videos/"+id, "", "media-owner")
+		if w.Code != 200 || !strings.Contains(w.Body.String(), "completed") {
+			t.Fatal(w.Code, w.Body.String())
+		}
+	}
+	if submissions != 1 || queries != 1 {
+		t.Fatal("task resubmitted or terminal query repeated", submissions, queries)
+	}
+	task, err := s.o.db.MediaTask(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := s.o.db.GetUsage(int(task.UsageID))
+	if err != nil || row["credits"] != 9.5 || row["status"] != "ok" {
+		t.Fatal(row, err)
+	}
+	w = request("POST", "/v1/images/generations", `{"model":"draw","prompt":"test"}`, "media-owner")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "5.71") {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	w = request("POST", "/v1/images/edits", `{"model":"edit","prompt":"test","image":["data:image/png;base64,aGVsbG8="]}`, "media-owner")
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	if _, err := s.o.db.CreateContribution(user.ID, "media-account", "workbuddy", "codebuddy", "private"); err != nil {
+		t.Fatal(err)
+	}
+	p, aerr := s.o.checkAPIKey("Bearer portal-media", "")
+	if aerr != nil || !p.PortalModels["movie"] {
+		t.Fatal("owner media permission missing", aerr)
+	}
+	w = request("POST", "/v1/audio/transcriptions", `{"model":"wb-asr","audio_url":"https://example.invalid/voice.wav","async":true}`, "portal-media")
+	if w.Code != 202 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	var audioAccepted map[string]any
+	json.Unmarshal(w.Body.Bytes(), &audioAccepted)
+	w = request("GET", "/v1/media/tasks/"+audioAccepted["id"].(string), "", "portal-media")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "hello") {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	w = request("GET", "/v1/media/tasks", "", "portal-media")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), audioAccepted["id"].(string)) {
+		t.Fatal("task list omitted owned audio", w.Code, w.Body.String())
+	}
+
+	if err := s.o.db.SetAppModels(task.AppID, `["draw"]`); err != nil {
+		t.Fatal(err)
+	}
+	w = request("GET", "/v1/videos/"+id, "", "media-owner")
+	if w.Code != 403 {
+		t.Fatal("cached task bypassed revoked model permission", w.Code)
+	}
+
+	if err := s.o.db.SaveSettings(map[string]string{"model_aliases": "cinema=movie"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.o.db.CreateApp("media-alias", s.o.hashKey("media-alias"), "", "", "", `["cinema"]`, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	w = request("POST", "/v1/videos", `{"model":"cinema","prompt":"test"}`, "media-alias")
+	if w.Code != 202 {
+		t.Fatal("alias-only key submit failed", w.Code, w.Body.String())
+	}
+	json.Unmarshal(w.Body.Bytes(), &accepted)
+	aliasID := accepted["id"].(string)
+	w = request("GET", "/v1/videos/"+aliasID, "", "media-alias")
+	if w.Code != 200 {
+		t.Fatal("alias-only key query failed", w.Code, w.Body.String())
+	}
+
+}
+
+type decisionFixtureRuntime struct{}
+
+func (*decisionFixtureRuntime) Name() string   { return "decisionfixture" }
+func (*decisionFixtureRuntime) Prefix() string { return "decisionfixture/" }
+func (*decisionFixtureRuntime) Ready() bool    { return true }
+func (*decisionFixtureRuntime) Models(context.Context) []provider.CatalogModel {
+	return []provider.CatalogModel{{ID: "decisionfixture/d", Extra: map[string]any{"native_protocol": "systemone"}}}
+}
+func (*decisionFixtureRuntime) Serve(ctx context.Context, req provider.ServeRequest) (provider.UsageReport, error) {
+	if req.Protocol != provider.ProtocolSystemOne {
+		return provider.UsageReport{}, fmt.Errorf("wrong protocol")
+	}
+	writeJSON(req.Writer, 200, map[string]any{"state": req.Payload["state"], "questions": req.Payload["questions"]})
+	return provider.UsageReport{Status: "ok"}, nil
+}
+func TestSystemOnePublicRoutePreservesDecisionPayload(t *testing.T) {
+	s, _ := portalFixture(t)
+	s.o.cfg.ModelLimitsDisabled = true
+	if err := s.o.runtimes.Register(&decisionFixtureRuntime{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.o.db.CreateApp("decision", s.o.hashKey("decision"), "", "", "", `["decisionfixture/d"]`, 0); err != nil {
+		t.Fatal(err)
+	}
+	h := s.Handler()
+	r := httptest.NewRequest("POST", "http://127.0.0.1/v1/systemone", strings.NewReader(`{"model":"decisionfixture/d","state":"keep","questions":[{"type":"boolean","question":"test"}]}`))
+	r.Header.Set("Authorization", "Bearer decision")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"state":"keep"`) || !strings.Contains(w.Body.String(), `"questions"`) {
+		t.Fatal(w.Code, w.Body.String())
+	}
 }

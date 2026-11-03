@@ -597,3 +597,103 @@ func TestUsageMaintenanceKeepsAccountingAndBoundsContent(t *testing.T) {
 		t.Fatal("row cleanup failed", n)
 	}
 }
+
+func TestMediaTaskPersistsAndTerminalUsageIsIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "media.db")
+	db, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := MediaTask{ID: "video_test", Provider: "workbuddy", AccountUID: "account", Model: "movie", Kind: "video", Metadata: map[string]any{"seconds": 3}}
+	if err = db.CreateMediaTask(task, "key"); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.UpdateMediaTask(task.ID, "upstream", "queued", map[string]any{"id": task.ID, "status": "queued"}, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	db, err = New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	saved, err := db.MediaTask(task.ID)
+	if err != nil || saved.UpstreamID != "upstream" {
+		t.Fatal(saved, err)
+	}
+	credit := 51.43
+	if err = db.UpdateMediaTask(task.ID, "upstream", "completed", map[string]any{"id": task.ID, "status": "completed"}, &credit, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.UpdateMediaTask(task.ID, "wrong", "in_progress", map[string]any{}, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	saved, err = db.MediaTask(task.ID)
+	if err != nil || saved.Status != "completed" || saved.UpstreamID != "upstream" {
+		t.Fatal(saved, err)
+	}
+	row, err := db.GetUsage(int(saved.UsageID))
+	if err != nil || row["status"] != "ok" || row["credits"] != credit {
+		t.Fatal(row, err)
+	}
+	count, _ := db.UsageRowCount()
+	if count != 1 {
+		t.Fatal("polling duplicated usage", count)
+	}
+}
+
+func TestMediaDoesNotInvalidateExistingKeyTokenTotals(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "media-key.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	id, err := db.CreateApp("key", "hash", "", "", "", "[]", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	known := true
+	credit := 1.0
+	if err = db.LogUsage(UsageParams{AppID: id, Model: "chat", Protocol: "chat", InputTokens: 10, OutputTokens: 5, TokensKnown: &known, Credits: &credit}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.CreateMediaTask(MediaTask{ID: "video", Provider: "workbuddy", AccountUID: "a", AppID: id, Model: "movie", Kind: "video"}, "key"); err != nil {
+		t.Fatal(err)
+	}
+	apps, err := db.ListApps()
+	if err != nil || len(apps) != 1 || apps[0].Tokens != 15 || !apps[0].TokensKnown {
+		t.Fatal(apps, err)
+	}
+}
+
+func TestMediaResultRetentionKeepsUsageAndTaskState(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "retention-media.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.CreateMediaTask(MediaTask{ID: "old", Provider: "workbuddy", AccountUID: "a", Model: "wb-asr", Kind: "audio"}, "key"); err != nil {
+		t.Fatal(err)
+	}
+	credit := 1.0
+	if err = db.UpdateMediaTask("old", "upstream", "completed", map[string]any{"text": "sensitive transcript"}, &credit, ""); err != nil {
+		t.Fatal(err)
+	}
+	db.mu.Lock()
+	_, err = db.db.Exec("UPDATE media_tasks SET updated_at=? WHERE id='old'", float64(time.Now().Add(-8*24*time.Hour).Unix()))
+	db.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = db.MaintainUsage(context.Background(), 90, 100000, 7, 512<<20); err != nil {
+		t.Fatal(err)
+	}
+	task, err := db.MediaTask("old")
+	if err != nil || task.Status != "completed" || task.Response["result_cleared"] != true || task.Response["text"] != nil {
+		t.Fatal(task, err)
+	}
+	row, err := db.GetUsage(int(task.UsageID))
+	if err != nil || row["credits"] != credit {
+		t.Fatal(row, err)
+	}
+}

@@ -40,7 +40,7 @@ func (b *bufferedRequestBody) Close() error {
 }
 
 func isModelRoute(r *http.Request) bool {
-	return r.Method == "POST" && (r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/responses")
+	return r.Method == "POST" && (r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/responses" || r.URL.Path == "/v1/systemone" || r.URL.Path == "/v1/images/generations" || r.URL.Path == "/v1/images/edits" || r.URL.Path == "/v1/videos" || r.URL.Path == "/v1/audio/transcriptions")
 }
 
 func isRefresh(r *http.Request) bool {

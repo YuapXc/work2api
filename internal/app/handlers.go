@@ -89,6 +89,22 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 		writeAPIErr(w, aerr)
 		return
 	}
+	if protocol == "systemone" {
+		rt, ok := s.o.runtimes.Resolve(principal.EffectiveModel)
+		supported := false
+		if ok && principal.RouteModel == "" {
+			for _, m := range rt.Models(r.Context()) {
+				if s.o.resolveModel(m.ID) == principal.EffectiveModel && m.Extra["native_protocol"] == "systemone" {
+					supported = true
+					break
+				}
+			}
+		}
+		if !supported {
+			writeAPIErr(w, errBody(400, "请选择原生 SystemOne 决策模型，不支持聊天模型或合并路由", "invalid_request_error"))
+			return
+		}
+	}
 	streamHint := false
 	if value, ok := payload["stream"]; ok {
 		streamHint = boolVal(value)
@@ -122,6 +138,8 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 	proto := provider.ProtocolAnthropic
 	if protocol == "responses" {
 		proto = provider.ProtocolResponses
+	} else if protocol == "systemone" {
+		proto = provider.ProtocolSystemOne
 	}
 	if s.dispatchRuntime(w, r, proto, payload, principal) {
 		return

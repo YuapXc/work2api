@@ -416,6 +416,9 @@ func (o *Runtime) pickForCaller(p *provider.Caller, model, key string) (*pool.Ac
 	return o.PickAccount(model, key)
 }
 func (o *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provider.UsageReport, error) {
+	if model, _ := o.Catalog.CachedModel(strings.TrimPrefix(ToStr(req.Payload["model"]), "workbuddy/")); model != nil && model["model_type"] != nil {
+		return provider.UsageReport{}, errBody(400, "该模型用于媒体生成，请使用图片或视频接口", "invalid_request_error")
+	}
 	ctx = upstream.WithParsedFrames(ctx)
 	caller := req.Caller
 	r := (&http.Request{Header: req.Headers}).WithContext(ctx)

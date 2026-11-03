@@ -143,6 +143,8 @@ type UsageParams struct {
 
 // UsageDiagnostics contains protocol facts only, never prompts or credentials.
 type UsageDiagnostics struct {
+	MediaTaskID        string             `json:"media_task_id,omitempty"`
+	Media              map[string]any     `json:"media,omitempty"`
 	ImagesRemoved      int                `json:"images_removed,omitempty"`
 	ImagesRepaired     int                `json:"images_repaired,omitempty"`
 	ImageRecovery      string             `json:"image_recovery,omitempty"`
@@ -724,6 +726,16 @@ func (d *DB) MaintainUsage(ctx context.Context, days, maxRows, contentDays int, 
  diagnostics=json_set(CASE WHEN json_valid(diagnostics) THEN CASE WHEN json_type(diagnostics)='object' THEN diagnostics ELSE '{}' END ELSE '{}' END,'$.content_cleared',json('true')) WHERE id IN `
 	if contentDays > 0 {
 		if err := loop(clear+"(SELECT id FROM usage_logs WHERE ts < ? AND "+hasContent+" ORDER BY ts LIMIT 64)", now-float64(contentDays)*86400); err != nil {
+			return err
+		}
+	}
+	if days > 0 {
+		if err := loop("DELETE FROM media_tasks WHERE id IN (SELECT id FROM media_tasks WHERE updated_at < ? ORDER BY updated_at LIMIT 64)", now-float64(days)*86400); err != nil {
+			return err
+		}
+	}
+	if contentDays > 0 {
+		if err := loop(`UPDATE media_tasks SET response=json_object('id',id,'model',model,'status',status,'result_cleared',json('true')) WHERE id IN (SELECT id FROM media_tasks WHERE updated_at < ? AND status IN ('completed','failed','cancelled') AND COALESCE(json_extract(response,'$.result_cleared'),0)=0 ORDER BY updated_at LIMIT 64)`, now-float64(contentDays)*86400); err != nil {
 			return err
 		}
 	}

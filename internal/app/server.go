@@ -98,6 +98,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/messages", s.handleMessages)
 	mux.HandleFunc("POST /v1/messages/count_tokens", s.handleCountTokens)
 	mux.HandleFunc("POST /v1/responses", s.handleResponses)
+	mux.HandleFunc("POST /v1/systemone", func(w http.ResponseWriter, r *http.Request) { s.handleConverted(w, r, "systemone") })
+	mux.HandleFunc("POST /v1/images/generations", s.handleMedia)
+	mux.HandleFunc("POST /v1/images/edits", s.handleMedia)
+	mux.HandleFunc("POST /v1/videos", s.handleMedia)
+	mux.HandleFunc("POST /v1/audio/transcriptions", s.handleMedia)
+	mux.HandleFunc("POST /v1/media/uploads", s.handleMedia)
+	mux.HandleFunc("GET /v1/videos/{id}", s.handleVideoTask)
+	mux.HandleFunc("GET /v1/media/tasks", s.handleMediaTaskList)
+	mux.HandleFunc("GET /v1/media/tasks/{id}", s.handleVideoTask)
 	s.mountAdmin(mux)
 	s.mountPortal(mux)
 	s.mountWebUI(mux)
@@ -253,7 +262,7 @@ func (s *Server) requestGuard(next http.Handler) http.Handler {
 				writeJSON(w, status, errBody(status, message, "invalid_request_error").Body)
 				return
 			}
-			if !jsonWithinComplexity(body, s.o.cfg.MaxJSONItems, s.o.cfg.MaxJSONDepth) {
+			if !isMediaMultipart(r) && !jsonWithinComplexity(body, s.o.cfg.MaxJSONItems, s.o.cfg.MaxJSONDepth) {
 				writeJSON(w, 400, errBody(400, "JSON 结构过于复杂或嵌套过深", "invalid_request_error").Body)
 				return
 			}

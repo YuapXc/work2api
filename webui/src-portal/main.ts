@@ -20,6 +20,7 @@ const router = createRouter({
   routes: [
     { path: '/models', component: () => import('./views/Models.vue'), meta: { title: '可用模型' } },
     { path: '/', component: () => import('./views/Home.vue'), meta: { title: '首页' } },
+    { path: '/media', component: () => import('./views/Media.vue'), meta: { title: '非聊天工作台' } },
     { path: '/keys', component: () => import('./views/Keys.vue'), meta: { title: 'API 密钥' } },
     { path: '/contribute', component: () => import('./views/Contribute.vue'), meta: { title: '贡献账号' } },
     { path: '/usage', component: () => import('./views/Usage.vue'), meta: { title: '用量' } },

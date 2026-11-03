@@ -26,6 +26,7 @@ export function channelName(r: Partial<UsageRecord>) {
 }
 export function resultLabel(r: Partial<UsageRecord>) {
   const reason = r.diagnostics?.finish_reason
+  if (r.diagnostics?.media_task_id && r.status === 'incomplete') return ({submitting:'提交中',queued:'排队中',in_progress:'生成中',unknown:'结果待确认'} as Record<string,string>)[reason || ''] || '处理中'
   if (reason === 'content_filter') return '审核拒绝'
   if (r.status === 'incomplete') return reason === 'length' ? '输出上限' : '输出未完成'
   if (r.status === 'ok') return reason === 'tool_calls' ? '工具调用' : '成功'

@@ -8,6 +8,7 @@ const d=computed(()=>props.record.diagnostics),p=computed(()=>d.value?.performan
 const budget=(v?:Record<string,number>)=>v && Object.keys(v).length?Object.entries(v).map(([k,n])=>k+': '+int(n)).join(' · '):'未显式指定'
 const compatibility=computed(()=>({original:'原文',identity:'固定身份兼容',client_metadata:'客户端身份与归因精简'} as Record<string,string>)[d.value?.compatibility || ''] || '未记录')
 const explanation=computed(()=>{
+ if(d.value?.media_task_id) return props.record.status === 'ok' ? '媒体生成已完成。' : '媒体任务尚未完成或生成失败，请使用原任务 ID 查询，避免重复提交。'
  if(d.value?.finish_reason==='length')return '上游报告 length：达到生成预算或上下文边界。本次已产生的思考、回答或工具参数可能不完整。'
  if(d.value?.finish_reason==='content_filter')return '上游报告审核拒绝，HTTP 成功不代表模型输出完整。'
  if(props.record.status==='incomplete')return '响应未完整结束，请结合故障阶段与上游尝试记录定位。'
@@ -23,6 +24,7 @@ function stageLabel(stage:{headers_finished:boolean;http_status:number;header_wa
  <div class="space-y-4 text-small">
   <p v-if="admin && d?.content_cleared" class="rounded-lg bg-elevated px-3 py-2 text-muted">正文已按保留策略清理；用量、成本与性能记录保留。</p>
   <div class="flex flex-wrap items-center justify-between gap-2"><span class="inline-flex items-center gap-2 rounded-md border px-2 py-1 text-micro font-medium" :class="resultClass(record)">{{resultLabel(record)}}<span v-if="p?.http_status">HTTP {{p.http_status}}</span></span><span class="text-micro text-muted">{{dt(record.ts,'YYYY-MM-DD HH:mm:ss')}}</span></div>
+  <section v-if="d?.media_task_id" class="rounded-xl border border-line p-4 space-y-2 text-small"><div class="font-medium text-ink">媒体生成</div><div class="mono break-all text-micro text-muted">{{ d.media_task_id }}</div><div class="flex flex-wrap gap-x-4 gap-y-1 text-muted"><span v-if="d.media?.size">尺寸 {{ d.media.size }}</span><span v-if="d.media?.n">数量 {{ d.media.n }}</span><span v-if="d.media?.seconds">时长 {{ d.media.seconds }} 秒</span><span v-if="d.media?.output_video_duration">实际时长 {{ d.media.output_video_duration }} 秒</span><span v-if="d.media?.resolution">分辨率 {{ d.media.resolution }}</span><span v-if="d.media?.aspect_ratio">画幅 {{ d.media.aspect_ratio }}</span></div></section>
   <p v-if="record.status!=='ok' || d?.finish_reason==='tool_calls'" class="rounded-lg bg-elevated px-3 py-2 text-muted">{{explanation}}</p>
   <div v-if="record.error" class="rounded-lg border border-fault/25 bg-fault/5 p-3 whitespace-pre-wrap break-all text-fault">{{record.error}}</div>
   <section class="rounded-xl border border-line">

@@ -605,3 +605,5 @@ func (m *Manager) RecoverChatAuthorization(ctx context.Context, rejectedBearer s
 	}
 	return m.ensureFresh(ctx, true, token)
 }
+
+func (m *Manager) SupportsTranscription() bool { return strings.HasPrefix(m.Profile(), "cn-") }

@@ -33,7 +33,8 @@ import (
 // v19 adds owner identity, credential epochs, temporary passwords and identity audit.
 // v23 adds indexed diagnostic-content byte accounting, lazily backfilled.
 // v24 adds an expression index for content-free request grouping.
-const SchemaVersion = 24
+// v25 adds durable, caller-scoped media tasks and their usage linkage.
+const SchemaVersion = 25
 
 // DB wraps the SQLite connection.
 type DB struct {
@@ -423,6 +424,15 @@ CREATE INDEX IF NOT EXISTS idx_contrib_user ON contributions(user_id);
  route_id INTEGER NOT NULL REFERENCES model_routes(id) ON DELETE CASCADE,
  members TEXT NOT NULL, PRIMARY KEY(app_id,route_id)
  );`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS media_tasks (
+ id TEXT PRIMARY KEY, provider TEXT NOT NULL, account_uid TEXT NOT NULL,
+ app_id INTEGER NOT NULL, user_id INTEGER NOT NULL, model TEXT NOT NULL,
+ kind TEXT NOT NULL, requested_model TEXT NOT NULL DEFAULT '', upstream_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+ response TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL, updated_at REAL NOT NULL,
+ usage_id INTEGER NOT NULL
+ ); CREATE INDEX IF NOT EXISTS idx_media_tasks_updated ON media_tasks(updated_at); CREATE INDEX IF NOT EXISTS idx_media_tasks_caller ON media_tasks(app_id,user_id,created_at DESC);`); err != nil {
 		return err
 	}
 	if err := migratePortalAccess(tx, version); err != nil {

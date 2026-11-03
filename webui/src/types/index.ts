@@ -206,6 +206,9 @@ export interface UsagePoint {
 }
 
 export interface UsageDiagnostics {
+ media_task_id?: string
+ media?: {operation?: string; size?: string; n?: number; seconds?: number; resolution?: string; aspect_ratio?: string; enable_audio?: boolean; output_video_duration?: number; output_video_coefficient?: number}
+
  content_cleared?: boolean
  token_details?: { reasoning_tokens?: number | null; cache_creation_tokens?: number | null }
   requested_model?: string

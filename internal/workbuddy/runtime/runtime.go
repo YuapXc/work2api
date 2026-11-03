@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net/http"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -32,6 +33,7 @@ type Streamer interface {
 // Runtime owns the mutable WorkBuddy resources for exactly one gateway.
 // AccountMu coordinates import/delete with the gateway's ownership transaction.
 type Runtime struct {
+	MediaClient      *http.Client
 	creditMu         sync.Mutex
 	maintenanceGuard *provider.MaintenanceGuard
 	creditStates     map[string]creditState
