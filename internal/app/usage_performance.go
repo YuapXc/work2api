@@ -11,8 +11,10 @@ import (
 
 type usageTimingKey struct{}
 type usageTimingRows struct {
-	mu  sync.Mutex
-	ids []int64
+	mu          sync.Mutex
+	ids         []int64
+	pending     []store.UsageParams
+	deferWrites bool
 }
 
 func trackUsageTiming(ctx context.Context, id int64) {
@@ -28,7 +30,7 @@ func trackUsageTiming(ctx context.Context, id int64) {
 	}
 }
 
-func (s *Server) persistUsageTiming(rows *usageTimingRows, t streamwatch.TimingSnapshot, status int, stream bool) {
+func (s *Server) persistUsageTiming(rows *usageTimingRows, t streamwatch.TimingSnapshot, status int, stream bool, elapsed ...time.Duration) {
 	rows.mu.Lock()
 	ids := append([]int64(nil), rows.ids...)
 	rows.mu.Unlock()
@@ -36,6 +38,9 @@ func (s *Server) persistUsageTiming(rows *usageTimingRows, t streamwatch.TimingS
 		return
 	}
 	duration := time.Since(t.Start)
+	if len(elapsed) > 0 {
+		duration = elapsed[0]
+	}
 	value := store.UsagePerformance{HTTPStatus: status, ResponseStream: stream, RequestID: t.RequestID, QueueMS: t.Queue.Milliseconds(), AccountWaitMS: t.Account.Milliseconds(), TotalMS: duration.Milliseconds(), Attempts: t.Attempts, Upstream429: t.Upstream429}
 	if t.BytesSeen {
 		ms := t.FirstByte.Milliseconds()

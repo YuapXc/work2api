@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"work2api/internal/jsonutil"
@@ -127,17 +128,18 @@ func copyCustomMap(input map[string]any) map[string]any {
 // output can never become an executable free-text tool call.
 type CustomToolWriter struct {
 	http.ResponseWriter
-	names      map[string]bool
-	namespaces map[string]NamespaceName
-	items      map[string]bool
-	delivered  map[string]bool
-	buffer     bytes.Buffer
-	limit      int
-	status     int
-	committed  bool
-	sequence   int
-	failure    error
-	responseID string
+	names          map[string]bool
+	namespaces     map[string]NamespaceName
+	items          map[string]bool
+	delivered      map[string]bool
+	buffer         bytes.Buffer
+	limit          int
+	status         int
+	committed      bool
+	sequence       int
+	failure        error
+	responseID     string
+	responseLength int
 }
 
 func NewCustomToolWriter(w http.ResponseWriter, names map[string]bool, limit int) *CustomToolWriter {
@@ -165,6 +167,9 @@ func (w *CustomToolWriter) stream() bool {
 func (w *CustomToolWriter) commit() {
 	if !w.committed {
 		w.Header().Del("Content-Length")
+		if w.responseLength > 0 && !w.stream() {
+			w.Header().Set("Content-Length", strconv.Itoa(w.responseLength))
+		}
 		status := w.status
 		if status == 0 {
 			status = http.StatusOK
@@ -266,6 +271,7 @@ func (w *CustomToolWriter) Finish() error {
 	if err != nil {
 		return err
 	}
+	w.responseLength = len(data)
 	w.commit()
 	_, err = w.ResponseWriter.Write(data)
 	return err

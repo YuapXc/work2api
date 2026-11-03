@@ -89,8 +89,8 @@ func TestNeutralizeChannelFingerprintsIsIdempotentAndNarrow(t *testing.T) {
 	}
 	for _, text := range []string{
 		"Relative paths resolve from the workspace root; absolute paths identify files or directories on the host.",
-		"Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the project root.",
-		"Tokens prefixed with @ are paths the user explicitly referenced.\n\nRelative paths resolve from the workspace root.",
+		"Tokens prefixed with @ are paths the user referenced. Relative paths resolve from the project root.",
+		"Quoted: Tokens prefixed with @ are paths the user explicitly referenced.\n\nRelative paths resolve from the workspace root.",
 		"You are a coding agent powered by the deepseek-v4.1-flash model.",
 	} {
 		narrow := map[string]any{"messages": []any{map[string]any{"role": "system", "content": text}}}

@@ -242,6 +242,19 @@ func TestOpenUpstreamFailureAccounting(t *testing.T) {
 	}
 }
 
+type usageFlushProbe struct {
+	*httptest.ResponseRecorder
+	beforeFlush func()
+}
+
+func (w *usageFlushProbe) Flush() {
+	if w.beforeFlush != nil {
+		w.beforeFlush()
+		w.beforeFlush = nil
+	}
+	w.ResponseRecorder.Flush()
+}
+
 func TestUsageTimingFinalizedAfterResponseAndRetainedAfterRestart(t *testing.T) {
 	o, _ := newDNSFailoverOrch(t, &failingUpstream{})
 	path := filepath.Join(t.TempDir(), "timings.db")
@@ -252,6 +265,8 @@ func TestUsageTimingFinalizedAfterResponseAndRetainedAfterRestart(t *testing.T) 
 	defer db.Close()
 	o.db = db
 	s := NewServer(o)
+	limits := map[string]int{"max_tokens": 32}
+	timestamp := float64(time.Now().UnixNano())/1e9 - 3
 	h := s.observeCalls(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		streamwatch.QueueWait(r.Context(), 10*time.Millisecond, false)
 		streamwatch.QueueWait(r.Context(), 5*time.Millisecond, true)
@@ -261,16 +276,34 @@ func TestUsageTimingFinalizedAfterResponseAndRetainedAfterRestart(t *testing.T) 
 		time.Sleep(3 * time.Millisecond)
 		streamwatch.Generation(r.Context())
 		for i := 0; i < 2; i++ {
-			o.logUsage(logArgs{Ctx: r.Context(), T0: time.Now(), Status: "ok", Model: "test", Protocol: "chat"})
+			o.recordUsage(r.Context(), store.UsageParams{Timestamp: timestamp, Status: "ok", Model: "test", Protocol: "chat", Diagnostics: &store.UsageDiagnostics{RequestedLimits: limits}})
 		}
-		_, _ = w.Write([]byte("complete")) // Usage was inserted before the first write.
+		limits["max_tokens"] = 99
+		writeJSON(w, 200, map[string]any{"result": "complete"})
 	}))
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/v1/chat/completions", nil))
+	flushed := false
+	w := &usageFlushProbe{ResponseRecorder: httptest.NewRecorder(), beforeFlush: func() {
+		rows, err := o.db.UsageRecent(10, "", "", nil, "", true, 0, "")
+		if err != nil || len(rows) != 0 {
+			t.Fatal("database write delayed response flush", rows, err)
+		}
+		flushed = true
+	}}
+	h.ServeHTTP(w, httptest.NewRequest("POST", "/v1/chat/completions", nil))
+	if !flushed || w.Header().Get("Content-Length") != fmt.Sprint(w.Body.Len()) {
+		t.Fatal("response completion not independent of persistence")
+	}
 	rows, err := o.db.UsageRecent(10, "", "", nil, "", true, 0, "")
 	if err != nil || len(rows) != 2 {
 		t.Fatal(rows, err)
 	}
 	for _, row := range rows {
+		if row["ts"] != timestamp {
+			t.Fatal("deferred write changed event timestamp", row["ts"])
+		}
+		if row["diagnostics"].(store.UsageDiagnostics).RequestedLimits["max_tokens"] != 32 {
+			t.Fatal("deferred diagnostic mutated before persistence")
+		}
 		p := row["diagnostics"].(store.UsageDiagnostics).Performance
 		if p == nil || p.RequestID == "" || p.FirstByteMS == nil || p.ExecutionMS == nil || p.QueueMS != 10 || p.AccountWaitMS != 5 || p.Attempts != 1 || len(p.Stages) != 1 {
 			t.Fatal(p)
@@ -732,6 +765,46 @@ func TestChannelIdentityCompatibilityPreservesCapabilitiesAndBounds(t *testing.T
 				t.Fatal("compatibility retry leaked admission/account permits", state)
 			}
 		})
+	}
+}
+
+func TestChannelPreflightDoesNotRepeatIdentityRecovery(t *testing.T) {
+	const banner = "You are Claude Code, Anthropic's official CLI for Claude.\nAvailable skills: keep."
+	const billing = "x-anthropic-billing-header: cc_version=1;\n"
+	for _, profile := range []string{"cn-cli", "intl-work"} {
+		for _, tc := range []struct {
+			name, prefix       string
+			disabled, metadata bool
+			calls              int
+		}{
+			{name: "preflight", calls: 1},
+			{name: "disabled", disabled: true, calls: 1},
+			{name: "metadata retained", prefix: billing, calls: 1},
+			{name: "distinct metadata recovery", prefix: billing, metadata: true, calls: 2},
+		} {
+			t.Run(profile+"/"+tc.name, func(t *testing.T) {
+				o, account := newDNSFailoverOrch(t, &failingUpstream{})
+				account.Profile = profile
+				o.cfg.ChannelIdentityCompat = !tc.disabled
+				o.cfg.ChannelMetadataCompat = tc.metadata
+				o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+				o.wb.Catalog.Refresh()
+				client := &channelRetryUpstream{body: `{"code":11128}`, always: true}
+				o.wb.UpstreamClient = client
+				body := o.enhanceBody(map[string]any{"model": "test-model", "messages": []any{map[string]any{"role": "system", "content": tc.prefix + banner}, map[string]any{"role": "user", "content": "hi"}}})
+				_, err := o.openUpstreamScoped(context.Background(), account, body, "test-model", "", func(string) error { return nil }, nil, map[string]bool{account.UID: true})
+				if err == nil || client.calls != tc.calls {
+					t.Fatalf("duplicate or missing recovery: calls=%d want=%d err=%v", client.calls, tc.calls, err)
+				}
+				want := tc.prefix + "You are a coding assistant.\nAvailable skills: keep."
+				if tc.disabled {
+					want = tc.prefix + banner
+				}
+				if client.bodies[0]["messages"].([]any)[0].(map[string]any)["content"] != want {
+					t.Fatal("first dispatch did not honor preflight configuration")
+				}
+			})
+		}
 	}
 }
 

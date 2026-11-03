@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -597,9 +598,16 @@ func (s *Server) auth(r *http.Request) (*Principal, *apiError) {
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	body, err := json.Marshal(v)
+	if err != nil {
+		status = http.StatusInternalServerError
+		body = []byte(`{"error":{"message":"response encoding failed","type":"server_error"}}`)
+	}
+	body = append(body, '\n')
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	_, _ = w.Write(body)
 }
 
 func writeAPIErr(w http.ResponseWriter, e *apiError) {

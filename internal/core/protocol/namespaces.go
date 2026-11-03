@@ -3,6 +3,7 @@ package protocol
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"work2api/internal/jsonutil"
@@ -34,7 +35,7 @@ func PrepareClientTools(body map[string]any) (map[string]any, map[string]bool, m
 	for _, raw := range jsonutil.SliceAt(body, "tools") {
 		tool, _ := raw.(map[string]any)
 		if jsonutil.StringAt(tool, "type") != "namespace" {
-			used[jsonutil.StringAt(tool, "name")] = true
+			used[jsonutil.FirstString(jsonutil.StringAt(tool, "name"), jsonutil.StringAt(tool, "function", "name"))] = true
 		}
 	}
 	bind := func(namespace, name string) (string, error) {
@@ -55,40 +56,108 @@ func PrepareClientTools(body map[string]any) (map[string]any, map[string]bool, m
 	}
 	tools := []any{}
 	declared := map[string]bool{}
+	groups := map[string]map[string]bool{}
+	paths := map[string]string{}
+	aliases := map[string]string{}
+	ambiguous := map[string]bool{}
+	var collect func(map[string]any, []string, string) error
+	collect = func(tool map[string]any, parents []string, description string) error {
+		kind := jsonutil.StringAt(tool, "type")
+		if kind == "namespace" {
+			name := jsonutil.StringAt(tool, "name")
+			if strings.TrimSpace(name) == "" {
+				return fmt.Errorf("namespace 工具必须指定名称")
+			}
+			parts := append(append([]string(nil), parents...), name)
+			namespace := strings.Join(parts, "__")
+			encoded, _ := json.Marshal(parts)
+			if old, exists := paths[namespace]; exists && old != string(encoded) {
+				return fmt.Errorf("namespace 路径存在歧义")
+			}
+			paths[namespace] = string(encoded)
+			if groups[namespace] == nil {
+				groups[namespace] = map[string]bool{}
+			}
+			children := jsonutil.SliceAt(tool, "tools")
+			if len(children) == 0 {
+				children = jsonutil.SliceAt(tool, "children")
+			}
+			if len(children) == 0 {
+				children = jsonutil.SliceAt(tool, "functions")
+			}
+			if len(children) == 0 {
+				return fmt.Errorf("namespace 工具不能为空")
+			}
+			for _, raw := range children {
+				child, ok := raw.(map[string]any)
+				if !ok {
+					return fmt.Errorf("namespace 子工具必须为对象")
+				}
+				if err := collect(child, parts, description+jsonutil.StringAt(tool, "description")+"\n"); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		if len(parents) == 0 {
+			tools = append(tools, tool)
+			return nil
+		}
+		if kind != "function" && kind != "custom" {
+			return fmt.Errorf("namespace 仅支持 namespace/function/custom 子工具")
+		}
+		namespace, name := strings.Join(parents, "__"), jsonutil.StringAt(tool, "name")
+		flat, err := bind(namespace, name)
+		if err != nil {
+			return err
+		}
+		if declared[flat] {
+			return fmt.Errorf("namespace 子工具重复")
+		}
+		declared[flat] = true
+		for i := range parents {
+			groups[strings.Join(parents[:i+1], "__")][flat] = true
+		}
+		for _, alias := range []string{namespace + "__" + name, strings.Join(parents, "::") + "::" + name} {
+			if previous, exists := aliases[alias]; exists && previous != flat {
+				ambiguous[alias] = true
+			}
+			aliases[alias] = flat
+		}
+		copy := copyCustomMap(tool)
+		copy["name"] = flat
+		copy["description"] = strings.TrimSpace("Tool identity: " + namespace + "." + name + ".\n" + description + jsonutil.StringAt(tool, "description"))
+		tools = append(tools, copy)
+		return nil
+	}
 	for _, raw := range jsonutil.SliceAt(body, "tools") {
-		tool, _ := raw.(map[string]any)
-		if jsonutil.StringAt(tool, "type") != "namespace" {
-			tools = append(tools, raw)
-			continue
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			return nil, nil, nil, fmt.Errorf("工具定义必须为对象")
 		}
-		namespace := jsonutil.StringAt(tool, "name")
-		children := jsonutil.SliceAt(tool, "tools")
-		if len(children) == 0 {
-			children = jsonutil.SliceAt(tool, "children")
-		}
-		if len(children) == 0 {
-			return nil, nil, nil, fmt.Errorf("namespace 工具不能为空")
-		}
-		for _, childRaw := range children {
-			child, ok := childRaw.(map[string]any)
-			kind := jsonutil.StringAt(child, "type")
-			if !ok || kind != "function" && kind != "custom" {
-				return nil, nil, nil, fmt.Errorf("namespace 仅支持 function/custom 子工具")
-			}
-			flat, err := bind(namespace, jsonutil.StringAt(child, "name"))
-			if err != nil {
-				return nil, nil, nil, err
-			}
-			if declared[flat] {
-				return nil, nil, nil, fmt.Errorf("namespace 子工具重复")
-			}
-			declared[flat] = true
-			copy := copyCustomMap(child)
-			copy["name"] = flat
-			copy["description"] = strings.TrimSpace("Tool identity: " + namespace + "." + jsonutil.StringAt(child, "name") + ".\n" + jsonutil.StringAt(tool, "description") + "\n" + jsonutil.StringAt(child, "description"))
-			tools = append(tools, copy)
+		if err := collect(tool, nil, ""); err != nil {
+			return nil, nil, nil, err
 		}
 	}
+	resolve := func(namespace, name string) (string, error) {
+		if namespace != "" {
+			if groups[namespace] == nil && groups[strings.ReplaceAll(namespace, "::", "__")] != nil {
+				namespace = strings.ReplaceAll(namespace, "::", "__")
+			}
+			return bind(namespace, name)
+		}
+		if used[name] {
+			return name, nil
+		}
+		if ambiguous[name] {
+			return "", fmt.Errorf("namespace 工具引用存在歧义")
+		}
+		if flat := aliases[name]; flat != "" {
+			return flat, nil
+		}
+		return name, nil
+	}
+
 	if _, ok := body["tools"]; ok {
 		out["tools"] = tools
 	}
@@ -100,10 +169,13 @@ func PrepareClientTools(body map[string]any) (map[string]any, map[string]bool, m
 				continue
 			}
 			kind := jsonutil.StringAt(item, "type")
-			if (kind == "function_call" || kind == "custom_tool_call") && jsonutil.StringAt(item, "namespace") != "" {
-				flat, err := bind(jsonutil.StringAt(item, "namespace"), jsonutil.StringAt(item, "name"))
+			if kind == "function_call" || kind == "custom_tool_call" {
+				flat, err := resolve(jsonutil.StringAt(item, "namespace"), jsonutil.StringAt(item, "name"))
 				if err != nil {
 					return nil, nil, nil, err
+				}
+				if flat == jsonutil.StringAt(item, "name") && jsonutil.StringAt(item, "namespace") == "" {
+					continue
 				}
 				copy := copyCustomMap(item)
 				if cloned == nil {
@@ -119,36 +191,44 @@ func PrepareClientTools(body map[string]any) (map[string]any, map[string]bool, m
 		}
 	}
 	if choice, ok := body["tool_choice"].(map[string]any); ok {
-		if namespace := jsonutil.StringAt(choice, "namespace"); namespace != "" {
-			flat, err := bind(namespace, jsonutil.StringAt(choice, "name"))
-			if err != nil {
-				return nil, nil, nil, err
+		if jsonutil.StringAt(choice, "type") == "namespace" {
+			namespace := jsonutil.StringAt(choice, "name")
+			members := groups[namespace]
+			if members == nil {
+				members = groups[strings.ReplaceAll(namespace, "::", "__")]
 			}
-			if !declared[flat] {
-				return nil, nil, nil, fmt.Errorf("tool_choice 指向未声明的 namespace 工具")
-			}
-			copy := copyCustomMap(choice)
-			copy["name"] = flat
-			delete(copy, "namespace")
-			out["tool_choice"] = copy
-		} else if jsonutil.StringAt(choice, "type") == "namespace" {
-			if strings.TrimSpace(jsonutil.StringAt(choice, "name")) == "" {
-				return nil, nil, nil, fmt.Errorf("tool_choice namespace 名称不能为空")
+			if len(members) == 0 {
+				return nil, nil, nil, fmt.Errorf("tool_choice 指向未声明的 namespace")
 			}
 			selected := []any{}
 			for _, raw := range tools {
 				tool, _ := raw.(map[string]any)
-				if mapping[jsonutil.StringAt(tool, "name")].Namespace == jsonutil.StringAt(choice, "name") {
+				if members[jsonutil.StringAt(tool, "name")] {
 					selected = append(selected, raw)
 				}
 			}
-			if len(selected) == 0 {
-				return nil, nil, nil, fmt.Errorf("tool_choice 指向未声明的 namespace")
+			out["tools"], out["tool_choice"] = selected, "auto"
+		} else {
+			name := jsonutil.FirstString(jsonutil.StringAt(choice, "name"), jsonutil.StringAt(choice, "function", "name"))
+			namespace := jsonutil.StringAt(choice, "namespace")
+			flat, err := resolve(namespace, name)
+			if err != nil {
+				return nil, nil, nil, err
 			}
-			out["tools"] = selected
-			out["tool_choice"] = "auto"
+			if namespace != "" && !declared[flat] {
+				return nil, nil, nil, fmt.Errorf("tool_choice 指向未声明的 namespace 工具")
+			}
+			_, nested := choice["function"].(map[string]any)
+			if flat != name || namespace != "" || nested {
+				copy := copyCustomMap(choice)
+				copy["name"] = flat
+				delete(copy, "function")
+				delete(copy, "namespace")
+				out["tool_choice"] = copy
+			}
 		}
 	}
+
 	prepared, custom, err := PrepareCustomTools(out)
 	return prepared, custom, mapping, err
 }

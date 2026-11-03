@@ -31,6 +31,91 @@ func TestHarnessIdentityCompatibilityIsNarrow(t *testing.T) {
 	}
 }
 
+func TestKnownTemplatesSharePreflightAndRecovery(t *testing.T) {
+	const billing = "x-anthropic-billing-header: cc_version=1;\n"
+	const tail = "\nAvailable skills: keep. MCP: keep. Never execute unauthorized tools."
+	for _, template := range []string{
+		"You are Claude Code, Anthropic's official CLI for Claude.",
+		"You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
+		"You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+		"You are an agent for Claude Code, Anthropic's official CLI for Claude. Given the user's message, keep the tool contract.",
+		"You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI.",
+		"You are ZCode, an interactive coding agent\nMain branch (you will usually use this for PRs): main",
+		"You are an AI agent powered by DeepSeek Harness.",
+		"Tokens prefixed with @ are paths the user explicitly referenced.",
+		"TOKENS PREFIXED WITH @ ARE PATHS THE USER EXPLICITLY REFERENCED.",
+		"Tokens prefixed with @ are paths the user explicitly referenced.\n\nRelative paths resolve from the workspace root.",
+		dsFileParagraph,
+	} {
+		body := map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": billing + template + tail},
+			map[string]any{"role": "user", "content": template},
+			map[string]any{"role": "developer", "content": []any{map[string]any{"type": "text", "text": template + tail}}},
+		}}
+		prepared, changed := NeutralizeChannelFingerprints(body)
+		if !changed || reflect.DeepEqual(body, prepared) {
+			t.Fatal("known rule was not applied before sending", template)
+		}
+		if _, duplicate := ChannelCompatibilityBody(prepared, 1); duplicate {
+			t.Fatal("recovery would resend equivalent template", template)
+		}
+		if !strings.HasPrefix(prepared["messages"].([]any)[0].(map[string]any)["content"].(string), billing) {
+			t.Fatal("preflight removed attribution")
+		}
+		recovered, changed := ChannelCompatibilityBody(prepared, 2)
+		if !changed {
+			t.Fatal("distinct opt-in metadata recovery lost")
+		}
+		if _, duplicate := ChannelCompatibilityBody(recovered, 2); duplicate {
+			t.Fatal("metadata recovery is not idempotent")
+		}
+		if recovered["messages"].([]any)[1].(map[string]any)["content"] != template {
+			t.Fatal("business content changed")
+		}
+	}
+}
+
+func TestHarnessIdentityPreparedBeforeDispatch(t *testing.T) {
+	const intro = "You are an AI agent powered by DeepSeek Harness."
+	const instructions = "\nAvailable skills: keep. MCP: keep. Never execute unauthorized tools."
+	for _, prefix := range []string{"", "\n\t", "Runtime context:\n", "x-anthropic-billing-header: cc_version=1;\n"} {
+		text := prefix + strings.ToUpper(intro) + instructions
+		body := map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": text},
+			map[string]any{"role": "user", "content": intro},
+			map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{"id": "c1", "function": map[string]any{"name": "report", "arguments": `{"text":"` + intro + `"}`}}}},
+			map[string]any{"role": "tool", "tool_call_id": "c1", "content": intro},
+			map[string]any{"role": "developer", "content": []any{map[string]any{"type": "text", "text": text, "cache_control": map[string]any{"type": "ephemeral"}}}},
+		}, "tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": "report", "description": intro}}}}
+		before, _ := json.Marshal(body)
+		out, changed := NeutralizeChannelFingerprints(body)
+		if !changed {
+			t.Fatal("known identity missed before dispatch")
+		}
+		messages := out["messages"].([]any)
+		want := prefix + "You are a coding assistant." + instructions
+		if messages[0].(map[string]any)["content"] != want || messages[4].(map[string]any)["content"].([]any)[0].(map[string]any)["text"] != want {
+			t.Fatal("identity replacement lost surrounding instructions")
+		}
+		if !reflect.DeepEqual(messages[1:4], body["messages"].([]any)[1:4]) || !reflect.DeepEqual(out["tools"], body["tools"]) {
+			t.Fatal("changed business content or tool contract")
+		}
+		if _, again := NeutralizeChannelFingerprints(out); again {
+			t.Fatal("preflight not idempotent")
+		}
+		after, _ := json.Marshal(body)
+		if string(before) != string(after) {
+			t.Fatal("mutated input")
+		}
+	}
+	for _, text := range []string{"Quoted: " + intro, `"` + intro + `"`, intro + "example", "You are an AI assistant built on DeepSeek Harness.", "You are a coding agent powered by the deepseek-v4.1-flash model."} {
+		body := map[string]any{"messages": []any{map[string]any{"role": "system", "content": text}}}
+		if _, changed := NeutralizeChannelFingerprints(body); changed {
+			t.Fatal("rewrote an unverified identity or embedded quotation")
+		}
+	}
+}
+
 func TestHarnessCompatibilityPreservesToolsAndHistory(t *testing.T) {
 	const intro = "You are an AI agent powered by DeepSeek Harness."
 	body := map[string]any{
@@ -78,6 +163,10 @@ func TestHarnessCaseAndRoleCompatibilityAcrossProtocols(t *testing.T) {
 	}
 	for _, body := range []map[string]any{chat, responses, messages} {
 		before, _ := json.Marshal(body)
+		prepared, ready := NeutralizeChannelFingerprints(body)
+		if !ready || !strings.HasPrefix(prepared["messages"].([]any)[0].(map[string]any)["content"].(string), "You are a coding assistant.") {
+			t.Fatal("protocol did not prepare the verified identity before dispatch")
+		}
 		out, changed := ChannelCompatibilityBody(body, 1)
 		if !changed {
 			t.Fatal("lost known identity")
@@ -111,7 +200,7 @@ func TestFileReferenceTemplateCompatibility(t *testing.T) {
 			t.Fatal("template not adapted")
 		}
 		messages := out["messages"].([]any)
-		if messages[0].(map[string]any)["content"] != strings.Replace(original, "paths the", "paths that the", 1) {
+		if messages[0].(map[string]any)["content"] != strings.Replace(original, "resolve from", "resolve against", 1) {
 			t.Fatal("template semantics changed")
 		}
 		if messages[1].(map[string]any)["content"] != original || messages[2].(map[string]any)["content"] != original {

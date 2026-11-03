@@ -184,7 +184,7 @@ func (s *Server) observeCalls(next http.Handler) http.Handler {
 			return
 		}
 		ctx, t := streamwatch.WithTiming(r.Context())
-		rows := &usageTimingRows{}
+		rows := &usageTimingRows{deferWrites: true}
 		ctx = context.WithValue(ctx, usageTimingKey{}, rows)
 		r = r.WithContext(ctx)
 		var id [16]byte
@@ -194,12 +194,25 @@ func (s *Server) observeCalls(next http.Handler) http.Handler {
 		}
 		writer := &observedWriter{ResponseWriter: w, timing: t}
 		defer func() {
+			// Finish client output before synchronous SQLite work. The handler
+			// still owns every write; shutdown cannot abandon a background queue.
+			if writer.status != 0 && ctx.Err() == nil {
+				_ = http.NewResponseController(writer).Flush()
+			}
+			elapsed := time.Since(t.Start)
 			if r.Context().Err() != nil {
 				streamwatch.Outcome(ctx, "error")
 			}
 			snapshot := t.Snapshot()
 			s.calls.record(snapshot, writer.status)
-			s.persistUsageTiming(rows, snapshot, writer.status, strings.HasPrefix(writer.Header().Get("Content-Type"), "text/event-stream"))
+			rows.mu.Lock()
+			pending := rows.pending
+			rows.pending = nil
+			rows.mu.Unlock()
+			for _, params := range pending {
+				s.o.persistUsage(ctx, params)
+			}
+			s.persistUsageTiming(rows, snapshot, writer.status, strings.HasPrefix(writer.Header().Get("Content-Type"), "text/event-stream"), elapsed)
 		}()
 		next.ServeHTTP(writer, r)
 	})

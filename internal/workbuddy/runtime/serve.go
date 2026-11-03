@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"work2api/internal/streamwatch"
@@ -404,9 +405,16 @@ func IsLocalOverload(body map[string]any) bool {
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	body, err := json.Marshal(v)
+	if err != nil {
+		status = http.StatusInternalServerError
+		body = []byte(`{"error":{"message":"response encoding failed","type":"server_error"}}`)
+	}
+	body = append(body, '\n')
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	_, _ = w.Write(body)
 }
 func writeAPIErr(w http.ResponseWriter, e *apiError) { writeJSON(w, e.Status, e.Body) }
 func (o *Runtime) pickForCaller(p *provider.Caller, model, key string) (*pool.Account, *apiError) {

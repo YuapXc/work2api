@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"work2api/internal/config"
+	"work2api/internal/core/protocol"
 	"work2api/internal/core/provider"
 	"work2api/internal/store"
 	"work2api/internal/streamwatch"
@@ -1493,13 +1494,17 @@ func (p *customProtocolProbe) Serve(_ context.Context, req provider.ServeRequest
 	if req.Protocol != provider.ProtocolResponses || tools[0].(map[string]any)["type"] != "function" {
 		p.t.Fatal("custom tool not adapted at dispatch", req)
 	}
+	if _, err := protocol.ConvertRequest(protocol.Responses, protocol.Chat, req.Payload); err != nil {
+		p.t.Fatal("prepared tool request cannot reach downstream chat bridge", err)
+	}
+	name := tools[0].(map[string]any)["name"].(string)
 	args := `{"input":"*** Begin Patch\n*** End Patch"}`
 	conv := adapters.NewResponsesStreamConverter("model")
 	stream, _ := req.Payload["stream"].(bool)
 	if !stream {
 		conv.SetNonstream()
 	}
-	chunk := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"apply_patch","arguments":` + strconv.Quote(args) + `}}]}}]}`
+	chunk := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":` + strconv.Quote(name) + `,"arguments":` + strconv.Quote(args) + `}}]}}]}`
 	events := conv.FeedLine(chunk) + conv.FeedLine(`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`)
 	if stream {
 		req.Writer.Header().Set("Content-Type", "text/event-stream")
@@ -1524,21 +1529,32 @@ func TestResponsesCustomToolsAtGatewayBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, stream := range []bool{false, true} {
-		body := fmt.Sprintf(`{"model":"custom/model","stream":%t,"input":"make a patch","tools":[{"type":"custom","name":"apply_patch"}]}`, stream)
-		r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
-		r.Header.Set("Authorization", "Bearer custom-fixture-key")
-		r = r.WithContext(context.WithValue(r.Context(), principalContextKey{}, &Principal{AppID: appID, AppName: "custom-caller"}))
-		w := httptest.NewRecorder()
-		s.handleResponses(w, r)
-		if w.Code != 200 || !strings.Contains(w.Body.String(), `"type":"custom_tool_call"`) || !strings.Contains(w.Body.String(), `"call_id":"call_1"`) {
-			t.Fatal("custom output lost at gateway", w.Code, w.Body.String())
-		}
-		if stream && (!strings.Contains(w.Body.String(), `"type":"response.completed"`) || strings.Contains(w.Body.String(), `"type":"response.function_call_arguments.delta"`)) {
-			t.Fatal("custom stream not restored", w.Body.String())
-		}
-		if state := s.modelsAdmission.snapshot(); state["running"] != 0 || state["queued"] != 0 || state["buffer_reserved_bytes"] != int64(0) {
-			t.Fatal("custom request leaked resources", state)
+	for _, tools := range []string{
+		`"tools":[{"type":"custom","name":"apply_patch"}]`,
+		`"tools":[{"type":"namespace","name":"apps","tools":[{"type":"namespace","name":"editor","tools":[{"type":"custom","name":"apply_patch"}]}]}],"tool_choice":{"type":"function","function":{"name":"apps::editor::apply_patch"}}`,
+	} {
+		for _, stream := range []bool{false, true} {
+			body := fmt.Sprintf(`{"model":"custom/model","stream":%t,"input":"make a patch",%s}`, stream, tools)
+			r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
+			r.Header.Set("Authorization", "Bearer custom-fixture-key")
+			r = r.WithContext(context.WithValue(r.Context(), principalContextKey{}, &Principal{AppID: appID, AppName: "custom-caller"}))
+			w := httptest.NewRecorder()
+			s.observeCalls(http.HandlerFunc(s.handleResponses)).ServeHTTP(w, r)
+			if w.Code != 200 || !strings.Contains(w.Body.String(), `"type":"custom_tool_call"`) || !strings.Contains(w.Body.String(), `"call_id":"call_1"`) {
+				t.Fatal("custom output lost at gateway", w.Code, w.Body.String())
+			}
+			if strings.Contains(tools, `"namespace"`) && !strings.Contains(w.Body.String(), `"namespace":"apps__editor"`) {
+				t.Fatal("nested namespace lost at gateway", w.Body.String())
+			}
+			if !stream && w.Header().Get("Content-Length") != strconv.Itoa(w.Body.Len()) {
+				t.Fatal("custom result completion requires handler EOF")
+			}
+			if stream && (!strings.Contains(w.Body.String(), `"type":"response.completed"`) || strings.Contains(w.Body.String(), `"type":"response.function_call_arguments.delta"`)) {
+				t.Fatal("custom stream not restored", w.Body.String())
+			}
+			if state := s.modelsAdmission.snapshot(); state["running"] != 0 || state["queued"] != 0 || state["buffer_reserved_bytes"] != int64(0) {
+				t.Fatal("custom request leaked resources", state)
+			}
 		}
 	}
 }
@@ -2229,14 +2245,8 @@ func TestUnifiedRoutePortalEmptyAllowlistAndMemberScope(t *testing.T) {
 	o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
 	o.wb.Catalog.Refresh() // Catalog transport returns fixture JSON without network access.
 	s := NewServer(o)
-	var member string
-	for id := range s.physicalCatalog() {
-		if strings.HasPrefix(id, "workbuddy/") && id != "workbuddy/auto" {
-			member = id
-			break
-		}
-	}
-	if member == "" {
+	const member = "workbuddy/test-model"
+	if s.physicalCatalog()[member] == nil {
 		t.Fatal("fixture needs WorkBuddy catalog")
 	}
 	route := store.ModelRoute{Model: "portal-unified", Name: "Portal", Enabled: true, Members: []string{member}}

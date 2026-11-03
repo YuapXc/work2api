@@ -18,10 +18,14 @@ var codexCLIIntro = regexp.MustCompile(`(?i)^you are a coding agent running in t
 // the actual branch value and every surrounding instruction intact.
 var mainBranchTemplate = regexp.MustCompile(`(?m)^Main branch \(you will usually use this for PRs\):`)
 
-var fileReferenceTemplate = regexp.MustCompile(`(?im)(^|\n)(Tokens prefixed with @ are paths) (the user explicitly referenced\.)`)
+var fileReferenceTemplate = regexp.MustCompile(`(?im)(^|\n)(Tokens prefixed with @ are paths) (the user explicitly referenced\.)( Relative paths resolve against the workspace root)?`)
 
 // CPA's fixed GUI phrase is also confirmed by a domestic two-model replay.
 var harnessWebGUI = regexp.MustCompile(`(?i)\bDeepSeek Harness Web GUI\b`)
+
+// Issue #539: restrict the verified declaration to a complete line opening;
+// quotations, model identities and business data must remain unchanged.
+var harnessIdentityLine = regexp.MustCompile(`(?im)^([ \t]*)You are an AI agent powered by DeepSeek Harness\.([ \t]+|\r?$)`)
 
 func CompatibilityName(level int) string {
 	switch level {
@@ -101,12 +105,16 @@ const (
 // conversation content, not a client declaration, and is left byte-identical.
 // The rewrite is idempotent and never mutates the caller's body.
 func NeutralizeChannelFingerprints(body map[string]any) (map[string]any, bool) {
+	return transformSystemText(body, neutralizeClientTemplates)
+}
+
+func transformSystemText(body map[string]any, transform func(string) string) (map[string]any, bool) {
 	messages, _ := body["messages"].([]any)
 	if len(messages) == 0 {
 		return body, false
 	}
 	changed := false
-	copyMessages := append([]any(nil), messages...)
+	var copyMessages []any
 	for i, item := range messages {
 		message, ok := item.(map[string]any)
 		if !ok {
@@ -118,13 +126,13 @@ func NeutralizeChannelFingerprints(body map[string]any) (map[string]any, bool) {
 		var content any
 		switch value := message["content"].(type) {
 		case string:
-			rewritten := neutralizeClientTemplates(value)
+			rewritten := transform(value)
 			if rewritten == value {
 				continue
 			}
 			content = rewritten
 		case []any:
-			blocks := append([]any(nil), value...)
+			var blocks []any
 			blockChanged := false
 			for j, item := range value {
 				block, ok := item.(map[string]any)
@@ -135,9 +143,12 @@ func NeutralizeChannelFingerprints(body map[string]any) (map[string]any, bool) {
 				if !ok {
 					continue
 				}
-				rewritten := neutralizeClientTemplates(text)
+				rewritten := transform(text)
 				if rewritten == text {
 					continue
+				}
+				if blocks == nil {
+					blocks = append([]any(nil), value...)
 				}
 				copyBlock := make(map[string]any, len(block))
 				for k, v := range block {
@@ -159,6 +170,9 @@ func NeutralizeChannelFingerprints(body map[string]any) (map[string]any, bool) {
 			copyMessage[k] = v
 		}
 		copyMessage["content"] = content
+		if copyMessages == nil {
+			copyMessages = append([]any(nil), messages...)
+		}
 		copyMessages[i] = copyMessage
 		changed = true
 	}
@@ -174,8 +188,30 @@ func NeutralizeChannelFingerprints(body map[string]any) (map[string]any, bool) {
 }
 
 func neutralizeClientTemplates(text string) string {
+	prefix, rest := BillingPrefix(text)
+	padding := rest[:len(rest)-len(strings.TrimLeft(rest, " \t\r\n"))]
+	if value, changed := CompatibleIdentity(rest[len(padding):]); changed {
+		text = prefix + padding + value
+	}
+	if harnessIdentityLine.MatchString(text) {
+		text = harnessIdentityLine.ReplaceAllString(text, "${1}You are a coding assistant.${2}")
+	}
 	text = strings.ReplaceAll(text, fileReferenceFingerprint, fileReferenceRewritten)
-	return harnessWebGUI.ReplaceAllString(text, "web interface")
+	if fileReferenceTemplate.MatchString(text) {
+		text = fileReferenceTemplate.ReplaceAllStringFunc(text, func(match string) string {
+			if strings.HasSuffix(match, " Relative paths resolve against the workspace root") {
+				return match
+			}
+			return fileReferenceTemplate.ReplaceAllString(match, "${1}${2} that ${3}${4}")
+		})
+	}
+	if mainBranchTemplate.MatchString(text) {
+		text = mainBranchTemplate.ReplaceAllString(text, "Default branch (you will usually use this for PRs):")
+	}
+	if harnessWebGUI.MatchString(text) {
+		text = harnessWebGUI.ReplaceAllString(text, "web interface")
+	}
+	return text
 }
 
 func BillingPrefix(text string) (prefix, rest string) {
@@ -197,82 +233,27 @@ func BillingPrefix(text string) (prefix, rest string) {
 	return line, ""
 }
 
-// Transform only leading system text. Replace verified client declarations and
-// the fixed branch annotation; level 2 additionally removes client attribution.
-// Skills, tools, permission rules, user messages and tool results are untouched.
+// Reuse the preflight rules so a rejected request cannot retry the same
+// template under another compatibility level. Attribution removal stays opt-in.
 func ChannelCompatibilityBody(body map[string]any, level int) (map[string]any, bool) {
-	templateChanged, metadataChanged := false, false
-	transform := func(text string) string {
-		prefix, rest := BillingPrefix(text)
-		padding := rest[:len(rest)-len(strings.TrimLeft(rest, "\r\n"))]
-		value, changed := CompatibleIdentity(strings.TrimLeft(rest, "\r\n"))
-		if rewritten := harnessWebGUI.ReplaceAllString(value, "web interface"); rewritten != value {
-			value, changed = rewritten, true
-		}
-		if fileReferenceTemplate.MatchString(value) {
-			value = fileReferenceTemplate.ReplaceAllString(value, "${1}${2} that ${3}")
-			changed = true
-		}
-		if mainBranchTemplate.MatchString(value) {
-			value = mainBranchTemplate.ReplaceAllString(value, "Default branch (you will usually use this for PRs):")
-			changed = true
-		}
-		templateChanged = templateChanged || changed
-		if level == 2 && prefix != "" {
-			metadataChanged = true
-			prefix = ""
-		}
-		return prefix + padding + value
-	}
-	messages, _ := body["messages"].([]any)
-	copyMessages := append([]any(nil), messages...)
-	for i, item := range messages {
-		message, ok := item.(map[string]any)
-		if !ok || message["role"] != "system" && message["role"] != "developer" {
-			break
-		}
-		var content any
-		switch value := message["content"].(type) {
-		case string:
-			content = transform(value)
-		case []any:
-			blocks := append([]any(nil), value...)
-			for j, item := range value {
-				block, ok := item.(map[string]any)
-				if !ok || block["type"] != "text" {
-					continue
-				}
-				text, ok := block["text"].(string)
-				if !ok {
-					continue
-				}
-				copyBlock := make(map[string]any, len(block))
-				for k, v := range block {
-					copyBlock[k] = v
-				}
-				copyBlock["text"] = transform(text)
-				blocks[j] = copyBlock
-			}
-			content = blocks
-		default:
-			continue
-		}
-		copyMessage := make(map[string]any, len(message))
-		for k, v := range message {
-			copyMessage[k] = v
-		}
-		copyMessage["content"] = content
-		copyMessages[i] = copyMessage
-	}
-	if level == 1 && !templateChanged || level == 2 && !metadataChanged {
+	if level != 1 && level != 2 {
 		return body, false
 	}
-	out := make(map[string]any, len(body))
-	for k, v := range body {
-		out[k] = v
+	metadataChanged := false
+	out, changed := transformSystemText(body, func(text string) string {
+		text = neutralizeClientTemplates(text)
+		if level == 2 {
+			if prefix, rest := BillingPrefix(text); prefix != "" {
+				metadataChanged = true
+				return rest
+			}
+		}
+		return text
+	})
+	if level == 2 && !metadataChanged {
+		return body, false
 	}
-	out["messages"] = copyMessages
-	return out, true
+	return out, changed
 }
 
 func CompatibilityFingerprint(body map[string]any) string {

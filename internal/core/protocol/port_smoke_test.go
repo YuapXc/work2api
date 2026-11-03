@@ -223,6 +223,60 @@ func BenchmarkClientToolPreparationLargeHistory(b *testing.B) {
 	}
 }
 
+func TestRequestCloneIsolationAndFallback(t *testing.T) {
+	var input map[string]any
+	if err := json.Unmarshal([]byte(`{"messages":[{"content":[{"type":"text","text":"keep"}]}],"number":1,"null":null}`), &input); err != nil {
+		t.Fatal(err)
+	}
+	copy, err := ConvertRequest(Chat, Chat, input)
+	if err != nil || !reflect.DeepEqual(copy, input) {
+		t.Fatal("same-protocol copy changed JSON", err)
+	}
+	block := copy["messages"].([]any)[0].(map[string]any)["content"].([]any)[0].(map[string]any)
+	block["text"] = "changed"
+	if input["messages"].([]any)[0].(map[string]any)["content"].([]any)[0].(map[string]any)["text"] != "keep" {
+		t.Fatal("nested request mutation leaked")
+	}
+	input = map[string]any{"typed": []string{"a", "b"}, "integer": 12}
+	raw, _ := json.Marshal(input)
+	var legacy map[string]any
+	_ = json.Unmarshal(raw, &legacy)
+	if copy := jsonutil.CloneMap(input); !reflect.DeepEqual(copy, legacy) {
+		t.Fatal("typed extension fallback changed")
+	}
+	if jsonutil.CloneMap(nil) != nil {
+		t.Fatal("nil map changed")
+	}
+	copy = jsonutil.CloneMap(map[string]any{"object": map[string]any(nil), "array": []any(nil)})
+	if copy["object"] != nil || copy["array"] != nil {
+		t.Fatal("null extension normalization changed")
+	}
+}
+
+func BenchmarkDecodedRequestClone(b *testing.B) {
+	var input map[string]any
+	text := strings.Repeat("synthetic context ", 65536)
+	raw, _ := json.Marshal(map[string]any{"messages": []any{map[string]any{"role": "user", "content": text}}, "model": "synthetic"})
+	_ = json.Unmarshal(raw, &input)
+	for _, legacy := range []bool{false, true} {
+		b.Run(fmt.Sprintf("json_roundtrip=%t", legacy), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				var copy map[string]any
+				if legacy {
+					encoded, _ := json.Marshal(input)
+					_ = json.Unmarshal(encoded, &copy)
+				} else {
+					copy = jsonutil.CloneMap(input)
+				}
+				if copy["model"] != "synthetic" {
+					b.Fatal("copy lost model")
+				}
+			}
+		})
+	}
+}
+
 func (r *terminalOnlyReader) Read(p []byte) (int, error) {
 	r.reads++
 	if r.reads > 1 {
@@ -311,6 +365,115 @@ func TestNamespaceToolsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestNestedNamespaceToolsRoundTrip(t *testing.T) {
+	tools := []any{
+		map[string]any{"type": "function", "name": "read"},
+		map[string]any{"type": "namespace", "name": "apps", "description": "Root guidance.", "tools": []any{
+			map[string]any{"type": "namespace", "name": "github", "description": "GitHub guidance.", "children": []any{
+				map[string]any{"type": "function", "name": "read", "parameters": map[string]any{"type": "object"}},
+				map[string]any{"type": "custom", "name": "patch"},
+			}},
+			map[string]any{"type": "namespace", "name": "gitlab", "functions": []any{map[string]any{"type": "function", "name": "read"}}},
+		}},
+	}
+	for _, choice := range []map[string]any{
+		{"type": "function", "name": "read"},
+		{"type": "function", "namespace": "apps__github", "name": "read"},
+		{"type": "function", "namespace": "apps::github", "name": "read"},
+		{"type": "function", "name": "apps__github__read"},
+		{"type": "function", "function": map[string]any{"name": "apps::github::read"}},
+		{"type": "custom", "namespace": "apps__github", "name": "patch"},
+	} {
+		body := map[string]any{"tools": tools, "tool_choice": choice, "input": []any{
+			map[string]any{"type": "function_call", "name": "apps::github::read", "call_id": "c1", "arguments": "{}"},
+			map[string]any{"type": "function_call_output", "call_id": "c1", "output": "ok"},
+			map[string]any{"type": "custom_tool_call", "namespace": "apps__github", "name": "patch", "call_id": "c2", "input": "raw patch"},
+			map[string]any{"type": "custom_tool_call_output", "call_id": "c2", "output": "done"},
+		}}
+		before, _ := json.Marshal(body)
+		prepared, custom, mapping, err := PrepareClientTools(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		after, _ := json.Marshal(body)
+		if !bytes.Equal(before, after) {
+			t.Fatal("mutated nested namespace request")
+		}
+		var read, patch, other string
+		for flat, original := range mapping {
+			switch original {
+			case NamespaceName{"apps__github", "read"}:
+				read = flat
+			case NamespaceName{"apps__github", "patch"}:
+				patch = flat
+			case NamespaceName{"apps__gitlab", "read"}:
+				other = flat
+			}
+		}
+		if read == "" || patch == "" || other == "" || read == other || !custom[patch] {
+			t.Fatal("nested tool identity collision")
+		}
+		want := read
+		if choice["name"] == "read" && choice["namespace"] == nil {
+			want = "read"
+		}
+		if choice["type"] == "custom" {
+			want = patch
+		}
+		if jsonutil.FirstString(jsonutil.StringAt(prepared, "tool_choice", "name"), jsonutil.StringAt(prepared, "tool_choice", "function", "name")) != want {
+			t.Fatal("forced selection not mapped")
+		}
+		if _, err := FunctionToolSubset(prepared, Responses); err != nil {
+			t.Fatal("prepared choice rejected by downstream protocol bridge", err)
+		}
+		if _, err := ConvertRequest(Responses, Chat, prepared); err != nil {
+			t.Fatal("prepared nested tools cannot convert to chat", err)
+		}
+		history := jsonutil.SliceAt(prepared, "input")
+		if jsonutil.StringAt(history[0].(map[string]any), "name") != read || jsonutil.StringAt(history[2].(map[string]any), "name") != patch || jsonutil.StringAt(history[2].(map[string]any), "arguments") != `{"input":"raw patch"}` {
+			t.Fatal("nested history or custom payload lost")
+		}
+		for _, stream := range []bool{false, true} {
+			w := httptest.NewRecorder()
+			writer := NewClientToolWriter(w, custom, mapping, 1<<20)
+			item := map[string]any{"type": "function_call", "id": "fc1", "call_id": "c2", "name": patch, "arguments": `{"input":"raw patch"}`}
+			response := map[string]any{"output": []any{item}, "status": "completed"}
+			if stream {
+				writer.Header().Set("Content-Type", "text/event-stream")
+				raw, _ := json.Marshal(map[string]any{"type": "response.completed", "response": response})
+				writer.Write([]byte("data: " + string(raw) + "\n\n"))
+			} else {
+				raw, _ := json.Marshal(response)
+				writer.Write(raw)
+			}
+			if err := writer.Finish(); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(w.Body.String(), `"namespace":"apps__github"`) || !strings.Contains(w.Body.String(), `"type":"custom_tool_call"`) || !strings.Contains(w.Body.String(), `"input":"raw patch"`) || strings.Contains(w.Body.String(), patch) {
+				t.Fatal("nested response identity or payload lost", w.Body.String())
+			}
+		}
+	}
+	for _, tc := range []struct {
+		namespace string
+		count     int
+	}{{"apps", 3}, {"apps__github", 2}, {"apps::github", 2}, {"apps__gitlab", 1}} {
+		prepared, _, _, err := PrepareClientTools(map[string]any{"tools": tools, "tool_choice": map[string]any{"type": "namespace", "name": tc.namespace}})
+		if err != nil || len(jsonutil.SliceAt(prepared, "tools")) != tc.count {
+			t.Fatal("namespace selection escaped or lost descendants", tc.namespace, err)
+		}
+	}
+	for _, body := range []map[string]any{
+		{"tools": tools, "tool_choice": map[string]any{"type": "function", "namespace": "apps__github", "name": "missing"}},
+		{"tools": []any{map[string]any{"type": "namespace", "name": "outer", "tools": []any{map[string]any{"type": "namespace", "name": "empty"}}}}},
+		{"tools": []any{tools[1], map[string]any{"type": "namespace", "name": "apps__github", "tools": []any{map[string]any{"type": "function", "name": "other"}}}}},
+	} {
+		if _, _, _, err := PrepareClientTools(body); err == nil {
+			t.Fatal("invalid or ambiguous nested namespace accepted")
+		}
+	}
+}
+
 func TestCustomToolsRoundTrip(t *testing.T) {
 	patch := "*** Begin Patch\n*** Add File: hello.txt\n+你好\\world\n*** End Patch"
 	body := map[string]any{
@@ -376,8 +539,9 @@ func TestCustomToolsRoundTrip(t *testing.T) {
 			if err := w.Finish(); err != nil {
 				t.Fatal(err)
 			}
-			if recorder.Header().Get("Content-Length") != "" {
-				t.Fatal("stale content length")
+			length := recorder.Header().Get("Content-Length")
+			if streaming && length != "" || !streaming && length != fmt.Sprint(recorder.Body.Len()) {
+				t.Fatal("stale or missing content length")
 			}
 			if streaming {
 				seq := 0

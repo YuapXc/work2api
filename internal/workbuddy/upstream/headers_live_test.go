@@ -77,10 +77,16 @@ func runLiveConversationHeaders(t *testing.T, site string, probeClients bool) {
 	if os.Getenv("WORK2API_LIVE_PROFILE_VERSIONS") == "1" {
 		modes = []string{"version-previous", "version-current"}
 	}
+	if site == siterouting.Domestic && os.Getenv("WORK2API_LIVE_CN_PREFLIGHT") == "1" {
+		modes = []string{"current", "harness-preflight-original", "harness-preflight-compatible"}
+	}
 	for _, mode := range modes {
 		requestBody := body
 		if strings.HasPrefix(mode, "harness-") {
 			intro := "You are an AI agent powered by DeepSeek Harness."
+			if strings.HasPrefix(mode, "harness-preflight-") {
+				intro = "Runtime context:\n\t" + strings.ToUpper(intro)
+			}
 			if mode == "harness-coding" {
 				intro = "You are a coding agent powered by the deepseek-v4.1-flash model."
 			}
@@ -100,7 +106,11 @@ func runLiveConversationHeaders(t *testing.T, site string, probeClients bool) {
 			}
 			if strings.HasSuffix(mode, "-compatible") {
 				var changed bool
-				requestBody, changed = wbruntime.ChannelCompatibilityBody(requestBody, 1)
+				if strings.HasPrefix(mode, "harness-preflight-") {
+					requestBody, changed = wbruntime.NeutralizeChannelFingerprints(requestBody)
+				} else {
+					requestBody, changed = wbruntime.ChannelCompatibilityBody(requestBody, 1)
+				}
 				if !changed {
 					t.Fatal("verified Harness opening was not adapted")
 				}

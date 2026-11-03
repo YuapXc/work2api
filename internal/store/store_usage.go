@@ -115,6 +115,7 @@ func (d *DB) SaveSettings(kv map[string]string) error {
 
 // UsageParams are the fields for a usage log entry.
 type UsageParams struct {
+	Timestamp    float64
 	Diagnostics  *UsageDiagnostics
 	TokensKnown  *bool
 	Model        string
@@ -233,12 +234,16 @@ func (d *DB) LogUsageWithID(p UsageParams) (id int64, resultErr error) {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	timestamp := p.Timestamp
+	if timestamp <= 0 {
+		timestamp = float64(time.Now().UnixNano()) / 1e9
+	}
 	result, err := d.db.Exec(
 		`INSERT INTO usage_logs (ts, model, protocol, account_uid, input_tokens, output_tokens,
 		   total_tokens, latency_ms, status, error, input_content, output_content,
 		   reasoning_content, credits, app_name, user_id, reasoning_effort, tokens_known, cached_tokens, app_id, diagnostics, content_bytes)
 		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		float64(time.Now().UnixNano())/1e9, p.Model, p.Protocol, p.AccountUID,
+		timestamp, p.Model, p.Protocol, p.AccountUID,
 		p.InputTokens, p.OutputTokens, total, p.LatencyMs, p.Status, p.Error,
 		p.InputContent, p.OutputContent, p.ReasoningContent, credits, p.AppName, userID, effort, p.TokensKnown, cached, nullableID(p.AppID), diagnostics, len(p.InputContent)+len(p.OutputContent)+len(p.ReasoningContent))
 	if err != nil {
