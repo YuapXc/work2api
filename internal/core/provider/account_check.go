@@ -37,3 +37,8 @@ func AccountCheckMaxAge(ctx context.Context) time.Duration {
 	}
 	return 30 * time.Minute
 }
+
+// AccountIdentityInspector exposes only locally constructed, redacted diagnostics.
+type AccountIdentityInspector interface {
+	AccountIdentityPreview(string) (map[string]any, error)
+}

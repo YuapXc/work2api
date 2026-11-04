@@ -66,15 +66,15 @@ func CollapseStreamWithUsageContext(ctx context.Context, reader io.Reader, proto
 	})
 	if readErr != nil && readErr != errStreamNormalTermination {
 		if streamErr != nil {
-			return nil, Usage{}, false, streamErr
+			return nil, acc.response.Usage, acc.reported, streamErr
 		}
-		return nil, Usage{}, false, readErr
+		return nil, acc.response.Usage, acc.reported, readErr
 	}
 	if !terminated {
 		if streamErr != nil {
-			return nil, Usage{}, false, streamErr
+			return nil, acc.response.Usage, acc.reported, streamErr
 		}
-		return nil, Usage{}, false, errSSEUnexpectedEOF
+		return nil, acc.response.Usage, acc.reported, errSSEUnexpectedEOF
 	}
 	acc.response.Text = acc.text.String()
 	for index, builder := range acc.arguments {

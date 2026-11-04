@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"encoding/json"
 	"testing"
 	"work2api/internal/jsonutil"
 )
@@ -45,6 +46,31 @@ func TestThinkingControlTypesAreNotEffortLevels(t *testing.T) {
 		got := responsesReasoning(map[string]any{"type": kind, "budget_tokens": 2048}).(map[string]any)
 		if got["effort"] != "low" || got["type"] != nil {
 			t.Fatal("invalid Responses reasoning", got)
+		}
+	}
+}
+
+func TestBooleanReasoningControlsPreserveNativeIntent(t *testing.T) {
+	for _, tc := range []struct {
+		raw                string
+		enabled, specified bool
+	}{
+		{`{}`, false, false}, {`{"reasoning_effort":null}`, false, false},
+		{`{"thinking":{"type":"adaptive"},"output_config":{"effort":"low"}}`, true, true},
+		{`{"thinking":{"type":"disabled"},"output_config":{"effort":"high"}}`, false, true},
+		{`{"thinking":{"type":"enabled","budget_tokens":2048}}`, true, true},
+		{`{"reasoning":{"effort":"high"}}`, true, true},
+		{`{"reasoning_effort":"off"}`, false, true},
+		{`{"output_config":{"effort":"max"}}`, true, true},
+		{`{"reasoning_effort":"unknown"}`, false, false},
+	} {
+		var input map[string]any
+		if err := json.Unmarshal([]byte(tc.raw), &input); err != nil {
+			t.Fatal(err)
+		}
+		enabled, specified := ReasoningEnabled(input)
+		if enabled != tc.enabled || specified != tc.specified {
+			t.Fatal(tc.raw, enabled, specified)
 		}
 	}
 }

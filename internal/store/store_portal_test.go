@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -1139,4 +1140,117 @@ func TestInviteV22MigrationPreservesLegacyUsage(t *testing.T) {
 	if _, e = db.CreateInvitedUser("unused-now-used", "hash", "UNUSED"); e != nil {
 		t.Fatal(e)
 	}
+}
+
+func TestPortalAccountSnapshotMatchesLiveScope(t *testing.T) {
+	db := mustDB(t)
+	owner, _ := db.CreateUser("snapshot-owner", "hash", "user")
+	other, _ := db.CreateUser("snapshot-other", "hash", "user")
+	for _, user := range []int64{owner, other} {
+		for _, status := range []string{"active", "private", "invalid", "verifying", "revoked"} {
+			for _, provider := range []string{"workbuddy", "trae", "qoder", "opencode"} {
+				uid := fmt.Sprintf("%d-%s-%s", user, provider, status)
+				if _, err := db.db.Exec(`INSERT INTO contributions(user_id,account_uid,provider,site,status,created_at) VALUES(?,?,?,'cn',?,0)`, user, uid, provider, status); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	for _, user := range []int64{owner, other, other + 1} {
+		wantOwned, _ := db.OwnedAccountUIDs(user)
+		wantExcluded, _ := db.PrivatePoolExcludedUIDs()
+		owned, excluded, err := db.PortalAccountScope(user)
+		if err != nil || !reflect.DeepEqual(owned, wantOwned) || !reflect.DeepEqual(excluded, wantExcluded) {
+			t.Fatal("snapshot scope changed", user, err)
+		}
+	}
+	if err := db.SetUserPublicModels(owner, []string{"model-a", "model-b"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetUserPublicModels(other, []string{"model-b"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	all, err := db.AllUserModelGrants()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, user := range []int64{owner, other} {
+		want, err := db.UserModelGrants(user)
+		if err != nil || !reflect.DeepEqual(want, all[user]) {
+			t.Fatal("batch grants changed", user, err)
+		}
+	}
+	if err := db.SetUserPublicModels(owner, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	all, err = db.AllUserModelGrants()
+	if err != nil || len(all[owner]) != 0 {
+		t.Fatal("grant revocation cached", err)
+	}
+}
+
+func BenchmarkPortalLiveReads(b *testing.B) {
+	db, err := New(filepath.Join(b.TempDir(), "bench.db"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	users := make([]int64, 100)
+	for i := range users {
+		users[i], err = db.CreateUser(fmt.Sprintf("bench-%d", i), "hash", "user")
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err = db.SetUserPublicModels(users[i], []string{"m1", "m2", "m3"}, nil); err != nil {
+			b.Fatal(err)
+		}
+		for j := 0; j < 5; j++ {
+			status := "active"
+			if j%2 == 0 {
+				status = "private"
+			}
+			if _, err = db.db.Exec(`INSERT INTO contributions(user_id,account_uid,provider,site,status,created_at) VALUES(?,?,'workbuddy','cn',?,0)`, users[i], fmt.Sprintf("u%d-a%d", i, j), status); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	b.Run("scope-before", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := db.OwnedAccountUIDs(users[0]); err != nil {
+				b.Fatal(err)
+			}
+			for j := 0; j < 2; j++ {
+				if _, err := db.PrivatePoolExcludedUIDs(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+	b.Run("scope-after", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, _, err := db.PortalAccountScope(users[0]); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("admin-grants-before", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			for _, user := range users {
+				if _, err := db.UserModelGrants(user); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+	b.Run("admin-grants-after", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := db.AllUserModelGrants(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }

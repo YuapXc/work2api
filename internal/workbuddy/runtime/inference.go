@@ -38,7 +38,7 @@ func (o *Runtime) LogUsage(a LogArgs) {
 		streamwatch.Outcome(a.Ctx, a.Status)
 	}
 	completedTransport := a.Status == "ok" || a.Status == "incomplete"
-	if a.Quota != nil && completedTransport {
+	if a.Quota != nil && a.Usage != nil {
 		a.Quota.Observe(a.Usage)
 	}
 	if a.UserID > 0 {
@@ -68,7 +68,7 @@ func (o *Runtime) LogUsage(a LogArgs) {
 			credits = &c
 		}
 	}
-	if completedTransport {
+	if completedTransport || credits != nil {
 		SessionCredits(a.Ctx, credits)
 	}
 	uid := ""

@@ -401,6 +401,14 @@ func TestCredentialRefreshDoesNotBlockOtherAccountsAndPersists(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- r.ensure(context.Background(), expired) }()
 	<-entered
+	adminDone := make(chan struct{})
+	go func() { r.AdminData(context.Background()); close(adminDone) }()
+	select {
+	case <-adminDone:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("admin data waited for credential network refresh")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	other := make(chan error, 1)
@@ -1128,6 +1136,25 @@ func TestMaintenanceAuthFailureStopsCheckinForDisabledAccount(t *testing.T) {
 	}
 }
 
+func TestQuotaUnauthorizedPreservesRecoverySignal(t *testing.T) {
+	r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(401)
+		io.WriteString(w, `{"message":"private upstream detail"}`)
+	})
+	a := &auth.Auth{UID: "quota401", Variant: "cn", AccessToken: "fixture", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	id := accountID(a.UID)
+	r.accounts[id] = &accountState{Auth: a, Enabled: true, Identities: map[string]*auth.Auth{"cn": a}}
+	err := r.refreshQuota(context.Background(), id, true)
+	var remote *upstream.Error
+	if !errors.As(err, &remote) || remote.Status != 401 || strings.Contains(err.Error(), "private upstream detail") {
+		t.Fatal("quota error lost type or leaked remote message", err)
+	}
+	state := r.authGuard().State(id+":cn:auth", a.MaintenanceIdentity())
+	if state.Kind != "authorization_unverified" || state.NeedsLogin {
+		t.Fatal("quota rejection did not request revalidation", state)
+	}
+}
+
 func TestDisabledTraeAccountStillChecksStatus(t *testing.T) {
 	var calls atomic.Int32
 	r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
@@ -1206,4 +1233,37 @@ func TestReadOnlyCheckPreservesDisabledAccountAndScope(t *testing.T) {
 	if result.Status != "invalid" || gets.Load() != 0 || posts.Load() != 0 {
 		t.Fatal("known expiry bypassed maintenance gate", result)
 	}
+}
+
+func TestQuotaPublicationDoesNotWaitForCredentialRotation(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+		close(entered)
+		<-release
+		io.WriteString(w, `{"is_credits_billing":true,"user_entitlement_pack_list":[]}`)
+	})
+	a := &auth.Auth{UID: "quota-publish", Variant: "cn", AccessToken: "fixture", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	id := accountID(a.UID)
+	state := &accountState{Auth: a, Enabled: true, Identities: map[string]*auth.Auth{"cn": a}}
+	r.accounts[id] = state
+	done := make(chan error, 1)
+	go func() { done <- r.refreshQuotaRaw(context.Background(), id, true) }()
+	<-entered
+	a.Lock()
+	close(release)
+	select {
+	case err := <-done:
+		a.Unlock()
+		if err == nil {
+			t.Fatal("published quota while identity unavailable")
+		}
+	case <-time.After(time.Second):
+		a.Unlock()
+		<-done
+		t.Fatal("quota publication waited for network credential lock")
+	}
+	if !state.QuotaFailed {
+		t.Fatal("singleflight followers would see stale success")
+	}
+	r.Models(context.Background())
 }

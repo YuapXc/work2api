@@ -176,7 +176,10 @@ func (w *observedWriter) Write(p []byte) (int, error) {
 	}
 	return n, err
 }
-func (w *observedWriter) Flush() { _ = http.NewResponseController(w.ResponseWriter).Flush() }
+func (w *observedWriter) FlushError() error {
+	return http.NewResponseController(w.ResponseWriter).Flush()
+}
+func (w *observedWriter) Flush() { _ = w.FlushError() }
 func (s *Server) observeCalls(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !isModelRoute(r) {

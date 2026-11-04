@@ -52,10 +52,25 @@ const checkModel = ref('')
 const checking = ref(false)
 const testing = ref(false)
 const modelsLoading = ref(false)
+const identityResult = ref<{ profile: string; endpoint: string; headers: Record<string,string>; present: Record<string,boolean> } | null>(null)
+const identityBusy = ref(false)
+const identityError = ref('')
+async function inspectIdentity() {
+  const row = checkTarget.value
+  if (!row || identityBusy.value) return
+  identityBusy.value = true; identityError.value = ''
+  try {
+    const result = await api.accountIdentity(row.provider, row.id)
+    if (checkOpen.value && checkTarget.value?.key === row.key) identityResult.value = result
+  } catch (e: any) {
+    if (checkOpen.value && checkTarget.value?.key === row.key) identityError.value = e.message || '诊断读取失败'
+  } finally { identityBusy.value = false }
+}
 async function openAccountCheck(source: Record<string, any>) {
   const row = source as Row
   dismissPopovers()
   checkTarget.value = row
+  identityResult.value = null; identityError.value = ''
   checkResult.value = row.raw.account_check || null
   modelTestResult.value = row.raw.account_test || null
   checkModels.value = []; checkModel.value = ''; checkOpen.value = true; modelsLoading.value = true
@@ -1087,6 +1102,16 @@ async function saveConfig() {
           <p class="text-small text-muted">检查对应授权或目录接口，复用维护恢复机制；不生成内容、不改变启停状态。</p>
           <div v-if="checkResult" class="rounded-lg border border-line bg-bg/70 p-3 text-small" :class="checkResult.status === 'valid' ? 'text-live' : checkResult.status === 'invalid' ? 'text-fault' : 'text-muted'">
             <p>{{ checkResult.message }}</p><p class="mt-1 text-micro text-faint">{{ checkResult.scope }} · {{ dt(checkResult.checked_at) }}</p>
+          </div>
+        </section>
+        <section v-if="checkTarget?.provider === 'workbuddy'" class="border-t border-line pt-4 space-y-3">
+          <div class="flex items-center justify-between gap-3"><h3 class="text-small font-medium text-ink">出站身份诊断</h3><WButton variant="ghost" :loading="identityBusy" @click="inspectIdentity">查看诊断</WButton></div>
+          <p class="text-micro text-faint">仅在本地构造并脱敏，不发送请求、不刷新凭据；字段存在不代表上游鉴权通过。</p>
+          <p v-if="identityError" class="text-small text-warn">{{ identityError }}</p>
+          <div v-if="identityResult" class="min-w-0 rounded-lg border border-line bg-bg/70 p-3 text-small space-y-3">
+            <dl class="grid grid-cols-[4rem_minmax(0,1fr)] gap-x-3 gap-y-2"><dt class="text-muted">身份</dt><dd class="mono break-all">{{ identityResult.profile }}</dd><dt class="text-muted">端点</dt><dd class="mono break-all text-micro">{{ identityResult.endpoint }}</dd></dl>
+            <details><summary class="cursor-pointer text-muted">协议字段</summary><dl class="mt-2 space-y-2"><div v-for="(value,name) in identityResult.headers" :key="name" class="min-w-0"><dt class="text-micro text-faint break-all">{{ name }}</dt><dd class="mono text-micro break-all">{{ value }}</dd></div></dl></details>
+            <details><summary class="cursor-pointer text-muted">凭据与请求标识</summary><dl class="mt-2 space-y-1"><div v-for="(value,name) in identityResult.present" :key="name" class="flex flex-wrap justify-between gap-x-3"><dt class="mono text-micro text-faint break-all">{{ name }}</dt><dd class="text-micro whitespace-nowrap" :class="value ? 'text-muted' : 'text-faint'">{{ value ? '已提供' : '未提供' }}</dd></div></dl></details>
           </div>
         </section>
         <section class="border-t border-line pt-4 space-y-3">

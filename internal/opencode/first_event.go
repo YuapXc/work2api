@@ -154,7 +154,7 @@ func (b *attemptBody) Close() error { b.cancel(); return b.ReadCloser.Close() }
 
 func readInferenceAttempt(client *http.Client, req *http.Request, from protocol.Protocol) (*http.Response, error) {
 	resp, err := client.Do(req)
-	if err != nil || resp.StatusCode/100 != 2 || !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+	if err != nil || resp.StatusCode/100 != 2 || from == protocol.SystemOne || !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
 		return resp, err
 	}
 	watch := streamwatch.NewWatch(resp.Body, req.Context(), 0, 0)

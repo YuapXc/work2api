@@ -149,11 +149,15 @@ func (s *Scheduler) cleanupUsage() {
 func (s *Scheduler) run() {
 	maintenanceDone := make(chan struct{})
 	go s.runUsageMaintenance(maintenanceDone)
+	var mediaDone chan struct{}
 	defer func() {
 		if s.cancel != nil {
 			s.cancel()
 		}
 		<-maintenanceDone
+		if mediaDone != nil {
+			<-mediaDone
+		}
 		close(s.done)
 	}()
 	// Warm credits + model catalog once so the WebUI/API has data immediately.
@@ -181,6 +185,8 @@ func (s *Scheduler) run() {
 	}
 
 	leaveWarm()
+	mediaDone = make(chan struct{})
+	go s.runMediaTracking(mediaDone)
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 	for {

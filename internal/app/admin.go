@@ -33,6 +33,7 @@ func parseFloatDefault(s string, def float64) float64 {
 }
 
 func (s *Server) mountAdmin(mux *http.ServeMux) {
+	mux.HandleFunc("GET /admin/providers/{name}/accounts/{id}/identity", s.adminAccountIdentity)
 	mux.HandleFunc("POST /admin/login", s.handleAdminLogin)
 	mux.HandleFunc("POST /admin/logout", s.handleAdminLogout)
 	mux.HandleFunc("GET /admin/overview", s.adminOverview)

@@ -63,8 +63,8 @@ func (o *Runtime) serveChat(w http.ResponseWriter, r *http.Request, payload map[
 	effort := UsageReasoningEffort(body)
 	t0 := time.Now()
 
+	usage := map[string]any{}
 	if clientStream {
-		usage := map[string]any{}
 		status := "ok"
 		out := provider.NewLogCaptureWithPolicy(provider.LogCapturePolicy{Enabled: principal.UserID == 0, Limit: o.cfg.UsageContentMaxBytes})
 		reason := provider.NewLogCaptureWithPolicy(provider.LogCapturePolicy{Enabled: principal.UserID == 0, Limit: o.cfg.UsageContentMaxBytes})
@@ -110,15 +110,15 @@ func (o *Runtime) serveChat(w http.ResponseWriter, r *http.Request, payload map[
 				if st == 429 && IsLocalOverload(detail) {
 					w.Header().Set("Retry-After", "2")
 				}
-				o.LogUsage(LogArgs{Ctx: r.Context(), Protocol: "chat", Model: model, Acc: served, T0: t0, Status: "error", ErrStr: err.Error(), Input: input, AppName: principal.AppName, UserID: principal.UserID, AppID: principal.AppID, Quota: provider.CurrentInvocation(r.Context()).UsageObserver, Effort: effort, UpdatePool: false})
+				o.LogUsage(LogArgs{Ctx: r.Context(), Protocol: "chat", Model: model, Acc: served, T0: t0, Status: "error", ErrStr: err.Error(), Input: input, AppName: principal.AppName, UserID: principal.UserID, AppID: principal.AppID, Quota: provider.CurrentInvocation(r.Context()).UsageObserver, Effort: effort, Usage: usage, UpdatePool: false})
 				writeJSON(w, st, detail)
 				return
 			}
 			if ue, ok := err.(*upstream.UpstreamError); ok {
-				o.LogUsage(LogArgs{Ctx: r.Context(), Protocol: "chat", Model: model, Acc: served, T0: t0, Status: "error", ErrStr: UpstreamErrorText(ue.StatusCode, ue.Raw), Input: input, AppName: principal.AppName, UserID: principal.UserID, AppID: principal.AppID, Quota: provider.CurrentInvocation(r.Context()).UsageObserver, Effort: effort, UpdatePool: false})
+				o.LogUsage(LogArgs{Ctx: r.Context(), Protocol: "chat", Model: model, Acc: served, T0: t0, Status: "error", ErrStr: UpstreamErrorText(ue.StatusCode, ue.Raw), Input: input, AppName: principal.AppName, UserID: principal.UserID, AppID: principal.AppID, Quota: provider.CurrentInvocation(r.Context()).UsageObserver, Effort: effort, Usage: usage, UpdatePool: false})
 				writeChunk("data: " + JsonError(ue.StatusCode, string(ue.Raw)) + "\n\n")
 			} else {
-				o.LogUsage(LogArgs{Ctx: r.Context(), Protocol: "chat", Model: model, Acc: served, T0: t0, Status: "error", ErrStr: err.Error(), Input: input, AppName: principal.AppName, UserID: principal.UserID, AppID: principal.AppID, Quota: provider.CurrentInvocation(r.Context()).UsageObserver, Effort: effort, UpdatePool: false})
+				o.LogUsage(LogArgs{Ctx: r.Context(), Protocol: "chat", Model: model, Acc: served, T0: t0, Status: "error", ErrStr: err.Error(), Input: input, AppName: principal.AppName, UserID: principal.UserID, AppID: principal.AppID, Quota: provider.CurrentInvocation(r.Context()).UsageObserver, Effort: effort, Usage: usage, UpdatePool: false})
 				status, detail := ErrToHTTP(err)
 				if body, ok := detail["error"].(map[string]any); ok {
 					body["code"] = status
@@ -148,12 +148,13 @@ func (o *Runtime) serveChat(w http.ResponseWriter, r *http.Request, payload map[
 		return callErr
 	})
 	if err != nil {
+		usage, _ = collected["usage"].(map[string]any)
 		setRetryHints(w, err)
 		st, detail := ErrToHTTP(err)
 		if ue, ok := err.(*upstream.UpstreamError); ok {
-			o.LogUsage(LogArgs{Ctx: r.Context(), Protocol: "chat", Model: model, Acc: served, T0: t0, Status: "error", ErrStr: UpstreamErrorText(ue.StatusCode, ue.Raw), Input: input, AppName: principal.AppName, UserID: principal.UserID, AppID: principal.AppID, Quota: provider.CurrentInvocation(r.Context()).UsageObserver, Effort: effort, UpdatePool: false})
+			o.LogUsage(LogArgs{Ctx: r.Context(), Protocol: "chat", Model: model, Acc: served, T0: t0, Status: "error", ErrStr: UpstreamErrorText(ue.StatusCode, ue.Raw), Input: input, AppName: principal.AppName, UserID: principal.UserID, AppID: principal.AppID, Quota: provider.CurrentInvocation(r.Context()).UsageObserver, Effort: effort, Usage: usage, UpdatePool: false})
 		} else {
-			o.LogUsage(LogArgs{Ctx: r.Context(), Protocol: "chat", Model: model, Acc: served, T0: t0, Status: "error", ErrStr: err.Error(), Input: input, AppName: principal.AppName, UserID: principal.UserID, AppID: principal.AppID, Quota: provider.CurrentInvocation(r.Context()).UsageObserver, Effort: effort, UpdatePool: false})
+			o.LogUsage(LogArgs{Ctx: r.Context(), Protocol: "chat", Model: model, Acc: served, T0: t0, Status: "error", ErrStr: err.Error(), Input: input, AppName: principal.AppName, UserID: principal.UserID, AppID: principal.AppID, Quota: provider.CurrentInvocation(r.Context()).UsageObserver, Effort: effort, Usage: usage, UpdatePool: false})
 		}
 		if st == 429 && IsLocalOverload(detail) {
 			w.Header().Set("Retry-After", "2")
@@ -277,7 +278,7 @@ func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload
 			errStr = UpstreamErrorText(ue.StatusCode, ue.Raw)
 		}
 		// 账号池处罚已在 openUpstream 统一处理，这里只记日志（UpdatePool:false）。
-		o.LogUsage(LogArgs{Ctx: r.Context(), Protocol: protocol, Model: model, Acc: served, T0: t0, Status: "error", ErrStr: errStr, Input: input, AppName: principal.AppName, UserID: principal.UserID, AppID: principal.AppID, Quota: provider.CurrentInvocation(r.Context()).UsageObserver, Effort: effort, UpdatePool: false})
+		o.LogUsage(LogArgs{Ctx: r.Context(), Protocol: protocol, Model: model, Acc: served, T0: t0, Status: "error", ErrStr: errStr, Input: input, AppName: principal.AppName, UserID: principal.UserID, AppID: principal.AppID, Quota: provider.CurrentInvocation(r.Context()).UsageObserver, Effort: effort, Usage: conv.Usage(), UpdatePool: false})
 		if streamMode && opened {
 			if protocol == "anthropic" {
 				writeChunk(ErrAnthropic(st, errStr))
@@ -307,13 +308,23 @@ func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload
 	if conv.CompletionStatus() == "incomplete" {
 		status = "incomplete"
 	}
-	o.LogUsage(LogArgs{Ctx: r.Context(), Protocol: protocol, Model: model, Acc: served, T0: t0, Status: status, Usage: conv.Usage(), Input: input, Output: out, Reasoning: conv.Reasoning(), AppName: principal.AppName, UserID: principal.UserID, AppID: principal.AppID, Quota: provider.CurrentInvocation(r.Context()).UsageObserver, Effort: effort, UpdatePool: true})
+	var deliveryErr error
+	defer func() {
+		args := LogArgs{Ctx: r.Context(), Protocol: protocol, Model: model, Acc: served, T0: t0, Status: status, Usage: conv.Usage(), Input: input, Output: out, Reasoning: conv.Reasoning(), AppName: principal.AppName, UserID: principal.UserID, AppID: principal.AppID, Quota: provider.CurrentInvocation(r.Context()).UsageObserver, Effort: effort, UpdatePool: true}
+		if deliveryErr != nil {
+			args.Status = "error"
+			args.ErrStr = "客户端响应发送失败：" + deliveryErr.Error()
+			args.UpdatePool = false
+		}
+		o.LogUsage(args)
+	}()
 	if streamMode {
 		if responses, ok := conv.(*adapters.ResponsesStreamConverter); ok {
 			// Each done/completed event retains its official full payload; only
 			// the encoding/writing is incremental to bound transient copies.
 			if !opened {
 				if err := writeChunk(""); err != nil {
+					deliveryErr = err
 					return
 				}
 			}
@@ -332,10 +343,11 @@ func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload
 				return controller.Flush()
 			})
 			if err != nil {
+				deliveryErr = err
 				return
 			}
 		} else {
-			_ = writeChunk(conv.Finish())
+			deliveryErr = writeChunk(conv.Finish())
 		}
 		return
 	}

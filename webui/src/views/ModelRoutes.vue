@@ -10,6 +10,8 @@ import WSpinner from '@/components/ui/WSpinner.vue'
 import WEmpty from '@/components/ui/WEmpty.vue'
 const routes = ref<ModelRoute[]>([])
 const models = ref<RouteMember[]>([])
+const suggestions = ref<ModelRoute[]>([])
+const previewing = ref(false)
 const loading = ref(true)
 const saving = ref(false)
 const editing = ref(false)
@@ -29,7 +31,7 @@ function move(index: number, delta: number) {
 }
 async function load() {
  loading.value = true
- try { const data = await api.modelRoutes(); routes.value = data.routes; models.value = data.models }
+ try { const data = await api.modelRoutes(); routes.value = data.routes; models.value = data.models; suggestions.value = data.suggestions || [] }
  catch { toast.error('统一模型配置读取失败，请重试') }
  finally { loading.value = false }
 }
@@ -39,6 +41,21 @@ async function save() {
  try { await api.saveModelRoute(draft.value); toast.success('统一模型已保存'); editing.value = false; await load() }
  catch (e: any) { toast.error(e?.response?.data?.error?.message || '保存失败，请刷新后重试') }
  finally { saving.value = false }
+}
+async function generate() {
+ if (!suggestions.value.length || saving.value) return
+ if (!await confirm({ title: `生成 ${suggestions.value.length} 个统一模型？`, body: '仅保存下方列出的同名模型组合，不修改已有路由。生成后可编辑成员、顺序与显示名称；现有受限 Key 不会自动增加权限。', okText: '生成合并表' })) return
+ saving.value = true
+ let created = 0; let failed = 0
+ try {
+  for (const route of suggestions.value) {
+   try { await api.saveModelRoute(route); created++ } catch { failed++ }
+  }
+  if (created) toast.success(`已生成 ${created} 个统一模型`)
+  if (failed) toast.error(`${failed} 个配置未生成，目录或名称可能已变化，请刷新后检查`)
+  await load()
+  if (!suggestions.value.length) previewing.value = false
+ } finally { saving.value = false }
 }
 async function remove(route: ModelRoute) {
  if (!await confirm({ title: `删除 ${route.name}？`, body: '该调用名称将停止可用。已有 Key 的成员授权不会因同名重建而恢复。', tone: 'danger', okText: '删除' })) return
@@ -53,12 +70,26 @@ onMounted(load)
   <template #actions>
    <RouterLink to="/models"><WButton>返回模型目录</WButton></RouterLink>
    <WButton :disabled="loading || saving" @click="load">刷新</WButton>
+   <WButton :disabled="loading || saving" @click="previewing = !previewing">自动合并同名</WButton>
    <WButton variant="primary" :disabled="saving" @click="edit()">新建统一模型</WButton>
   </template>
   <div class="rounded-xl border border-line bg-panel p-4 text-small text-muted leading-relaxed mb-5">
    按成员顺序选择渠道，成功后保持会话粘性。每个渠道继续使用自己的账号成本、区域和故障切换策略。
    仅在响应开始前的限流或服务故障时尝试下一成员；权限和请求能力不符合的成员会跳过。
   </div>
+  <section v-if="previewing" class="rounded-xl border border-line bg-panel p-4 mb-5 space-y-3">
+   <div class="flex flex-wrap items-start justify-between gap-3">
+    <div><h2 class="font-semibold text-ink">同名模型合并预览</h2><p class="text-small text-muted mt-1">仅匹配模型 ID 完全相同的不同渠道；已参与手工路由的模型跳过。名称冲突时使用 group/ 前缀。</p></div>
+    <WButton variant="primary" :disabled="loading || saving || !suggestions.length" :loading="saving" @click="generate">生成合并表 · {{ suggestions.length }}</WButton>
+   </div>
+   <div v-if="suggestions.length" class="grid gap-3 md:grid-cols-2">
+    <article v-for="route in suggestions" :key="route.model" class="rounded-lg border border-line p-3 min-w-0">
+     <div class="flex items-start justify-between gap-2"><p class="font-mono text-small text-brand break-all min-w-0">{{ route.model }}</p><WButton size="sm" :disabled="saving" @click="edit(route); previewing = false">单独编辑</WButton></div>
+     <ol class="mt-2 space-y-1"><li v-for="(member, index) in route.members" :key="member" class="text-xs text-muted break-all">{{ index + 1 }}. {{ member }}</li></ol>
+    </article>
+   </div>
+   <p v-else class="text-small text-muted">当前没有新的可合并同名模型。已有配置不会被覆盖。</p>
+  </section>
   <WSpinner v-if="loading && !routes.length" />
   <div v-else class="grid gap-5 items-start" :class="editing ? 'xl:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]' : ''">
    <section class="min-w-0 space-y-3">

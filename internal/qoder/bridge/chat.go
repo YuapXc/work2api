@@ -3,7 +3,6 @@ package bridge
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -133,14 +132,32 @@ func (b *Bridge) ServeChat(ctx context.Context, w http.ResponseWriter, req map[s
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(200)
-		flusher, _ := w.(http.Flusher)
+		callCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		var writeErr error
+		send := func(text string) {
+			if writeErr != nil {
+				return
+			}
+			_, writeErr = io.WriteString(w, text)
+			if writeErr == nil {
+				writeErr = http.NewResponseController(w).Flush()
+				if writeErr == http.ErrNotSupported {
+					writeErr = nil
+				}
+			}
+			if writeErr != nil {
+				writeErr = &ClientDeliveryError{Err: writeErr}
+				cancel()
+			}
+		}
 
 		var toolCallBuf []interface{}
 		var totalInputTokens, totalOutputTokens int
 		streamFull := provider.NewLogCapture(ctx)
 		streamReasoning := provider.NewLogCapture(ctx)
 
-		err := b.CallQoderWithOpts(ctx, InferAgent(model), messages, model, tools, requestCallOpts(req), func(d Delta) {
+		err := b.CallQoderWithOpts(callCtx, InferAgent(model), messages, model, tools, requestCallOpts(req), func(d Delta) {
 			if d.Err != nil {
 				logger.Error("[Chat][%s] upstream error in stream callback: %v", reqID, d.Err)
 				return
@@ -167,25 +184,22 @@ func (b *Bridge) ServeChat(ctx context.Context, w http.ResponseWriter, req map[s
 				logger.Error("[Chat][%s] marshal chunk failed: %v", reqID, err)
 				return
 			}
-			fmt.Fprintf(w, "data: %s\n\n", string(data))
-			if flusher != nil {
-				flusher.Flush()
-			}
+			send("data: " + string(data) + "\n\n")
 		})
 		result.InputTokens = totalInputTokens
 		result.OutputTokens = totalOutputTokens
 		result.Output = streamFull.String()
 		result.Reasoning = streamReasoning.String()
+		if writeErr != nil {
+			return result, writeErr
+		}
 		if err != nil {
 			logger.Error("[Chat][%s] stream 请求失败: %v (耗时 %dms)", reqID, err, time.Since(startTime).Milliseconds())
 			errMsg, errType := FriendlyError(err)
 			errData, _ := json.Marshal(map[string]interface{}{
 				"error": map[string]interface{}{"message": errMsg, "type": errType},
 			})
-			fmt.Fprintf(w, "data: %s\n\n", string(errData))
-			if flusher != nil {
-				flusher.Flush()
-			}
+			send("data: " + string(errData) + "\n\n")
 			return result, err
 		}
 		finishReason := "stop"
@@ -202,12 +216,9 @@ func (b *Bridge) ServeChat(ctx context.Context, w http.ResponseWriter, req map[s
 			done["usage"] = result.Usage
 		}
 		data, _ := json.Marshal(done)
-		fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", string(data))
-		if flusher != nil {
-			flusher.Flush()
-		}
+		send("data: " + string(data) + "\n\ndata: [DONE]\n\n")
 		logger.Info("[Chat][%s] stream 完成 finish=%s tool_calls=%d 耗时=%dms", reqID, finishReason, len(toolCallBuf), time.Since(startTime).Milliseconds())
-		return result, nil
+		return result, writeErr
 	} else {
 		var full strings.Builder
 		var reasoning strings.Builder

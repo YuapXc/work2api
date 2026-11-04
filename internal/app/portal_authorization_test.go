@@ -765,6 +765,7 @@ func TestMediaHTTPTaskOwnershipAndSingleSubmit(t *testing.T) {
 	s.o.wb.SetManager("media-account", mgr)
 	s.o.wb.Pool = pool.New(map[string]pool.Credential{"media-account": mgr}, "")
 	submissions, queries := 0, 0
+	queryEntered, queryRelease := make(chan struct{}), make(chan struct{})
 	transport := mediaAppTransport(func(r *http.Request) (*http.Response, error) {
 		body := `{"code":0,"data":{"agents":[{"name":"cli","models":[]}],"models":[{"id":"movie","tags":["text-to-video"],"videoGeneration":{"defaultSeconds":3,"minSeconds":3,"maxSeconds":15}},{"id":"draw","tags":["text-to-image"]},{"id":"edit","tags":["image-to-image"]}]}}`
 		switch r.URL.Path {
@@ -787,6 +788,10 @@ func TestMediaHTTPTaskOwnershipAndSingleSubmit(t *testing.T) {
 			body = `{"code":0,"data":{"status":"completed","audio_transcription":{"text":"hello"},"usage":{"credit":0.01}}}`
 		case "/v2/videos/tasks":
 			queries++
+			if queries == 1 {
+				close(queryEntered)
+				<-queryRelease
+			}
 			var p map[string]any
 			json.NewDecoder(r.Body).Decode(&p)
 			if p["task_id"] != "upstream-task" {
@@ -837,6 +842,32 @@ func TestMediaHTTPTaskOwnershipAndSingleSubmit(t *testing.T) {
 	id := accepted["id"].(string)
 	if w = request("GET", "/v1/videos/"+id, "", "media-other"); w.Code != 404 {
 		t.Fatal("task leaked across keys", w.Code)
+	}
+	if w = request("GET", "/v1/videos/"+id+"?cached=1", "", "media-owner"); w.Code != 200 || queries != 0 {
+		t.Fatal("UI polling duplicated upstream queries", w.Code, queries)
+	}
+	if err := s.o.db.DeferMediaTaskCheck(id, "", time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	trackingDone := make(chan struct{})
+	go func() {
+		defer close(trackingDone)
+		(&Scheduler{o: s.o}).reconcileMediaTasks(context.Background())
+	}()
+	select {
+	case <-queryEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("background query did not start")
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := s.o.queryMediaTask(canceled, id); err != context.Canceled || queries != 1 {
+		t.Fatal("canceled waiter duplicated the task query", err, queries)
+	}
+	close(queryRelease)
+	<-trackingDone
+	if submissions != 1 || queries != 1 {
+		t.Fatal("background tracking failed or resubmitted generation", submissions, queries)
 	}
 	for i := 0; i < 2; i++ {
 		w = request("GET", "/v1/videos/"+id, "", "media-owner")
@@ -905,6 +936,25 @@ func TestMediaHTTPTaskOwnershipAndSingleSubmit(t *testing.T) {
 	}
 	json.Unmarshal(w.Body.Bytes(), &accepted)
 	aliasID := accepted["id"].(string)
+	aliasTask, err := s.o.db.MediaTask(aliasID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.o.db.SetAppModels(aliasTask.AppID, `["draw"]`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.o.db.DeferMediaTaskCheck(aliasID, "", time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	beforeQueries := queries
+	(&Scheduler{o: s.o}).reconcileMediaTasks(context.Background())
+	deferred, err := s.o.db.MediaTask(aliasID)
+	if err != nil || queries != beforeQueries || deferred.Status != "queued" || deferred.CheckFailures == 0 || deferred.NextCheckAt <= nowSec() {
+		t.Fatal("revoked task dispatched or lost recoverable state", deferred, err, queries)
+	}
+	if err := s.o.db.SetAppModels(aliasTask.AppID, `["cinema"]`); err != nil {
+		t.Fatal(err)
+	}
 	w = request("GET", "/v1/videos/"+aliasID, "", "media-alias")
 	if w.Code != 200 {
 		t.Fatal("alias-only key query failed", w.Code, w.Body.String())

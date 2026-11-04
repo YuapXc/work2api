@@ -9,12 +9,16 @@ import (
 
 	"work2api/internal/core/provider"
 	"work2api/internal/store"
-	"work2api/internal/workbuddy/siterouting"
 )
 
 // Free evidence affects model permission only. Account scopes include all
 // supporting public credentials, retaining the channel's normal selection.
 func (o *Orchestrator) defaultModelAccess(settings map[string]string) (map[string]bool, map[string]map[string]bool) {
+	excluded, err := o.db.PrivatePoolExcludedUIDs()
+	return o.defaultModelAccessIn(settings, excluded, err)
+}
+
+func (o *Orchestrator) defaultModelAccessIn(settings map[string]string, excluded map[string]bool, exclusionErr error) (map[string]bool, map[string]map[string]bool) {
 	policy := store.DefaultPolicy(settings)
 	aliases := parseModelAliases(settings["model_aliases"])
 	resolve := func(m string) string {
@@ -30,10 +34,12 @@ func (o *Orchestrator) defaultModelAccess(settings map[string]string) (map[strin
 		if id != "" && id != "auto" {
 			catalog[id] = o.modelEntryAccountUIDs(entry)
 			if policy.Mode == "auto" {
-				prices := o.wb.Catalog.CreditsByRegion(id)
 				for uid := range catalog[id] {
-					if a := o.wb.Pool.Get(uid); a != nil && a.Enabled {
-						if cost, known := prices[siterouting.ProfileSite(a.Profile)]; known && cost == 0 {
+					if a := o.wb.Pool.Get(uid); a != nil && a.Enabled && exclusionErr == nil && !excluded[uid] {
+						if m := o.manager(uid); m != nil && m.AuthorizationInvalid() {
+							continue
+						}
+						if cost := o.wb.Catalog.AccountCost(a.Profile, uid, id); cost != nil && *cost == 0 {
 							defaults[id] = true
 						}
 					}

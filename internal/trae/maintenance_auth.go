@@ -22,7 +22,8 @@ func (r *Runtime) authGuard() *provider.MaintenanceGuard {
 	return r.maintenanceGuard
 }
 func (r *Runtime) observeMaintenance(a *auth.Auth, scope, fingerprint string, err error) {
-	if errors.Is(err, context.Canceled) || a.MaintenanceIdentity() != fingerprint {
+	currentIdentity, readable := a.TryMaintenanceIdentity()
+	if errors.Is(err, context.Canceled) || !readable || currentIdentity != fingerprint {
 		return
 	}
 	r.mu.Lock()

@@ -9,6 +9,11 @@ import (
 	"work2api/internal/trae/upstream"
 )
 
+type quotaRefreshError struct{ cause error }
+
+func (e *quotaRefreshError) Error() string { return "Trae 额度刷新失败" }
+func (e *quotaRefreshError) Unwrap() error { return e.cause }
+
 func (r *Runtime) AdminRefreshCredits(ctx context.Context) (map[string]any, error) {
 	r.mu.Lock()
 	ids := []string{}
@@ -91,7 +96,11 @@ func (r *Runtime) refreshQuotaRaw(ctx context.Context, id string, force bool) (r
 	defer r.mu.Unlock()
 	defer close(done)
 	a.QuotaProbeDone = nil
-	if r.accounts[id] != a || identity.MaintenanceIdentity() != fingerprint {
+	current, readable := identity.TryMaintenanceIdentity()
+	if r.accounts[id] != a || !readable || current != fingerprint {
+		if r.accounts[id] == a {
+			a.QuotaFailed = true
+		}
 		return errors.New("Trae 账号已变更")
 	}
 	a.QuotaFailed = err != nil
@@ -170,7 +179,7 @@ func (r *Runtime) refreshQuotaRaw(ctx context.Context, id string, force bool) (r
 		}
 	}
 	if err != nil {
-		return errors.New("Trae 额度刷新失败")
+		return &quotaRefreshError{cause: err}
 	}
 	return nil
 }
@@ -349,10 +358,11 @@ func (r *Runtime) AdminCheckin(ctx context.Context) (map[string]any, error) {
 			}
 		}
 		r.mu.Lock()
-		if r.accounts[id] == a && result["status"] == "pending" {
+		current, readable := a.Auth.TryMaintenanceIdentity()
+		valid := r.accounts[id] == a && readable && current == fingerprint
+		if valid && result["status"] == "pending" {
 			a.CheckinPending = today
 		}
-		valid := r.accounts[id] == a && a.Auth.MaintenanceIdentity() == fingerprint
 		r.mu.Unlock()
 		if !valid {
 			result["status"] = "paused"
@@ -363,7 +373,8 @@ func (r *Runtime) AdminCheckin(ctx context.Context) (map[string]any, error) {
 				return nil, err
 			}
 			r.mu.Lock()
-			if r.accounts[id] == a && a.Auth.MaintenanceIdentity() == fingerprint {
+			current, readable := a.Auth.TryMaintenanceIdentity()
+			if r.accounts[id] == a && readable && current == fingerprint {
 				a.CheckinDate = today
 			}
 			r.mu.Unlock()

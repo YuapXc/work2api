@@ -271,12 +271,13 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 		item := jsonutil.MapAt(value, "item")
 		if jsonutil.StringAt(item, "type") == "reasoning" {
 			key := responseToolKey(value, item)
-			if parser.responseReasoning[key] {
-				return nil
-			}
 			blocks := decodeResponsesReasoning(item)
 			if len(blocks) > 0 {
-				return []bridgeStreamEvent{{Kind: "reasoning", Text: blocks[0].Text, Encrypted: blocks[0].Encrypted}}
+				text := blocks[0].Text
+				if parser.responseReasoning[key] {
+					text = ""
+				}
+				return []bridgeStreamEvent{{Kind: "reasoning", Text: text, Encrypted: blocks[0].Encrypted}}
 			}
 			return nil
 		}

@@ -22,6 +22,84 @@ type terminalOnlyReader struct {
 	reads int
 }
 
+func TestCollapseFailureKeepsObservedUsage(t *testing.T) {
+	for _, tail := range []string{"", "data: {bad}\n\n", "data: {\"error\":{\"message\":\"failed\"}}\n\n"} {
+		wire := "data: {\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7,\"completion_tokens_details\":{\"reasoning_tokens\":3}},\"choices\":[]}\n\n" + tail
+		body, usage, known, err := CollapseStreamWithUsage(strings.NewReader(wire), Chat, "test")
+		if err == nil || body != nil || !known || usage.Input != 12 || usage.Output != 7 || !usage.ReasoningKnown || usage.Reasoning != 3 {
+			t.Fatal("failure lost observed usage or returned partial success", string(body), usage, known, err)
+		}
+	}
+}
+
+func TestResponsesSummaryDoesNotDiscardEncryptedCompletion(t *testing.T) {
+	wire := "data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs1\",\"delta\":\"summary\"}\n\n" +
+		"data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"rs1\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"summary\"}],\"encrypted_content\":\"opaque-state\"}}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+	body, err := CollapseStream(strings.NewReader(wire), Responses, "test")
+	if err != nil || !bytes.Contains(body, []byte(`"encrypted_content":"opaque-state"`)) || bytes.Count(body, []byte(`"text":"summary"`)) != 1 {
+		t.Fatal(string(body), err)
+	}
+}
+
+func TestStreamReopensReasoningAfterTextAndTool(t *testing.T) {
+	for _, target := range []Protocol{Anthropic, Responses} {
+		t.Run(string(target), func(t *testing.T) {
+			var wire bytes.Buffer
+			e := newBridgeStreamEmitter(&wire, httptest.NewRecorder(), target, "test")
+			for _, event := range []bridgeStreamEvent{{Kind: "reasoning", Text: "first"}, {Kind: "text", Text: "answer"}, {Kind: "tool_start", ToolKey: "t", ToolID: "call1", ToolName: "lookup"}, {Kind: "tool_delta", ToolKey: "t", Text: "{}"}, {Kind: "reasoning", Text: "second"}, {Kind: "done"}} {
+				if err := e.Emit(event); err != nil {
+					t.Fatal(err)
+				}
+			}
+			open := map[string]bool{}
+			starts := 0
+			err := readSSE(strings.NewReader(wire.String()), func(name, data string) error {
+				if data == "[DONE]" {
+					return nil
+				}
+				var v map[string]any
+				if err := json.Unmarshal([]byte(data), &v); err != nil {
+					return err
+				}
+				key := fmt.Sprint(v["index"])
+				if target == Responses {
+					key = jsonutil.StringAt(v, "item_id")
+				}
+				switch name {
+				case "content_block_start":
+					open[key] = true
+					if jsonutil.StringAt(v, "content_block", "type") == "thinking" {
+						starts++
+					}
+				case "content_block_stop":
+					delete(open, key)
+				case "content_block_delta":
+					if !open[key] {
+						return fmt.Errorf("delta after closed block %s", key)
+					}
+				case "response.output_item.added":
+					key = jsonutil.StringAt(v, "item", "id")
+					open[key] = true
+					if jsonutil.StringAt(v, "item", "type") == "reasoning" {
+						starts++
+					}
+				case "response.output_item.done":
+					delete(open, jsonutil.StringAt(v, "item", "id"))
+				case "response.reasoning_summary_text.delta":
+					if !open[key] {
+						return fmt.Errorf("reasoning delta after done %s", key)
+					}
+				}
+				return nil
+			})
+			if err != nil || starts != 2 {
+				t.Fatal("invalid reasoning lifecycle", starts, err, wire.String())
+			}
+		})
+	}
+}
+
 func TestToolResultImagesSurviveProtocolConversion(t *testing.T) {
 	image := map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
 	body := map[string]any{"model": "test", "messages": []any{

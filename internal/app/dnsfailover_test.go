@@ -242,6 +242,33 @@ func TestOpenUpstreamFailureAccounting(t *testing.T) {
 	}
 }
 
+func TestWorkBuddyInterruptedUsageSurvivesAllProtocols(t *testing.T) {
+	for _, proto := range []provider.Protocol{provider.ProtocolChat, provider.ProtocolAnthropic, provider.ProtocolResponses} {
+		for _, streaming := range []bool{false, true} {
+			t.Run(fmt.Sprint(proto, streaming), func(t *testing.T) {
+				client := &failingUpstream{err: errors.New("connection reset"), lines: []string{`data: {"choices":[{"index":0,"delta":{"content":"partial","reasoning_content":"thinking"}}],"usage":{"prompt_tokens":12,"completion_tokens":7,"credit":0.5,"completion_tokens_details":{"reasoning_tokens":3}}}`}}
+				o, _ := newDNSFailoverOrch(t, client)
+				o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+				o.wb.Catalog.Refresh()
+				payload := map[string]any{"model": "test-model", "stream": streaming, "max_tokens": 128, "messages": []any{map[string]any{"role": "user", "content": "test"}}}
+				if proto == provider.ProtocolResponses {
+					payload["input"] = "test"
+					delete(payload, "messages")
+				}
+				w := httptest.NewRecorder()
+				o.wb.Serve(context.Background(), provider.ServeRequest{Protocol: proto, Payload: payload, Writer: w, Headers: http.Header{}})
+				rows, err := o.db.UsageRecent(10, "", "", nil, "", false, 0, "")
+				if err != nil || len(rows) != 1 || rows[0]["input_tokens"] != int64(12) || rows[0]["output_tokens"] != int64(7) || rows[0]["credits"] != 0.5 || rows[0]["status"] != "error" || client.calls != 1 {
+					t.Fatal("failure lost usage or replayed generation", rows, err, client.calls)
+				}
+				if !streaming && w.Code < 400 {
+					t.Fatal("partial JSON returned as success", w.Code, w.Body.String())
+				}
+			})
+		}
+	}
+}
+
 type usageFlushProbe struct {
 	*httptest.ResponseRecorder
 	beforeFlush func()
@@ -1315,5 +1342,58 @@ func TestScopedChannelDenialKeepsSafeClassification(t *testing.T) {
 	}
 	if client.calls > 5 {
 		t.Fatal("recovery exceeded existing budget")
+	}
+}
+
+type terminalFailureWriter struct {
+	*httptest.ResponseRecorder
+	marker string
+}
+
+func (w *terminalFailureWriter) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), w.marker) {
+		return 0, errors.New("terminal delivery failed")
+	}
+	return w.ResponseRecorder.Write(p)
+}
+func TestWorkBuddyTerminalDeliveryFailureRetainsUsage(t *testing.T) {
+	for _, proto := range []provider.Protocol{provider.ProtocolAnthropic, provider.ProtocolResponses} {
+		t.Run(string(proto), func(t *testing.T) {
+			client := &failingUpstream{lines: []string{`data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":7,"credit":0.5}}`, "data: [DONE]"}}
+			o, acc := newDNSFailoverOrch(t, client)
+			o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+			o.wb.Catalog.Refresh()
+			marker := "message_stop"
+			if proto == provider.ProtocolResponses {
+				marker = "response.completed"
+			}
+			w := &terminalFailureWriter{httptest.NewRecorder(), marker}
+			payload := map[string]any{"model": "test-model", "stream": true, "max_tokens": 128, "messages": []any{map[string]any{"role": "user", "content": "test"}}}
+			if proto == provider.ProtocolResponses {
+				payload["input"] = "test"
+				delete(payload, "messages")
+			}
+			o.wb.Serve(context.Background(), provider.ServeRequest{Protocol: proto, Payload: payload, Writer: w, Headers: http.Header{}})
+			rows, err := o.db.UsageRecent(10, "", "", nil, "", false, 0, "")
+			if err != nil || len(rows) != 1 || rows[0]["status"] != "error" || rows[0]["output_tokens"] != int64(7) || rows[0]["credits"] != 0.5 || client.calls != 1 {
+				t.Fatal(rows, err, client.calls)
+			}
+			if acc.CooldownUntil > float64(time.Now().Unix()) {
+				t.Fatal("client error penalized upstream account")
+			}
+		})
+	}
+}
+
+func (w *terminalFailureWriter) WriteString(s string) (int, error) { return w.Write([]byte(s)) }
+
+type failedFlushWriter struct{ *httptest.ResponseRecorder }
+
+func (w *failedFlushWriter) FlushError() error { return errors.New("flush failed") }
+func TestObservedWriterPreservesFlushFailure(t *testing.T) {
+	_, timing := streamwatch.WithTiming(context.Background())
+	w := &observedWriter{ResponseWriter: &failedFlushWriter{httptest.NewRecorder()}, timing: timing}
+	if err := http.NewResponseController(w).Flush(); err == nil || err.Error() != "flush failed" {
+		t.Fatal("observer swallowed delivery error", err)
 	}
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -449,5 +451,125 @@ func TestRetryAfterFormats(t *testing.T) {
 	delay := retryAfterDelay(time.Now().Add(time.Minute).UTC().Format(http.TimeFormat))
 	if delay < 58*time.Second || delay > time.Minute {
 		t.Fatal(delay)
+	}
+}
+
+type failedStreamWriter struct {
+	*httptest.ResponseRecorder
+	marker string
+}
+
+func (w *failedStreamWriter) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), w.marker) {
+		return 0, errors.New("client write failed")
+	}
+	return w.ResponseRecorder.Write(p)
+}
+func TestQoderStreamingDeliveryFailurePreservesUsage(t *testing.T) {
+	for _, protocol := range []string{"chat", "anthropic"} {
+		for _, terminal := range []bool{false, true} {
+			t.Run(fmt.Sprint(protocol, terminal), func(t *testing.T) {
+				var calls atomic.Int32
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					raw, _ := json.Marshal(map[string]any{"body": `{"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`, "statusCodeValue": 200})
+					w.Write([]byte("data: " + string(raw) + "\n\n"))
+				}))
+				defer srv.Close()
+				sess, err := cosy.NewSession(cosy.AuthIdentity{Uid: "fixture", UserType: "personal_standard"}, "fixture", "fixture", "fixture")
+				if err != nil {
+					t.Fatal(err)
+				}
+				b := &Bridge{sess: sess, client: NewBearerClient(sess), templateBase: map[string]any{}, chatStreamURL: srv.URL}
+				marker := "answer"
+				if terminal {
+					if protocol == "chat" {
+						marker = "[DONE]"
+					} else {
+						marker = "message_stop"
+					}
+				}
+				w := &failedStreamWriter{httptest.NewRecorder(), marker}
+				req := map[string]any{"model": "qfmodel", "stream": true, "messages": []any{map[string]any{"role": "user", "content": "hello"}}}
+				var result ServeResult
+				if protocol == "chat" {
+					result, err = b.ServeChat(context.Background(), w, req)
+				} else {
+					result, err = b.ServeClaude(context.Background(), w, req)
+				}
+				if err == nil || !strings.Contains(err.Error(), "client write failed") || result.InputTokens != 10 || result.OutputTokens != 5 || calls.Load() != 1 {
+					t.Fatal(result, err, calls.Load())
+				}
+			})
+		}
+	}
+}
+
+func (w *failedStreamWriter) WriteString(s string) (int, error) { return w.Write([]byte(s)) }
+
+func TestQoderNativeReasoningControlsReachUpstream(t *testing.T) {
+	for _, protocol := range []string{"chat", "anthropic", "responses"} {
+		for _, tc := range []struct {
+			name     string
+			controls map[string]any
+			want     bool
+		}{
+			{"default", nil, true},
+			{"disabled", map[string]any{"thinking": map[string]any{"type": "disabled"}}, false},
+			{"adaptive", map[string]any{"thinking": map[string]any{"type": "adaptive"}}, true},
+			{"effort-off", map[string]any{"reasoning_effort": "none"}, false},
+			{"native-effort", map[string]any{"reasoning": map[string]any{"effort": "high"}}, true},
+		} {
+			t.Run(protocol+"/"+tc.name, func(t *testing.T) {
+				var actual map[string]any
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					encoded, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					rawBody, err := cosy.Decode(string(encoded))
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					if err := json.Unmarshal(rawBody, &actual); err != nil {
+						t.Error(err)
+						return
+					}
+					raw, _ := json.Marshal(map[string]any{"body": `{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`, "statusCodeValue": 200})
+					w.Write([]byte("data: " + string(raw) + "\n\n"))
+				}))
+				defer srv.Close()
+				sess, err := cosy.NewSession(cosy.AuthIdentity{Uid: "fixture", UserType: "personal_standard"}, "fixture", "fixture", "fixture")
+				if err != nil {
+					t.Fatal(err)
+				}
+				b := &Bridge{sess: sess, client: NewBearerClient(sess), templateBase: map[string]any{"model_config": map[string]any{"is_reasoning": true}, "parameters": map[string]any{}}, chatStreamURL: srv.URL}
+				req := map[string]any{"model": "qfmodel", "max_tokens": float64(128), "messages": []any{map[string]any{"role": "user", "content": "hi"}}, "input": "hi"}
+				for k, v := range tc.controls {
+					req[k] = v
+				}
+				switch protocol {
+				case "chat":
+					_, err = b.ServeChat(context.Background(), httptest.NewRecorder(), req)
+				case "anthropic":
+					_, err = b.ServeClaude(context.Background(), httptest.NewRecorder(), req)
+				case "responses":
+					_, err = b.ServeCodex(context.Background(), httptest.NewRecorder(), req)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				mc, _ := actual["model_config"].(map[string]any)
+				if mc["is_reasoning"] != tc.want {
+					t.Fatal("native control lost", actual)
+				}
+				params, _ := actual["parameters"].(map[string]any)
+				if params["max_tokens"] != float64(128) {
+					t.Fatal("output budget lost", actual)
+				}
+			})
+		}
 	}
 }

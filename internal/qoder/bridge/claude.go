@@ -3,7 +3,6 @@ package bridge
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"sort"
@@ -69,16 +68,7 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 	prompt := ExtractLatestUserPrompt(incomingMsgs)
 	messages := BuildQoderMessages(b.templateMessages(), incomingMsgs, prompt, toolsEnabled)
 
-	// 解析 thinking 参数和 max_tokens
-	opts := CallOpts{}
-	if thinking, ok := req["thinking"].(map[string]interface{}); ok {
-		if tp, _ := thinking["type"].(string); tp == "enabled" {
-			opts.IsReasoning = true
-		}
-	}
-	if mt, ok := req["max_tokens"].(float64); ok && int(mt) > 0 {
-		opts.MaxTokens = int(mt)
-	}
+	opts := requestCallOpts(req)
 
 	logger.Info("[Claude][%s] model=%s stream=%v tools=%v thinking=%v max_tokens=%d msgs=%d", reqID, model, stream, toolsEnabled, opts.IsReasoning, opts.MaxTokens, len(incomingMsgs))
 
@@ -89,14 +79,29 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(200)
-		flusher, _ := w.(http.Flusher)
+		callCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		var writeErr error
+		send := func(text string) {
+			if writeErr != nil {
+				return
+			}
+			_, writeErr = io.WriteString(w, text)
+			if writeErr == nil {
+				writeErr = http.NewResponseController(w).Flush()
+				if writeErr == http.ErrNotSupported {
+					writeErr = nil
+				}
+			}
+			if writeErr != nil {
+				writeErr = &ClientDeliveryError{Err: writeErr}
+				cancel()
+			}
+		}
 
 		writeSse := func(eventType string, data interface{}) {
 			d, _ := json.Marshal(data)
-			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, string(d))
-			if flusher != nil {
-				flusher.Flush()
-			}
+			send("event: " + eventType + "\ndata: " + string(d) + "\n\n")
 		}
 
 		writeSse("message_start", map[string]interface{}{
@@ -114,6 +119,10 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 		})
 		writeSse("ping", map[string]interface{}{"type": "ping"})
 
+		if writeErr != nil {
+			return result, writeErr
+		}
+
 		// toolCallMerged: key=index, value=merged tool call
 		toolCallMerged := map[int]map[string]interface{}{}
 		contentBlockIndex := 0
@@ -125,7 +134,7 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 		thinkingBuf := provider.NewLogCapture(ctx)
 		streamFull := provider.NewLogCapture(ctx)
 
-		err := b.CallQoderWithOpts(ctx, "claude", messages, model, tools, opts, func(d Delta) {
+		err := b.CallQoderWithOpts(callCtx, "claude", messages, model, tools, opts, func(d Delta) {
 			if d.Err != nil {
 				return
 			}
@@ -173,6 +182,9 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 		result.OutputTokens = totalOutputTokens
 		result.Output = streamFull.String()
 		result.Reasoning = thinkingBuf.String()
+		if writeErr != nil {
+			return result, writeErr
+		}
 		if err != nil {
 			logger.Error("[Claude][%s] stream 请求失败: %v (耗时 %dms)", reqID, err, time.Since(startTime).Milliseconds())
 			// Claude SSE 协议要求 error 事件的 data 为 JSON；纯文本会被客户端解析失败
@@ -187,10 +199,7 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 					"message": errMsg,
 				},
 			})
-			fmt.Fprintf(w, "event: error\ndata: %s\n\n", string(payload))
-			if flusher != nil {
-				flusher.Flush()
-			}
+			send("event: error\ndata: " + string(payload) + "\n\n")
 			return result, err
 		}
 
@@ -239,7 +248,7 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 		})
 		writeSse("message_stop", map[string]interface{}{"type": "message_stop"})
 		logger.Info("[Claude][%s] stream 完成 stop=%s content_len=%d tool_calls=%d 耗时=%dms", reqID, stopReason, streamContentLen, len(mergedTools), time.Since(startTime).Milliseconds())
-		return result, nil
+		return result, writeErr
 	} else {
 		var full strings.Builder
 		var reasoningBuf strings.Builder

@@ -58,6 +58,29 @@ func (p *accountCheckerProbe) Serve(ctx context.Context, req provider.ServeReque
 func newAccountCheckerProbe() *accountCheckerProbe {
 	return &accountCheckerProbe{registryProbe: registryProbe{name: "check-probe", prefix: "check-probe/"}, revision: "first"}
 }
+
+func TestAccountIdentityPreviewRequiresAdmin(t *testing.T) {
+	s, _ := portalFixture(t)
+	s.o.cfg.AdminToken = "identity-admin-secret"
+	uid := s.o.wb.Pool.Accounts()[0].UID
+	h := s.Handler()
+	request := func(token string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("GET", "http://127.0.0.1/admin/providers/workbuddy/accounts/"+uid+"/identity", nil)
+		if token != "" {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	if w := request(""); w.Code != 401 {
+		t.Fatal("unauthenticated identity access", w.Code)
+	}
+	w := request(s.o.cfg.AdminToken)
+	if w.Code != 200 || w.Header().Get("Cache-Control") != "no-store" || !strings.Contains(w.Body.String(), `"local_only":true`) {
+		t.Fatal(w.Code, w.Body.String())
+	}
+}
 func TestAccountCheckCoalescingReuseAndCancellation(t *testing.T) {
 	p := newAccountCheckerProbe()
 	var b accountCheckBook

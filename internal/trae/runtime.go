@@ -613,8 +613,12 @@ func (r *Runtime) AdminData(context.Context) provider.AdminData {
 			if identity == nil {
 				continue
 			}
+			fingerprint, ready := identity.TryMaintenanceIdentity()
+			if !ready {
+				continue
+			}
 			for _, scope := range []string{"auth", "catalog", "quota", "checkin"} {
-				state := guard.State(id+":"+product+":"+scope, identity.MaintenanceIdentity())
+				state := guard.State(id+":"+product+":"+scope, fingerprint)
 				if state.Kind != "" {
 					pending = append(pending, state.Public(product+" · "+map[string]string{"auth": "授权", "catalog": "模型目录", "quota": "额度", "checkin": "签到"}[scope]))
 				}

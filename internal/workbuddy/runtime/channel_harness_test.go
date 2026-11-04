@@ -366,3 +366,21 @@ func TestMediaVideoReferenceMaterialsFollowOfficialWire(t *testing.T) {
 		t.Fatal("reference audio without visual material accepted")
 	}
 }
+
+func TestBuddyProxyDSHCompatibilityParity(t *testing.T) {
+	const rules = "\nAvailable skills: keep all descriptions. Preserve tools and permissions."
+	for _, intro := range []string{
+		"You are a coding agent powered by DeepSeek Harness.",
+		"You are an AI assistant powered by DeepSeek Harness.",
+		"You are an AI agent powered by DeepSeek.",
+		"You are an AI agent. DeepSeek Harness.",
+		"Powered by DeepSeek Harness, you are an AI agent.",
+		strings.Repeat("DeepSeek Harness runtime. ", 20),
+	} {
+		body := map[string]any{"messages": []any{map[string]any{"role": "system", "content": intro + rules}, map[string]any{"role": "developer", "content": intro + rules}}}
+		out, changed := NeutralizeChannelFingerprints(body)
+		if changed || !reflect.DeepEqual(body, out) {
+			t.Fatal("broadened upstream verified trigger", intro)
+		}
+	}
+}

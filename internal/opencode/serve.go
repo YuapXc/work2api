@@ -184,7 +184,9 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 		if err != nil {
 			rt.logger.Warn("stream collapse failed", "component", "opencode.conversion", "request_id", ids.Request, "model", model, "error", err)
 			protocol.WriteError(w, external, http.StatusBadGateway, "unsupported upstream response", "upstream_error", ids.Request)
-			return provider.UsageReport{Status: "error", Error: "collapse failed"}, nil
+			report := usageReport(usage, known)
+			report.Status, report.Error = "error", "collapse failed"
+			return report, nil
 		}
 	} else {
 		responseBody, err = streamwatch.ReadBody(ctx, resp.Body, 0)
@@ -199,7 +201,9 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 		if err != nil {
 			rt.logger.Warn("response protocol conversion failed", "component", "opencode.conversion", "request_id", ids.Request, "model", model, "error", err)
 			protocol.WriteError(w, external, http.StatusBadGateway, "unsupported upstream response", "upstream_error", ids.Request)
-			return provider.UsageReport{Status: "error", Error: "conversion failed"}, nil
+			report := usageReport(usage, known)
+			report.Status, report.Error = "error", "conversion failed"
+			return report, nil
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -254,10 +258,11 @@ func (rt *Runtime) serveSystemOne(ctx context.Context, w http.ResponseWriter, ex
 	if ct := resp.Header.Get("Content-Type"); strings.HasPrefix(ct, "text/event-stream") {
 		w.Header().Set("Content-Type", ct)
 		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no")
 		w.WriteHeader(resp.StatusCode)
 		watch := streamwatch.NewWatch(resp.Body, ctx, 0, 0)
 		defer watch.Close()
-		_, err = io.Copy(w, watch.Reader(resp.Body))
+		_, err = io.Copy(flushingWriter{w}, watch.Reader(resp.Body))
 		report := usageReport(protocol.Usage{}, false)
 		if protocol.ClientCanceled(ctx, err) {
 			report.Status, report.Error = "incomplete", "client canceled"
@@ -276,6 +281,19 @@ func (rt *Runtime) serveSystemOne(ctx context.Context, w http.ResponseWriter, ex
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(responseBody)
 	return usageReport(usage, known), nil
+}
+
+type flushingWriter struct{ http.ResponseWriter }
+
+func (w flushingWriter) Write(data []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(data)
+	if err == nil {
+		err = http.NewResponseController(w.ResponseWriter).Flush()
+		if errors.Is(err, http.ErrNotSupported) {
+			err = nil
+		}
+	}
+	return n, err
 }
 
 func (rt *Runtime) prepareRouteBodies(from protocol.Protocol, route Route, input map[string]any) (map[Tier][]byte, error) {

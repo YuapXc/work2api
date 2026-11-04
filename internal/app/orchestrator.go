@@ -74,6 +74,7 @@ type Orchestrator struct {
 	accountHealth accountHealthObservations
 	accountChecks accountCheckBook
 	routes        routeAffinity
+	mediaChecks   mediaCheckFlights
 }
 
 type cdEntry = wbruntime.CooldownEntry
@@ -172,6 +173,10 @@ func (o *Orchestrator) checkAPIKey(authorization, xAPIKey string) (*Principal, *
 	if err != nil || app == nil {
 		return nil, errBody(401, "invalid api key", "auth_error")
 	}
+	return o.principalForApp(app)
+}
+
+func (o *Orchestrator) principalForApp(app map[string]any) (*Principal, *apiError) {
 	name, _ := app["name"].(string)
 	id, _ := app["id"].(int64)
 	userID, _ := app["user_id"].(int64)
@@ -207,11 +212,7 @@ func (o *Orchestrator) attachPortalScope(p *Principal) *apiError {
 	if user.MustChangePassword {
 		return errBody(403, "请先修改临时密码", "password_change_required")
 	}
-	owned, err := o.db.OwnedAccountUIDs(p.UserID)
-	if err != nil {
-		return errBody(503, "本人账号查询失败", "server_error")
-	}
-	excluded, err := o.db.PrivatePoolExcludedUIDs()
+	owned, excluded, err := o.db.PortalAccountScope(p.UserID)
 	if err != nil {
 		return errBody(503, "账号范围查询失败", "server_error")
 	}
@@ -223,10 +224,22 @@ func (o *Orchestrator) attachPortalScope(p *Principal) *apiError {
 	if err != nil {
 		return errBody(503, "模型授权查询失败", "server_error")
 	}
-	defaults, catalog := o.defaultModelAccess(settings)
+	defaults, catalog := o.defaultModelAccessIn(settings, excluded, nil)
+	aliases := parseModelAliases(settings["model_aliases"])
+	resolve := func(model string) string {
+		if real, ok := aliases[model]; ok {
+			model = real
+		}
+		return strings.TrimPrefix(model, "workbuddy/")
+	}
+	grantsByModel := make(map[string][]store.ModelGrant, len(grants))
+	for _, grant := range grants {
+		model := resolve(grant.Model)
+		grantsByModel[model] = append(grantsByModel[model], grant)
+	}
 	disabled := map[string]bool{}
 	for _, m := range parseJSONStringArray(settings["portal_disabled_models"]) {
-		disabled[o.resolveModel(m)] = true
+		disabled[resolve(m)] = true
 	}
 	p.AccountScope = map[string]bool{}
 	p.ModelScopes = map[string]map[string]bool{}
@@ -248,10 +261,7 @@ func (o *Orchestrator) attachPortalScope(p *Principal) *apiError {
 				p.SharedModels[model] = true
 			}
 		}
-		for _, g := range grants {
-			if o.resolveModel(g.Model) != model {
-				continue
-			}
+		for _, g := range grantsByModel[model] {
 			for _, uid := range g.AccountUIDs {
 				if uid == "*" {
 					for id := range uids {

@@ -646,6 +646,7 @@ func (s *Server) portalModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	visible := s.o.portalCatalogPermissions(p)
+	var routePhysical map[string]map[string]any
 	for _, model := range append(s.o.runtimeModels(r.Context()), s.routeCatalog(r.Context())...) {
 		id := str2(model["id"])
 		if !visible[id] && !visible[s.o.resolveModel(id)] {
@@ -653,6 +654,17 @@ func (s *Server) portalModels(w http.ResponseWriter, r *http.Request) {
 		}
 		item := map[string]any{"id": id, "own_account": p.OwnedModels[s.o.resolveModel(id)], "default_access": p.SharedModels[s.o.resolveModel(id)]}
 		if route, _ := s.o.modelRoute(id); route != nil {
+			if routePhysical == nil {
+				routePhysical = s.physicalCatalog()
+			}
+			members, aerr := s.routeCandidatesIn(p, *route, nil, routePhysical)
+			if aerr != nil || len(members) == 0 {
+				continue
+			}
+			model = routeCatalogEntry(*route, members, routePhysical)
+			if model == nil {
+				continue
+			}
 			own, shared := false, false
 			for _, member := range route.Members {
 				resolved := s.o.resolveModel(member)
@@ -1386,17 +1398,20 @@ func (s *Server) adminPortalOverview(w http.ResponseWriter, r *http.Request) {
 		writeAPIErr(w, errBody(503, "默认模型规则查询失败", "server_error"))
 		return
 	}
-	grants := map[int64][]store.ModelGrant{}
+	grants, err := s.o.db.AllUserModelGrants()
+	if err != nil {
+		writeAPIErr(w, errBody(503, "用户权限查询失败", "server_error"))
+		return
+	}
+	visibleGrants := make(map[int64][]store.ModelGrant, len(users))
 	for _, u := range users {
-		g, e := s.o.db.UserModelGrants(u.ID)
-		if e != nil {
-			writeAPIErr(w, errBody(503, "用户权限查询失败", "server_error"))
-			return
+		visibleGrants[u.ID] = grants[u.ID]
+		if visibleGrants[u.ID] == nil {
+			visibleGrants[u.ID] = []store.ModelGrant{}
 		}
-		grants[u.ID] = g
 	}
 	defaults, _ := s.o.defaultModelAccess(settings)
-	writeJSON(w, 200, map[string]any{"users": users, "invites": invites, "groups": []any{}, "contributions": contributions, "accounts": accounts, "account_count": len(accounts), "model_policy": store.DefaultPolicy(settings), "default_models": sortedPortalModels(defaults), "user_model_grants": grants, "registration_mode": s.o.cfg.PortalRegistrationMode, "user_concurrency": s.portalUserLimit(0), "user_concurrency_max": s.modelsAdmission.sharedCapacity, "user_concurrency_overrides": portalConcurrencyOverrides(settings), "default_group_id": intOf(settings["portal_default_group"]), "default_auto_grant": settings["portal_default_auto_grant"] == "1"})
+	writeJSON(w, 200, map[string]any{"users": users, "invites": invites, "groups": []any{}, "contributions": contributions, "accounts": accounts, "account_count": len(accounts), "model_policy": store.DefaultPolicy(settings), "default_models": sortedPortalModels(defaults), "user_model_grants": visibleGrants, "registration_mode": s.o.cfg.PortalRegistrationMode, "user_concurrency": s.portalUserLimit(0), "user_concurrency_max": s.modelsAdmission.sharedCapacity, "user_concurrency_overrides": portalConcurrencyOverrides(settings), "default_group_id": intOf(settings["portal_default_group"]), "default_auto_grant": settings["portal_default_auto_grant"] == "1"})
 }
 
 func (s *Server) adminPortalDefaultGroup(w http.ResponseWriter, r *http.Request) {

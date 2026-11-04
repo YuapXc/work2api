@@ -34,7 +34,8 @@ import (
 // v23 adds indexed diagnostic-content byte accounting, lazily backfilled.
 // v24 adds an expression index for content-free request grouping.
 // v25 adds durable, caller-scoped media tasks and their usage linkage.
-const SchemaVersion = 25
+// v26 persists asynchronous media polling and query backoff.
+const SchemaVersion = 26
 
 // DB wraps the SQLite connection.
 type DB struct {
@@ -433,6 +434,14 @@ CREATE INDEX IF NOT EXISTS idx_contrib_user ON contributions(user_id);
  response TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL, updated_at REAL NOT NULL,
  usage_id INTEGER NOT NULL
  ); CREATE INDEX IF NOT EXISTS idx_media_tasks_updated ON media_tasks(updated_at); CREATE INDEX IF NOT EXISTS idx_media_tasks_caller ON media_tasks(app_id,user_id,created_at DESC);`); err != nil {
+		return err
+	}
+	for _, column := range []string{"next_check_at REAL NOT NULL DEFAULT 0", "check_failures INTEGER NOT NULL DEFAULT 0", "check_error TEXT NOT NULL DEFAULT ''"} {
+		if _, err := tx.Exec("ALTER TABLE media_tasks ADD COLUMN " + column); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_media_tasks_pending ON media_tasks(next_check_at,updated_at) WHERE upstream_id<>'' AND status NOT IN ('completed','failed','cancelled')`); err != nil {
 		return err
 	}
 	if err := migratePortalAccess(tx, version); err != nil {

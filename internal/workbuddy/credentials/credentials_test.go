@@ -36,6 +36,38 @@ func writeTestCredential(t *testing.T, path, token string) {
 	}
 }
 
+func TestChatIdentityPreviewIsOfflineAndRedacted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "preview.info")
+	writeTestCredential(t, path, "private-access-token")
+	m := NewManager(path)
+	m.client = &http.Client{Transport: refreshTransport(func(*http.Request) (*http.Response, error) {
+		t.Error("offline preview attempted a network request")
+		return nil, errors.New("no network")
+	})}
+	preview, err := m.ChatIdentityPreview()
+	if err != nil || preview["local_only"] != true || preview["endpoint"] == "" {
+		t.Fatal(preview, err)
+	}
+	raw, err := json.Marshal(preview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"private-access-token", "refresh-1", path, `"alias"`, `"test"`} {
+		if strings.Contains(string(raw), secret) {
+			t.Fatal("identity preview leaked private data")
+		}
+	}
+	if present, ok := preview["present"].(map[string]bool); !ok || !present["Authorization"] {
+		t.Fatal("credential presence missing", preview)
+	}
+	if err := m.Retire(false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.ChatIdentityPreview(); err == nil {
+		t.Fatal("removed account still has an identity preview")
+	}
+}
+
 func refreshResponse(r *http.Request, body string) *http.Response {
 	return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header), Request: r}
 }

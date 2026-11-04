@@ -607,3 +607,39 @@ func (m *Manager) RecoverChatAuthorization(ctx context.Context, rejectedBearer s
 }
 
 func (m *Manager) SupportsTranscription() bool { return strings.HasPrefix(m.Profile(), "cn-") }
+
+// ChatIdentityPreview constructs headers locally; no expiry refresh or request is made.
+func (m *Manager) ChatIdentityPreview() (map[string]any, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.retired {
+		return nil, errors.New("账号已移除")
+	}
+	session, err := m.session()
+	if err != nil {
+		return nil, errors.New("本地授权文件不可读取")
+	}
+	profile, err := siterouting.ProfileForAuth(session.Auth)
+	if err != nil {
+		return nil, errors.New("账号出站身份不可识别")
+	}
+	endpoint, err := siterouting.ChatURLForProfile(profile)
+	if err != nil {
+		return nil, err
+	}
+	headers := profiles.ChatHeaders(session.Auth, profiles.Account(session.Account))
+	safe := map[string]string{}
+	for _, name := range []string{"User-Agent", "X-IDE-Type", "X-IDE-Name", "X-IDE-Version", "x-stainless-arch", "x-stainless-os", "x-stainless-lang", "x-stainless-package-version", "x-stainless-runtime", "x-stainless-runtime-version"} {
+		if value := headers[name]; value != "" {
+			safe[name] = value
+		}
+	}
+	present := map[string]bool{}
+	for _, name := range []string{"Authorization", "X-Device-Token", "X-User-Id", "X-Enterprise-Id", "X-Request-ID", "X-Conversation-ID", "X-Conversation-Request-ID", "X-Conversation-Message-ID"} {
+		present[name] = headers[name] != ""
+	}
+	if token, _ := session.Auth["accessToken"].(string); strings.TrimSpace(token) == "" || encryptedToken(session.Auth) {
+		present["Authorization"] = false
+	}
+	return map[string]any{"profile": profile, "endpoint": endpoint, "headers": safe, "present": present, "local_only": true}, nil
+}

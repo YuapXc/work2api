@@ -2365,3 +2365,64 @@ func TestUnifiedStreamDoesNotUseNonStreamResponseCap(t *testing.T) {
 		t.Fatal("non-stream cap removed")
 	}
 }
+
+func TestAutoModelSuggestionsPreserveManualRoutesAndNames(t *testing.T) {
+	catalog := map[string]map[string]any{}
+	for _, id := range []string{"workbuddy/model", "qoder/model", "trae/model", "qoder/new", "trae/new", "workbuddy/auto", "qoder/auto", "workbuddy/movie", "trae/movie", "workbuddy/case", "trae/Case", "workbuddy/internal/name", "trae/internal/name"} {
+		catalog[id] = map[string]any{}
+	}
+	catalog["workbuddy/movie"]["model_type"] = "video"
+	catalog["trae/movie"]["model_type"] = "video"
+	suggestions := suggestModelRoutes(nil, catalog, nil)
+	if len(suggestions) != 3 {
+		t.Fatal(suggestions)
+	}
+	byName := map[string]store.ModelRoute{}
+	for _, r := range suggestions {
+		byName[r.Model] = r
+	}
+	if len(byName["group/model"].Members) != 3 || byName["group/model"].Members[0] != "workbuddy/model" || len(byName["new"].Members) != 2 || len(byName["group/internal/name"].Members) != 2 {
+		t.Fatal(suggestions)
+	}
+	manual := store.ModelRoute{Model: "custom", Members: []string{"workbuddy/model"}, Enabled: false}
+	after := suggestModelRoutes([]store.ModelRoute{manual}, catalog, map[string]string{"new": "somewhere", "group/new": "elsewhere"})
+	if len(after) != 1 || after[0].Model != "group/internal/name" {
+		t.Fatal("manual or alias configuration overwritten", after)
+	}
+	first, _ := json.Marshal(suggestions)
+	again, _ := json.Marshal(suggestModelRoutes(nil, catalog, nil))
+	if string(first) != string(again) {
+		t.Fatal("suggestion order unstable")
+	}
+}
+func TestRouteVisionReflectsAuthorizedCapableMembers(t *testing.T) {
+	o, _ := newDNSFailoverOrch(t, &failingUpstream{})
+	for _, name := range []string{"first", "second"} {
+		if err := o.runtimes.Register(&routeProtocolProbe{registryProbe: registryProbe{name: name, prefix: name + "/"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := NewServer(o)
+	route := store.ModelRoute{Model: "combined", Name: "Combined", Enabled: true, Members: []string{"first/model", "second/model"}}
+	catalog := map[string]map[string]any{"first/model": {"vision": false, "context_length": 200000, "max_output_tokens": 8000}, "second/model": {"supports_image": true, "context_length": 1000000, "max_output_tokens": 64000}}
+	app, err := o.db.CreateApp("vision-route", "hash-vision", "", "", "", `["first/model"]`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &Principal{AppID: app, AllowedModels: []string{"first/model"}}
+	members, aerr := s.routeCandidatesIn(p, route, nil, catalog)
+	if aerr != nil || len(members) != 1 || routeCatalogEntry(route, members, catalog)["vision"] != false {
+		t.Fatal("unauthorized vision exposed", members, aerr)
+	}
+	p.AllowedModels = append(p.AllowedModels, "second/model")
+	members, aerr = s.routeCandidatesIn(p, route, nil, catalog)
+	entry := routeCatalogEntry(route, members, catalog)
+	if aerr != nil || entry["vision"] != true || entry["context_length"] != 200000 {
+		t.Fatal("available vision hidden or window overstated", entry, aerr)
+	}
+	image := map[string]any{"messages": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://example.invalid/image.png"}}}}}}
+	members, aerr = s.routeCandidatesIn(p, route, image, catalog)
+	if aerr != nil || len(members) != 1 || members[0] != "second/model" {
+		t.Fatal("image dispatched to text-only member", members, aerr)
+	}
+}

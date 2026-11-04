@@ -281,7 +281,7 @@ func TestPrivateFailoverEligibilityAndAffinityInvalidation(t *testing.T) {
 	if time.Until(r.accountCooldowns[preferred]) < 119*time.Second {
 		t.Fatal("Retry-After ignored")
 	}
-	for _, cause := range []error{context.Canceled, &net.DNSError{Err: "DNS failed"}, bridge.WrapTransportError(&net.DNSError{Err: "DNS timeout", IsTimeout: true}), &bridge.UpstreamError{Status: 401}, &bridge.UpstreamError{Status: 400, Detail: "invalid_parameter_error"}, &bridge.UpstreamError{Status: 503, Detail: "DataInspectionFailed"}} {
+	for _, cause := range []error{&bridge.ClientDeliveryError{Err: io.ErrUnexpectedEOF}, context.Canceled, &net.DNSError{Err: "DNS failed"}, bridge.WrapTransportError(&net.DNSError{Err: "DNS timeout", IsTimeout: true}), &bridge.UpstreamError{Status: 401}, &bridge.UpstreamError{Status: 400, Detail: "invalid_parameter_error"}, &bridge.UpstreamError{Status: 503, Detail: "DataInspectionFailed"}} {
 		if canFailover(cause) {
 			t.Fatal("nonretryable switched", cause)
 		}

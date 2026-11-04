@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"work2api/internal/config"
@@ -165,6 +166,40 @@ func TestAdminGuard(t *testing.T) {
 	for _, c := range cases {
 		if got := call(c.token, c.path, c.remote, c.host, c.header); got != c.want {
 			t.Errorf("%s: got %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+func TestLoopbackManagementRejectsCrossOriginWrites(t *testing.T) {
+	s := &Server{o: &Orchestrator{cfg: &config.Config{AdminCookieSecureAuto: true}}}
+	for _, path := range []string{"/admin/settings", "/admin/portal/bootstrap"} {
+		for _, tc := range []struct {
+			origin, site string
+			want         int
+		}{
+			{"http://127.0.0.1:8787", "same-origin", 200},
+			{"", "", 200},
+			{"http://127.0.0.1:9999", "same-site", 403},
+			{"https://attacker.example", "cross-site", 403},
+			{"null", "", 403},
+			{"http://127.0.0.1:8787/path", "", 403},
+			{"", "cross-site", 403},
+		} {
+			t.Run(path+"/"+tc.origin+tc.site, func(t *testing.T) {
+				called := false
+				h := s.adminGuard(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true; w.WriteHeader(200) }))
+				r := httptest.NewRequest("POST", "http://127.0.0.1:8787"+path, strings.NewReader(`{"model_aliases":"changed=model"}`))
+				r.RemoteAddr = "127.0.0.1:40000"
+				r.Header.Set("Content-Type", "text/plain")
+				r.Header.Set("Origin", tc.origin)
+				r.Header.Set("Sec-Fetch-Site", tc.site)
+				r.Header.Set("X-Admin-Token", "unverified")
+				w := httptest.NewRecorder()
+				h.ServeHTTP(w, r)
+				if w.Code != tc.want || called != (tc.want == 200) {
+					t.Fatal(w.Code, called, w.Body.String())
+				}
+			})
 		}
 	}
 }

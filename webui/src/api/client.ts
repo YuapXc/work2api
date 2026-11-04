@@ -97,7 +97,7 @@ export const api = {
  updateDownload: () => http.post('/admin/update/download'),
  updateInstall: (allow_migration: boolean, expected_digest: string) => http.post('/admin/update/install', {allow_migration,expected_digest}),
  updatePolicy: (policy: import('@/types').UpdatePolicy) => http.post('/admin/update/policy',policy),
- modelRoutes: () => http.get<unknown, { routes: ModelRoute[]; models: RouteMember[] }>('/admin/model-routes'),
+ modelRoutes: () => http.get<unknown, { routes: ModelRoute[]; models: RouteMember[]; suggestions: ModelRoute[] }>('/admin/model-routes'),
  saveModelRoute: (route: ModelRoute) => http.post<unknown, { ok: boolean }>('/admin/model-routes', route),
  deleteModelRoute: (route: ModelRoute) => http.delete(`/admin/model-routes/${route.id}?revision=${route.revision}`),
   portalInviteHistory: (code: string, offset = 0) => http.get<unknown, {records: import('./portal').InviteRedemption[]; next_offset: number}>(`/admin/portal/invites/${encodeURIComponent(code)}/history`, {params:{offset}}),
@@ -228,6 +228,7 @@ export const api = {
     http.post<unknown, { ok: boolean; config?: Record<string, unknown> }>(
       `/admin/providers/${encodeURIComponent(name)}/config`, patch),
 
+  accountIdentity: (name: string, id: string) => http.get<unknown, { profile: string; endpoint: string; headers: Record<string,string>; present: Record<string,boolean>; local_only: boolean }>(`/admin/providers/${encodeURIComponent(name)}/accounts/${encodeURIComponent(id)}/identity`),
   accountCheckSnapshots: () => http.get<unknown, { results: { provider: string; id: string; check: Record<string, any> | null; test: Record<string, any> | null }[] }>('/admin/account-checks'),
   checkAccount: (name: string, id: string) => http.post<unknown, Record<string, any>>(`/admin/providers/${encodeURIComponent(name)}/accounts/${encodeURIComponent(id)}/check`, {}, { timeout: 35000 }),
   testAccount: (name: string, id: string, model: string) => http.post<unknown, Record<string, any>>(`/admin/providers/${encodeURIComponent(name)}/accounts/${encodeURIComponent(id)}/test`, { model }, { timeout: 95000 }),

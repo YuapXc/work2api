@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"time"
 	"work2api/internal/core/provider"
 )
@@ -55,4 +56,12 @@ func (r *Runtime) CheckAccount(ctx context.Context, id string, force bool) provi
 	result := provider.Checked("valid", "额度授权", "额度接口验证通过；未测试模型调用")
 	result.CheckedAt = int64(state.Updated)
 	return result
+}
+
+func (r *Runtime) AccountIdentityPreview(id string) (map[string]any, error) {
+	m := r.Manager(id)
+	if m == nil || r.Pool.Get(id) == nil {
+		return nil, errors.New("账号已移除")
+	}
+	return m.ChatIdentityPreview()
 }

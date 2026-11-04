@@ -466,6 +466,34 @@ func (d *DB) OwnedAccountUIDs(userID int64) (map[string]bool, error) {
 	return out, rows.Err()
 }
 
+// PortalAccountScope reads ownership and public exclusions from one live snapshot.
+func (d *DB) PortalAccountScope(userID int64) (map[string]bool, map[string]bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	rows, err := d.db.Query(`SELECT account_uid,0 FROM contributions WHERE status<>'active'
+ UNION ALL SELECT account_uid,1 FROM contributions WHERE user_id=?
+ AND provider IN ('workbuddy','trae','qoder','opencode') AND status IN ('active','private')`, userID)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	owned, excluded := map[string]bool{}, map[string]bool{}
+	for rows.Next() {
+		var uid string
+		var personal int
+		if err := rows.Scan(&uid, &personal); err != nil {
+			return nil, nil, err
+		}
+		if personal == 0 {
+			excluded[uid] = true
+		}
+		if personal == 1 {
+			owned[uid] = true
+		}
+	}
+	return owned, excluded, rows.Err()
+}
+
 // PrivatePoolExcludedUIDs prevents historical platform keys from selecting
 // user-owned credentials or platform accounts configured for shared use only.
 func (d *DB) PrivatePoolExcludedUIDs() (map[string]bool, error) {

@@ -204,3 +204,22 @@ func (s *Server) adminAccountCheckSnapshots(w http.ResponseWriter, r *http.Reque
 	}
 	writeJSON(w, 200, map[string]any{"results": results})
 }
+
+func (s *Server) adminAccountIdentity(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	rt, _, id := s.checkTarget(w, r)
+	if rt == nil {
+		return
+	}
+	inspector, ok := rt.(provider.AccountIdentityInspector)
+	if !ok {
+		writeAPIErr(w, errBody(400, "该渠道尚未提供出站身份诊断", "unsupported"))
+		return
+	}
+	value, err := inspector.AccountIdentityPreview(id)
+	if err != nil {
+		writeAPIErr(w, errBody(503, "本地账号身份不可读取，请检查授权文件", "identity_unavailable"))
+		return
+	}
+	writeJSON(w, 200, value)
+}

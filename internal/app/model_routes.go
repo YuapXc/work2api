@@ -63,43 +63,59 @@ func (s *Server) routeCatalog(ctx context.Context) []map[string]any {
 		if !route.Enabled {
 			continue
 		}
-		vision := true
-		known := 0
-		contextLimit, outputLimit := 0, 0
-		contextKnown, outputKnown := true, true
-		for _, member := range route.Members {
-			m := catalog[member]
-			if m == nil || m["model_type"] == "image" || m["model_type"] == "video" || m["model_type"] == "audio" {
-				continue
-			}
-			known++
-			vision = vision && (m["vision"] == true || m["modality"] == "multimodal")
-			c := firstInt(m, "context_length", "context_window")
-			o := firstInt(m, "max_output_tokens", "max_output")
-			contextKnown = contextKnown && c > 0
-			outputKnown = outputKnown && o > 0
-			if c > 0 && (contextLimit == 0 || c < contextLimit) {
-				contextLimit = c
-			}
-			if o > 0 && (outputLimit == 0 || o < outputLimit) {
-				outputLimit = o
-			}
+		if entry := routeCatalogEntry(route, route.Members, catalog); entry != nil {
+			out = append(out, entry)
 		}
-		if known == 0 {
-			continue
-		}
-		if !contextKnown {
-			contextLimit = 0
-		}
-		if !outputKnown {
-			outputLimit = 0
-		}
-		out = append(out, map[string]any{"id": route.Model, "name": route.Name, "provider": "unified", "owned_by": "unified", "object": "model", "vision": vision, "context_length": contextLimit, "max_output_tokens": outputLimit, "members": route.Members, "route_id": route.ID})
 	}
 	return out
 }
 
+func modelHasVision(m map[string]any) bool {
+	return m["vision"] == true || m["supports_image"] == true || m["modality"] == "multimodal"
+}
+func routeCatalogEntry(route store.ModelRoute, members []string, catalog map[string]map[string]any) map[string]any {
+	vision := false
+	known := 0
+	contextLimit, outputLimit := 0, 0
+	contextKnown, outputKnown := true, true
+	for _, member := range members {
+		m := catalog[member]
+		if m == nil || m["model_type"] == "image" || m["model_type"] == "video" || m["model_type"] == "audio" {
+			continue
+		}
+		known++
+		vision = vision || modelHasVision(m)
+		c := firstInt(m, "context_length", "context_window")
+		o := firstInt(m, "max_output_tokens", "max_output")
+		contextKnown = contextKnown && c > 0
+		outputKnown = outputKnown && o > 0
+		if c > 0 && (contextLimit == 0 || c < contextLimit) {
+			contextLimit = c
+		}
+		if o > 0 && (outputLimit == 0 || o < outputLimit) {
+			outputLimit = o
+		}
+	}
+	if known == 0 {
+		return nil
+	}
+	if !contextKnown {
+		contextLimit = 0
+	}
+	if !outputKnown {
+		outputLimit = 0
+	}
+	modality := "text"
+	if vision {
+		modality = "multimodal"
+	}
+	return map[string]any{"id": route.Model, "name": route.Name, "provider": "unified", "owned_by": "unified", "object": "model", "vision": vision, "supports_image": vision, "modality": modality, "context_length": contextLimit, "max_output_tokens": outputLimit, "members": members, "route_id": route.ID}
+}
+
 func (s *Server) routeCandidates(p *Principal, route store.ModelRoute, payload map[string]any) ([]string, *apiError) {
+	return s.routeCandidatesIn(p, route, payload, s.physicalCatalog())
+}
+func (s *Server) routeCandidatesIn(p *Principal, route store.ModelRoute, payload map[string]any, catalog map[string]map[string]any) ([]string, *apiError) {
 	if p == nil {
 		p = &Principal{}
 	}
@@ -109,6 +125,13 @@ func (s *Server) routeCandidates(p *Principal, route store.ModelRoute, payload m
 	settings, err := s.o.db.GetSettings()
 	if err != nil {
 		return nil, errBody(503, "模型权限查询失败", "server_error")
+	}
+	aliases := parseModelAliases(settings["model_aliases"])
+	resolve := func(model string) string {
+		if real, ok := aliases[model]; ok {
+			model = real
+		}
+		return strings.TrimPrefix(model, "workbuddy/")
 	}
 	if p.UserID > 0 {
 		for _, m := range parseJSONStringArray(settings["portal_disabled_models"]) {
@@ -130,14 +153,21 @@ func (s *Server) routeCandidates(p *Principal, route store.ModelRoute, payload m
 			logicalAllowed = true
 		}
 	}
-	catalog := s.physicalCatalog()
 	out := []string{}
+	hasImages := requestHasImages(payload)
+	requestedOutput := firstInt(payload, "max_tokens", "max_output_tokens", "max_completion_tokens")
+	explicitMembers := map[string]bool{}
+	for _, allowed := range p.AllowedModels {
+		if allowed != route.Model {
+			explicitMembers[physicalModel(resolve(allowed))] = true
+		}
+	}
 	for _, member := range route.Members {
 		entry := catalog[member]
 		if entry == nil || entry["model_type"] == "image" || entry["model_type"] == "video" || entry["model_type"] == "audio" {
 			continue
 		}
-		resolved := s.o.resolveModel(member)
+		resolved := resolve(member)
 		rt, ok := s.o.runtimes.Resolve(resolved)
 		if !ok || !rt.Ready() {
 			continue
@@ -145,10 +175,8 @@ func (s *Server) routeCandidates(p *Principal, route store.ModelRoute, payload m
 		keyAllowed := p.UserID > 0 && p.ModelPolicy == "follow" || p.AppID == 0 || p.UserID == 0 && len(p.AllowedModels) == 0 || len(p.AllowedModels) > 0 && modelAllowed(p, member, resolved) && !logicalAllowed
 		// A separately granted physical member remains usable even when another
 		// route member was added after the logical grant was captured.
-		for _, allowed := range p.AllowedModels {
-			if physicalModel(s.o.resolveModel(allowed)) == member && allowed != route.Model {
-				keyAllowed = true
-			}
+		if explicitMembers[member] {
+			keyAllowed = true
 		}
 		if logicalAllowed && grants[member] {
 			keyAllowed = true
@@ -162,11 +190,11 @@ func (s *Server) routeCandidates(p *Principal, route store.ModelRoute, payload m
 				continue
 			}
 		}
-		if requestHasImages(payload) && entry["vision"] != true && entry["supports_image"] != true && entry["modality"] != "multimodal" {
+		if hasImages && !modelHasVision(entry) {
 			continue
 		}
 		if max := firstInt(entry, "max_output_tokens", "max_output"); max > 0 {
-			if requested := firstInt(payload, "max_tokens", "max_output_tokens", "max_completion_tokens"); requested > max {
+			if requestedOutput > max {
 				continue
 			}
 		}
@@ -200,6 +228,70 @@ func requestHasImages(v any) bool {
 	return false
 }
 
+func catalogNameExists(name string, catalog map[string]map[string]any) bool {
+	return catalog[physicalModel(name)] != nil || catalog["workbuddy/"+name] != nil
+}
+
+func suggestModelRoutes(routes []store.ModelRoute, catalog map[string]map[string]any, aliases map[string]string) []store.ModelRoute {
+	groups := map[string][]string{}
+	order := map[string]int{"workbuddy": 0, "qoder": 1, "opencode": 2, "trae": 3}
+	for id, entry := range catalog {
+		channel, name, ok := strings.Cut(id, "/")
+		if _, known := order[channel]; !ok || !known || name == "" || name == "auto" || name == "default" {
+			continue
+		}
+		if entry["model_type"] == "image" || entry["model_type"] == "video" || entry["model_type"] == "audio" {
+			continue
+		}
+		groups[name] = append(groups[name], id)
+	}
+	names := make([]string, 0, len(groups))
+	for name := range groups {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	used := map[string]bool{}
+	covered := map[string]bool{}
+	for _, route := range routes {
+		used[route.Model] = true
+		for _, m := range route.Members {
+			covered[m] = true
+		}
+	}
+	out := []store.ModelRoute{}
+	for _, name := range names {
+		members := groups[name]
+		if len(members) < 2 {
+			continue
+		}
+		manual := false
+		for _, m := range members {
+			manual = manual || covered[m]
+		}
+		if manual {
+			continue
+		}
+		model := name
+		if catalogNameExists(model, catalog) || aliases[model] != "" {
+			model = "group/" + name
+		}
+		if used[model] || aliases[model] != "" || catalog[model] != nil || !routeNamePattern.MatchString(model) || strings.Contains(model, "//") {
+			continue
+		}
+		sort.Slice(members, func(i, j int) bool {
+			a, _, _ := strings.Cut(members[i], "/")
+			b, _, _ := strings.Cut(members[j], "/")
+			if order[a] != order[b] {
+				return order[a] < order[b]
+			}
+			return members[i] < members[j]
+		})
+		out = append(out, store.ModelRoute{Model: model, Name: name, Enabled: true, Members: members})
+		used[model] = true
+	}
+	return out
+}
+
 func (s *Server) adminModelRoutes(w http.ResponseWriter, r *http.Request) {
 	routes, err := s.o.db.ModelRoutes()
 	if err != nil {
@@ -216,7 +308,12 @@ func (s *Server) adminModelRoutes(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Slice(models, func(i, j int) bool { return str2(models[i]["id"]) < str2(models[j]["id"]) })
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, 200, map[string]any{"routes": routes, "models": models})
+	settings, err := s.o.db.GetSettings()
+	if err != nil {
+		writeAPIErr(w, errBody(503, "配置读取失败", "server_error"))
+		return
+	}
+	writeJSON(w, 200, map[string]any{"routes": routes, "models": models, "suggestions": suggestModelRoutes(routes, catalog, parseModelAliases(settings["model_aliases"]))})
 }
 
 var routeNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$`)
@@ -247,7 +344,7 @@ func (s *Server) adminSaveModelRoute(w http.ResponseWriter, r *http.Request) {
 		writeAPIErr(w, errBody(503, "模型配置读取失败", "server_error"))
 		return
 	}
-	if catalog[physicalModel(route.Model)] != nil || parseModelAliases(settings["model_aliases"])[route.Model] != "" {
+	if catalogNameExists(route.Model, catalog) || parseModelAliases(settings["model_aliases"])[route.Model] != "" {
 		writeAPIErr(w, errBody(409, "名称与现有模型或别名冲突，请换一个调用名称", "invalid_request_error"))
 		return
 	}

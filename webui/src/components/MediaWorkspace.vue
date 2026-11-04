@@ -19,6 +19,8 @@ const first = ref(''), last = ref(''), references = ref({ images: '', videos: ''
 const uploadImages = ref<string[]>([]), audioFile = ref<File | null>(null)
 const uploading = ref(false)
 const nextBefore = ref(0)
+const listBusy = ref(false)
+let listFlight: object | null = null
 const tasks = ref<Row[]>([]), selected = ref<Row | null>(null), error = ref(''), loading = ref(false), submitting = ref(false), querying = ref(false)
 const model = computed(() => models.value.find(m => m.id === modelID.value))
 const config = computed(() => model.value?.video_generation || {})
@@ -32,6 +34,7 @@ let epoch = 0, mounted = true, ticker: ReturnType<typeof setInterval> | undefine
 const requests = new Set<AbortController>()
 const lines = (s: string) => s.split('\n').map(s => s.trim()).filter(Boolean)
 const terminal = (s: string) => ['completed','failed','cancelled','unknown'].includes(s)
+const pollable = (task: Row) => task.can_poll !== false && (!terminal(task.status) || task.status === 'unknown' && task.can_poll === true)
 const stateName = (s: string) => ({submitting:'提交中',queued:'排队中',pending:'排队中',in_progress:'处理中',processing:'处理中',completed:'已完成',failed:'失败',cancelled:'已取消',unknown:'结果待确认'} as Row)[s] || s
 const date = (n: number) => new Date(n * 1000).toLocaleString()
 const safeURL = (s: unknown) => typeof s === 'string' && (s.startsWith('https://') || /^data:image\/(png|jpeg|webp);base64,/.test(s)) ? s : ''
@@ -49,25 +52,40 @@ async function request(path: string, body?: unknown, signal?: AbortSignal) {
   return data
  } finally { requests.delete(abort); signal?.removeEventListener('abort',stop) }
 }
-async function refresh(before=0) {
- if (!token.value || loading.value) return
- const current = epoch
- const data = await request('/v1/media/tasks'+(before?`?before=${before}`:''))
- if (mounted && current === epoch) {tasks.value = before ? [...tasks.value,...(data.data || [])] : data.data || [];nextBefore.value=data.next_before || 0}
+async function refresh(before=0, merge=false) {
+ if (!token.value || loading.value || listBusy.value) return
+ const current = epoch, flight = {}
+ listFlight = flight; listBusy.value = true
+ try {
+  const data = await request('/v1/media/tasks'+(before?`?before=${before}`:''))
+  if (!mounted || current !== epoch || listFlight !== flight) return
+  const incoming: Row[] = data.data || []
+  if (before || merge && tasks.value.length) {
+   const updated = new Map(incoming.map(task => [task.id, task]))
+   const existing = new Set(tasks.value.map(task => task.id))
+   const additions = incoming.filter(task => !existing.has(task.id))
+   const retained = tasks.value.map(task => updated.get(task.id) || task)
+   tasks.value = before ? [...retained,...additions] : [...additions,...retained]
+   if (before) nextBefore.value = data.next_before || 0
+  } else {
+   tasks.value = incoming; nextBefore.value = data.next_before || 0
+  }
+ } finally { if (listFlight === flight) { listFlight = null; listBusy.value = false } }
 }
 async function openTask(task: Row, quiet = false) {
  if (querying.value || !token.value) return
  const current = epoch; querying.value = true
  try {
-  const data = await request(`/v1/media/tasks/${encodeURIComponent(task.id)}`)
+  const data = await request(`/v1/media/tasks/${encodeURIComponent(task.id)}${quiet ? '?cached=1' : ''}`)
   if (!mounted || current !== epoch) return
-  selected.value = {...task,...data}; await refresh()
+  selected.value = {...task,...data}; await refresh(0,true)
  } catch (e: any) { if (!quiet && current === epoch) error.value = e.message }
- finally { querying.value = false }
+ finally { if (current === epoch) querying.value = false }
 }
 async function chooseKey() {
  const current = ++epoch
  for (const abort of requests) abort.abort()
+ listFlight = null; listBusy.value = false; querying.value = false
  token.value = ''; models.value = []; tasks.value = []; selected.value = null; error.value = ''; loading.value = true
  try {
   if (!keyID.value) return
@@ -135,7 +153,7 @@ async function submit() {
  finally {submitting.value=false;controller=null}
 }
 onMounted(async()=>{try {keys.value=(await props.loadKeys()).filter(k=>k.enabled !== false && k.enabled !== 0);keyID.value=String(keys.value[0]?.id || '')}catch(e:any){error.value=e.message}
- ticker=setInterval(()=>{if(!document.hidden && !submitting.value && selected.value?.id && !terminal(selected.value.status)) void openTask(selected.value,true)},6000)
+ ticker=setInterval(()=>{if(!document.hidden && !submitting.value && token.value) { if(selected.value?.id && pollable(selected.value)) void openTask(selected.value,true); else if(tasks.value.some(pollable)) void refresh(0,true).catch(()=>{}) }},6000)
 })
 onBeforeUnmount(()=>{mounted=false;epoch++;clearInterval(ticker);controller?.abort();for(const abort of requests)abort.abort();token.value='';uploadImages.value=[]})
 </script>
@@ -184,7 +202,7 @@ onBeforeUnmount(()=>{mounted=false;epoch++;clearInterval(ticker);controller?.abo
       <p class="text-micro text-faint mt-3">产物链接可能过期，请及时保存。媒体实际计费不按聊天 Tokens 推算。</p>
      </template>
     </section>
-    <section class="rounded-2xl border border-line bg-surface overflow-hidden"><div class="flex items-center justify-between gap-3 p-4"><h2 class="font-semibold text-ink">当前 Key 的任务</h2><WButton size="sm" variant="ghost" :disabled="!token || loading" @click="refresh().catch(e=>error=e.message)">刷新</WButton></div><WEmpty v-if="!tasks.length" title="暂无任务" hint="提交后的任务会保留在这里，可在重新打开页面后查询。"/><div v-else class="divide-y divide-line max-h-[32rem] overflow-y-auto"><button v-for="task in tasks" :key="task.id" type="button" class="grid w-full grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-1 px-4 py-3 text-left hover:bg-elevated focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand" :disabled="querying" @click="openTask(task)"><span class="truncate text-small text-ink">{{task.model}}</span><span class="text-micro whitespace-nowrap" :class="task.status==='completed'?'text-live':task.status==='failed'?'text-fault':'text-muted'">{{stateName(task.status)}}</span><span class="text-micro text-faint">{{date(task.created_at)}}</span><span class="text-micro text-faint">{{ {image:'图片',video:'视频',audio:'转写'}[task.kind as 'image'|'video'|'audio'] }}</span></button></div><div v-if="nextBefore" class="p-3 border-t border-line"><WButton size="sm" variant="ghost" @click="refresh(nextBefore).catch(e=>error=e.message)">加载更早任务</WButton></div></section>
+    <section class="rounded-2xl border border-line bg-surface overflow-hidden"><div class="flex items-center justify-between gap-3 p-4"><h2 class="font-semibold text-ink">当前 Key 的任务</h2><WButton size="sm" variant="ghost" :disabled="!token || loading || listBusy" @click="refresh().catch(e=>error=e.message)">刷新</WButton></div><WEmpty v-if="!tasks.length" title="暂无任务" hint="提交后的任务会保留在这里，可在重新打开页面后查询。"/><div v-else class="divide-y divide-line max-h-[32rem] overflow-y-auto"><button v-for="task in tasks" :key="task.id" type="button" class="grid w-full grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-1 px-4 py-3 text-left hover:bg-elevated focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand" :disabled="querying" @click="openTask(task)"><span class="truncate text-small text-ink">{{task.model}}</span><span class="text-micro whitespace-nowrap" :class="task.status==='completed'?'text-live':task.status==='failed'?'text-fault':'text-muted'">{{stateName(task.status)}}</span><span class="text-micro text-faint">{{date(task.created_at)}}</span><span class="text-micro text-faint">{{ {image:'图片',video:'视频',audio:'转写'}[task.kind as 'image'|'video'|'audio'] }}</span><span v-if="task.check_message" class="col-span-2 text-micro text-warn break-words">{{ task.check_message }}</span></button></div><div v-if="nextBefore" class="p-3 border-t border-line"><WButton size="sm" variant="ghost" :disabled="listBusy" @click="refresh(nextBefore).catch(e=>error=e.message)">加载更早任务</WButton></div></section>
    </div>
   </div>
  </WPage>

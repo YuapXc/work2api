@@ -84,6 +84,10 @@ func (emitter *bridgeStreamEmitter) Emit(event bridgeStreamEvent) error {
 	}
 	switch event.Kind {
 	case "reasoning":
+		if event.Text == "" && event.Encrypted == "" {
+			return nil
+		}
+		emitter.reopenReasoning()
 		if event.Encrypted != "" {
 			emitter.reasoningEncrypted = event.Encrypted
 			if emitter.target != Responses && event.Text == "" {
@@ -104,6 +108,7 @@ func (emitter *bridgeStreamEmitter) Emit(event bridgeStreamEvent) error {
 		if event.Signature == "" {
 			return nil
 		}
+		emitter.reopenReasoning()
 		return emitter.emitReasoningSignature(event.Signature)
 	case "text":
 		if event.Text == "" {
@@ -345,6 +350,14 @@ func (emitter *bridgeStreamEmitter) emitReasoningSignature(signature string) err
 	return nil
 }
 
+func (emitter *bridgeStreamEmitter) reopenReasoning() {
+	if emitter.reasoningClosed {
+		emitter.reasoningClosed, emitter.reasoningOpen = false, false
+		emitter.reasoning.Reset()
+		emitter.reasoningEncrypted = ""
+	}
+}
+
 func (emitter *bridgeStreamEmitter) startReasoning() error {
 	if emitter.reasoningOpen || emitter.reasoningClosed {
 		return nil
@@ -352,6 +365,12 @@ func (emitter *bridgeStreamEmitter) startReasoning() error {
 	emitter.reasoningOpen = true
 	switch emitter.target {
 	case Anthropic:
+		if emitter.textOpen {
+			if err := emitter.sse("content_block_stop", map[string]any{"type": "content_block_stop", "index": emitter.textIndex}); err != nil {
+				return err
+			}
+			emitter.textOpen = false
+		}
 		emitter.reasoningIndex = emitter.nextAnthropic
 		emitter.nextAnthropic++
 		return emitter.sse("content_block_start", map[string]any{

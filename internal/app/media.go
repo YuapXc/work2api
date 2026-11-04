@@ -245,7 +245,7 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if kind == "audio" && payload["async"] != true && payload["async"] != "true" {
-		s.awaitTranscription(w, r, ctx, media, request, id, upstreamID, strOr(payload["response_format"], "json"))
+		s.awaitTranscription(w, r, ctx, id, strOr(payload["response_format"], "json"))
 		return
 	}
 	writeJSON(w, http.StatusAccepted, output)
@@ -298,81 +298,31 @@ func (s *Server) handleVideoTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if t.Status == "completed" || t.Status == "failed" || t.Status == "cancelled" || t.UpstreamID == "" {
+	if t.Status == "completed" || t.Status == "failed" || t.Status == "cancelled" || t.UpstreamID == "" || r.URL.Query().Get("cached") == "1" {
 		if t.Status == "submitting" && t.UpstreamID == "" {
 			t.Status = "unknown"
 		}
 		if len(t.Response) == 0 {
 			t.Response = map[string]any{"id": t.ID, "status": t.Status, "model": t.Model}
 		}
+		t.Response["can_poll"] = t.UpstreamID != "" && t.Status != "completed" && t.Status != "failed" && t.Status != "cancelled"
+		if t.CheckError != "" {
+			t.Response["check_message"] = t.CheckError
+		}
 		writeJSON(w, 200, t.Response)
 		return
 	}
-	rt, ok := s.o.runtimes.Resolve(t.Model)
-	if !ok || rt.Name() != t.Provider {
-		writeAPIErr(w, errBody(503, "原任务渠道不可用", "upstream_error"))
-		return
-	}
-	media, ok := rt.(provider.MediaProvider)
-	if !ok {
-		writeAPIErr(w, errBody(503, "原任务渠道不可用", "upstream_error"))
-		return
-	}
-	call := provider.CurrentInvocation(r.Context())
-	call.Provider = t.Provider
-	call.Caller = p.SessionCaller()
-	ctx := s.o.invocationContext(provider.WithInvocation(r.Context(), call))
-	queryOperation := "video-query"
-	if t.Kind == "audio" {
-		queryOperation = "transcription-query"
-	}
-	result, err := media.CallMedia(ctx, provider.MediaRequest{Operation: queryOperation, Model: strings.TrimPrefix(t.Model, "workbuddy/"), AccountID: t.AccountUID, Payload: map[string]any{"task_id": t.UpstreamID}})
+	ctx := s.o.invocationContext(r.Context())
+	output, err := s.o.queryMediaTask(ctx, t.ID)
 	if err != nil {
 		mediaError(w, err)
 		return
 	}
-	status, _ := result["status"].(string)
-	if status == "pending" {
-		status = "queued"
-	}
-	if status == "processing" {
-		status = "in_progress"
-	}
-	if status == "" {
-		status = "unknown"
-	}
-	output := map[string]any{"id": t.ID, "object": t.Kind, "model": t.Model, "status": status, "created_at": int64(t.CreatedAt)}
-	if status == "completed" && t.Kind == "audio" {
-		transcript, _ := result["audio_transcription"].(map[string]any)
-		output["text"] = transcript["text"]
-	}
-	if status == "completed" && t.Kind == "video" {
-		items, ok := result["videos"].([]any)
-		if !ok {
-			items, _ = result["data"].([]any)
-		}
-		if len(items) == 0 {
-			writeAPIErr(w, errBody(502, "任务已完成但尚无视频产物，请稍后查询原任务", "media_result_unavailable"))
+	if validate, ok := r.Context().Value(portalDispatchCheckKey{}).(func(string, string) *apiError); ok {
+		if aerr := validate(t.AccountUID, t.Model); aerr != nil {
+			writeAPIErr(w, aerr)
 			return
 		}
-		output["data"] = items
-	}
-	if v, ok := result["usage"]; ok {
-		output["usage"] = v
-	}
-	message := ""
-	if status == "failed" || status == "cancelled" {
-		message = "上游媒体任务" + status
-		output["error"] = map[string]any{"message": message}
-		for _, key := range []string{"error", "message", "msg", "reason", "fail_reason"} {
-			if v, ok := result[key]; ok {
-				output[key] = v
-			}
-		}
-	}
-	if err = s.o.db.UpdateMediaTask(t.ID, t.UpstreamID, status, output, mediaCredit(result), message); err != nil {
-		writeAPIErr(w, errBody(503, "任务状态保存失败，可继续查询原任务", "server_error"))
-		return
 	}
 	writeJSON(w, 200, output)
 }
@@ -435,7 +385,7 @@ func (s *Server) handleMediaTaskList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"data": visible, "next_before": next})
 }
 
-func (s *Server) awaitTranscription(w http.ResponseWriter, r *http.Request, ctx context.Context, media provider.MediaProvider, req provider.MediaRequest, id, upstreamID, format string) {
+func (s *Server) awaitTranscription(w http.ResponseWriter, r *http.Request, ctx context.Context, id, format string) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
 	for {
@@ -449,33 +399,22 @@ func (s *Server) awaitTranscription(w http.ResponseWriter, r *http.Request, ctx 
 			return
 		case <-timer.C:
 		}
-		result, err := media.CallMedia(ctx, provider.MediaRequest{Operation: "transcription-query", Model: req.Model, AccountID: req.AccountID, Payload: map[string]any{"task_id": upstreamID}})
+		result, err := s.o.queryMediaTask(ctx, id)
 		if err != nil {
 			mediaError(w, err)
 			return
 		}
 		status, _ := result["status"].(string)
-		transcript, _ := result["audio_transcription"].(map[string]any)
-		output := map[string]any{"id": id, "status": status, "text": transcript["text"], "usage": result["usage"]}
-		message := ""
-		if status == "failed" {
-			message = "上游音频转写失败"
-			output["error"] = result["error"]
-		}
-		if err = s.o.db.UpdateMediaTask(id, upstreamID, status, output, mediaCredit(result), message); err != nil {
-			mediaError(w, err)
-			return
-		}
-		if status == "failed" {
-			writeAPIErr(w, errBody(502, message, "transcription_failed"))
+		if status == "failed" || status == "cancelled" {
+			writeAPIErr(w, errBody(502, "上游音频转写未完成", "transcription_failed"))
 			return
 		}
 		if status == "completed" {
 			if format == "text" {
 				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-				_, _ = io.WriteString(w, strOr(transcript["text"], ""))
+				_, _ = io.WriteString(w, strOr(result["text"], ""))
 			} else {
-				writeJSON(w, 200, map[string]any{"text": transcript["text"], "usage": result["usage"]})
+				writeJSON(w, 200, map[string]any{"text": result["text"], "usage": result["usage"]})
 			}
 			return
 		}

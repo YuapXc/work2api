@@ -611,6 +611,12 @@ func TestMediaTaskPersistsAndTerminalUsageIsIdempotent(t *testing.T) {
 	if err = db.UpdateMediaTask(task.ID, "upstream", "queued", map[string]any{"id": task.ID, "status": "queued"}, nil, ""); err != nil {
 		t.Fatal(err)
 	}
+	if err = db.CreateMediaTask(MediaTask{ID: "unsubmitted", Provider: "workbuddy", Model: "movie", Kind: "video"}, "key"); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.DeferMediaTaskCheck(task.ID, "暂时不可查询", time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
 	db.Close()
 	db, err = New(path)
 	if err != nil {
@@ -621,6 +627,15 @@ func TestMediaTaskPersistsAndTerminalUsageIsIdempotent(t *testing.T) {
 	if err != nil || saved.UpstreamID != "upstream" {
 		t.Fatal(saved, err)
 	}
+	if saved.CheckFailures != 1 || saved.CheckError != "暂时不可查询" {
+		t.Fatal("query backoff did not survive restart", saved)
+	}
+	if due, err := db.PendingMediaTasks(float64(time.Now().Unix())); err != nil || len(due) != 0 {
+		t.Fatal("backoff or unknown submission ignored", due, err)
+	}
+	if due, err := db.PendingMediaTasks(float64(time.Now().Add(2 * time.Minute).Unix())); err != nil || len(due) != 1 || due[0] != task.ID {
+		t.Fatal("submitted task not recoverable", due, err)
+	}
 	credit := 51.43
 	if err = db.UpdateMediaTask(task.ID, "upstream", "completed", map[string]any{"id": task.ID, "status": "completed"}, &credit, ""); err != nil {
 		t.Fatal(err)
@@ -629,7 +644,7 @@ func TestMediaTaskPersistsAndTerminalUsageIsIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	saved, err = db.MediaTask(task.ID)
-	if err != nil || saved.Status != "completed" || saved.UpstreamID != "upstream" {
+	if err != nil || saved.Status != "completed" || saved.UpstreamID != "upstream" || saved.CheckFailures != 0 || saved.CheckError != "" {
 		t.Fatal(saved, err)
 	}
 	row, err := db.GetUsage(int(saved.UsageID))
@@ -637,8 +652,43 @@ func TestMediaTaskPersistsAndTerminalUsageIsIdempotent(t *testing.T) {
 		t.Fatal(row, err)
 	}
 	count, _ := db.UsageRowCount()
-	if count != 1 {
+	if count != 2 {
 		t.Fatal("polling duplicated usage", count)
+	}
+}
+
+func TestMediaPollingMigrationPreservesExistingTask(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "media-migrate.db")
+	db, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateMediaTask(MediaTask{ID: "existing", Provider: "workbuddy", Model: "movie", Kind: "video"}, "key"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpdateMediaTask("existing", "upstream", "queued", map[string]any{"status": "queued"}, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.db.Exec(`DROP INDEX idx_media_tasks_pending;
+	ALTER TABLE media_tasks DROP COLUMN next_check_at;
+	ALTER TABLE media_tasks DROP COLUMN check_failures;
+	ALTER TABLE media_tasks DROP COLUMN check_error;
+	PRAGMA user_version=25`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	db, err = New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	task, err := db.MediaTask("existing")
+	if err != nil || task == nil || task.UpstreamID != "upstream" || task.CheckFailures != 0 {
+		t.Fatal("migration lost existing task", task, err)
+	}
+	if due, err := db.PendingMediaTasks(float64(time.Now().Unix())); err != nil || len(due) != 1 || due[0] != task.ID {
+		t.Fatal("old submitted task not scheduled", due, err)
 	}
 }
 

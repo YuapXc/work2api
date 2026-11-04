@@ -386,6 +386,50 @@ func (sessionCostCatalog) RoundTrip(r *http.Request) (*http.Response, error) {
 
 type accountQuoteCatalog struct{ paidFree bool }
 
+func TestDefaultModelPermissionUsesAccountQuoteWithoutConstrainingRouting(t *testing.T) {
+	s, owner := portalFixture(t)
+	o := s.o
+	original := o.wb.Pool.Accounts()[0]
+	o.wb.Pool = pool.New(map[string]pool.Credential{
+		"free": portalCatalogCredential{original.Mgr, "free"},
+		"paid": portalCatalogCredential{original.Mgr, "paid"},
+	}, "")
+	transport := &accountQuoteCatalog{}
+	o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: transport})
+	o.wb.Catalog.Refresh()
+	check := func(expected bool) {
+		t.Helper()
+		defaults, scopes := o.defaultModelAccess(map[string]string{})
+		if defaults["test-model"] != expected || !scopes["test-model"]["paid"] {
+			t.Fatal("free permission lost account evidence or changed routing scope", defaults, scopes)
+		}
+	}
+	check(true)
+	o.wb.Pool.SetEnabled("free", false, "manual")
+	check(false)
+	o.wb.Pool.SetEnabled("free", true, "manual")
+	check(true)
+	contribution, err := o.db.CreateContribution(owner.ID, "free", "workbuddy", "codebuddy", "active")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := o.db.WithdrawContribution(contribution, owner.ID, "withdraw"); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	check(false)
+	if ok, err := o.db.RestoreContributionSharing(contribution, owner.ID); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	check(true)
+	transport.paidFree = true
+	o.wb.Catalog.Refresh()
+	check(false)
+	defaults, _ := o.defaultModelAccess(map[string]string{"portal_model_policy": `{"mode":"auto","include":["test-model"],"exclude":[]}`})
+	if !defaults["test-model"] {
+		t.Fatal("manual inclusion was overridden by paid price")
+	}
+}
+
 func (c *accountQuoteCatalog) RoundTrip(r *http.Request) (*http.Response, error) {
 	price := any(nil)
 	switch r.Header.Get("x-test-models") {

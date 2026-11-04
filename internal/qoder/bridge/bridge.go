@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"work2api/internal/core/protocol"
 	"work2api/internal/qoder/cosy"
 
 	"work2api/internal/qoder/account"
@@ -361,22 +362,25 @@ func DeepCopyMap(m map[string]interface{}) map[string]interface{} {
 
 // CallOpts 控制单次 CallQoder 的可选行为。
 type CallOpts struct {
-	IsReasoning bool // 是否启用推理模式（对应上游 model_config.is_reasoning）
-	MaxTokens   int  // 客户端请求的 max_tokens，0 表示使用模板默认值
+	ReasoningSet bool
+	IsReasoning  bool // 是否启用推理模式（对应上游 model_config.is_reasoning）
+	MaxTokens    int  // 客户端请求的 max_tokens，0 表示使用模板默认值
 }
 
 func requestCallOpts(req map[string]interface{}) CallOpts {
+	enabled, specified := protocol.ReasoningEnabled(req)
+	opts := CallOpts{IsReasoning: enabled, ReasoningSet: specified}
 	for _, key := range []string{"max_output_tokens", "max_completion_tokens", "max_tokens"} {
-		if value := req[key]; value != nil {
-			switch n := value.(type) {
-			case int:
-				return CallOpts{MaxTokens: n}
-			case float64:
-				return CallOpts{MaxTokens: int(n)}
-			}
+		switch n := req[key].(type) {
+		case int:
+			opts.MaxTokens = n
+			return opts
+		case float64:
+			opts.MaxTokens = int(n)
+			return opts
 		}
 	}
-	return CallOpts{}
+	return opts
 }
 
 func (b *Bridge) CallQoder(ctx context.Context, agent string, messages []interface{}, model string, tools interface{}, onDelta func(Delta)) error {
@@ -467,11 +471,14 @@ func (b *Bridge) callQoderWithOpts(ctx context.Context, agent string, messages [
 	body["stream"] = true
 	body["aliyun_user_type"] = b.sess.Identity.UserType
 
-	if mc, ok := body["model_config"].(map[string]interface{}); ok {
-		mc["key"] = model
-		if opts.IsReasoning {
-			mc["is_reasoning"] = true
-		}
+	mc, _ := body["model_config"].(map[string]interface{})
+	if mc == nil {
+		mc = map[string]any{}
+		body["model_config"] = mc
+	}
+	mc["key"] = model
+	if opts.ReasoningSet || opts.IsReasoning {
+		mc["is_reasoning"] = opts.IsReasoning
 	}
 
 	if opts.MaxTokens > 0 {

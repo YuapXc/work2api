@@ -28,6 +28,11 @@ const (
 	ErrTypeCallCount      = "call_count_limit"
 )
 
+type ClientDeliveryError struct{ Err error }
+
+func (e *ClientDeliveryError) Error() string { return "客户端响应发送失败：" + e.Err.Error() }
+func (e *ClientDeliveryError) Unwrap() error { return e.Err }
+
 // TransientMaxRetries 同账号瞬时故障额外重试次数（退避时长见 RetryBackoff）。
 const TransientMaxRetries = 2
 
@@ -120,6 +125,10 @@ func IsTransientUpstream(code int, detail string) bool {
 // IsTransientTransport 判断传输层瞬时故障（对 qoder.sh 的 TLS/连接抖动常见）：
 // SSL EOF/重置、连接重置/中止、超时等。context 主动取消、配置/证书类错误不算。
 func IsTransientTransport(err error) bool {
+	var delivery *ClientDeliveryError
+	if errors.As(err, &delivery) {
+		return false
+	}
 	if err == nil {
 		return false
 	}

@@ -531,6 +531,44 @@ func TestLiveOpenCodeCompatibility(t *testing.T) {
 
 type catalogTestTransport func(*http.Request) (*http.Response, error)
 
+type flushCheckedReader struct {
+	first bool
+	w     *httptest.ResponseRecorder
+}
+
+func (r *flushCheckedReader) Read(p []byte) (int, error) {
+	if !r.first {
+		r.first = true
+		return copy(p, []byte("event: progress\ndata: {\"step\":1}\n\n")), nil
+	}
+	if !r.w.Flushed {
+		return 0, errors.New("first SSE event was buffered")
+	}
+	return 0, io.EOF
+}
+
+func TestSystemOneFlushesBeforeReadingNextEvent(t *testing.T) {
+	w := httptest.NewRecorder()
+	proxy := &proxyTransport{client: &http.Client{Transport: catalogTestTransport(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(&flushCheckedReader{w: w}), Request: req}, nil
+	})}}
+	proxy.healthy.Store(true)
+	transports := &transportPool{items: []*proxyTransport{proxy}}
+	nodes, err := newNodePool([]string{"fixture"}, transports, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaultConfig()
+	cfg.Retry.MaxAttempts = 1
+	cfg.Performance.AttemptTimeoutSeconds = 5
+	rt := &Runtime{cfg: cfg, transports: transports, zenNodes: nodes, goNodes: &nodePool{}, catalog: NewCatalog(TierZen, nil)}
+	rt.catalog.ReplaceWithCapabilities([]string{"decision"}, nil, map[Tier]map[string]protocol.Protocol{TierZen: {"decision": protocol.SystemOne}}, nil, nil)
+	report, err := rt.serveSystemOne(context.Background(), w, protocol.SystemOne, map[string]any{"model": "decision", "stream": true}, Route{ID: "decision", Tier: TierZen, Protocol: protocol.SystemOne}, RequestIDs{})
+	if err != nil || report.Status != "ok" || !w.Flushed || !strings.Contains(w.Body.String(), `"step":1`) {
+		t.Fatal(report, err, w.Body.String())
+	}
+}
+
 func (f catalogTestTransport) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
 
 func TestCatalogCancellationPreservesHealth(t *testing.T) {

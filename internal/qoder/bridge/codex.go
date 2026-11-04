@@ -54,9 +54,13 @@ func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[
 		}
 		_, writeErr = io.WriteString(w, text)
 		if writeErr == nil {
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
+			writeErr = http.NewResponseController(w).Flush()
+			if writeErr == http.ErrNotSupported {
+				writeErr = nil
 			}
+		}
+		if writeErr != nil {
+			writeErr = &ClientDeliveryError{Err: writeErr}
 		}
 	}
 	callCtx, cancel := context.WithCancel(ctx)

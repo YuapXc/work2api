@@ -474,10 +474,10 @@ func CollectStream(fallbackModel string, produce func(yield LineFunc) error) (ma
 		return nil
 	})
 	if err != nil && !errors.Is(err, errDone) {
-		return nil, err
+		return map[string]any{"usage": usage}, err
 	}
 	if err := state.complete(false); err != nil {
-		return nil, err
+		return map[string]any{"usage": usage}, err
 	}
 
 	message := map[string]any{"role": "assistant", "content": contentParts.String()}

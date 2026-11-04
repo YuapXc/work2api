@@ -23,6 +23,34 @@ func PrepareRequest(from, to Protocol, input map[string]any, upstreamURL string)
 	return output, nil
 }
 
+// ReasoningEnabled projects native controls for providers with a boolean switch.
+// Unspecified controls preserve the provider default; effort does not override
+// an explicit thinking mode.
+func ReasoningEnabled(input map[string]any) (enabled, specified bool) {
+	if thinking, ok := input["thinking"].(map[string]any); ok {
+		switch strings.ToLower(jsonutil.StringAt(thinking, "type")) {
+		case "enabled", "adaptive":
+			return true, true
+		case "disabled":
+			return false, true
+		}
+	}
+	values := []any{input["reasoning_effort"], jsonutil.AnyAt(input, "output_config", "effort"), input["effort"], jsonutil.AnyAt(input, "reasoning", "effort")}
+	for _, value := range values {
+		text, ok := value.(string)
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(text)) {
+		case "none", "off", "disabled":
+			return false, true
+		case "low", "medium", "high", "xhigh", "max":
+			return true, true
+		}
+	}
+	return false, false
+}
+
 // ForcedEffort applies an operator-configured thinking level to a prepared
 // upstream body, so a client can be served at a fixed level without the client
 // cooperating.

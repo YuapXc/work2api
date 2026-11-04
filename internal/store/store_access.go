@@ -70,6 +70,32 @@ func (d *DB) UserModelGrants(userID int64) ([]ModelGrant, error) {
 	return out, rows.Err()
 }
 
+// AllUserModelGrants supplies the administrator's all-user view without N+1 queries.
+func (d *DB) AllUserModelGrants() (map[int64][]ModelGrant, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	rows, err := d.db.Query(`SELECT user_id,model,account_uid FROM user_model_grants ORDER BY user_id,model,account_uid`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64][]ModelGrant{}
+	for rows.Next() {
+		var userID int64
+		var model, uid string
+		if err := rows.Scan(&userID, &model, &uid); err != nil {
+			return nil, err
+		}
+		grants := out[userID]
+		if len(grants) == 0 || grants[len(grants)-1].Model != model {
+			grants = append(grants, ModelGrant{Model: model, AccountUIDs: []string{}})
+		}
+		grants[len(grants)-1].AccountUIDs = append(grants[len(grants)-1].AccountUIDs, uid)
+		out[userID] = grants
+	}
+	return out, rows.Err()
+}
+
 // Replace public grants while preserving the scoped legacy grants. A caller
 // must explicitly delete a legacy grant by model rather than accidentally
 // widening it when saving the ordinary model picker.

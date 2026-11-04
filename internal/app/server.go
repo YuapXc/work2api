@@ -330,6 +330,10 @@ func (s *Server) adminGuard(next http.Handler) http.Handler {
 					"type":    "forbidden"}})
 				return
 			}
+			if !s.adminOriginAllowed(r, false) {
+				writeAPIErr(w, errBody(403, "拒绝跨源管理请求", "forbidden"))
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -458,18 +462,21 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	data := s.modelCatalog(r.Context())
 	out := make([]map[string]any, 0, len(data))
+	var routePhysical map[string]map[string]any
 	for _, item := range data {
 		id := str2(item["id"])
 		if route, _ := s.o.modelRoute(id); route != nil {
-			members, aerr := s.routeCandidates(principal, *route, nil)
+			if routePhysical == nil {
+				routePhysical = s.physicalCatalog()
+			}
+			members, aerr := s.routeCandidatesIn(principal, *route, nil, routePhysical)
 			if aerr != nil || len(members) == 0 {
 				continue
 			}
-			clean := map[string]any{}
-			for k, v := range item {
-				clean[k] = v
+			clean := routeCatalogEntry(*route, members, routePhysical)
+			if clean == nil {
+				continue
 			}
-			clean["members"] = members
 			out = append(out, clean)
 			continue
 		}
