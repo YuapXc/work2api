@@ -12,6 +12,7 @@ import (
 	"strings"
 	"work2api/internal/core/protocol"
 	"work2api/internal/jsonutil"
+	"work2api/internal/streamwatch"
 )
 
 // Tool definitions from jasonxu114514/opencode2api a6601da and the OpenCode CLI.
@@ -32,20 +33,38 @@ var officialTools = func() map[string]struct {
 	return definitions
 }()
 
-// Alias only declared conflicting client tools. Schemas and tool argument
-// strings are opaque; never rewrite them or replace them with official schemas.
-func aliasClientTools(input map[string]any, proto protocol.Protocol, anonymous ...bool) (map[string]any, map[string]string) {
+// Isolate conflicting names and prefixes from compatibility tools and aliases.
+// Schemas and tool argument strings stay opaque.
+func aliasClientTools(input map[string]any, proto protocol.Protocol, anonymous, compatibilityTools bool) (map[string]any, map[string]string) {
 	forward, reverse := map[string]string{}, map[string]string{}
 	used := map[string]bool{}
 	for _, raw := range jsonutil.SliceAt(input, "tools") {
-		used[anonymousToolName(proto, raw)] = true
+		if name := anonymousToolName(proto, raw); name != "" {
+			used[name] = true
+		}
+	}
+	var reserved []string
+	if compatibilityTools {
+		reserved = append(reserved, anonymousCoreTools...)
 	}
 	for name := range used {
-		if _, known := officialTools[name]; !known && name != "bash" && !(len(anonymous) > 0 && anonymous[0]) {
+		if _, known := officialTools[name]; known || name == "bash" {
+			reserved = append(reserved, name)
+		}
+	}
+	if !anonymous && len(reserved) == 0 {
+		return input, nil
+	}
+	sort.Strings(reserved)
+	const aliasPrefix = "w2a_"
+	for name := range used {
+		i := sort.SearchStrings(reserved, name)
+		conflicts := i < len(reserved) && strings.HasPrefix(reserved[i], name)
+		if !anonymous && !conflicts && !strings.HasPrefix(aliasPrefix, name) && !strings.HasPrefix(name, aliasPrefix) {
 			continue
 		}
 		sum := sha256.Sum256([]byte("opencode-client-tool\x00" + name))
-		alias := "w2a_" + hex.EncodeToString(sum[:12])
+		alias := aliasPrefix + hex.EncodeToString(sum[:12])
 		for used[alias] {
 			alias += "_"
 		}
@@ -209,77 +228,132 @@ func restoreToolNames(obj map[string]any, names map[string]string) bool {
 	return changed
 }
 
+type partialToolCall struct {
+	name string
+	args strings.Builder
+}
+
 type toolAliasWriter struct {
 	http.ResponseWriter
 	names        map[string]string
 	blocked      map[string]bool
 	pending      bytes.Buffer
 	failure      error
-	partialNames map[string]string
+	partialTools map[[2]int]*partialToolCall
+	heldBytes    int
 }
 
 func (w *toolAliasWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
-func (w *toolAliasWriter) Flush() {
-	if f, ok := w.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
+func (w *toolAliasWriter) Flush()                      { _ = w.FlushError() }
+
+func (w *toolAliasWriter) FlushError() error {
+	if w.failure != nil {
+		return w.failure
 	}
+	w.failure = http.NewResponseController(w.ResponseWriter).Flush()
+	return w.failure
 }
-func (w *toolAliasWriter) rewrite(raw []byte) []byte {
-	var obj map[string]any
-	if json.Unmarshal(raw, &obj) != nil {
-		return raw
+
+func (w *toolAliasWriter) holdsToolPrefix(name string) bool {
+	for alias := range w.names {
+		if strings.HasPrefix(alias, name) {
+			return true
+		}
+	}
+	for blocked := range w.blocked {
+		if strings.HasPrefix(blocked, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *toolAliasWriter) rewriteChatTool(key [2]int, fn map[string]any) bool {
+	fragment, _ := fn["name"].(string)
+	partial := w.partialTools[key]
+	if fragment == "" && partial == nil {
+		return false
+	}
+	candidate := fragment
+	if partial != nil {
+		candidate = partial.name + fragment
+	}
+	if w.blocked[candidate] {
+		w.failure = fmt.Errorf("upstream selected a non-executable compatibility tool")
+		return false
+	}
+	args, hasArgs := fn["arguments"].(string)
+	hold := w.names[candidate] == "" && w.holdsToolPrefix(candidate)
+	if (hold || partial != nil) && fn["arguments"] != nil && !hasArgs {
+		w.failure = fmt.Errorf("invalid fragmented tool arguments")
+		return false
+	}
+	if hold {
+		if len(fragment)+len(args) > streamwatch.DefaultMaxEventBytes-w.heldBytes {
+			w.failure = fmt.Errorf("unresolved tool call exceeds stream buffer limit")
+			return false
+		}
+		if partial == nil {
+			if w.partialTools == nil {
+				w.partialTools = map[[2]int]*partialToolCall{}
+			}
+			partial = &partialToolCall{}
+			w.partialTools[key] = partial
+		}
+		partial.name = candidate
+		partial.args.WriteString(args)
+		w.heldBytes += len(fragment) + len(args)
+		delete(fn, "name")
+		delete(fn, "arguments")
+		return true
+	}
+	if partial == nil {
+		return false
+	}
+	fn["name"] = candidate
+	if partial.args.Len() > 0 || hasArgs {
+		fn["arguments"] = partial.args.String() + args
+	}
+	w.heldBytes -= len(partial.name) + partial.args.Len()
+	delete(w.partialTools, key)
+	return true
+}
+
+func (w *toolAliasWriter) rewriteObject(obj map[string]any) bool {
+	if obj == nil {
+		if len(w.partialTools) > 0 {
+			w.failure = fmt.Errorf("incomplete client tool name")
+		}
+		return false
 	}
 	changed := false
-	// Chat permits a function name to arrive in several deltas. Hold only an
-	// alias prefix, not the event or its arguments; emit the original name as
-	// soon as the full alias is known.
-	for _, rawChoice := range jsonutil.SliceAt(obj, "choices") {
+	for position, rawChoice := range jsonutil.SliceAt(obj, "choices") {
 		choice, _ := rawChoice.(map[string]any)
-		for _, rawCall := range jsonutil.SliceAt(jsonutil.MapAt(choice, "delta"), "tool_calls") {
+		choiceIndex := position
+		if choice["index"] != nil {
+			choiceIndex = jsonutil.IntAt(choice, "index")
+		}
+		for position, rawCall := range jsonutil.SliceAt(jsonutil.MapAt(choice, "delta"), "tool_calls") {
 			call, _ := rawCall.(map[string]any)
 			fn := jsonutil.MapAt(call, "function")
-			fragment, ok := fn["name"].(string)
-			if !ok || fragment == "" {
+			if fn == nil {
 				continue
 			}
-			key := fmt.Sprintf("%d:%d", jsonutil.IntAt(choice, "index"), jsonutil.IntAt(call, "index"))
-			candidate := w.partialNames[key] + fragment
-			if w.blocked[candidate] {
-				w.failure = fmt.Errorf("upstream selected a non-executable compatibility tool")
-				return raw
+			callIndex := position
+			if call["index"] != nil {
+				callIndex = jsonutil.IntAt(call, "index")
 			}
-			if original := w.names[candidate]; original != "" {
-				fn["name"] = candidate
-				delete(w.partialNames, key)
-				changed = true
-				continue
+			changed = w.rewriteChatTool([2]int{choiceIndex, callIndex}, fn) || changed
+			if w.failure != nil {
+				return false
 			}
-			prefix := false
-			for alias := range w.names {
-				if strings.HasPrefix(alias, candidate) {
-					prefix = true
-					break
+		}
+		if jsonutil.StringAt(choice, "finish_reason") != "" {
+			for key := range w.partialTools {
+				if key[0] == choiceIndex {
+					w.failure = fmt.Errorf("incomplete client tool name")
+					return false
 				}
-			}
-			if !prefix {
-				for name := range w.blocked {
-					if strings.HasPrefix(name, candidate) {
-						prefix = true
-						break
-					}
-				}
-			}
-			if prefix {
-				if w.partialNames == nil {
-					w.partialNames = map[string]string{}
-				}
-				w.partialNames[key] = candidate
-				fn["name"] = ""
-				changed = true
-			} else if w.partialNames[key] != "" {
-				fn["name"] = candidate
-				delete(w.partialNames, key)
-				changed = true
 			}
 		}
 	}
@@ -289,14 +363,28 @@ func (w *toolAliasWriter) rewrite(raw []byte) []byte {
 		}
 	})
 	if w.failure != nil {
+		return false
+	}
+	return restoreToolNames(obj, w.names) || changed
+}
+
+func (w *toolAliasWriter) rewriteEvent(event map[string]any) error {
+	w.rewriteObject(event)
+	return w.failure
+}
+
+func (w *toolAliasWriter) rewrite(raw []byte) []byte {
+	if bytes.Equal(raw, []byte("[DONE]")) {
+		w.rewriteObject(nil)
 		return raw
 	}
-	changed = restoreToolNames(obj, w.names) || changed
-	if !changed {
+	var obj map[string]any
+	if json.Unmarshal(raw, &obj) != nil || !w.rewriteObject(obj) {
 		return raw
 	}
 	encoded, err := json.Marshal(obj)
 	if err != nil {
+		w.failure = err
 		return raw
 	}
 	return encoded
@@ -365,7 +453,7 @@ func (w *toolAliasWriter) Finish() error {
 	if w.pending.Len() > 0 {
 		return fmt.Errorf("incomplete tool alias response event")
 	}
-	if len(w.partialNames) > 0 {
+	if len(w.partialTools) > 0 {
 		return fmt.Errorf("incomplete client tool name")
 	}
 	return nil

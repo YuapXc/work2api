@@ -240,12 +240,17 @@ func (w *CustomToolWriter) Write(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
-func (w *CustomToolWriter) Flush() {
-	if w.committed {
-		if f, ok := w.ResponseWriter.(http.Flusher); ok {
-			f.Flush()
-		}
+func (w *CustomToolWriter) Flush() { _ = w.FlushError() }
+
+func (w *CustomToolWriter) FlushError() error {
+	if !w.committed {
+		return nil
 	}
+	if err := http.NewResponseController(w.ResponseWriter).Flush(); err != nil {
+		w.failure = err
+		return err
+	}
+	return nil
 }
 func (w *CustomToolWriter) Finish() error {
 	if w.failure != nil {

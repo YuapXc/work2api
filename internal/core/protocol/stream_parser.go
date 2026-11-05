@@ -12,6 +12,7 @@ import (
 
 type bridgeStreamParser struct {
 	generationCtx     context.Context
+	rewrite           func(map[string]any) error
 	protocol          Protocol
 	started           bool
 	tools             map[string]bool
@@ -27,6 +28,11 @@ func (parser *bridgeStreamParser) Parse(eventName, data string) ([]bridgeStreamE
 		if parser.protocol != Chat {
 			return nil, fmt.Errorf("unexpected [DONE] terminator for %s stream", parser.protocol)
 		}
+		if parser.rewrite != nil {
+			if err := parser.rewrite(nil); err != nil {
+				return nil, err
+			}
+		}
 		return []bridgeStreamEvent{{Kind: "done"}}, nil
 	}
 	var value map[string]any
@@ -34,6 +40,11 @@ func (parser *bridgeStreamParser) Parse(eventName, data string) ([]bridgeStreamE
 		return nil, fmt.Errorf("invalid upstream SSE JSON: %w", err)
 	}
 	parser.observeGeneration(eventName, value)
+	if parser.rewrite != nil {
+		if err := parser.rewrite(value); err != nil {
+			return nil, err
+		}
+	}
 	switch parser.protocol {
 	case Chat:
 		return parser.parseChatEvent(eventName, value), nil

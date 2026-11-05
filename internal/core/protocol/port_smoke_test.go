@@ -985,3 +985,36 @@ func TestStreamingCaptureDoesNotTrimProtocolOutput(t *testing.T) {
 		}
 	}
 }
+
+type streamFlushFailure struct {
+	*httptest.ResponseRecorder
+	err     error
+	flushes int
+}
+
+func (w *streamFlushFailure) FlushError() error {
+	w.flushes++
+	return w.err
+}
+func TestStreamStopsOnFlushFailureWithObservedUsage(t *testing.T) {
+	failure := errors.New("fixture flush failed")
+	for _, forward := range []bool{true, false} {
+		base := &streamFlushFailure{ResponseRecorder: httptest.NewRecorder(), err: failure}
+		base.Header().Set("Content-Type", "text/event-stream")
+		reader := &terminalOnlyReader{wire: `data: {"id":"fixture","choices":[{"delta":{"content":"answer"}}],"usage":{"prompt_tokens":12,"completion_tokens":7}}` + "\n\n"}
+		var usage Usage
+		var known bool
+		var err error
+		if forward {
+			usage, known, err = ForwardStream(t.Context(), base, reader, Chat, "fixture")
+		} else {
+			usage, known, err = TranscodeStream(t.Context(), NewCustomToolWriter(base, nil, 0), reader, Chat, Responses, "fixture")
+		}
+		if !errors.Is(err, failure) || !known || usage.Input != 12 || usage.Output != 7 || reader.reads != 1 || base.flushes != 1 {
+			t.Fatal(forward, usage, known, err, reader.reads, base.flushes)
+		}
+		if strings.Contains(base.Body.String(), "upstream_error") {
+			t.Fatal("delivery failure mislabeled as upstream", base.Body.String())
+		}
+	}
+}

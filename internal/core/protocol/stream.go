@@ -18,6 +18,10 @@ var errStreamNormalTermination = errors.New("upstream stream terminated normally
 
 var errSSEUnexpectedEOF = errors.New("unexpected end of SSE stream")
 
+type downstreamStreamError struct{ error }
+
+func (e downstreamStreamError) Unwrap() error { return e.error }
+
 type streamTermination uint8
 
 const (
@@ -55,12 +59,18 @@ func transcodeStreamWithUsage(w http.ResponseWriter, reader io.Reader, from, to 
 // gateway. A cancelled client must not receive a synthetic upstream error
 // after its connection has gone away.
 func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reader, from, to Protocol, model string) (Usage, bool, error) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	return TranscodeStreamWithRewrite(ctx, w, reader, from, to, model, nil)
+}
+
+// TranscodeStreamWithRewrite normalizes decoded upstream events before conversion.
+// The rewrite receives nil at a Chat terminal marker.
+func TranscodeStreamWithRewrite(ctx context.Context, w http.ResponseWriter, reader io.Reader, from, to Protocol, model string, rewrite func(map[string]any) error) (Usage, bool, error) {
+	if _, ok := w.(http.Flusher); !ok {
 		return Usage{}, false, fmt.Errorf("response writer does not support streaming")
 	}
 	parser := &bridgeStreamParser{
 		generationCtx:     ctx,
+		rewrite:           rewrite,
 		protocol:          from,
 		tools:             map[string]bool{},
 		toolIDs:           map[string]string{},
@@ -68,7 +78,7 @@ func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reade
 		responseArgs:      map[string]bool{},
 		responseReasoning: map[string]bool{},
 	}
-	emitter := newBridgeStreamEmitter(w, flusher, to, model)
+	emitter := newBridgeStreamEmitter(w, w, to, model)
 	termination := streamOpen
 	readErr := readSSE(reader, func(eventName, data string) error {
 		events, err := parser.Parse(eventName, data)
@@ -79,7 +89,7 @@ func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reade
 			}
 			return errStreamUpstreamFailure
 		}
-		for _, event := range events {
+		for i, event := range events {
 			switch event.Kind {
 			case "done":
 				termination = streamNormalTermination
@@ -87,6 +97,12 @@ func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reade
 				termination = streamErrorTermination
 			}
 			if err := emitter.Emit(event); err != nil {
+				// The whole frame was parsed even if delivering its delta failed.
+				for _, remaining := range events[i+1:] {
+					if remaining.Kind == "usage" {
+						_ = emitter.Emit(remaining)
+					}
+				}
 				return err
 			}
 			if event.Kind == "done" {
@@ -99,7 +115,8 @@ func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reade
 		if errors.Is(readErr, errStreamNormalTermination) {
 			return emitter.usage, emitter.usageReported, nil
 		}
-		if ClientCanceled(ctx, readErr) {
+		var delivery downstreamStreamError
+		if ClientCanceled(ctx, readErr) || errors.As(readErr, &delivery) {
 			return emitter.usage, emitter.usageReported, readErr
 		}
 		if termination == streamOpen {
@@ -148,16 +165,22 @@ func ClientCanceled(ctx context.Context, streamErr error) bool {
 // choose large writes, so flushing in Write is the only reliable place to
 // keep same-protocol streams live.
 type sseFlushWriter struct {
-	writer  io.Writer
-	flusher http.Flusher
+	writer io.Writer
+	flush  func() error
 }
 
 func (writer *sseFlushWriter) Write(data []byte) (int, error) {
 	n, err := writer.writer.Write(data)
-	if n > 0 {
-		writer.flusher.Flush()
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
 	}
-	return n, err
+	if err == nil && n > 0 {
+		err = writer.flush()
+	}
+	if err != nil {
+		return n, downstreamStreamError{err}
+	}
+	return n, nil
 }
 
 func forwardSSEWithUsage(w http.ResponseWriter, reader io.Reader, protocol Protocol, model string) (Usage, bool, error) {
@@ -165,15 +188,14 @@ func forwardSSEWithUsage(w http.ResponseWriter, reader io.Reader, protocol Proto
 }
 
 func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader, protocol Protocol, model string) (Usage, bool, error) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		return Usage{}, false, fmt.Errorf("response writer does not support streaming")
 	}
 	observer := newStreamUsageObserver(protocol)
 	observer.parser.generationCtx = ctx
 	buffer, release := streamwatch.BorrowLineBuffer()
 	defer release()
-	writer := &sseFlushWriter{writer: w, flusher: flusher}
+	writer := &sseFlushWriter{writer: w, flush: http.NewResponseController(w).Flush}
 	var copyErr error
 	for {
 		n, readErr := reader.Read(buffer)
@@ -217,7 +239,8 @@ func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader,
 	if observer.NormalTermination() && observer.ParseError() == nil {
 		return usage, observer.Reported(), copyErr
 	}
-	if ClientCanceled(ctx, copyErr) {
+	var delivery downstreamStreamError
+	if ClientCanceled(ctx, copyErr) || errors.As(copyErr, &delivery) {
 		if copyErr == nil {
 			copyErr = ctx.Err()
 		}
@@ -230,7 +253,7 @@ func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader,
 	if cause == nil {
 		cause = errSSEUnexpectedEOF
 	}
-	emitter := newBridgeStreamEmitter(w, flusher, protocol, model)
+	emitter := newBridgeStreamEmitter(w, w, protocol, model)
 	if err := emitUnexpectedStreamError(emitter, cause); err != nil {
 		return usage, observer.Reported(), err
 	}

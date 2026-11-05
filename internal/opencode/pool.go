@@ -19,11 +19,12 @@ import (
 )
 
 type proxyTransport struct {
-	index    int
-	name     string
-	client   *http.Client
-	healthy  atomic.Bool
-	checking atomic.Bool
+	index       int
+	name        string
+	client      *http.Client
+	healthy     atomic.Bool
+	checking    atomic.Bool
+	probeOrigin atomic.Pointer[string]
 }
 
 type transportPool struct {
@@ -216,7 +217,11 @@ func (p *transportPool) CheckHealth(ctx context.Context, target string, timeout 
 		}
 		checks++
 		go func() {
-			results <- p.checkClaimedProxy(ctx, proxy, target, timeout)
+			origin := target
+			if last := proxy.probeOrigin.Load(); last != nil {
+				origin = *last
+			}
+			results <- p.checkClaimedProxy(ctx, proxy, origin, timeout)
 		}()
 	}
 	out := make([]proxyHealthResult, 0, checks)
@@ -233,13 +238,17 @@ func (p *transportPool) checkClaimedProxy(ctx context.Context, proxy *proxyTrans
 	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, target, nil)
 	if err == nil {
 		req.Header.Set("User-Agent", userAgent())
-		resp, requestErr := proxy.client.Do(req)
+		client := http.Client{
+			Transport:     proxy.client.Transport,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		}
+		resp, requestErr := client.Do(req)
 		err = requestErr
 		if resp != nil {
-			_, readErr := io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-			if err == nil {
-				err = readErr
+			if resp.StatusCode == http.StatusProxyAuthRequired {
+				err = fmt.Errorf("proxy probe HTTP %d", resp.StatusCode)
 			}
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 			_ = resp.Body.Close()
 		}
 	}

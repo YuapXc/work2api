@@ -464,7 +464,8 @@ type routeWriter struct {
 	limit     int
 }
 
-func (w *routeWriter) Header() http.Header { return w.header }
+func (w *routeWriter) Unwrap() http.ResponseWriter { return w.dst }
+func (w *routeWriter) Header() http.Header         { return w.header }
 func (w *routeWriter) WriteHeader(status int) {
 	if w.status == 0 {
 		w.status = status
@@ -557,14 +558,14 @@ func (w *routeWriter) Write(data []byte) (int, error) {
 	}
 	return len(data), nil
 }
-func (w *routeWriter) Flush() {
+func (w *routeWriter) Flush() { _ = w.FlushError() }
+
+func (w *routeWriter) FlushError() error {
 	if w.status >= 400 {
-		return
+		return nil
 	}
 	w.start()
-	if f, ok := w.dst.(http.Flusher); ok {
-		f.Flush()
-	}
+	return http.NewResponseController(w.dst).Flush()
 }
 func (w *routeWriter) finish() {
 	if !w.started {

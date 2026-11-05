@@ -30,8 +30,14 @@ func CollapseStreamWithUsage(reader io.Reader, protocol Protocol, model string) 
 // CollapseStreamWithUsageContext observes upstream generation even when the
 // client requests a single JSON response. It does not time JSON serialization.
 func CollapseStreamWithUsageContext(ctx context.Context, reader io.Reader, protocol Protocol, model string) ([]byte, Usage, bool, error) {
+	return CollapseStreamWithRewrite(ctx, reader, protocol, model, nil)
+}
+
+// CollapseStreamWithRewrite normalizes upstream events before accumulating them.
+func CollapseStreamWithRewrite(ctx context.Context, reader io.Reader, protocol Protocol, model string, rewrite func(map[string]any) error) ([]byte, Usage, bool, error) {
 	parser := &bridgeStreamParser{
 		generationCtx:     ctx,
+		rewrite:           rewrite,
 		protocol:          protocol,
 		tools:             map[string]bool{},
 		toolIDs:           map[string]string{},

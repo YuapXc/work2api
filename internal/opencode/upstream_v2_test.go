@@ -120,3 +120,21 @@ func TestAdminHealthCountsCoolingKeysAndDeduplicatesIdentity(t *testing.T) {
 		t.Fatal("duplicate shared identity", keys)
 	}
 }
+
+func TestProxyRecoveryUsesFailingServiceOrigin(t *testing.T) {
+	target := proxyProbeOrigin("https://upstream.invalid/zen/go?private=1")
+	for _, status := range []int{http.StatusNotFound, http.StatusProxyAuthRequired} {
+		proxy := &proxyTransport{client: &http.Client{Transport: catalogTestTransport(func(req *http.Request) (*http.Response, error) {
+			if req.URL.String() != "https://upstream.invalid/" || req.Method != http.MethodGet || req.Header.Get("Authorization") != "" {
+				t.Error("unexpected probe request", req.Method, req.URL)
+			}
+			return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+		})}}
+		proxy.probeOrigin.Store(&target)
+		results := (&transportPool{items: []*proxyTransport{proxy}}).CheckHealth(context.Background(), "https://cloudflare.com/cdn-cgi/trace", time.Second)
+		wantHealthy := status != http.StatusProxyAuthRequired
+		if len(results) != 1 || proxy.healthy.Load() != wantHealthy || results[0].failed == wantHealthy {
+			t.Fatal(status, results, proxy.healthy.Load())
+		}
+	}
+}

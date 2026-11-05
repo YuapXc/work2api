@@ -4,20 +4,39 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 	"work2api/internal/core/provider"
 )
 
 const (
-	proxyHealthCheckURL      = "https://cloudflare.com/cdn-cgi/trace"
+	defaultProxyProbeOrigin  = "https://opencode.ai/"
 	proxyHealthCheckInterval = 15 * time.Minute
 	proxyHealthCheckTimeout  = 10 * time.Second
 )
 
+func proxyProbeOrigin(base string) string {
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+		return defaultProxyProbeOrigin
+	}
+	return (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/"}).String()
+}
+
+func (rt *Runtime) defaultProxyProbeOrigin() string {
+	if rt.anonymous.Len() > 0 {
+		return proxyProbeOrigin(rt.anonymousBase())
+	}
+	if rt.zenNodes != nil && rt.zenNodes.Len() == 0 && rt.goNodes != nil && rt.goNodes.Len() > 0 {
+		return proxyProbeOrigin(rt.cfg.Upstream.Go)
+	}
+	return proxyProbeOrigin(rt.cfg.Upstream.Zen)
+}
+
 // syncProxyResult updates proxy health from real traffic. Only timeouts and
 // connection refusals mark a proxy unavailable.
-func (rt *Runtime) syncProxyResult(ctx context.Context, proxy *proxyTransport, status int, err error) bool {
+func (rt *Runtime) syncProxyResult(ctx context.Context, proxy *proxyTransport, base string, status int, err error) bool {
 	var attempt *attemptError
 	if errors.As(err, &attempt) && attempt.phase == "first_event" {
 		return false
@@ -27,7 +46,7 @@ func (rt *Runtime) syncProxyResult(ctx context.Context, proxy *proxyTransport, s
 	}
 	if isProxyFailure(err) {
 		rt.rebindFailedProxy(proxy)
-		rt.verifyProxyAfterError(ctx, proxy, status)
+		rt.verifyProxyAfterError(ctx, proxy, base, status)
 		return true
 	}
 	if status >= 200 && status < 400 {
@@ -38,22 +57,24 @@ func (rt *Runtime) syncProxyResult(ctx context.Context, proxy *proxyTransport, s
 		return false
 	}
 	if err != nil {
-		rt.verifyProxyAfterError(ctx, proxy, status)
+		rt.verifyProxyAfterError(ctx, proxy, base, status)
 		return false
 	}
 	if status >= 400 && status < 600 {
-		rt.verifyProxyAfterError(ctx, proxy, status)
+		rt.verifyProxyAfterError(ctx, proxy, base, status)
 	}
 	return false
 }
 
-func (rt *Runtime) verifyProxyAfterError(ctx context.Context, proxy *proxyTransport, status int) {
+func (rt *Runtime) verifyProxyAfterError(ctx context.Context, proxy *proxyTransport, base string, status int) {
 	if !proxy.checking.CompareAndSwap(false, true) {
 		return
 	}
+	target := proxyProbeOrigin(base)
+	proxy.probeOrigin.Store(&target)
 	checkCtx := context.WithoutCancel(ctx)
 	go func() {
-		result := rt.transports.checkClaimedProxy(checkCtx, proxy, proxyHealthCheckURL, proxyHealthCheckTimeout)
+		result := rt.transports.checkClaimedProxy(checkCtx, proxy, target, proxyHealthCheckTimeout)
 		rt.applyProxyHealthResult(result, "upstream HTTP response", status)
 	}()
 }
@@ -96,7 +117,7 @@ func (rt *Runtime) restoreProxy(proxy *proxyTransport) (zenMoved, goMoved int) {
 
 func (rt *Runtime) StartProxyHealthChecks(ctx context.Context) {
 	check := func() {
-		results := rt.transports.CheckHealth(ctx, proxyHealthCheckURL, proxyHealthCheckTimeout)
+		results := rt.transports.CheckHealth(ctx, rt.defaultProxyProbeOrigin(), proxyHealthCheckTimeout)
 		for _, result := range results {
 			rt.applyProxyHealthResult(result, "scheduled health check", 0)
 		}
@@ -261,15 +282,17 @@ func (rt *Runtime) refreshAnonymousTier(ctx context.Context, base string) []stri
 			break
 		}
 		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		probeBase := base
 		models, status, err := FetchModels(refreshCtx, node.proxy.client, base, anonymousZenKey)
 		if status == http.StatusNotFound && base != rt.cfg.Upstream.Zen {
-			models, status, err = FetchModels(refreshCtx, node.proxy.client, rt.cfg.Upstream.Zen, anonymousZenKey)
+			probeBase = rt.cfg.Upstream.Zen
+			models, status, err = FetchModels(refreshCtx, node.proxy.client, probeBase, anonymousZenKey)
 		}
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 			cancel()
 			return nil
 		}
-		rt.syncProxyResult(refreshCtx, node.proxy, status, err)
+		rt.syncProxyResult(refreshCtx, node.proxy, probeBase, status, err)
 		cancel()
 		if err == nil {
 			rt.anonymous.MarkSuccess(node)
@@ -310,7 +333,7 @@ func (rt *Runtime) refreshTier(ctx context.Context, base string, nodes *nodePool
 			cancel()
 			return nil
 		}
-		rt.syncProxyResult(refreshCtx, proxy, status, err)
+		rt.syncProxyResult(refreshCtx, proxy, base, status, err)
 		cancel()
 		if err == nil {
 			nodes.MarkSuccess(node)

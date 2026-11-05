@@ -26,7 +26,7 @@ type bridgeStreamTool struct {
 
 type bridgeStreamEmitter struct {
 	w                  io.Writer
-	flush              http.Flusher
+	flush              func() error
 	target             Protocol
 	model              string
 	id                 string
@@ -58,10 +58,10 @@ type bridgeStreamEmitter struct {
 	responseOutput  []any
 }
 
-func newBridgeStreamEmitter(writer io.Writer, flusher http.Flusher, target Protocol, model string) *bridgeStreamEmitter {
+func newBridgeStreamEmitter(writer io.Writer, response http.ResponseWriter, target Protocol, model string) *bridgeStreamEmitter {
 	return &bridgeStreamEmitter{
 		w:              writer,
-		flush:          flusher,
+		flush:          http.NewResponseController(response).Flush,
 		target:         target,
 		model:          model,
 		created:        time.Now().Unix(),
@@ -683,13 +683,15 @@ func (emitter *bridgeStreamEmitter) sse(eventName string, value any) error {
 func (emitter *bridgeStreamEmitter) rawSSE(eventName, data string) error {
 	if eventName != "" {
 		if _, err := fmt.Fprintf(emitter.w, "event: %s\n", eventName); err != nil {
-			return err
+			return downstreamStreamError{err}
 		}
 	}
 	if _, err := fmt.Fprintf(emitter.w, "data: %s\n\n", data); err != nil {
-		return err
+		return downstreamStreamError{err}
 	}
-	emitter.flush.Flush()
+	if err := emitter.flush(); err != nil {
+		return downstreamStreamError{err}
+	}
 	return nil
 }
 

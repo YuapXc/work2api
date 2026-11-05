@@ -1397,3 +1397,15 @@ func TestObservedWriterPreservesFlushFailure(t *testing.T) {
 		t.Fatal("observer swallowed delivery error", err)
 	}
 }
+
+func TestUnifiedRouteFlushFailureReachesProvider(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	base := &failedFlushWriter{httptest.NewRecorder()}
+	route := &routeWriter{dst: base, header: make(http.Header), logical: "fixture", stream: true}
+	writer := &flushCancelWriter{&cancelWriter{ResponseWriter: route, cancel: cancel}}
+	err := http.NewResponseController(writer).Flush()
+	if err == nil || err.Error() != "flush failed" || ctx.Err() != context.Canceled || !route.started {
+		t.Fatal("flush error did not reach the provider", err, ctx.Err(), route.started)
+	}
+}

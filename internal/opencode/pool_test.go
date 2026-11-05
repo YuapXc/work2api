@@ -40,7 +40,7 @@ func TestUpstreamCompatibilityAndToolAliases(t *testing.T) {
 			}
 			body := map[string]any{"tools": []any{definition}, "messages": []any{map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{"function": map[string]any{"name": "read", "arguments": `{"name":"read"}`}}}}}}
 			original, _ := json.Marshal(body)
-			lowered, names := aliasClientTools(body, proto)
+			lowered, names := aliasClientTools(body, proto, false, false)
 			if len(names) != 1 {
 				t.Fatal("client tool not aliased")
 			}
@@ -272,7 +272,7 @@ func TestFragmentedToolNamePreservesArguments(t *testing.T) {
 	if err := writer.Finish(); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(w.Body.String(), `"name":"read"`) || strings.Count(w.Body.String(), `"arguments":"w2a_example"`) != 2 {
+	if !strings.Contains(w.Body.String(), `"name":"read"`) || strings.Count(w.Body.String(), `"arguments":`) != 1 || !strings.Contains(w.Body.String(), `"arguments":"w2a_examplew2a_example"`) {
 		t.Fatal("fragmented name or opaque arguments corrupted", w.Body.String())
 	}
 }
@@ -474,7 +474,7 @@ func TestLiveOpenCodeCompatibility(t *testing.T) {
 		payload["model"] = "opencode/" + model
 		payload["stream"] = true
 		streamed := invoke(payload)
-		_, aliases := aliasClientTools(payload, external)
+		_, aliases := aliasClientTools(payload, external, false, false)
 		for _, line := range strings.Split(streamed.Body.String(), "\n") {
 			if !strings.HasPrefix(line, "data:") {
 				continue
@@ -637,8 +637,8 @@ func TestDNSFailurePreservesProxyAndNodeHealth(t *testing.T) {
 			if isProxyFailure(dnsErr) {
 				t.Fatal("DNS failure classified as broken proxy")
 			}
-			rt.observeKeyResult(context.Background(), nodes, nodes.nodes[0], proxy, nil, dnsErr)
-			rt.observeAnonymousResult(context.Background(), anon, nil, dnsErr)
+			rt.observeKeyResult(context.Background(), nodes, nodes.nodes[0], proxy, "https://example.invalid", nil, dnsErr)
+			rt.observeAnonymousResult(context.Background(), anon, "https://example.invalid", nil, dnsErr)
 			if !proxy.healthy.Load() || proxy.checking.Load() {
 				t.Fatal("DNS failure mutated proxy health or launched a probe")
 			}
@@ -989,5 +989,88 @@ func TestSSEHeadCancellationClosesReader(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("prelude reader survived client cancellation")
+	}
+}
+
+func BenchmarkFreeShapeEncoding(b *testing.B) {
+	model := "fixture-free"
+	route := Route{ID: model, Tier: TierZen, Protocol: protocol.Chat}
+	rt := &Runtime{cfg: defaultConfig(), catalog: NewCatalog(TierZen, nil)}
+	input := map[string]any{"model": model, "messages": []any{map[string]any{"role": "user", "content": strings.Repeat("long context ", 80000)}}}
+	before := func() ([]byte, error) {
+		payload, err := protocol.PrepareRequest(protocol.Chat, protocol.Chat, input, rt.cfg.Upstream.Zen)
+		if err != nil {
+			return nil, err
+		}
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			return nil, err
+		}
+		shapeFreePayload(decoded, protocol.Chat)
+		return json.Marshal(decoded)
+	}
+	after := func() ([]byte, error) {
+		bodies, err := rt.prepareRouteBodies(protocol.Chat, route, input)
+		return bodies[TierZen], err
+	}
+	a, err := before()
+	if err != nil {
+		b.Fatal(err)
+	}
+	z, err := after()
+	if err != nil || !bytes.Equal(a, z) || input["stream"] != nil {
+		b.Fatal("free shaping wire contract changed", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		encode func() ([]byte, error)
+	}{{"before", before}, {"after", after}} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if _, err := tc.encode(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestFreeTierRecoveryPreservesShapedToolBody(t *testing.T) {
+	model := "fixture-free"
+	rt := &Runtime{cfg: defaultConfig(), catalog: NewCatalog(TierZen, nil)}
+	route := Route{ID: model, Tier: TierZen, Protocol: protocol.Responses, KeyTiers: []Tier{TierZen, TierGo}}
+	input := map[string]any{"model": model, "previous_response_id": "expired", "input": []any{
+		map[string]any{"type": "reasoning", "id": "rs_expired", "encrypted_content": "opaque"},
+		map[string]any{"type": "message", "role": "user", "content": "continue"},
+	}}
+	bodies, err := rt.prepareRouteBodies(protocol.Responses, route, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, changed := stripStaleReasoningInputs(route, bodies)
+	if !changed || len(recovered) != 2 {
+		t.Fatal("expected recovery for both tiers", changed, len(recovered))
+	}
+	for _, tier := range []Tier{TierZen, TierGo} {
+		var payload map[string]any
+		if err := json.Unmarshal(recovered[tier], &payload); err != nil {
+			t.Fatal(err)
+		}
+		tools, _ := payload["tools"].([]any)
+		items, _ := payload["input"].([]any)
+		if payload["stream"] != true || payload["previous_response_id"] != nil || len(tools) != 2 || len(items) != 1 {
+			t.Fatal(tier, payload)
+		}
+		if item, ok := items[0].(map[string]any); !ok || item["role"] != "user" {
+			t.Fatal(tier, items)
+		}
+	}
+	if input["stream"] != nil || input["previous_response_id"] != "expired" {
+		t.Fatal("caller payload mutated", input)
 	}
 }

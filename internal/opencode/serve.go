@@ -81,9 +81,11 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 		return rt.serveSystemOne(ctx, w, external, payload, route, ids)
 	}
 
-	payload, toolNames := aliasClientTools(payload, external, route.Anonymous)
-	compatibilityTools := route.Anonymous || rt.catalog.IsFreeModel(model)
+	free := rt.catalog.IsFreeModel(model)
+	compatibilityTools := route.Anonymous || free
+	payload, toolNames := aliasClientTools(payload, external, route.Anonymous, compatibilityTools)
 	payload = describeClientTools(payload, external, toolNames, compatibilityTools)
+	var aliasWriter *toolAliasWriter
 	if len(toolNames) > 0 || compatibilityTools {
 		blocked := map[string]bool{}
 		for _, original := range toolNames {
@@ -94,17 +96,17 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 				blocked[name] = true
 			}
 		}
-		writer := &toolAliasWriter{ResponseWriter: w, names: toolNames, blocked: blocked}
-		w = writer
+		aliasWriter = &toolAliasWriter{ResponseWriter: w, names: toolNames, blocked: blocked}
+		w = aliasWriter
 		defer func() {
-			if err := writer.Finish(); err != nil {
+			if err := aliasWriter.Finish(); err != nil && result.Error == "" {
 				result.Status = "error"
 				result.Error = err.Error()
 				serveErr = err
 			}
 		}()
 	}
-	bodies, bodyLimits, err := rt.prepareRouteBodiesWithLimits(external, route, payload)
+	bodies, bodyLimits, err := rt.prepareRouteBodiesWithLimits(external, route, payload, free)
 	if err != nil {
 		protocol.WriteError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
 		return provider.UsageReport{Status: "error", Error: err.Error()}, nil
@@ -157,6 +159,8 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 		var known bool
 		if external == upstreamRoute.Protocol {
 			usage, known, err = protocol.ForwardStream(ctx, w, watch.Reader(resp.Body), upstreamRoute.Protocol, model)
+		} else if upstreamRoute.Protocol == protocol.Chat && aliasWriter != nil {
+			usage, known, err = protocol.TranscodeStreamWithRewrite(ctx, aliasWriter.ResponseWriter, watch.Reader(resp.Body), protocol.Chat, external, model, aliasWriter.rewriteEvent)
 		} else {
 			usage, known, err = protocol.TranscodeStream(ctx, w, watch.Reader(resp.Body), upstreamRoute.Protocol, external, model)
 		}
@@ -177,10 +181,15 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 	var known bool
 	// Free models (and the anonymous lane) are force-streamed upstream even when
 	// the client asked for a single JSON document; collapse the SSE back.
-	if upstreamRoute.Anonymous || rt.catalog.IsFreeModel(upstreamRoute.ID) {
+	if upstreamRoute.Anonymous || free {
 		watch := streamwatch.NewWatch(resp.Body, ctx, 0, 0)
 		defer watch.Close()
-		responseBody, usage, known, err = protocol.CollapseStreamWithUsageContext(ctx, watch.Reader(resp.Body), upstreamRoute.Protocol, model)
+		if upstreamRoute.Protocol == protocol.Chat && aliasWriter != nil {
+			responseBody, usage, known, err = protocol.CollapseStreamWithRewrite(ctx, watch.Reader(resp.Body), protocol.Chat, model, aliasWriter.rewriteEvent)
+			w = aliasWriter.ResponseWriter
+		} else {
+			responseBody, usage, known, err = protocol.CollapseStreamWithUsageContext(ctx, watch.Reader(resp.Body), upstreamRoute.Protocol, model)
+		}
 		if err != nil {
 			rt.logger.Warn("stream collapse failed", "component", "opencode.conversion", "request_id", ids.Request, "model", model, "error", err)
 			protocol.WriteError(w, external, http.StatusBadGateway, "unsupported upstream response", "upstream_error", ids.Request)
@@ -208,8 +217,13 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(responseBody)
-	return usageReport(usage, known), nil
+	report := usageReport(usage, known)
+	if _, err := w.Write(responseBody); err != nil {
+		report.Status = "error"
+		report.Error = err.Error()
+		return report, err
+	}
+	return report, nil
 }
 
 // serveSystemOne relays a System One decision payload verbatim to every tier.
@@ -297,11 +311,11 @@ func (w flushingWriter) Write(data []byte) (int, error) {
 }
 
 func (rt *Runtime) prepareRouteBodies(from protocol.Protocol, route Route, input map[string]any) (map[Tier][]byte, error) {
-	bodies, _, err := rt.prepareRouteBodiesWithLimits(from, route, input)
+	bodies, _, err := rt.prepareRouteBodiesWithLimits(from, route, input, rt.catalog != nil && rt.catalog.IsFreeModel(route.ID))
 	return bodies, err
 }
 
-func (rt *Runtime) prepareRouteBodiesWithLimits(from protocol.Protocol, route Route, input map[string]any) (map[Tier][]byte, map[Tier]map[string]int, error) {
+func (rt *Runtime) prepareRouteBodiesWithLimits(from protocol.Protocol, route Route, input map[string]any, free bool) (map[Tier][]byte, map[Tier]map[string]int, error) {
 	tiers := make([]Tier, 0, len(route.KeyTiers)+1)
 	seen := make(map[Tier]bool, len(route.KeyTiers)+1)
 	addTier := func(tier Tier) {
@@ -351,6 +365,9 @@ func (rt *Runtime) prepareRouteBodiesWithLimits(from protocol.Protocol, route Ro
 		}
 		if effort := rt.cfg.ForcedEffort(jsonutil.StringAt(upstreamPayload, "model")); effort != "" {
 			protocol.ForcedEffort(proto, upstreamPayload, effort)
+		}
+		if (route.Anonymous && tier == TierZen) || free {
+			shapeFreePayload(upstreamPayload, proto)
 		}
 		encoded, err := json.Marshal(upstreamPayload)
 		if err != nil {

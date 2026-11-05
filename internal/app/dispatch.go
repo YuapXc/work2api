@@ -289,13 +289,17 @@ func (w *cancelWriter) Write(p []byte) (int, error) {
 
 type flushCancelWriter struct{ *cancelWriter }
 
-func (w *flushCancelWriter) Flush() {
+func (w *flushCancelWriter) Flush() { _ = w.FlushError() }
+
+func (w *flushCancelWriter) FlushError() error {
 	w.committed = true
 	controller := http.NewResponseController(w.ResponseWriter)
 	_ = controller.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	if err := controller.Flush(); err != nil {
+	err := controller.Flush()
+	if err != nil {
 		w.cancel()
 	}
+	return err
 }
 
 // The legacy model-test endpoint uses the same registry and execution boundary.

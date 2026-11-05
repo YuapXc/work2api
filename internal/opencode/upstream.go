@@ -231,7 +231,6 @@ func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies 
 	if len(body) == 0 {
 		return nil, errors.New("no prepared Zen request body"), 0
 	}
-	body = prepareAnonymousBody(body, route.ProtocolFor(TierZen))
 	for attempts < limit {
 		if ctx.Err() != nil {
 			if lastErr == nil {
@@ -278,7 +277,7 @@ func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies 
 			// A malformed/oversized request says nothing about this exit's health.
 			return resp, nil, attempts
 		}
-		rt.observeAnonymousResult(ctx, node, resp, err)
+		rt.observeAnonymousResult(ctx, node, rt.anonymousBase(), resp, err)
 		if err == nil && resp.StatusCode/100 == 2 {
 			return resp, nil, attempts
 		}
@@ -304,36 +303,14 @@ const anonymousZenKey = "public"
 // agent-shaped request. Requests without them are rejected with 403.
 var anonymousCoreTools = []string{"shell", "read"}
 
-// prepareAnonymousBody normalizes a body for the free tier: streaming enabled,
-// include_usage for Chat, and the core agent tools present. System One decision
-// payloads are forwarded verbatim.
-func prepareAnonymousBody(body []byte, proto protocol.Protocol) []byte {
+// shapeFreePayload prepares the agent request before serialization.
+func shapeFreePayload(payload map[string]any, proto protocol.Protocol) {
 	if proto == protocol.SystemOne {
-		return body
+		return
 	}
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return body
-	}
-	changed := false
-	if streaming, ok := payload["stream"].(bool); !ok || !streaming {
-		payload["stream"] = true
-		changed = true
-	}
-	if ensureAnonymousChatUsage(payload, proto) {
-		changed = true
-	}
-	if ensureAnonymousTools(payload, proto) {
-		changed = true
-	}
-	if !changed {
-		return body
-	}
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return body
-	}
-	return encoded
+	payload["stream"] = true
+	ensureAnonymousChatUsage(payload, proto)
+	ensureAnonymousTools(payload, proto)
 }
 
 func ensureAnonymousChatUsage(payload map[string]any, proto protocol.Protocol) bool {
@@ -436,16 +413,6 @@ func anonymousTool(proto protocol.Protocol, name string) map[string]any {
 	}
 }
 
-// shapeKeyBody normalizes key-tier free-model bodies to agent shape, mirroring
-// the anonymous lane. Paid models keep their original bodies.
-func (rt *Runtime) shapeKeyBody(body []byte, route Route, tier Tier) ([]byte, bool) {
-	if !rt.catalog.IsFreeModel(route.ID) {
-		return body, false
-	}
-	shaped := prepareAnonymousBody(body, route.ProtocolFor(tier))
-	return shaped, !bytes.Equal(shaped, body)
-}
-
 func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies map[Tier][]byte, ids RequestIDs, attemptOffset int) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
@@ -463,9 +430,6 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies map[Ti
 	body := bodies[route.Tier]
 	if len(body) == 0 {
 		return nil, fmt.Errorf("no prepared %s request body", route.Tier), 0
-	}
-	if shaped, changed := rt.shapeKeyBody(body, route, route.Tier); changed {
-		body = shaped
 	}
 	visited := 0
 	for attempts < rt.cfg.Retry.MaxAttempts && visited < nodes.Len()*rt.cfg.Retry.MaxAttempts {
@@ -525,7 +489,7 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies map[Ti
 			}
 			break
 		}
-		rt.observeKeyResult(ctx, nodes, node, proxy, resp, err)
+		rt.observeKeyResult(ctx, nodes, node, proxy, baseURL, resp, err)
 		if err == nil && resp.StatusCode/100 == 2 {
 			return resp, nil, attempts
 		}
@@ -544,9 +508,9 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies map[Ti
 	return nil, lastErr, attempts
 }
 
-func (rt *Runtime) observeKeyResult(ctx context.Context, nodes *nodePool, node *upstreamNode, proxy *proxyTransport, resp *http.Response, err error) {
+func (rt *Runtime) observeKeyResult(ctx context.Context, nodes *nodePool, node *upstreamNode, proxy *proxyTransport, base string, resp *http.Response, err error) {
 	status := upstreamStatus(resp)
-	proxyFailed := rt.syncProxyResult(ctx, proxy, status, err)
+	proxyFailed := rt.syncProxyResult(ctx, proxy, base, status, err)
 	if err == nil && status/100 == 2 || isNonRetryableClientResponse(resp, err) {
 		nodes.MarkSuccess(node)
 		return
@@ -556,9 +520,9 @@ func (rt *Runtime) observeKeyResult(ctx context.Context, nodes *nodePool, node *
 	}
 }
 
-func (rt *Runtime) observeAnonymousResult(ctx context.Context, node *anonymousNode, resp *http.Response, err error) {
+func (rt *Runtime) observeAnonymousResult(ctx context.Context, node *anonymousNode, base string, resp *http.Response, err error) {
 	status := upstreamStatus(resp)
-	rt.syncProxyResult(ctx, node.proxy, status, err)
+	rt.syncProxyResult(ctx, node.proxy, base, status, err)
 	if err == nil && status/100 == 2 {
 		rt.anonymous.MarkSuccess(node)
 	} else {
