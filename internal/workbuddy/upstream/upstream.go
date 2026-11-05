@@ -191,7 +191,7 @@ func (c *Client) StreamUpstream(ctx context.Context, headers map[string]string, 
 
 	// Upstream sometimes answers a stream request with a single JSON object.
 	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "json") {
-		return c.handleJSONResponse(resp, restoreToolNameLines(yield, toolNames))
+		return c.handleJSONResponse(resp, yield, toolNames)
 	}
 
 	return streamSSE(resp, yield, toolNames)
@@ -199,7 +199,7 @@ func (c *Client) StreamUpstream(ctx context.Context, headers map[string]string, 
 
 // handleJSONResponse deals with a non-streaming JSON body returned for a stream
 // request, normalizing it into two SSE lines.
-func (c *Client) handleJSONResponse(resp *http.Response, yield LineFunc) error {
+func (c *Client) handleJSONResponse(resp *http.Response, yield LineFunc, names map[string]string) error {
 	raw, err := streamwatch.ReadBody(resp.Request.Context(), resp.Body, 0)
 	if err != nil {
 		return err
@@ -237,6 +237,11 @@ func (c *Client) handleJSONResponse(resp *http.Response, yield LineFunc) error {
 	if state.finish == "" {
 		choices[0].(map[string]any)["finish_reason"] = "tool_calls"
 	}
+	restore := toolNameRestorer{reverse: names}
+	restore.restore(chunk)
+	if len(restore.pending) > 0 {
+		return invalidStream("上游工具名称未完整返回")
+	}
 	out, _ := json.Marshal(chunk)
 	if err := yield("data: " + string(out)); err != nil {
 		return err
@@ -256,10 +261,9 @@ func streamSSE(resp *http.Response, yield LineFunc, names ...map[string]string) 
 	var terminal []string
 	terminalBytes := 0
 	done := false
-	var restored string
-	var restore LineFunc
-	if len(names) > 0 && len(names[0]) > 0 {
-		restore = restoreToolNameLines(func(line string) error { restored = line; return nil }, names[0])
+	var restore toolNameRestorer
+	if len(names) > 0 {
+		restore.reverse = names[0]
 	}
 	process := func() error {
 		if event.Len() == 0 {
@@ -267,13 +271,10 @@ func streamSSE(resp *http.Response, yield LineFunc, names ...map[string]string) 
 		}
 		data := strings.TrimSuffix(event.String(), "\n")
 		event.Reset()
-		if restore != nil {
-			if err := restore("data: " + data); err != nil {
-				return err
-			}
-			data = strings.TrimSpace(strings.TrimPrefix(restored, "data:"))
-		}
 		if strings.TrimSpace(data) == "[DONE]" {
+			if len(restore.pending) > 0 {
+				return invalidStream("上游工具名称未完整返回")
+			}
 			if err := state.complete(true); err != nil {
 				return err
 			}
@@ -287,6 +288,7 @@ func streamSSE(resp *http.Response, yield LineFunc, names ...map[string]string) 
 		if json.Unmarshal([]byte(data), &chunk) != nil {
 			return invalidStream("上游返回了无效 SSE 数据")
 		}
+		renamed := restore.restore(chunk)
 		if err := state.observe(chunk); err != nil {
 			return err
 		}
@@ -295,7 +297,7 @@ func streamSSE(resp *http.Response, yield LineFunc, names ...map[string]string) 
 		}
 		// Keep ordinary single-line payloads; only multiline SSE needs folding.
 		line := "data: " + data
-		if strings.Contains(data, "\n") {
+		if renamed || strings.Contains(data, "\n") {
 			raw, _ := json.Marshal(chunk)
 			line = "data: " + string(raw)
 		}

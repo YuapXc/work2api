@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -165,6 +166,9 @@ func TestToolNamesTransportRoundTrip(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			const arguments = `{"name":"report.status","number":9007199254740993}`
 			body := map[string]any{"model": "test", "tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": name, "parameters": map[string]any{"type": "object", "default": json.Number("9007199254740993")}}}}, "tool_choice": name, "messages": []any{map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{"id": "old", "function": map[string]any{"name": name, "arguments": arguments}}}}, map[string]any{"role": "tool", "tool_call_id": "old", "name": name, "content": "report.status"}}}
+			if name == "report.status" {
+				body["tool_choice"] = map[string]any{"type": "function", "function": map[string]any{"name": name}}
+			}
 			original, _ := json.Marshal(body)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				var got map[string]any
@@ -184,7 +188,11 @@ func TestToolNamesTransportRoundTrip(t *testing.T) {
 				}
 				history := got["messages"].([]any)
 				call := history[0].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
-				if got["tool_choice"] != alias || call["name"] != alias || call["arguments"] != arguments || history[1].(map[string]any)["name"] != alias || history[1].(map[string]any)["content"] != "report.status" {
+				wantChoice := any(alias)
+				if name == "report.status" {
+					wantChoice = map[string]any{"type": "function", "function": map[string]any{"name": alias}}
+				}
+				if !reflect.DeepEqual(got["tool_choice"], wantChoice) || call["name"] != alias || call["arguments"] != arguments || history[1].(map[string]any)["name"] != alias || history[1].(map[string]any)["content"] != "report.status" {
 					t.Error("request contract changed")
 				}
 				if fn["parameters"].(map[string]any)["default"] != json.Number("9007199254740993") {

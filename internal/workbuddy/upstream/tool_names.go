@@ -1,11 +1,12 @@
 package upstream
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -28,27 +29,63 @@ func toolNameError(message string) error {
 }
 
 // Only protocol name fields are visited; schemas, text and argument JSON stay opaque.
-func visitRequestToolNames(body map[string]any, visit func(map[string]any)) {
-	for _, raw := range slice(body["tools"]) {
-		tool, _ := raw.(map[string]any)
-		fn, _ := tool["function"].(map[string]any)
-		visit(fn)
-	}
-	if choice, ok := body["tool_choice"].(map[string]any); ok {
-		fn, _ := choice["function"].(map[string]any)
-		visit(fn)
-	}
-	for _, raw := range slice(body["messages"]) {
-		msg, _ := raw.(map[string]any)
-		for _, raw := range slice(msg["tool_calls"]) {
-			call, _ := raw.(map[string]any)
-			fn, _ := call["function"].(map[string]any)
-			visit(fn)
+// The callback returns nil for an unchanged object.
+func rewriteRequestToolNames(body map[string]any, rewrite func(map[string]any) map[string]any) map[string]any {
+	var out map[string]any
+	set := func(key string, value any) {
+		if out == nil {
+			out = maps.Clone(body)
 		}
+		out[key] = value
+	}
+	rewriteFunction := func(object map[string]any) map[string]any {
+		fn, _ := object["function"].(map[string]any)
+		if next := rewrite(fn); next != nil {
+			object = maps.Clone(object)
+			object["function"] = next
+			return object
+		}
+		return nil
+	}
+	if tools := rewriteToolObjects(body["tools"], rewriteFunction); tools != nil {
+		set("tools", tools)
+	}
+	choice, _ := body["tool_choice"].(map[string]any)
+	if next := rewriteFunction(choice); next != nil {
+		set("tool_choice", next)
+	}
+	messages := rewriteToolObjects(body["messages"], func(msg map[string]any) map[string]any {
+		var next map[string]any
 		if msg["role"] == "tool" {
-			visit(msg)
+			next = rewrite(msg)
+		}
+		if calls := rewriteToolObjects(msg["tool_calls"], rewriteFunction); calls != nil {
+			if next == nil {
+				next = maps.Clone(msg)
+			}
+			next["tool_calls"] = calls
+		}
+		return next
+	})
+	if messages != nil {
+		set("messages", messages)
+	}
+	return out
+}
+
+func rewriteToolObjects(value any, rewrite func(map[string]any) map[string]any) []any {
+	list := slice(value)
+	var out []any
+	for i, raw := range list {
+		object, _ := raw.(map[string]any)
+		if next := rewrite(object); next != nil {
+			if out == nil {
+				out = slices.Clone(list)
+			}
+			out[i] = next
 		}
 	}
+	return out
 }
 
 func slice(v any) []any { out, _ := v.([]any); return out }
@@ -63,15 +100,15 @@ func prepareToolNames(body map[string]any) (map[string]any, map[string]string, e
 			return nil, nil, toolNameError("function 工具必须指定非空名称")
 		}
 	}
-	visitRequestToolNames(body, func(fn map[string]any) {
+	rewriteRequestToolNames(body, func(fn map[string]any) map[string]any {
 		name, _ := fn["name"].(string)
-		if name == "" {
-			return
+		if name != "" {
+			used[name] = true
+			if !validToolName(name) {
+				invalid[name] = true
+			}
 		}
-		used[name] = true
-		if !validToolName(name) {
-			invalid[name] = true
-		}
+		return nil
 	})
 	if len(invalid) == 0 {
 		return body, nil, nil
@@ -94,21 +131,14 @@ func prepareToolNames(body map[string]any) (map[string]any, map[string]string, e
 			break
 		}
 	}
-	raw, err := json.Marshal(body)
-	if err != nil {
-		return nil, nil, err
-	}
-	var out map[string]any
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if err = decoder.Decode(&out); err != nil {
-		return nil, nil, err
-	}
-	visitRequestToolNames(out, func(fn map[string]any) {
+	out := rewriteRequestToolNames(body, func(fn map[string]any) map[string]any {
 		name, _ := fn["name"].(string)
 		if alias := forward[name]; alias != "" {
-			fn["name"] = alias
+			next := maps.Clone(fn)
+			next["name"] = alias
+			return next
 		}
+		return nil
 	})
 	if name, ok := out["tool_choice"].(string); ok && forward[name] != "" {
 		out["tool_choice"] = forward[name]
@@ -116,67 +146,54 @@ func prepareToolNames(body map[string]any) (map[string]any, map[string]string, e
 	return out, reverse, nil
 }
 
-func restoreToolNameLines(yield LineFunc, reverse map[string]string) LineFunc {
-	if len(reverse) == 0 {
-		return yield
+type toolNameRestorer struct {
+	reverse map[string]string
+	pending map[string]string
+}
+
+func (r *toolNameRestorer) restore(chunk map[string]any) bool {
+	if len(r.reverse) == 0 {
+		return false
 	}
-	pending := map[string]string{}
-	return func(line string) error {
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "[DONE]" {
-			if len(pending) > 0 {
-				return invalidStream("上游工具名称未完整返回")
+	changed := false
+	for _, raw := range slice(chunk["choices"]) {
+		choice, _ := raw.(map[string]any)
+		delta, _ := choice["delta"].(map[string]any)
+		for _, raw := range slice(delta["tool_calls"]) {
+			call, _ := raw.(map[string]any)
+			fn, _ := call["function"].(map[string]any)
+			part, _ := fn["name"].(string)
+			if part == "" {
+				continue
 			}
-			return yield(line)
-		}
-		var chunk map[string]any
-		if json.Unmarshal([]byte(data), &chunk) != nil {
-			return yield(line)
-		}
-		changed := false
-		for _, raw := range slice(chunk["choices"]) {
-			choice, _ := raw.(map[string]any)
-			delta, _ := choice["delta"].(map[string]any)
-			for _, raw := range slice(delta["tool_calls"]) {
-				call, _ := raw.(map[string]any)
-				fn, _ := call["function"].(map[string]any)
-				part, _ := fn["name"].(string)
-				if part == "" {
-					continue
-				}
-				key := fmt.Sprint(choice["index"], ":", call["index"])
-				name := pending[key] + part
-				if original := reverse[name]; original != "" {
-					fn["name"] = original
-					delete(pending, key)
-					changed = true
-					continue
-				}
-				prefix := false
-				for alias := range reverse {
-					if strings.HasPrefix(alias, name) {
-						prefix = true
-						break
-					}
-				}
-				if prefix {
-					pending[key] = name
-					delete(fn, "name")
-					changed = true
-				} else if pending[key] != "" {
-					fn["name"] = name
-					delete(pending, key)
-					changed = true
+			key := fmt.Sprint(choice["index"], ":", call["index"])
+			name := r.pending[key] + part
+			if original := r.reverse[name]; original != "" {
+				fn["name"] = original
+				delete(r.pending, key)
+				changed = true
+				continue
+			}
+			prefix := false
+			for alias := range r.reverse {
+				if strings.HasPrefix(alias, name) {
+					prefix = true
+					break
 				}
 			}
+			if prefix {
+				if r.pending == nil {
+					r.pending = make(map[string]string)
+				}
+				r.pending[key] = name
+				delete(fn, "name")
+				changed = true
+			} else if r.pending[key] != "" {
+				fn["name"] = name
+				delete(r.pending, key)
+				changed = true
+			}
 		}
-		if !changed {
-			return yield(line)
-		}
-		raw, err := json.Marshal(chunk)
-		if err != nil {
-			return err
-		}
-		return yield("data: " + string(raw))
 	}
+	return changed
 }

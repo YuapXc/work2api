@@ -331,7 +331,23 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 		}
 		return candidate.body, candidate.matched
 	}
-	fingerprint := CompatibilityFingerprint(body)
+	originalBody := body
+	var fingerprint string
+	getFingerprint := func() string {
+		if fingerprint == "" {
+			if imageRecoveryStage == 0 {
+				normalized, _ := compatibleBody(2)
+				fingerprint = compatibilityFingerprint(normalized)
+			} else {
+				fingerprint = CompatibilityFingerprint(originalBody)
+			}
+		}
+		return fingerprint
+	}
+	maxCompatLevel := 1
+	if o.cfg.ChannelMetadataCompat {
+		maxCompatLevel = 2
+	}
 	for attempt := 0; ; attempt++ {
 
 		SessionPhase(ctx, false)
@@ -441,10 +457,7 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 		attemptBody := body
 		level := 0
 		if o.cfg.ChannelIdentityCompat {
-			level = o.Sessions.Compatibility(sessionKey, acc.UID, fingerprint)
-			if !o.cfg.ChannelMetadataCompat && level > 1 {
-				level = 0
-			}
+			level = o.Sessions.Compatibility(sessionKey, acc.UID, maxCompatLevel, getFingerprint)
 			level = max(level, requestCompatLevel)
 			if acc.UID == compatUID {
 				level = compatLevel
@@ -471,7 +484,11 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 			d.ErrorKind = DiagnosticErrorKind(ctx, err)
 		}
 		if err == nil {
-			o.Sessions.RememberCompatibility(sessionKey, acc.UID, fingerprint, level)
+			saved := ""
+			if sessionKey != "" && level > 0 {
+				saved = getFingerprint()
+			}
+			o.Sessions.RememberCompatibility(sessionKey, acc.UID, saved, level)
 		}
 		ue, upstreamErr := err.(*upstream.UpstreamError)
 		denied := upstreamErr && IsChannelDenied(ue.StatusCode, string(ue.Raw))
@@ -554,11 +571,7 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 			log.Printf("渠道拒绝诊断: profile=%s model=%s compatibility=%s compat_enabled=%t metadata_enabled=%t identity_match=%t metadata_match=%t started=%t attempt=%d", acc.Profile, model, CompatibilityName(level), o.cfg.ChannelIdentityCompat, o.cfg.ChannelMetadataCompat, identityMatch, metadataMatch, started, attempt+1)
 		}
 		if denied && o.cfg.ChannelIdentityCompat && compatTries < 2 && attempt+1 < maxFailoverAttempts && recoveryAvailable(ctx) {
-			maxLevel := 1
-			if o.cfg.ChannelMetadataCompat {
-				maxLevel = 2
-			}
-			for next := level + 1; next <= maxLevel; next++ {
+			for next := level + 1; next <= maxCompatLevel; next++ {
 				if _, matched := compatibleBody(next); matched {
 					compatUID, compatLevel = acc.UID, next
 					requestCompatLevel = max(requestCompatLevel, next)

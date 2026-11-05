@@ -158,7 +158,7 @@ func IsModelBlocked(status int, text, lower string) bool {
 // display messages are not a reliable distinction. Explicit role validation is
 // handled by request normalization, not by changing the client's identity.
 func IsChannelDenied(status int, text string) bool {
-	if (status != 400 && status != 403) || !BusinessCode(text, "11128") {
+	if (status != 400 && status != 403) || !BusinessCode(text, "11128", "11-128") {
 		return false
 	}
 	root := JsonRoot(text)
@@ -182,7 +182,7 @@ func HasBusinessEnvelope(text string) bool {
 }
 
 // Only explicit business-code fields may invalidate a credential.
-func BusinessCode(text, want string) bool {
+func BusinessCode(text string, wanted ...string) bool {
 	root := JsonRoot(text)
 	nodes := []map[string]any{root}
 	if inner, ok := root["error"].(map[string]any); ok {
@@ -190,8 +190,11 @@ func BusinessCode(text, want string) bool {
 	}
 	for _, node := range nodes {
 		for _, key := range []string{"code", "errCode", "error_code"} {
-			if strings.TrimSpace(ToStr(node[key])) == want {
-				return true
+			code := strings.TrimSpace(ToStr(node[key]))
+			for _, want := range wanted {
+				if code == want {
+					return true
+				}
 			}
 		}
 	}

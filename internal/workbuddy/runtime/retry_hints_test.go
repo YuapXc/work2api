@@ -34,3 +34,26 @@ func TestRetryHintsAreUpstreamEvidenceOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestChannelDeniedAcceptsOnlyStructuredHyphenatedCode(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{400, `{"code":"11-128","msg":"request illegal"}`, true},
+		{403, `{"error":{"errCode":"11-128","message":"request illegal"}}`, true},
+		{400, `{"code":11128}`, true},
+		{403, `{"code":"11-124","msg":"request illegal"}`, false},
+		{403, `{"msg":"11-128"}`, false},
+		{400, `{"code":"11-128","msg":"first message is not system prompt"}`, false},
+		{429, `{"code":"11-128"}`, false},
+	} {
+		if got := IsChannelDenied(tc.status, tc.body); got != tc.want {
+			t.Fatalf("%d %s: got %v", tc.status, tc.body, got)
+		}
+		if tc.want && ClassifyUpstream(tc.status, []byte(tc.body), nil) != ErrChannelDenied {
+			t.Fatal("request rejection was misclassified", tc.body)
+		}
+	}
+}

@@ -986,7 +986,8 @@ func TestChannelCompatibilityProgressionAndSessionMemory(t *testing.T) {
 				}
 				body = makeBody("x-anthropic-billing-header: cc_version=2.1.0; cch=bbb;")
 				fingerprint := compatibilityFingerprint(body)
-				if o.sessions.Compatibility("memory", first.UID, fingerprint) != 2 {
+				getFingerprint := func() string { return fingerprint }
+				if o.sessions.Compatibility("memory", first.UID, 2, getFingerprint) != 2 {
 					t.Fatal("memory missed changing attribution")
 				}
 				_, err = o.openUpstreamScoped(ctx, first, body, "test-model", "memory", func(string) error { return nil }, nil, map[string]bool{first.UID: true})
@@ -994,11 +995,20 @@ func TestChannelCompatibilityProgressionAndSessionMemory(t *testing.T) {
 					t.Fatal("successful compatibility not reused", err)
 				}
 				body["tools"] = []any{map[string]any{"type": "function", "function": map[string]any{"name": "Other"}}}
-				if o.sessions.Compatibility("memory", first.UID, compatibilityFingerprint(body)) != 0 || o.sessions.Compatibility("other", first.UID, fingerprint) != 0 || o.sessions.Compatibility("memory", "other", fingerprint) != 0 {
+				if o.sessions.Compatibility("memory", first.UID, 2, func() string { return compatibilityFingerprint(body) }) != 0 {
+					t.Fatal("memory scope too broad")
+				}
+				unexpectedFingerprint := func() string {
+					t.Fatal("unusable compatibility memory requested a fingerprint")
+					return ""
+				}
+				if o.sessions.Compatibility("memory", first.UID, 1, unexpectedFingerprint) != 0 ||
+					o.sessions.Compatibility("other", first.UID, 2, unexpectedFingerprint) != 0 ||
+					o.sessions.Compatibility("memory", "other", 2, unexpectedFingerprint) != 0 {
 					t.Fatal("memory scope too broad")
 				}
 				o.sessions.UnbindMatching("memory", first.UID)
-				if o.sessions.Compatibility("memory", first.UID, fingerprint) != 0 {
+				if o.sessions.Compatibility("memory", first.UID, 2, unexpectedFingerprint) != 0 {
 					t.Fatal("failed binding kept compatibility")
 				}
 			})
@@ -1028,7 +1038,7 @@ func TestChannelCompatibilityProgressionAndSessionMemory(t *testing.T) {
 		third, _ := json.Marshal(client.bodies[2])
 		fourth, _ := json.Marshal(client.bodies[3])
 		after, _ := json.Marshal(body)
-		if string(third) != string(fourth) || string(before) != string(after) || o.sessions.Compatibility("scoped-memory", served.UID, compatibilityFingerprint(body)) != 2 {
+		if string(third) != string(fourth) || string(before) != string(after) || o.sessions.Compatibility("scoped-memory", served.UID, 2, func() string { return compatibilityFingerprint(body) }) != 2 {
 			t.Fatal("metadata compatibility reset, original mutated or successful memory lost")
 		}
 	})

@@ -258,6 +258,10 @@ func ChannelCompatibilityBody(body map[string]any, level int) (map[string]any, b
 
 func CompatibilityFingerprint(body map[string]any) string {
 	normalized, _ := ChannelCompatibilityBody(body, 2)
+	return compatibilityFingerprint(normalized)
+}
+
+func compatibilityFingerprint(normalized map[string]any) string {
 	messages, _ := normalized["messages"].([]any)
 	var system []any
 	for _, item := range messages {
@@ -267,22 +271,43 @@ func CompatibilityFingerprint(body map[string]any) string {
 		}
 		system = append(system, message["content"])
 	}
-	raw, _ := json.Marshal([]any{system, body["tools"]})
+	raw, _ := json.Marshal([]any{system, normalized["tools"]})
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }
 
-func (r *SessionRouter) Compatibility(key, uid, fingerprint string) int {
+func (r *SessionRouter) Compatibility(key, uid string, maxLevel int, fingerprint func() string) int {
+	if key == "" {
+		return 0
+	}
+	r.Mu.Lock()
+	level, _ := r.compatibilityLocked(key, uid, maxLevel)
+	r.Mu.Unlock()
+	if level == 0 {
+		return 0
+	}
+	want := fingerprint()
 	r.Mu.Lock()
 	defer r.Mu.Unlock()
-	e := r.M[key]
-	if e.Info != nil && e.Uid == uid && e.Info.CompatUID == uid && e.Info.CompatFingerprint == fingerprint {
-		return e.Info.CompatLevel
+	level, saved := r.compatibilityLocked(key, uid, maxLevel)
+	if saved == want {
+		return level
 	}
 	return 0
 }
 
+func (r *SessionRouter) compatibilityLocked(key, uid string, maxLevel int) (int, string) {
+	e := r.M[key]
+	if e.Info != nil && e.Uid == uid && e.Info.CompatUID == uid && e.Info.CompatLevel <= maxLevel {
+		return e.Info.CompatLevel, e.Info.CompatFingerprint
+	}
+	return 0, ""
+}
+
 func (r *SessionRouter) RememberCompatibility(key, uid, fingerprint string, level int) {
+	if key == "" {
+		return
+	}
 	r.Mu.Lock()
 	defer r.Mu.Unlock()
 	e := r.M[key]
