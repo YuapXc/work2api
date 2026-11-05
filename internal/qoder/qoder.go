@@ -455,7 +455,7 @@ func (r *Runtime) refreshAccountModels(ctx context.Context, acct *account.Accoun
 		if ctxWin == 0 {
 			ctxWin = fallbackContextWindow
 		}
-		out = append(out, provider.CatalogModel{
+		entry := provider.CatalogModel{
 			ID:         runtimePrefix + m.Key,
 			Name:       m.DisplayName,
 			Vision:     m.IsVL,
@@ -477,7 +477,11 @@ func (r *Runtime) refreshAccountModels(ctx context.Context, acct *account.Accoun
 				"modality":       modalityOf(m.IsVL),
 				"supportsImages": m.IsVL,
 			},
-		})
+		}
+		if reasoning := m.ReasoningMetadata(); reasoning != nil {
+			entry.Extra["reasoning"] = reasoning
+		}
+		out = append(out, entry)
 	}
 	current, currentSecret, _ := r.pickAccount()
 	r.mu.Lock()

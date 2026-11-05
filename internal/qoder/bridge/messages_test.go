@@ -513,12 +513,16 @@ func TestQoderNativeReasoningControlsReachUpstream(t *testing.T) {
 			name     string
 			controls map[string]any
 			want     bool
+			native   any
+			effort   string
 		}{
-			{"default", nil, true},
-			{"disabled", map[string]any{"thinking": map[string]any{"type": "disabled"}}, false},
-			{"adaptive", map[string]any{"thinking": map[string]any{"type": "adaptive"}}, true},
-			{"effort-off", map[string]any{"reasoning_effort": "none"}, false},
-			{"native-effort", map[string]any{"reasoning": map[string]any{"effort": "high"}}, true},
+			{"default", nil, true, nil, ""},
+			{"disabled", map[string]any{"thinking": map[string]any{"type": "disabled"}}, false, false, ""},
+			{"adaptive", map[string]any{"thinking": map[string]any{"type": "adaptive"}}, true, nil, ""},
+			{"effort-off", map[string]any{"reasoning_effort": "none"}, false, false, ""},
+			{"native-effort", map[string]any{"reasoning": map[string]any{"effort": "high"}}, true, true, "high"},
+			{"unsupported-effort", map[string]any{"reasoning_effort": "max"}, true, nil, ""},
+			{"other-account", map[string]any{"reasoning_effort": "high"}, true, nil, ""},
 		} {
 			t.Run(protocol+"/"+tc.name, func(t *testing.T) {
 				var actual map[string]any
@@ -546,6 +550,9 @@ func TestQoderNativeReasoningControlsReachUpstream(t *testing.T) {
 					t.Fatal(err)
 				}
 				b := &Bridge{sess: sess, client: NewBearerClient(sess), templateBase: map[string]any{"model_config": map[string]any{"is_reasoning": true}, "parameters": map[string]any{}}, chatStreamURL: srv.URL}
+				if tc.name != "other-account" {
+					b.thinkingCatalog.Store(&map[string]qoderThinking{"qfmodel": {efforts: []string{"high"}, canDisable: true}})
+				}
 				req := map[string]any{"model": "qfmodel", "max_tokens": float64(128), "messages": []any{map[string]any{"role": "user", "content": "hi"}}, "input": "hi"}
 				for k, v := range tc.controls {
 					req[k] = v
@@ -566,6 +573,10 @@ func TestQoderNativeReasoningControlsReachUpstream(t *testing.T) {
 					t.Fatal("native control lost", actual)
 				}
 				params, _ := actual["parameters"].(map[string]any)
+				effort, _ := params["reasoning_effort"].(string)
+				if params["enable_thinking"] != tc.native || effort != tc.effort {
+					t.Fatal("native effort did not respect account catalog", params)
+				}
 				if params["max_tokens"] != float64(128) {
 					t.Fatal("output budget lost", actual)
 				}

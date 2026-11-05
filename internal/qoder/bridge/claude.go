@@ -368,6 +368,9 @@ func (b *Bridge) HandleListModels(w http.ResponseWriter, r *http.Request) {
 			"supportsImages":    m.IsVL,
 			"price_factor":      m.PriceFactor,
 		}
+		if reasoning := m.ReasoningMetadata(); reasoning != nil {
+			entry["reasoning"] = reasoning
+		}
 		data = append(data, entry)
 	}
 	if len(data) == 0 {

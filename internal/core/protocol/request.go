@@ -35,20 +35,28 @@ func ReasoningEnabled(input map[string]any) (enabled, specified bool) {
 			return false, true
 		}
 	}
+	switch ExplicitReasoningEffort(input) {
+	case "none", "off", "disabled":
+		return false, true
+	case "":
+		return false, false
+	default:
+		return true, true
+	}
+}
+
+// ExplicitReasoningEffort reads native effort fields without deriving a level from a budget.
+func ExplicitReasoningEffort(input map[string]any) string {
 	values := []any{input["reasoning_effort"], jsonutil.AnyAt(input, "output_config", "effort"), input["effort"], jsonutil.AnyAt(input, "reasoning", "effort")}
 	for _, value := range values {
-		text, ok := value.(string)
-		if !ok {
-			continue
-		}
-		switch strings.ToLower(strings.TrimSpace(text)) {
-		case "none", "off", "disabled":
-			return false, true
-		case "low", "medium", "high", "xhigh", "max":
-			return true, true
+		text, _ := value.(string)
+		effort := strings.ToLower(strings.TrimSpace(text))
+		switch effort {
+		case "none", "off", "disabled", "minimal", "low", "medium", "high", "xhigh", "max":
+			return effort
 		}
 	}
-	return false, false
+	return ""
 }
 
 // ForcedEffort applies an operator-configured thinking level to a prepared

@@ -8,8 +8,10 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 	"work2api/internal/core/protocol"
 	"work2api/internal/qoder/cosy"
@@ -84,10 +86,11 @@ func FetchUserInfoWithTokenContext(ctx context.Context, token string, region acc
 }
 
 type Bridge struct {
-	sess         *cosy.SessionContext
-	client       *BearerClient
-	region       account.Region
-	templateBase map[string]interface{}
+	sess            *cosy.SessionContext
+	client          *BearerClient
+	region          account.Region
+	templateBase    map[string]interface{}
+	thinkingCatalog atomic.Pointer[map[string]qoderThinking]
 	// chatStreamURL 测试注入用：非空时覆盖 region 对应的上游 chat 流地址
 	chatStreamURL string
 }
@@ -99,7 +102,13 @@ type ContextTier struct {
 	Default bool   `json:"is_default"`
 }
 
+type qoderThinking struct {
+	efforts    []string
+	canDisable bool
+}
+
 type QoderModel struct {
+	thinking     qoderThinking
 	ContextTiers []ContextTier `json:"context_tiers,omitempty"`
 	Key          string        `json:"key"`
 	DisplayName  string        `json:"display_name"`
@@ -114,6 +123,51 @@ type QoderModel struct {
 	MaxOutputTokens int      `json:"max_output_tokens,omitempty"`
 	MaxInputTokens  int      `json:"max_input_tokens,omitempty"`
 	PriceFactor     *float64 `json:"price_factor,omitempty"`
+}
+
+func (m QoderModel) ReasoningMetadata() map[string]any {
+	if !m.IsReasoning && len(m.thinking.efforts) == 0 && !m.thinking.canDisable {
+		return nil
+	}
+	return map[string]any{
+		"supportsReasoning":  true,
+		"supportedEfforts":   slices.Clone(m.thinking.efforts),
+		"canDisableThinking": m.thinking.canDisable,
+	}
+}
+
+func readThinkingConfig(model map[string]any) qoderThinking {
+	var out qoderThinking
+	source := model["reasoning_efforts"]
+	if config, ok := model["thinking_config"].(map[string]any); ok {
+		switch value := config["disabled"].(type) {
+		case bool:
+			out.canDisable = value
+		case map[string]any:
+			out.canDisable = true
+		}
+		enabled, _ := config["enabled"].(map[string]any)
+		source = enabled["efforts"]
+	}
+	seen := map[string]bool{}
+	switch values := source.(type) {
+	case map[string]any:
+		for name := range values {
+			seen[name] = true
+		}
+	case []any:
+		for _, value := range values {
+			if name, ok := value.(string); ok {
+				seen[name] = true
+			}
+		}
+	}
+	for _, name := range []string{"minimal", "low", "medium", "high", "xhigh", "max"} {
+		if seen[name] {
+			out.efforts = append(out.efforts, name)
+		}
+	}
+	return out
 }
 
 // tokenPrefix 安全截取 token 前 n 字节用于日志展示（不足 n 返回全串）。
@@ -242,7 +296,15 @@ func (b *Bridge) ListAvailableModelsContext(ctx context.Context) ([]QoderModel, 
 	if err != nil {
 		return nil, fmt.Errorf("%s -> %w", modelListURL, err)
 	}
-	return dropRetiredModels(models), nil
+	models = dropRetiredModels(models)
+	thinking := make(map[string]qoderThinking, len(models))
+	for _, model := range models {
+		if len(model.thinking.efforts) > 0 || model.thinking.canDisable {
+			thinking[model.Key] = model.thinking
+		}
+	}
+	b.thinkingCatalog.Store(&thinking)
+	return models, nil
 }
 
 // dropRetiredModels 摘除上游已下线的过时模型（见 retiredModelKeys）。
@@ -298,6 +360,7 @@ func extractModels(rawList []interface{}) []QoderModel {
 			continue
 		}
 		model := QoderModel{
+			thinking:       readThinkingConfig(m),
 			Key:            StrVal(m, "key"),
 			DisplayName:    StrVal(m, "display_name"),
 			Enable:         enable,
@@ -362,14 +425,15 @@ func DeepCopyMap(m map[string]interface{}) map[string]interface{} {
 
 // CallOpts 控制单次 CallQoder 的可选行为。
 type CallOpts struct {
-	ReasoningSet bool
-	IsReasoning  bool // 是否启用推理模式（对应上游 model_config.is_reasoning）
-	MaxTokens    int  // 客户端请求的 max_tokens，0 表示使用模板默认值
+	ReasoningSet    bool
+	ReasoningEffort string
+	IsReasoning     bool // 是否启用推理模式（对应上游 model_config.is_reasoning）
+	MaxTokens       int  // 客户端请求的 max_tokens，0 表示使用模板默认值
 }
 
 func requestCallOpts(req map[string]interface{}) CallOpts {
 	enabled, specified := protocol.ReasoningEnabled(req)
-	opts := CallOpts{IsReasoning: enabled, ReasoningSet: specified}
+	opts := CallOpts{IsReasoning: enabled, ReasoningSet: specified, ReasoningEffort: protocol.ExplicitReasoningEffort(req)}
 	for _, key := range []string{"max_output_tokens", "max_completion_tokens", "max_tokens"} {
 		switch n := req[key].(type) {
 		case int:
@@ -479,6 +543,25 @@ func (b *Bridge) callQoderWithOpts(ctx context.Context, agent string, messages [
 	mc["key"] = model
 	if opts.ReasoningSet || opts.IsReasoning {
 		mc["is_reasoning"] = opts.IsReasoning
+	}
+
+	if catalog := b.thinkingCatalog.Load(); catalog != nil && opts.ReasoningSet {
+		thinking := (*catalog)[model]
+		enableNative := opts.IsReasoning && slices.Contains(thinking.efforts, opts.ReasoningEffort)
+		disableNative := !opts.IsReasoning && thinking.canDisable
+		if enableNative || disableNative {
+			params, _ := body["parameters"].(map[string]any)
+			if params == nil {
+				params = map[string]any{}
+				body["parameters"] = params
+			}
+			params["enable_thinking"] = enableNative
+			if enableNative {
+				params["reasoning_effort"] = opts.ReasoningEffort
+			} else {
+				delete(params, "reasoning_effort")
+			}
+		}
 	}
 
 	if opts.MaxTokens > 0 {

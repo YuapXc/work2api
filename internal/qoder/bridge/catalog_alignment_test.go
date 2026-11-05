@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"encoding/json"
+	"slices"
 	"testing"
 )
 
@@ -35,6 +36,28 @@ func TestResourceFailureStatusConsistentAcrossTransports(t *testing.T) {
 			if got := ErrorStatus(err); got != tc.status {
 				t.Fatalf("status = %d, want %d", got, tc.status)
 			}
+		}
+	}
+}
+
+func TestThinkingCatalogUsesAuthoritativeShape(t *testing.T) {
+	for _, tc := range []struct {
+		raw    string
+		levels []string
+		off    bool
+	}{
+		{`{"thinking_config":{"enabled":{"efforts":{"max":{},"low":{}}},"disabled":{}},"reasoning_efforts":["medium"]}`, []string{"low", "max"}, true},
+		{`{"thinking_config":{"enabled":{"efforts":["xhigh","minimal","xhigh",4]},"disabled":false}}`, []string{"minimal", "xhigh"}, false},
+		{`{"thinking_config":{},"reasoning_efforts":["max"]}`, nil, false},
+		{`{"thinking_config":null,"reasoning_efforts":["medium"]}`, []string{"medium"}, false},
+	} {
+		var model map[string]any
+		if err := json.Unmarshal([]byte(tc.raw), &model); err != nil {
+			t.Fatal(err)
+		}
+		got := readThinkingConfig(model)
+		if !slices.Equal(got.efforts, tc.levels) || got.canDisable != tc.off {
+			t.Fatal(tc.raw, got)
 		}
 	}
 }
