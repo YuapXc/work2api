@@ -7,6 +7,7 @@ import { toast } from '@/lib/toast'
 import ModelPromotions from '@/components/ModelPromotions.vue'
 import { int } from '@/lib/format'
 import { providerMeta } from '@/lib/providers'
+import type { AABenchmark } from '@/types'
 
 const props = defineProps<{ model: Record<string, any>; provider: string }>()
 const m = computed(() => props.model)
@@ -33,13 +34,38 @@ const reasoning = computed(() => {
 const ctx = computed(() => m.value.context_length ?? m.value.context)
 const maxOut = computed(() => m.value.max_output_tokens ?? m.value.max_output)
 const bench = computed(() => {
-  const data = m.value.benchmark
-  return data && [data.intelligence_index, data.coding_index, data.math_index].some(knownScore) ? data : null
+  const data = m.value.benchmark as AABenchmark | undefined
+  if (!data) return null
+  const scores = benchmarkScores(data)
+  const measurements = benchmarkMeasurements(data)
+  const variants = (data.variants || []).map(variant => ({
+    ...variant, scores: benchmarkScores(variant), measurements: benchmarkMeasurements(variant),
+  }))
+  return scores.length || measurements.length || variants.length ? { ...data, scores, measurements, variants } : null
 })
-function knownScore(v: unknown): boolean {
-  return (typeof v === 'number' || typeof v === 'string' && v.trim() !== '') && Number.isFinite(Number(v))
+function benchmarkScores(data: AABenchmark) {
+  return [
+    { label: '智能指数', value: data.intelligence_index },
+    { label: '编码', value: data.coding_index },
+    { label: '数学', value: data.math_index },
+  ].filter(score => typeof score.value === 'number' && Number.isFinite(score.value))
 }
-const fmtScore = (v: unknown) => knownScore(v) ? Number(v).toFixed(1) : '—'
+function benchmarkMeasurements(data: AABenchmark) {
+  const measurements: string[] = []
+  if (typeof data.median_output_tokens_per_second === 'number') {
+    measurements.push(`输出速度 ${data.median_output_tokens_per_second.toFixed(1)} tok/s`)
+  }
+  if (typeof data.median_time_to_first_answer_token_seconds === 'number') {
+    measurements.push(`首个答案 Token ${data.median_time_to_first_answer_token_seconds.toFixed(2)} s`)
+  }
+  const prices: string[] = []
+  if (typeof data.price_1m_input_tokens === 'number') prices.push(`输入 $${data.price_1m_input_tokens}`)
+  if (typeof data.price_1m_output_tokens === 'number') prices.push(`输出 $${data.price_1m_output_tokens}`)
+  if (prices.length) {
+    measurements.push(`${prices.join(' / ')} · USD/百万 Tokens`)
+  }
+  return measurements
+}
 
 // 每站点成本系数（credits_by_region）。同模型两站点不同价时分列展示并标出更便宜的
 // 那个（成本优先选号会用它）。全相同或只有一个站点则回退单值 m.credits。
@@ -64,8 +90,6 @@ const displayCredits = computed(() => {
 })
 
 const costMetric = computed(() => {
-  if (media.value) return { value: '-', label: '实际消费', title: '按生成结果返回的实际积分记录，不将未知价格当作免费。' }
-
   if (props.provider === 'qoder') return {
     value: finiteCost(m.value.price_factor) ? `×${m.value.price_factor}` : '-',
     label: '成本系数',
@@ -119,7 +143,6 @@ const systemOne = computed(() => String(m.value.native_protocol || '').toLowerCa
 </script>
 
 <template>
-  <!-- Each visible card row shares nine content tracks; optional empty tracks collapse. -->
   <div class="model-card glass min-w-0 rounded-xl p-4 transition-colors hover:border-brand/40">
     <div class="model-card-header flex items-start justify-between gap-2">
       <div class="min-w-0">
@@ -148,25 +171,24 @@ const systemOne = computed(() => String(m.value.native_protocol || '').toLowerCa
       <WTag v-if="systemOne" tone="warn" title="仅支持原生 SystemOne 决策结构，建议使用 /v1/systemone 专用入口">SystemOne</WTag>
     </div>
 
-    <div v-if="efforts.length" class="model-card-section model-card-efforts flex flex-wrap content-start items-center gap-1">
-      <span class="text-micro text-faint">思考强度</span>
-      <span
-        v-for="e in efforts"
-        :key="e"
-        class="mono rounded-md px-1.5 py-0.5 text-micro"
-        :class="e === reasoning.defaultEffort ? 'bg-brand/15 text-brand ring-1 ring-brand/30' : 'bg-elevated text-muted'"
-        :title="e === reasoning.defaultEffort ? '默认档位' : ''"
-      >{{ e }}</span>
-    </div>
-
-    <div v-if="media" class="model-card-section model-card-metrics border-t border-line pt-2.5 text-micro text-muted space-y-1.5">
-      <div v-if="video.resolutions?.length">分辨率 <span class="mono text-ink">{{ video.resolutions.join(' / ') }}</span></div>
-      <div v-if="video.minSeconds && video.maxSeconds">时长 <span class="mono text-ink">{{ video.minSeconds }}–{{ video.maxSeconds }} 秒</span><span v-if="video.defaultSeconds"> · 默认 {{ video.defaultSeconds }} 秒</span></div>
-      <div v-if="video.aspectRatios?.length">画幅 <span class="mono">{{ video.aspectRatios.join(' / ') }}</span></div>
-      <div>实际消费 <span class="mono text-ink">—</span></div>
-    </div>
-    <div v-else class="model-card-section model-card-metrics">
-      <div class="grid grid-cols-3 items-start gap-2 border-t border-line pt-2.5 text-center">
+    <div class="model-card-metrics model-card-divider grid grid-cols-3 content-start items-start gap-2 text-center">
+      <template v-if="media">
+        <div v-if="video.resolutions?.length" class="col-start-1">
+          <div class="mono flex flex-wrap justify-center gap-x-1.5 text-small font-semibold text-ink">
+            <span v-for="resolution in video.resolutions" :key="resolution">{{ resolution }}</span>
+          </div>
+          <div class="text-micro text-faint">分辨率</div>
+        </div>
+        <div v-if="video.minSeconds && video.maxSeconds" class="col-start-2">
+          <div class="mono text-small font-semibold text-ink">{{ video.minSeconds }}–{{ video.maxSeconds }} 秒</div>
+          <div class="text-micro text-faint">时长<span v-if="video.defaultSeconds"> · 默认 {{ video.defaultSeconds }} 秒</span></div>
+        </div>
+        <div class="col-start-3">
+          <div class="text-small font-semibold text-ink">按结果结算</div>
+          <div class="text-micro text-faint">计费方式</div>
+        </div>
+      </template>
+      <template v-else>
         <div>
           <div class="mono text-small font-semibold text-ink">{{ ctx ? int(ctx) : '—' }}</div>
           <div class="text-micro text-faint" :title="Array.isArray(m.context_tiers) ? m.context_tiers.map((t: any) => `${t.name}${t.is_default ? '（默认）' : ''}`).join(' / ') : undefined">上下文<span v-if="Array.isArray(m.context_tiers) && m.context_tiers.length > 1" class="ml-1 text-muted">· {{ m.context_tiers.length }} 档</span></div>
@@ -182,10 +204,25 @@ const systemOne = computed(() => String(m.value.native_protocol || '').toLowerCa
             <ModelPromotions :promotions="m.promotions" />
           </div>
         </div>
-      </div>
+      </template>
+    </div>
+
+    <div v-if="efforts.length" class="model-card-section model-card-efforts flex flex-wrap content-start items-center gap-1">
+      <span class="text-micro text-faint">思考强度</span>
+      <span
+        v-for="e in efforts"
+        :key="e"
+        class="mono rounded-md px-1.5 py-0.5 text-micro"
+        :class="e === reasoning.defaultEffort ? 'bg-brand/15 text-brand ring-1 ring-brand/30' : 'bg-elevated text-muted'"
+        :title="e === reasoning.defaultEffort ? '默认档位' : ''"
+      >{{ e }}</span>
     </div>
 
     <div class="model-card-section model-card-details space-y-1.5">
+      <div v-if="media && video.aspectRatios?.length" class="flex flex-wrap gap-x-1.5 text-micro text-faint">
+        <span>画幅</span>
+        <span v-for="ratio in video.aspectRatios" :key="ratio" class="mono text-muted">{{ ratio }}</span>
+      </div>
       <!-- SystemOne 模型用法提示：这类模型只接受结构化决策 payload，普通聊天/消息/
            Responses 调用会被上游 400，明确标注避免误用。 -->
       <div v-if="systemOne" class="rounded-lg border border-warn/30 bg-warn/5 px-2.5 py-1.5 text-micro leading-relaxed text-warn">
@@ -214,32 +251,47 @@ const systemOne = computed(() => String(m.value.native_protocol || '').toLowerCa
       <p class="line-clamp-2 text-micro leading-relaxed text-muted" :title="m.description">{{ m.description }}</p>
     </div>
 
-    <!-- AA 第三方评测（配置了 key 且匹配到时展示） -->
     <div v-if="bench" class="model-card-section model-card-benchmark">
-      <div class="rounded-lg border border-line bg-elevated/40 p-2.5">
-        <div class="mb-1.5 flex items-center justify-between">
-          <span class="truncate text-micro text-faint">AA 评测<span v-if="bench.name" class="ml-1 text-faint/70">· {{ bench.name }}</span></span>
-          <a :href="bench.aa_url || 'https://artificialanalysis.ai/models'" target="_blank" rel="noopener" class="shrink-0 text-micro text-brand hover:underline">榜单 ↗</a>
+      <div class="rounded-lg border border-line bg-elevated/40 px-2.5 py-2">
+        <div class="flex min-h-5 items-center gap-x-2 text-micro">
+          <a v-if="bench.aa_url" :href="bench.aa_url" target="_blank" rel="noopener" class="min-w-0 truncate text-brand hover:underline" title="Artificial Analysis">Artificial Analysis ↗</a>
+          <span v-else class="min-w-0 truncate text-faint">Artificial Analysis</span>
+          <span class="min-w-0 flex-1 truncate text-faint" :title="bench.name">{{ bench.name }}</span>
+          <span v-if="bench.scores[0]" class="shrink-0 whitespace-nowrap text-faint">
+            {{ bench.scores[0].label }}
+            <span class="mono text-small font-semibold text-ink">{{ Number(bench.scores[0].value).toFixed(1) }}</span>
+          </span>
         </div>
-        <div class="grid grid-cols-3 gap-2 text-center">
-          <div>
-            <div class="mono text-small font-semibold text-ink">{{ fmtScore(bench.intelligence_index) }}</div>
-            <div class="text-micro text-faint">智能</div>
+        <details v-if="bench.variants.length || bench.measurements.length || bench.scores.length > 1" class="mt-1 text-micro">
+          <summary class="cursor-pointer text-brand">{{ bench.variants.length ? '查看分档评测' : '查看评测数据' }}</summary>
+          <div v-if="!bench.variants.length" class="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-muted">
+            <span v-for="score in bench.scores.slice(1)" :key="score.label">{{ score.label }} {{ Number(score.value).toFixed(1) }}</span>
+            <span v-for="measurement in bench.measurements" :key="measurement">{{ measurement }}</span>
           </div>
-          <div>
-            <div class="mono text-small font-semibold text-ink">{{ fmtScore(bench.coding_index) }}</div>
-            <div class="text-micro text-faint">编码</div>
+          <p v-if="bench.variants.length && !bench.variants[0]?.effort" class="mt-1 text-faint">以下为 AA 测试档位，渠道档位待确认。</p>
+          <div v-for="variant in bench.variants" :key="variant.id" class="mt-1.5 flex flex-wrap items-baseline justify-between gap-x-3 border-t border-line pt-1.5">
+            <div class="min-w-0">
+              <span v-if="variant.effort" class="mr-1.5 font-medium text-ink">{{ variant.effort === 'off' ? '关闭思考' : variant.effort }}</span>
+              <a v-if="variant.aa_url" :href="variant.aa_url" target="_blank" rel="noopener" class="break-words text-brand hover:underline">{{ variant.name }} ↗</a>
+              <span v-else class="break-words text-faint">{{ variant.name }}</span>
+            </div>
+            <div v-if="variant.scores.length" class="flex flex-wrap gap-x-2.5">
+              <span v-for="score in variant.scores" :key="score.label" class="text-muted">
+                {{ score.label }} <span class="mono font-semibold text-ink">{{ Number(score.value).toFixed(1) }}</span>
+              </span>
+            </div>
+            <span v-else-if="!variant.measurements.length" class="text-faint">暂无评测</span>
+            <div v-if="variant.measurements.length" class="flex w-full flex-wrap gap-x-3 gap-y-1 text-muted">
+              <span v-for="measurement in variant.measurements" :key="measurement">{{ measurement }}</span>
+            </div>
           </div>
-          <div>
-            <div class="mono text-small font-semibold text-ink">{{ fmtScore(bench.math_index) }}</div>
-            <div class="text-micro text-faint">数学</div>
-          </div>
-        </div>
+          <p v-if="bench.measurements.length || bench.variants.some(v => v.measurements.length)" class="mt-1.5 text-faint">性能为 AA 跨供应商的中位数，价格为 AA 参考价。</p>
+        </details>
       </div>
     </div>
 
-    <div class="model-card-section model-card-actions"><slot name="actions" /></div>
-    <div class="model-card-section model-card-footer"><slot name="footer" /></div>
+    <div class="model-card-actions model-card-divider"><slot name="actions" /></div>
+    <div class="model-card-footer model-card-divider"><slot name="footer" /></div>
   </div>
 </template>
 
@@ -257,6 +309,11 @@ const systemOne = computed(() => String(m.value.native_protocol || '').toLowerCa
   margin-bottom: 0.75rem;
 }
 .model-card-section:not(:empty) { padding-top: 0.625rem; }
+.model-card-divider:not(:empty) {
+  margin-top: 0.625rem;
+  padding-top: 0.625rem;
+  border-top: 1px solid rgb(var(--c-line));
+}
 @media (min-width: 640px) {
   .model-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
@@ -273,8 +330,8 @@ const systemOne = computed(() => String(m.value.native_protocol || '').toLowerCa
   }
   .model-card-header { grid-row: 1; }
   .model-card-capabilities { grid-row: 2; }
-  .model-card-efforts { grid-row: 3; }
-  .model-card-metrics { grid-row: 4; }
+  .model-card-metrics { grid-row: 3; }
+  .model-card-efforts { grid-row: 4; }
   .model-card-details { grid-row: 5; }
   .model-card-description { grid-row: 6; }
   .model-card-benchmark { grid-row: 7; }

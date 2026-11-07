@@ -35,7 +35,8 @@ import (
 // v24 adds an expression index for content-free request grouping.
 // v25 adds durable, caller-scoped media tasks and their usage linkage.
 // v26 persists asynchronous media polling and query backoff.
-const SchemaVersion = 26
+// v27 adds per-model Artificial Analysis bindings.
+const SchemaVersion = 27
 
 // DB wraps the SQLite connection.
 type DB struct {
@@ -204,6 +205,7 @@ CREATE TABLE IF NOT EXISTS usage_logs (
     credits REAL, app_name TEXT, user_id INTEGER, reasoning_effort TEXT
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS aa_model_bindings (model TEXT PRIMARY KEY, binding TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS model_cooldowns (
     account_uid TEXT, model TEXT, cooldown_until REAL, reason TEXT,
     created_at REAL, PRIMARY KEY (account_uid, model)

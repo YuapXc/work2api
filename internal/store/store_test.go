@@ -6,7 +6,42 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"work2api/internal/benchmarks"
 )
+
+func TestBenchmarkBindingsPersistAndClear(t *testing.T) {
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "benchmarks.db")
+	db, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := benchmarks.Binding{EntryID: "aa-id", Identity: "observed-revision", Efforts: map[string]string{"high": "aa-high"}}
+	if err := db.SaveBenchmarkBinding(ctx, "workbuddy/example", binding); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	bindings, err := db.BenchmarkBindings(ctx)
+	got := bindings["workbuddy/example"]
+	if err != nil || got.EntryID != binding.EntryID || got.Identity != binding.Identity || got.Efforts["high"] != "aa-high" {
+		t.Fatalf("binding was not restored: %+v, %v", got, err)
+	}
+	if err := db.SaveBenchmarkBinding(ctx, "workbuddy/example", benchmarks.Binding{}); err != nil {
+		t.Fatal(err)
+	}
+	if bindings, err := db.BenchmarkBindings(ctx); err != nil || len(bindings) != 0 {
+		t.Fatalf("binding was not cleared: %+v, %v", bindings, err)
+	}
+}
 
 func TestAppCostsKeepChannelsAndOwnersSeparate(t *testing.T) {
 	db, err := New(filepath.Join(t.TempDir(), "costs.db"))

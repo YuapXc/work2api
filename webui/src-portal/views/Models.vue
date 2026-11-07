@@ -37,7 +37,7 @@ onMounted(load)
     <div class="model-grid">
       <ModelInfoCard v-for="model in filtered" :key="model.id" :model="model" :provider="channel(model)">
         <template #footer>
-          <div v-if="model.own_account || model.default_access" class="flex flex-wrap items-center gap-2 border-t border-line pt-2.5 text-micro">
+          <div v-if="model.own_account || model.default_access" class="flex flex-wrap items-center gap-2 text-micro">
             <span v-if="model.own_account" class="rounded bg-live/12 px-2 py-1 text-live">本人账号</span>
             <span v-if="model.default_access" class="rounded bg-brand/12 px-2 py-1 text-brand">默认开放授权</span>
           </div>

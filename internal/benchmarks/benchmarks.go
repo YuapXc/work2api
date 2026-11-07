@@ -1,21 +1,15 @@
 // Package benchmarks integrates Artificial Analysis (artificialanalysis.ai)
-// third-party LLM evaluations into the model catalog. AA exposes a free API
-// (GET /api/v2/data/llms/models, x-api-key header, ~1000 req/day) that the docs
-// require callers to cache server-side and never expose the key to clients.
-//
-// So this package fetches + caches on the backend (24h success, 6h failure
-// cooldown); the WebUI reads a derived, key-free view. AA data is keyed by
-// standard vendor slugs/names, while our three providers name models very
-// differently, so Lookup resolves a per-provider "seed" and matches it against
-// AA in three layers: exact (id/slug/name) → curated keyword map → a
-// version-safe fuzzy containment. The fuzzy layer refuses matches that split a
-// numeric version token (so "kimi-k2.8-preview" never binds to AA "Kimi K2"),
-// which calibration against the live catalog proved was the dominant false
-// positive.
+// third-party LLM evaluations into the model catalog. The WebUI reads a
+// derived, key-free view from the server-side cache. AA data is keyed by
+// standard vendor slugs and names. Catalog matching preserves model versions
+// and reasoning variants; ambiguous aliases require an administrator binding.
 package benchmarks
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"regexp"
@@ -25,11 +19,10 @@ import (
 )
 
 const (
-	endpoint     = "https://artificialanalysis.ai/api/v2/data/llms/models"
-	cacheTTL     = 24 * time.Hour
+	endpoint     = "https://artificialanalysis.ai/api/v2/language/models/free"
 	failCooldown = 6 * time.Hour
 	reqTimeout   = 20 * time.Second
-	aaURL        = "https://artificialanalysis.ai/models"
+	modelURL     = "https://artificialanalysis.ai/models/"
 )
 
 // SettingsSource reads the persisted settings (the AA key lives under aa_api_key).
@@ -50,34 +43,51 @@ type aaModel struct {
 		Coding       *float64 `json:"artificial_analysis_coding_index"`
 		Math         *float64 `json:"artificial_analysis_math_index"`
 	} `json:"evaluations"`
-
-	nID, nSlug, nName string // normalized match keys (filled on ingest)
+	Performance struct {
+		OutputTokensPerSecond *float64 `json:"median_output_tokens_per_second"`
+		FirstAnswerSeconds    *float64 `json:"median_time_to_first_answer_token_seconds"`
+	} `json:"performance"`
+	Pricing struct {
+		InputPerMillion  *float64 `json:"price_1m_input_tokens"`
+		OutputPerMillion *float64 `json:"price_1m_output_tokens"`
+	} `json:"pricing"`
 }
 
 // Result is the key-free, WebUI-facing view of one model's evaluation.
 type Result struct {
-	Name         string   `json:"name"`
-	Creator      string   `json:"creator,omitempty"`
-	Intelligence *float64 `json:"intelligence_index"`
-	Coding       *float64 `json:"coding_index"`
-	Math         *float64 `json:"math_index"`
-	Source       string   `json:"source"`
-	AAURL        string   `json:"aa_url"`
+	Name                  string   `json:"name"`
+	Creator               string   `json:"creator,omitempty"`
+	Intelligence          *float64 `json:"intelligence_index"`
+	Coding                *float64 `json:"coding_index"`
+	Math                  *float64 `json:"math_index"`
+	Source                string   `json:"source"`
+	AAURL                 string   `json:"aa_url,omitempty"`
+	OutputTokensPerSecond *float64 `json:"median_output_tokens_per_second,omitempty"`
+	FirstAnswerSeconds    *float64 `json:"median_time_to_first_answer_token_seconds,omitempty"`
+	InputPerMillion       *float64 `json:"price_1m_input_tokens,omitempty"`
+	OutputPerMillion      *float64 `json:"price_1m_output_tokens,omitempty"`
 }
 
 // Store caches AA rows and resolves per-provider model ids to evaluations.
 type Store struct {
 	settings SettingsSource
+	client   *http.Client
 
 	mu        sync.Mutex
 	refreshMu sync.Mutex
-	rows      []aaModel
-	fetchedAt time.Time
+	catalog   *Catalog
 	lastFail  time.Time
 }
 
 // New builds a Store that reads the AA key from the given settings source.
-func New(settings SettingsSource) *Store { return &Store{settings: settings} }
+func New(settings SettingsSource) *Store {
+	return &Store{
+		settings: settings,
+		client: &http.Client{
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+	}
+}
 
 // key returns the configured AA API key (trimmed), or "".
 func (s *Store) key() string {
@@ -94,242 +104,130 @@ func (s *Store) key() string {
 // Configured reports whether an AA key is set.
 func (s *Store) Configured() bool { return s.key() != "" }
 
-// HasCache reports whether any rows are cached (regardless of freshness). Lets
-// request-path callers avoid triggering a blocking fetch.
-func (s *Store) HasCache() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.rows) > 0
+type catalogPage struct {
+	Pagination *struct {
+		Page    int  `json:"page"`
+		HasMore bool `json:"has_more"`
+	} `json:"pagination"`
+	Data []aaModel `json:"data"`
 }
 
-// fetch pulls the AA catalog. Returns nil (no error surfaced) on any failure so
-// callers fall back to the existing cache; the outbound client honors the
-// environment proxy since AA is a public third-party site (unlike the upstream
-// provider APIs which must stay direct).
-func (s *Store) fetch() []aaModel {
-	key := s.key()
-	if key == "" {
-		return nil
-	}
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+func (s *Store) fetchPage(ctx context.Context, key string, page int) (catalogPage, error) {
+	var payload catalogPage
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s?page=%d", endpoint, page), nil)
 	if err != nil {
-		return nil
+		return payload, errors.New("无法创建 Artificial Analysis 请求")
 	}
 	req.Header.Set("x-api-key", key)
-	client := &http.Client{Timeout: reqTimeout}
-	resp, err := client.Do(req)
+	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil
+		return payload, errors.New("连接 Artificial Analysis 失败或超时")
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusUnauthorized:
+		return payload, errors.New("Artificial Analysis API Key 无效（401）")
+	case http.StatusTooManyRequests:
+		return payload, errors.New("Artificial Analysis 请求额度已用尽（429）")
+	default:
+		return payload, fmt.Errorf("Artificial Analysis 返回 HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
-	if err != nil {
-		return nil
+	const maxPageBytes = 16 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPageBytes+1))
+	if err != nil || len(body) > maxPageBytes || json.Unmarshal(body, &payload) != nil ||
+		payload.Pagination == nil || payload.Pagination.Page != page || len(payload.Data) == 0 {
+		return payload, fmt.Errorf("Artificial Analysis 第 %d 页目录无效或为空", page)
 	}
-	var payload struct {
-		Data []aaModel `json:"data"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil
-	}
-	for i := range payload.Data {
-		payload.Data[i].nID = normalize(payload.Data[i].ID)
-		payload.Data[i].nSlug = normalize(payload.Data[i].Slug)
-		payload.Data[i].nName = normalize(payload.Data[i].Name)
-	}
-	return payload.Data
+	return payload, nil
 }
 
-// ensure returns cached rows if fresh; otherwise refreshes (respecting the
-// failure cooldown). Falls back to stale rows on fetch failure.
-func (s *Store) ensure() []aaModel {
-	s.refreshMu.Lock()
-	defer s.refreshMu.Unlock()
-	now := time.Now()
-	s.mu.Lock()
-	if len(s.rows) > 0 && now.Sub(s.fetchedAt) < cacheTTL {
-		rows := s.rows
-		s.mu.Unlock()
-		return rows
+func (s *Store) fetch(ctx context.Context, key string) ([]aaModel, error) {
+	ctx, cancel := context.WithTimeout(ctx, reqTimeout)
+	defer cancel()
+	var rows []aaModel
+	for page := 1; ; page++ {
+		payload, err := s.fetchPage(ctx, key, page)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, payload.Data...)
+		if !payload.Pagination.HasMore {
+			break
+		}
 	}
-	inFail := !s.lastFail.IsZero() && now.Sub(s.lastFail) < failCooldown
-	stale := s.rows
-	s.mu.Unlock()
-	if inFail {
-		return stale
-	}
-	rows := s.fetch()
-	if rows == nil {
-		s.mu.Lock()
-		s.lastFail = time.Now()
-		s.mu.Unlock()
-		return stale
-	}
-	s.mu.Lock()
-	s.rows = rows
-	s.fetchedAt = time.Now()
-	s.lastFail = time.Time{}
-	s.mu.Unlock()
-	return rows
+	return rows, nil
 }
 
-// Refresh forces a fetch (for the scheduler / manual WebUI refresh). Keeps the
-// existing cache on failure.
-func (s *Store) Refresh() {
+func (s *Store) RefreshIfEmpty(ctx context.Context) {
+	_ = s.refresh(ctx, false)
+}
+
+// Refresh replaces the cache only after fetching all pages.
+func (s *Store) Refresh(ctx context.Context) error {
+	return s.refresh(ctx, true)
+}
+
+func (s *Store) refresh(ctx context.Context, force bool) error {
 	if !s.refreshMu.TryLock() {
-		return
+		return errors.New("Artificial Analysis 评测正在刷新，请稍后再试")
 	}
 	defer s.refreshMu.Unlock()
-	rows := s.fetch()
-	if rows == nil {
-		s.mu.Lock()
-		s.lastFail = time.Now()
-		s.mu.Unlock()
-		return
-	}
-	s.mu.Lock()
-	s.rows = rows
-	s.fetchedAt = time.Now()
-	s.lastFail = time.Time{}
-	s.mu.Unlock()
-}
-
-var (
-	nonKey         = regexp.MustCompile(`[\s\-_.]+`)
-	opencodeSuffix = regexp.MustCompile(`-(free|contributor|fin)\b`)
-	qoderPrefix    = "qoder/"
-	opencodePrefix = "opencode/"
-)
-
-// normalize strips separators and lowercases, so "GPT-5.6 Sol" and "gpt-5.6-sol"
-// compare equal.
-func normalize(s string) string {
-	return nonKey.ReplaceAllString(strings.ToLower(strings.TrimSpace(s)), "")
-}
-
-// keywordMap recovers models whose provider name doesn't resemble any AA
-// slug/name, keyed by the normalized per-provider seed. Values are AA-name
-// substrings tried in order. Curated from live calibration; keep small.
-var keywordMap = map[string][]string{
-	"hy4preview":         {"hunyuan hybrid", "hunyuan"}, // Tencent Hunyuan (workbuddy id)
-	"hy4previewf":        {"hunyuan hybrid", "hunyuan"},
-	"deepseekv41flashsg": {"deepseek v4.1 flash"}, // Singapore variant → base flash
-	"kimik31":            {"kimi k3"},
-	"deepseekflash":      {"deepseek v4 flash", "deepseek flash"}, // qoder dfmodel name
-}
-
-// seed picks the field to match on, per provider: workbuddy uses the (Tencent)
-// id, qoder's id is obfuscated but its name is the real model, and opencode ids
-// are real slugs behind the namespace + free/contributor suffixes.
-func seed(providerName, id, name string) string {
-	switch providerName {
-	case "qoder":
-		if strings.TrimSpace(name) != "" {
-			return name
-		}
-		return strings.TrimPrefix(id, qoderPrefix)
-	case "opencode":
-		base := strings.TrimPrefix(id, opencodePrefix)
-		for opencodeSuffix.MatchString(base) {
-			base = opencodeSuffix.ReplaceAllString(base, "")
-		}
-		return base
-	default: // workbuddy and any future provider: match on id
-		return id
-	}
-}
-
-// containsSafe reports whether needle occurs in hay without splitting a numeric
-// version token — the char adjacent to the match on either side must not be a
-// digit when the match boundary itself is a digit. This is what stops
-// "kimik28preview" from matching "kimik2".
-func containsSafe(hay, needle string) bool {
-	if needle == "" || len(needle) < 4 {
-		return false
-	}
-	from := 0
-	for {
-		i := strings.Index(hay[from:], needle)
-		if i < 0 {
-			return false
-		}
-		i += from
-		end := i + len(needle)
-		beforeOK := i == 0 || !isDigit(hay[i-1]) || !isDigit(needle[0])
-		afterOK := end == len(hay) || !isDigit(hay[end]) || !isDigit(needle[len(needle)-1])
-		if beforeOK && afterOK {
-			return true
-		}
-		from = i + 1
-	}
-}
-
-func isDigit(b byte) bool { return b >= '0' && b <= '9' }
-
-// match resolves one seed to an AA row (nil if none).
-func (s *Store) match(rows []aaModel, providerName, id, name string) *aaModel {
-	sd := normalize(seed(providerName, id, name))
-	if sd == "" {
+	if !force && (s.catalog != nil || time.Since(s.lastFail) < failCooldown) {
 		return nil
 	}
-	// 1) exact id / slug / name
-	for i := range rows {
-		r := &rows[i]
-		if sd == r.nID || sd == r.nSlug || sd == r.nName {
-			return r
-		}
+	key := s.key()
+	if key == "" {
+		return errors.New("未配置 Artificial Analysis API Key")
 	}
-	// 2) curated keyword map (normalized-substring, version-safe)
-	if kws := keywordMap[sd]; len(kws) > 0 {
-		for _, kw := range kws {
-			nkw := normalize(kw)
-			for i := range rows {
-				if rows[i].nName != "" && containsSafe(rows[i].nName, nkw) {
-					return &rows[i]
-				}
-			}
+	rows, err := s.fetch(ctx, key)
+	if err != nil {
+		if ctx.Err() == nil {
+			s.lastFail = time.Now()
 		}
+		return err
 	}
-	// 3) version-safe fuzzy containment on the name (both directions)
-	for i := range rows {
-		r := &rows[i]
-		if r.nName == "" {
-			continue
-		}
-		if containsSafe(r.nName, sd) || containsSafe(sd, r.nName) {
-			return r
-		}
+	catalog := newCatalog(rows)
+	if len(catalog.families) == 0 {
+		s.lastFail = time.Now()
+		return errors.New("Artificial Analysis 未返回可用的模型条目")
 	}
+	s.mu.Lock()
+	s.catalog = catalog
+	s.mu.Unlock()
+	s.lastFail = time.Time{}
 	return nil
 }
 
-// lookup is a read-only snapshot; scheduled/explicit Refresh owns network IO.
-func (s *Store) lookup(providerName, id, name string) *aaModel {
-	s.mu.Lock()
-	rows := s.rows
-	s.mu.Unlock()
-	if len(rows) == 0 {
-		return nil
+var (
+	opencodeSuffix = regexp.MustCompile(`-(free|contributor)$`)
+	validModelSlug = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+)
+
+func seed(providerName, id string) string {
+	base := strings.TrimPrefix(id, providerName+"/")
+	if providerName == "opencode" {
+		return opencodeSuffix.ReplaceAllString(base, "")
 	}
-	return s.match(rows, providerName, id, name)
+	return base
 }
 
-// Map returns the WebUI-facing evaluation for a provider's model, or nil.
-func (s *Store) Map(providerName, id, name string) *Result {
-	r := s.lookup(providerName, id, name)
-	if r == nil {
-		return nil
+func (r aaModel) result() Result {
+	var url string
+	if validModelSlug.MatchString(r.Slug) {
+		url = modelURL + r.Slug
 	}
-	return &Result{
-		Name:         r.Name,
-		Creator:      r.Creator.Name,
-		Intelligence: r.Evaluations.Intelligence,
-		Coding:       r.Evaluations.Coding,
-		Math:         r.Evaluations.Math,
-		Source:       "aa",
-		AAURL:        aaURL,
+	return Result{
+		Name:                  r.Name,
+		Creator:               r.Creator.Name,
+		Intelligence:          r.Evaluations.Intelligence,
+		Coding:                r.Evaluations.Coding,
+		Math:                  r.Evaluations.Math,
+		Source:                "aa",
+		AAURL:                 url,
+		OutputTokensPerSecond: r.Performance.OutputTokensPerSecond,
+		FirstAnswerSeconds:    r.Performance.FirstAnswerSeconds,
+		InputPerMillion:       r.Pricing.InputPerMillion,
+		OutputPerMillion:      r.Pricing.OutputPerMillion,
 	}
 }

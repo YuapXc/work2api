@@ -1,7 +1,7 @@
 import axios, { type AxiosInstance, type InternalAxiosRequestConfig } from 'axios'
 import { toast } from '@/lib/toast'
 import type {
-  AABenchmark,
+  AABenchmark, AABenchmarkBinding, AABenchmarkBindingOptions,
   ActiveSession, SessionRow, SessionAccountOption,
   AccountInfo,
   AppInfo,
@@ -169,9 +169,13 @@ export const api = {
     http.post<unknown, { ok: boolean; models: ModelInfo[]; source?: 'dynamic' | 'static'; warnings?: string[]; providers?: ModelRefreshResult[] }>('/admin/models/refresh', {}, { params: provider ? { provider } : undefined }),
   // AA（Artificial Analysis）评测：按带命名空间的模型 id 返回智能/编码/数学指数
   benchmarks: () =>
-    http.get<unknown, { configured: boolean; models: Record<string, AABenchmark> }>('/admin/models/benchmarks'),
+    http.get<unknown, { configured: boolean; models: Record<string, AABenchmark>; binding_states?: Record<string, 'review' | 'conflict'> }>('/admin/models/benchmarks'),
   benchmarksRefresh: () =>
     http.post<unknown, { ok: boolean; configured: boolean }>('/admin/models/benchmarks/refresh'),
+  benchmarkBinding: (model: string, q?: string) =>
+    http.get<unknown, AABenchmarkBindingOptions>('/admin/models/benchmarks/binding', { params: { model, q } }),
+  saveBenchmarkBinding: (model: string, binding: AABenchmarkBinding) =>
+    http.post<unknown, { ok: boolean }>('/admin/models/benchmarks/binding', { model, binding }),
 
   // ---------- 多供应商（workbuddy / qoder / opencode）统一管理 ----------
   // 摘要列表：驱动左侧导航的供应商子项与概览页的供应商卡片

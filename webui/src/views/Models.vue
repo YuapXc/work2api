@@ -13,6 +13,7 @@ import WEmpty from '@/components/ui/WEmpty.vue'
 import WIcon from '@/components/ui/WIcon.vue'
 import WStat from '@/components/ui/WStat.vue'
 import ModelCard from '@/components/ModelCard.vue'
+import AABenchmarkBinding from '@/components/AABenchmarkBinding.vue'
 
 interface Entry {
   provider: string
@@ -28,11 +29,13 @@ const providerFilter = ref('')
 const modalityFilter = ref('')
 const aaConfigured = ref(false)
 const refreshingAA = ref(false)
+const bindingModel = ref('')
 
 const readErrors = ref<Record<string, string>>({})
 const knownProviders = ref<ProviderSummary[]>([])
 const refreshResults = ref<ModelRefreshResult[]>([])
 let loadVersion = 0
+let benchLoadVersion = 0
 
 async function load() {
   const version = ++loadVersion
@@ -76,17 +79,19 @@ async function load() {
 
 // AA 评测按带命名空间的模型 id 合并进各卡片（后端 key 即 e.model.id）。
 async function loadBenchmarks() {
+  const version = ++benchLoadVersion
   try {
     const res = await api.benchmarks()
+    if (version !== benchLoadVersion) return false
     aaConfigured.value = !!res.configured
-    if (!res.configured) return
     const map = res.models || {}
     for (const e of entries.value) {
-      const b = map[e.model.id] || (e.provider === 'workbuddy' ? map[String(e.model.id).replace(/^workbuddy\//, '')] : undefined)
-      if (b) e.model.benchmark = b
+      e.model.benchmark = map[e.model.id] || (e.provider === 'workbuddy' ? map[String(e.model.id).replace(/^workbuddy\//, '')] : undefined)
+      e.model.benchmark_state = res.binding_states?.[e.model.id]
     }
+    return res.configured
   } catch {
-    aaConfigured.value = false
+    return false
   }
 }
 
@@ -94,13 +99,17 @@ async function refreshAA() {
   refreshingAA.value = true
   try {
     await api.benchmarksRefresh()
-    await loadBenchmarks()
-    toast.success('已刷新 AA 评测')
+    if (await loadBenchmarks()) toast.success('已刷新 AA 评测')
   } catch {
-    toast.error('刷新失败：请确认已在设置页填入 AA API Key')
+    // The API client shows the server's refresh error.
   } finally {
     refreshingAA.value = false
   }
+}
+
+function bindingSaved() {
+  bindingModel.value = ''
+  void loadBenchmarks()
 }
 
 async function refresh() {
@@ -147,12 +156,15 @@ const stats = computed(() => {
   const total = entries.value.length
   const multi = entries.value.filter((e) => e.model.modality === 'multimodal' || e.model.vision).length
   const tool = entries.value.filter((e) => e.model.supportsToolCall === true || e.model.tool_call === true).length
-  const aa = entries.value.filter((e) => e.model.benchmark).length
+  const aa = entries.value.filter(({ model: { benchmark } }) => {
+    const scored = (b: any) => b && [b.intelligence_index, b.coding_index, b.math_index].some(value => typeof value === 'number')
+    return scored(benchmark) || benchmark?.variants?.some(scored)
+  }).length
   return { total, multi, tool, aa }
 })
 
 onMounted(load)
-onBeforeUnmount(() => { loadVersion++ })
+onBeforeUnmount(() => { loadVersion++; benchLoadVersion++ })
 </script>
 
 <template>
@@ -185,7 +197,7 @@ onBeforeUnmount(() => { loadVersion++ })
 
       <div v-if="!aaConfigured" class="mb-4 flex items-center gap-2 rounded-lg border border-line bg-elevated/40 px-3 py-2 text-small text-muted">
         <WIcon name="chart" :size="15" class="text-faint" />
-        在「设置」填入 Artificial Analysis API Key 后，这里会展示各模型的第三方权威评测（智能 / 编码 / 数学指数）。
+          在「设置」填入 Artificial Analysis API Key 后，这里会展示已匹配模型的第三方评测。
       </div>
 
       <div class="mb-4 flex flex-wrap items-center gap-2">
@@ -203,9 +215,14 @@ onBeforeUnmount(() => { loadVersion++ })
       </div>
 
       <div v-if="filtered.length" class="model-grid model-grid-admin">
-        <ModelCard v-for="e in filtered" :key="e.provider + '/' + e.model.id" :model="e.model" :provider="e.provider" />
+        <ModelCard
+          v-for="e in filtered" :key="e.provider + '/' + e.model.id"
+          :model="e.model" :provider="e.provider" :benchmark-binding="aaConfigured"
+          @bind-benchmark="bindingModel = e.model.id"
+        />
       </div>
       <WEmpty v-else title="没有匹配的模型" hint="调整搜索或筛选条件，或刷新目录。" />
     </template>
+    <AABenchmarkBinding v-if="bindingModel" :model="bindingModel" @close="bindingModel = ''" @saved="bindingSaved" />
   </WPage>
 </template>

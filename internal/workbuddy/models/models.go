@@ -472,6 +472,9 @@ func (r *Registry) fetchFromUpstreamContext(ctx context.Context) []fetchedModel 
 	var order []string
 	modelProfiles := map[string][]string{}
 	modelAccounts := map[string][]string{}
+	benchmarkNames := map[string][]string{}
+	benchmarkDefaults := map[string]string{}
+	benchmarkDefaultConflicts := map[string]bool{}
 	// 每模型每站点的成本系数（domestic/international）。合并是先到先得、会丢掉落败
 	// 站点的 credits，这里单独按站点各记一份，让界面能如实显示"同模型两站点不同价"，
 	// 也供成本优先选号用。nil（该站点没给值）不记，绝不当 0。
@@ -542,6 +545,20 @@ func (r *Registry) fetchFromUpstreamContext(ctx context.Context) []fetchedModel 
 			if !contains(modelAccounts[fm.id], account.UID) {
 				modelAccounts[fm.id] = append(modelAccounts[fm.id], account.UID)
 			}
+			names, _ := fm.entry["benchmark_names"].([]string)
+			for _, name := range append(append([]string(nil), names...), str(fm.entry["name"])) {
+				if name != "" && !contains(benchmarkNames[fm.id], name) {
+					benchmarkNames[fm.id] = append(benchmarkNames[fm.id], name)
+				}
+			}
+			level := str(fm.reasoning["defaultEffort"])
+			if level == "" {
+				level = str(fm.reasoning["effort"])
+			}
+			if previous, seen := benchmarkDefaults[fm.id]; seen && previous != level || fm.entry["benchmark_default_conflict"] == true {
+				benchmarkDefaultConflicts[fm.id] = true
+			}
+			benchmarkDefaults[fm.id] = level
 		}
 	}
 	if !anyOK {
@@ -552,6 +569,12 @@ func (r *Registry) fetchFromUpstreamContext(ctx context.Context) []fetchedModel 
 		fm := merged[id]
 		fm.entry["profiles"] = modelProfiles[id]
 		fm.entry["account_uids"] = modelAccounts[id]
+		if len(benchmarkNames[id]) > 1 {
+			fm.entry["benchmark_names"] = benchmarkNames[id]
+		}
+		if benchmarkDefaultConflicts[id] {
+			fm.entry["benchmark_default_conflict"] = true
+		}
 		if cbr := creditsByRegion[id]; len(cbr) > 0 {
 			fm.entry["credits_by_region"] = cbr
 		}

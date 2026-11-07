@@ -82,6 +82,8 @@ func (s *Server) mountAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/models/refresh", s.adminRefreshModels)
 	mux.HandleFunc("GET /admin/models/benchmarks", s.adminBenchmarks)
 	mux.HandleFunc("POST /admin/models/benchmarks/refresh", s.adminBenchmarksRefresh)
+	mux.HandleFunc("GET /admin/models/benchmarks/binding", s.adminBenchmarkBinding)
+	mux.HandleFunc("POST /admin/models/benchmarks/binding", s.adminSaveBenchmarkBinding)
 	mux.HandleFunc("POST /admin/models/test", s.adminModelTest)
 	mux.HandleFunc("GET /admin/settings", s.adminGetSettings)
 	mux.HandleFunc("POST /admin/settings", s.adminSaveSettings)
@@ -358,16 +360,26 @@ func (s *Server) adminBenchmarks(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"configured": false, "models": map[string]any{}})
 		return
 	}
-	if !s.o.bench.HasCache() {
-		s.o.bench.Refresh()
-	}
+	s.o.bench.RefreshIfEmpty(r.Context())
 	out := map[string]any{}
-	for _, m := range s.o.benchTargets(r.Context()) {
-		if res := s.o.bench.Map(m.provider, m.id, m.name); res != nil {
-			out[m.id] = res
+	states := map[string]string{}
+	catalog := s.o.bench.Catalog()
+	if catalog != nil {
+		bindings, err := s.o.db.BenchmarkBindings(r.Context())
+		if err != nil {
+			writeAPIErr(w, errBody(500, "评测绑定读取失败", "server_error"))
+			return
+		}
+		for _, m := range s.o.benchTargets(r.Context()) {
+			binding := bindings[m.ID]
+			if state := catalog.BindingState(m, binding); state != "" {
+				states[m.ID] = state
+			} else if res := catalog.Resolve(m, binding); res != nil {
+				out[m.ID] = res
+			}
 		}
 	}
-	writeJSON(w, 200, map[string]any{"configured": true, "models": out})
+	writeJSON(w, 200, map[string]any{"configured": true, "models": out, "binding_states": states})
 }
 
 func (s *Server) adminBenchmarksRefresh(w http.ResponseWriter, r *http.Request) {
@@ -375,7 +387,10 @@ func (s *Server) adminBenchmarksRefresh(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, 400, errBody(400, "未配置 Artificial Analysis API Key", "invalid_request_error").Body)
 		return
 	}
-	s.o.bench.Refresh()
+	if err := s.o.bench.Refresh(r.Context()); err != nil {
+		writeAPIErr(w, errBody(http.StatusBadGateway, err.Error(), "upstream_error"))
+		return
+	}
 	writeJSON(w, 200, map[string]any{"ok": true, "configured": true})
 }
 

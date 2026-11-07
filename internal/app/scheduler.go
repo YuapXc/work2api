@@ -181,7 +181,7 @@ func (s *Scheduler) run() {
 	// AA benchmarks: warm once at startup so the Models page has data without
 	// waiting for the daily window (skipped cheaply when no key is configured).
 	if s.o.bench.Configured() {
-		s.o.bench.Refresh()
+		_ = s.o.bench.Refresh(s.context())
 	}
 
 	leaveWarm()
@@ -227,7 +227,7 @@ func (s *Scheduler) tick() {
 	}
 	// --- daily AA benchmark refresh (only when configured) ---
 	if s.o.bench.Configured() && now.Hour() == parseHour(s.setting("aa_refresh_hour", "7"), 7) && s.lastBenchDate != t {
-		s.o.bench.Refresh()
+		_ = s.o.bench.Refresh(ctx)
 		s.lastBenchDate = t
 	}
 

@@ -87,12 +87,42 @@ export interface ModelReasoning {
 export interface AABenchmark {
   name?: string
   creator?: string
-  intelligence_index?: number
-  coding_index?: number
-  /** AA 已不再提供 agentic 指标，第三指标为数学 */
-  math_index?: number
+  intelligence_index?: number | null
+  coding_index?: number | null
+  math_index?: number | null
   source?: string
   aa_url?: string
+  median_output_tokens_per_second?: number
+  median_time_to_first_answer_token_seconds?: number
+  price_1m_input_tokens?: number
+  price_1m_output_tokens?: number
+  variants?: AABenchmarkVariant[]
+  default_effort?: string
+}
+
+export interface AABenchmarkVariant extends AABenchmark {
+  id: string
+  effort?: string
+}
+
+export interface AABenchmarkFamily {
+  id: string
+  name: string
+  creator?: string
+  variants: AABenchmarkVariant[]
+}
+
+export interface AABenchmarkBinding {
+  entry_id: string
+  efforts?: Record<string, string>
+}
+
+export interface AABenchmarkBindingOptions {
+  ready: boolean
+  binding: AABenchmarkBinding
+  state?: 'conflict' | 'review' | ''
+  efforts?: string[] | null
+  families?: AABenchmarkFamily[]
 }
 
 export interface ModelInfo {
