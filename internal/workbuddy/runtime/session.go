@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"work2api/internal/core/provider"
+	"work2api/internal/requestdiag"
 	"work2api/internal/store"
 )
 
@@ -48,7 +49,7 @@ type RequestSessionIdentityKey struct{}
 
 // Resolve once from the original request, before conversion or queueing.
 func WithRequestSessionIdentity(r *http.Request, body map[string]any) *http.Request {
-	r = r.WithContext(context.WithValue(r.Context(), RequestDiagnosticsKey{}, &RequestDiagnostics{UsageDiagnostics: store.UsageDiagnostics{RequestedLimits: OutputLimits(body)}}))
+	r = r.WithContext(context.WithValue(r.Context(), requestdiag.RequestDiagnosticsKey{}, &requestdiag.RequestDiagnostics{UsageDiagnostics: store.UsageDiagnostics{RequestedLimits: requestdiag.OutputLimits(body)}}))
 	identity := RequestSessionIdentity{}
 	if value := provider.HeaderSessionID(r.Header); value != "" {
 		identity.Key = "sid:" + value

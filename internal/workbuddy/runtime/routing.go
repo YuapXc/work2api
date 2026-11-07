@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"work2api/internal/core/provider"
+	"work2api/internal/requestdiag"
 	"work2api/internal/streamwatch"
 	"work2api/internal/workbuddy/pool"
 	"work2api/internal/workbuddy/siterouting"
@@ -472,15 +473,15 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 			}
 		}
 		compatUID, compatLevel = "", 0
-		if d := Diagnostic(ctx); d != nil {
+		if d := requestdiag.Diagnostic(ctx); d != nil {
 			d.FinishReason, d.ErrorKind, d.Started = "", "", false
-			d.EffectiveLimits = OutputLimits(attemptBody)
+			d.EffectiveLimits = requestdiag.OutputLimits(attemptBody)
 			d.Compatibility = CompatibilityName(level)
 			d.BillingDomain = siterouting.ProfileSite(acc.Profile)
 			d.BillingCoefficient = o.Catalog.AccountCost(acc.Profile, acc.UID, model)
 		}
 		started, err := o.RunOnce(ctx, acc, attemptBody, sink)
-		if d := Diagnostic(ctx); d != nil {
+		if d := requestdiag.Diagnostic(ctx); d != nil {
 			d.ErrorKind = DiagnosticErrorKind(ctx, err)
 		}
 		if err == nil {
@@ -555,7 +556,7 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 				}
 				compatUID, compatLevel = acc.UID, level
 				delete(tried, acc.UID)
-				if d := Diagnostic(ctx); d != nil {
+				if d := requestdiag.Diagnostic(ctx); d != nil {
 					d.ImagesRemoved += count
 					d.ImagesRepaired += fixed
 					d.ImageRecovery = mode

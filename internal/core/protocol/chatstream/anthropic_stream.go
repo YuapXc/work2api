@@ -1,4 +1,4 @@
-package adapters
+package chatstream
 
 import (
 	"encoding/json"
@@ -8,8 +8,8 @@ import (
 	"unicode/utf8"
 
 	"work2api/internal/core/provider"
+	"work2api/internal/identity"
 	"work2api/internal/tokenusage"
-	"work2api/internal/workbuddy/upstream"
 )
 
 // AnthropicStreamConverter converts an OpenAI Chat SSE stream into an Anthropic
@@ -60,7 +60,7 @@ func NewAnthropicStreamConverter(model string) *AnthropicStreamConverter {
 		model = "unknown"
 	}
 	return &AnthropicStreamConverter{
-		msgID:     randID("msg_"),
+		msgID:     identity.RandomID("msg", 12),
 		model:     model,
 		createdAt: time.Now().Unix(),
 		toolUses:  map[int]*toolUseSlot{},
@@ -188,7 +188,7 @@ func (c *AnthropicStreamConverter) processChunk(chunk map[string]any) string {
 		c.emittedStart = true
 	}
 	if u, ok := chunk["usage"].(map[string]any); ok && u != nil {
-		c.usage = upstream.MergeUsage(c.usage, u)
+		c.usage = tokenusage.Merge(c.usage, u)
 	}
 
 	choices, _ := chunk["choices"].([]any)

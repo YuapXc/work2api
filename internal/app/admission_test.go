@@ -19,10 +19,10 @@ import (
 
 	"work2api/internal/config"
 	"work2api/internal/core/protocol"
+	"work2api/internal/core/protocol/chatstream"
 	"work2api/internal/core/provider"
 	"work2api/internal/store"
 	"work2api/internal/streamwatch"
-	"work2api/internal/workbuddy/adapters"
 	"work2api/internal/workbuddy/models"
 	"work2api/internal/workbuddy/pool"
 	"work2api/internal/workbuddy/upstream"
@@ -1499,7 +1499,7 @@ func (p *customProtocolProbe) Serve(_ context.Context, req provider.ServeRequest
 	}
 	name := tools[0].(map[string]any)["name"].(string)
 	args := `{"input":"*** Begin Patch\n*** End Patch"}`
-	conv := adapters.NewResponsesStreamConverter("model")
+	conv := chatstream.NewResponsesStreamConverter("model")
 	stream, _ := req.Payload["stream"].(bool)
 	if !stream {
 		conv.SetNonstream()

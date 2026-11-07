@@ -89,6 +89,26 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Check gateway package boundaries
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -o pipefail
+          go list -f '{{ $pkg := .ImportPath }}{{ range .Deps }}{{ $pkg }} {{ . }}{{ "\n" }}{{ end }}' \
+            ./internal/core/... ./internal/requestdiag ./internal/streamwatch ./internal/tokenusage \
+            ./internal/workbuddy/... ./internal/qoder/... ./internal/opencode/... ./internal/trae/... |
+          awk '
+            {
+              split($1, source, "/")
+              split($2, dependency, "/")
+              if (dependency[1] == "work2api" && dependency[2] == "internal" &&
+                  dependency[3] ~ /^(workbuddy|qoder|opencode|trae)$/ && source[3] != dependency[3]) {
+                print "Cross-channel dependency: " $0 > "/dev/stderr"
+                failed = 1
+              }
+            }
+            END { exit failed }
+          '
       - name: Vet
         run: go vet ./...
       - name: Build

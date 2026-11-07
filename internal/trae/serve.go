@@ -170,6 +170,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 	tried := map[string]bool{}
 	refreshed := map[*auth.Auth]bool{}
 	var lastRejection error
+	var lastTransportFailure error
 	lastRetryDelay := time.Duration(0)
 	returnRejection := func() (provider.UsageReport, error) {
 		if lastRetryDelay > 0 {
@@ -195,6 +196,9 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 		if err != nil {
 			if ctx.Err() == nil && lastRejection != nil {
 				return returnRejection()
+			}
+			if ctx.Err() == nil && lastTransportFailure != nil {
+				return report, lastTransportFailure
 			}
 			return report, err
 		}
@@ -224,11 +228,18 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 		streamwatch.StartAttempt(ctx)
 		prepared, limits := upstream.PrepareBodyResolvedWithLimits(encoded, identity.Variant, identityModel)
 		report.EffectiveLimits = limits
-		stream, status, errorBody, headers, sendErr := r.client(ctx).ChatPreparedStreamWithHeaders(identity, prepared)
+		stream, status, errorBody, headers, sendErr, beforeSend := r.sendPreparedChat(ctx, identity, prepared)
 		streamwatch.AttemptHeaders(ctx, status, headers)
 		streamwatch.AttemptResult(ctx, status)
 		if sendErr != nil {
-			return report, errors.New("Trae 上游连接失败")
+			if ctx.Err() != nil {
+				return report, ctx.Err()
+			}
+			lastTransportFailure = errors.New("Trae 上游连接失败")
+			if beforeSend && attempt < 2 {
+				continue
+			}
+			return report, lastTransportFailure
 		}
 		if stream == nil {
 			kind := upstream.Classify(status, string(errorBody))
@@ -240,11 +251,18 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 					}
 					attempt++ // the same-identity retry shares the total dispatch budget
 					streamwatch.StartAttempt(ctx)
-					stream, status, errorBody, headers, sendErr = r.client(ctx).ChatPreparedStreamWithHeaders(identity, prepared)
+					stream, status, errorBody, headers, sendErr, beforeSend = r.sendPreparedChat(ctx, identity, prepared)
 					streamwatch.AttemptHeaders(ctx, status, headers)
 					streamwatch.AttemptResult(ctx, status)
 					if sendErr != nil {
-						return report, errors.New("Trae 上游连接失败")
+						if ctx.Err() != nil {
+							return report, ctx.Err()
+						}
+						lastTransportFailure = errors.New("Trae 上游连接失败")
+						if beforeSend && attempt < 2 {
+							continue
+						}
+						return report, lastTransportFailure
 					}
 					kind = upstream.Classify(status, string(errorBody))
 				}
@@ -335,10 +353,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 			usage, known, err = protocol.TranscodeStream(ctx, req.Writer, pipeReader, protocol.Chat, protocol.Protocol(req.Protocol), "trae/"+model)
 		} else {
 			var reply []byte
-			reply, usage, known, err = protocol.CollapseStreamWithUsageContext(ctx, pipeReader, protocol.Chat, "trae/"+model)
-			if err == nil {
-				reply, err = protocol.ConvertResponse(protocol.Chat, protocol.Protocol(req.Protocol), reply)
-			}
+			reply, usage, known, err = protocol.CollapseChatStreamAs(ctx, pipeReader, protocol.Protocol(req.Protocol), "trae/"+model, nil)
 			if err == nil {
 				req.Writer.Header().Set("Content-Type", "application/json")
 				_, err = req.Writer.Write(reply)
@@ -383,6 +398,9 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 	}
 	if lastRejection != nil {
 		return returnRejection()
+	}
+	if lastTransportFailure != nil {
+		return report, lastTransportFailure
 	}
 	return report, errors.New("Trae 可用账号已尝试完毕")
 }

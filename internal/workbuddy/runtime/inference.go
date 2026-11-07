@@ -8,12 +8,12 @@ import (
 	"time"
 	"unicode/utf8"
 	"work2api/internal/core/provider"
+	"work2api/internal/requestdiag"
 	"work2api/internal/streamwatch"
 
 	"work2api/internal/store"
 	"work2api/internal/tokenusage"
 	"work2api/internal/workbuddy/pool"
-	"work2api/internal/workbuddy/upstream"
 )
 
 type LogArgs struct {
@@ -80,7 +80,7 @@ func (o *Runtime) LogUsage(a LogArgs) {
 		effort = "default"
 	}
 	params := store.UsageParams{
-		Diagnostics:         UsageDiagnostics(a.Ctx),
+		Diagnostics:         requestdiag.UsageDiagnostics(a.Ctx),
 		Model:               a.Model,
 		Protocol:            a.Protocol,
 		AccountUID:          uid,
@@ -194,7 +194,7 @@ func MergeUsageFromLine(line string, acc map[string]any) map[string]any {
 
 func MergeUsageChunk(chunk map[string]any, acc map[string]any) map[string]any {
 	if u, ok := chunk["usage"].(map[string]any); ok && u != nil {
-		return upstream.MergeUsage(acc, u)
+		return tokenusage.Merge(acc, u)
 	}
 	return acc
 }

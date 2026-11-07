@@ -134,3 +134,27 @@ func ValidCache(u map[string]any) (*int, *int) {
 	}
 	return r, w
 }
+
+// Merge merges chunked usage; later chunks only override fields they
+// explicitly provide.
+func Merge(current, incoming map[string]any) map[string]any {
+	if incoming == nil {
+		return current
+	}
+	result := map[string]any{}
+	for k, v := range current {
+		result[k] = v
+	}
+	for key, value := range incoming {
+		if value == nil {
+			continue
+		}
+		if sub, ok := value.(map[string]any); ok {
+			cur, _ := result[key].(map[string]any)
+			result[key] = Merge(cur, sub)
+		} else {
+			result[key] = value
+		}
+	}
+	return result
+}

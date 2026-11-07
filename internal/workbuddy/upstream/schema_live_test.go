@@ -232,6 +232,46 @@ func TestToolNamesTransportRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCollectStreamKeepsInterleavedToolArguments(t *testing.T) {
+	var first, second strings.Builder
+	reply, err := upstream.CollectStream("test", func(yield upstream.LineFunc) error {
+		for i := range 64 {
+			for _, index := range []int{1, 0} {
+				fragment := fmt.Sprintf("%d:%d,", index, i)
+				if i == 0 {
+					fragment = `{"text":"` + fragment
+				}
+				if i == 63 {
+					fragment += `"}`
+				}
+				if index == 0 {
+					first.WriteString(fragment)
+				} else {
+					second.WriteString(fragment)
+				}
+				line := fmt.Sprintf(`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":%d,"id":"call_%d","function":{"name":"test","arguments":%q}}]}}]}`, index, index, fragment)
+				if err := yield(line); err != nil {
+					return err
+				}
+			}
+		}
+		return yield(`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := reply["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)["tool_calls"].([]any)
+	if len(calls) != 2 {
+		t.Fatal("expected two tool calls")
+	}
+	for i, want := range []string{first.String(), second.String()} {
+		call := calls[i].(map[string]any)
+		if call["id"] != fmt.Sprintf("call_%d", i) || call["function"].(map[string]any)["arguments"] != want {
+			t.Fatal("interleaved arguments or call order changed")
+		}
+	}
+}
+
 func TestInvalidToolDeclarationsFailBeforeTransport(t *testing.T) {
 	for _, names := range [][]string{{""}, {" "}} {
 		tools := []any{}
@@ -259,18 +299,22 @@ func TestRequestGzipPreservesBodyAndIdentity(t *testing.T) {
 			body := map[string]any{"model": "test", "messages": []any{map[string]any{"role": "user", "content": text}}, "stream": true}
 			want, _ := json.Marshal(body)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") != "Bearer "+strings.TrimPrefix(r.URL.Path, "/") {
+					t.Error("prepared body reused stale authorization")
+				}
+				compressed := tc.compressed && r.Header.Get("X-IDE-Type") == "CLI"
 				raw, err := io.ReadAll(r.Body)
 				if err != nil {
 					t.Error(err)
 					return
 				}
-				if (r.Header.Get("Content-Encoding") == "gzip") != tc.compressed {
+				if (r.Header.Get("Content-Encoding") == "gzip") != compressed {
 					t.Error("wrong compression policy")
 				}
 				if r.ContentLength != int64(len(raw)) {
 					t.Error("incorrect content length")
 				}
-				if tc.compressed {
+				if compressed {
 					if len(raw) >= len(want)/2 {
 						t.Error("no meaningful size reduction")
 					}
@@ -292,9 +336,16 @@ func TestRequestGzipPreservesBodyAndIdentity(t *testing.T) {
 				fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
 			}))
 			defer server.Close()
-			err := upstream.NewClient(server.Client()).StreamUpstream(context.Background(), map[string]string{"X-IDE-Type": tc.identity}, body, server.URL, func(string) error { return nil })
+			prepared, err := upstream.PrepareStreamBody(body)
 			if err != nil {
 				t.Fatal(err)
+			}
+			client := upstream.NewClient(server.Client())
+			for _, send := range []struct{ token, identity string }{{"old", tc.identity}, {"renewed", tc.identity}, {"desktop", "WorkBuddy"}} {
+				headers := map[string]string{"X-IDE-Type": send.identity, "Authorization": "Bearer " + send.token}
+				if err := client.StreamPrepared(t.Context(), headers, prepared, server.URL+"/"+send.token, func(string) error { return nil }); err != nil {
+					t.Fatal(err)
+				}
 			}
 		})
 	}

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"work2api/internal/streamwatch"
+	"work2api/internal/tokenusage"
 )
 
 // passthroughBodyKeys is the whitelist of body fields forwarded upstream.
@@ -116,30 +117,6 @@ func BuildUpstreamBody(payload map[string]any) map[string]any {
 	return body
 }
 
-// MergeUsage merges chunked usage; later chunks only override fields they
-// explicitly provide.
-func MergeUsage(current, incoming map[string]any) map[string]any {
-	if incoming == nil {
-		return current
-	}
-	result := map[string]any{}
-	for k, v := range current {
-		result[k] = v
-	}
-	for key, value := range incoming {
-		if value == nil {
-			continue
-		}
-		if sub, ok := value.(map[string]any); ok {
-			cur, _ := result[key].(map[string]any)
-			result[key] = MergeUsage(cur, sub)
-		} else {
-			result[key] = value
-		}
-	}
-	return result
-}
-
 // LineFunc receives each raw SSE data line (including "data: [DONE]").
 type LineFunc func(line string) error
 
@@ -147,29 +124,48 @@ type LineFunc func(line string) error
 // data line. Strict validation mirrors the Python impl: a stream missing a
 // finish reason or lacking any content/tool_calls is treated as invalid.
 func (c *Client) StreamUpstream(ctx context.Context, headers map[string]string, body map[string]any, url string, yield LineFunc) error {
-	if err := ValidateChoiceCount(body); err != nil {
+	prepared, err := PrepareStreamBody(body)
+	if err != nil {
 		return err
+	}
+	return c.StreamPrepared(ctx, headers, prepared, url, yield)
+}
+
+// PreparedStreamBody is owned by one dispatch and may be reused serially on authorization renewal.
+type PreparedStreamBody struct {
+	payload   []byte
+	toolNames map[string]string
+	gzipWire  []byte
+}
+
+func PrepareStreamBody(body map[string]any) (*PreparedStreamBody, error) {
+	if err := ValidateChoiceCount(body); err != nil {
+		return nil, err
 	}
 	body, toolNames, err := prepareToolNames(body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	return &PreparedStreamBody{payload: payload, toolNames: toolNames}, nil
+}
+
+func (c *Client) StreamPrepared(ctx context.Context, headers map[string]string, body *PreparedStreamBody, url string, yield LineFunc) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body.payload))
 	if err != nil {
 		return err
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	wire, err := encodeRequestBody(ctx, req.Header, payload)
+	wire, err := body.wire(ctx, req.Header)
 	if err != nil {
 		return err
 	}
-	if len(wire) != len(payload) {
+	if len(wire) != len(body.payload) {
 		req.Body = io.NopCloser(bytes.NewReader(wire))
 		req.ContentLength = int64(len(wire))
 		req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(wire)), nil }
@@ -191,10 +187,27 @@ func (c *Client) StreamUpstream(ctx context.Context, headers map[string]string, 
 
 	// Upstream sometimes answers a stream request with a single JSON object.
 	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "json") {
-		return c.handleJSONResponse(resp, yield, toolNames)
+		return c.handleJSONResponse(resp, yield, body.toolNames)
 	}
 
-	return streamSSE(resp, yield, toolNames)
+	return streamSSE(resp, yield, body.toolNames)
+}
+
+func (b *PreparedStreamBody) wire(ctx context.Context, headers http.Header) ([]byte, error) {
+	if !canGzipRequest(headers, b.payload) {
+		return b.payload, ctx.Err()
+	}
+	if b.gzipWire == nil {
+		wire, err := encodeRequestBody(ctx, headers, b.payload)
+		if err != nil {
+			return nil, err
+		}
+		b.gzipWire = wire
+	}
+	if len(b.gzipWire) != len(b.payload) {
+		headers.Set("Content-Encoding", "gzip")
+	}
+	return b.gzipWire, ctx.Err()
 }
 
 // handleJSONResponse deals with a non-streaming JSON body returned for a stream
@@ -391,8 +404,6 @@ func scanEventLine(data []byte, atEOF bool) (int, []byte, error) {
 // chat.completion object. producer drives the stream via a LineFunc.
 func CollectStream(fallbackModel string, produce func(yield LineFunc) error) (map[string]any, error) {
 	var contentParts, reasoningParts, refusalParts strings.Builder
-	toolCalls := map[int]map[string]any{}
-	var order []int
 	model := ""
 	finishReason := ""
 	var usage map[string]any
@@ -417,7 +428,7 @@ func CollectStream(fallbackModel string, produce func(yield LineFunc) error) (ma
 			model = m
 		}
 		if u, ok := chunk["usage"].(map[string]any); ok && u != nil {
-			usage = MergeUsage(usage, u)
+			usage = tokenusage.Merge(usage, u)
 		}
 		choices, _ := chunk["choices"].([]any)
 		for _, ch := range choices {
@@ -441,37 +452,6 @@ func CollectStream(fallbackModel string, produce func(yield LineFunc) error) (ma
 			if s, ok := delta["refusal"].(string); ok {
 				refusalParts.WriteString(s)
 			}
-			tcs, _ := delta["tool_calls"].([]any)
-			for _, t := range tcs {
-				tc, ok := t.(map[string]any)
-				if !ok {
-					continue
-				}
-				idx := 0
-				if n, ok := toInt(tc["index"]); ok {
-					idx = n
-				}
-				slot, exists := toolCalls[idx]
-				if !exists {
-					slot = map[string]any{"index": idx, "id": nil, "type": "function",
-						"function": map[string]any{"name": "", "arguments": ""}}
-					toolCalls[idx] = slot
-					order = append(order, idx)
-				}
-				if id, ok := tc["id"].(string); ok && id != "" {
-					slot["id"] = id
-				}
-				fn, _ := tc["function"].(map[string]any)
-				sfn := slot["function"].(map[string]any)
-				if fn != nil {
-					if name, ok := fn["name"].(string); ok && name != "" {
-						sfn["name"] = name
-					}
-					if args, ok := fn["arguments"].(string); ok && args != "" {
-						sfn["arguments"] = sfn["arguments"].(string) + args
-					}
-				}
-			}
 		}
 		return nil
 	})
@@ -489,11 +469,21 @@ func CollectStream(fallbackModel string, produce func(yield LineFunc) error) (ma
 	if reasoningParts.Len() > 0 {
 		message["reasoning_content"] = reasoningParts.String()
 	}
-	if len(order) > 0 {
+	if len(state.tools) > 0 {
+		order := make([]int, 0, len(state.tools))
+		for idx := range state.tools {
+			order = append(order, idx)
+		}
 		sortInts(order)
 		calls := make([]any, 0, len(order))
 		for _, idx := range order {
-			calls = append(calls, toolCalls[idx])
+			slot := state.tools[idx]
+			var id any
+			if slot.id != "" {
+				id = slot.id
+			}
+			calls = append(calls, map[string]any{"index": idx, "id": id, "type": "function",
+				"function": map[string]any{"name": slot.name, "arguments": slot.args.String()}})
 		}
 		message["tool_calls"] = calls
 	}

@@ -12,35 +12,13 @@ import (
 	"time"
 	"work2api/internal/streamwatch"
 
+	"work2api/internal/core/protocol/chatstream"
 	"work2api/internal/core/provider"
 	"work2api/internal/workbuddy/adapters"
 	"work2api/internal/workbuddy/pool"
 	"work2api/internal/workbuddy/projection"
 	"work2api/internal/workbuddy/upstream"
 )
-
-func SSEWriter(w http.ResponseWriter) (func(string) error, bool) {
-	_, ok := w.(http.Flusher)
-	if !ok {
-		return nil, false
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Accel-Buffering", "no")
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(30 * time.Second))
-	w.WriteHeader(http.StatusOK)
-	return func(s string) error {
-		controller := http.NewResponseController(w)
-		_ = controller.SetWriteDeadline(time.Now().Add(30 * time.Second))
-		if _, err := w.Write([]byte(s)); err != nil {
-			return errors.Join(context.Canceled, err)
-		}
-		if err := controller.Flush(); err != nil {
-			return errors.Join(context.Canceled, err)
-		}
-		return nil
-	}, true
-}
 
 func (o *Runtime) serveChat(w http.ResponseWriter, r *http.Request, payload map[string]any, principal *provider.Caller) {
 	clientStream := BoolVal(payload["stream"])
@@ -72,7 +50,7 @@ func (o *Runtime) serveChat(w http.ResponseWriter, r *http.Request, payload map[
 		opened := false
 		writeChunk := func(chunk string) error {
 			if !opened {
-				send, _ = SSEWriter(w)
+				send, _ = streamwatch.SSEWriter(w)
 				opened = true
 			}
 			return send(chunk)
@@ -188,8 +166,6 @@ type converter interface {
 	Usage() map[string]any
 }
 
-var _ = adapters.NewAnthropicStreamConverter
-
 func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload map[string]any, principal *provider.Caller, protocol string) {
 	var chatBody map[string]any
 	var cvErr error
@@ -234,9 +210,9 @@ func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload
 
 	var conv converter
 	if protocol == "anthropic" {
-		conv = adapters.NewAnthropicStreamConverter(model)
+		conv = chatstream.NewAnthropicStreamConverter(model)
 	} else {
-		conv = adapters.NewResponsesStreamConverter(model)
+		conv = chatstream.NewResponsesStreamConverter(model)
 	}
 	clientStream := false
 	if v, ok := payload["stream"]; ok {
@@ -246,7 +222,7 @@ func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload
 	streamMode := clientStream && canStream
 	if !streamMode {
 		conv.SetNonstream()
-	} else if messages, ok := conv.(*adapters.AnthropicStreamConverter); ok {
+	} else if messages, ok := conv.(*chatstream.AnthropicStreamConverter); ok {
 		messages.SetStreamingLogPolicy(provider.LogCapturePolicy{Enabled: principal.UserID == 0, Limit: o.cfg.UsageContentMaxBytes})
 	}
 	// Only open the SSE header stream when actually streaming; otherwise the
@@ -255,7 +231,7 @@ func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload
 	opened := false
 	writeChunk := func(chunk string) error {
 		if !opened {
-			send, _ = SSEWriter(w)
+			send, _ = streamwatch.SSEWriter(w)
 			opened = true
 		}
 		return send(chunk)
@@ -282,7 +258,7 @@ func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload
 		if streamMode && opened {
 			if protocol == "anthropic" {
 				writeChunk(ErrAnthropic(st, errStr))
-			} else if responses, ok := conv.(*adapters.ResponsesStreamConverter); ok {
+			} else if responses, ok := conv.(*chatstream.ResponsesStreamConverter); ok {
 				writeChunk(responses.Fail(errStr, st))
 			} else {
 				writeChunk("data: " + JsonError(st, errStr) + "\n\n")
@@ -319,7 +295,7 @@ func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload
 		o.LogUsage(args)
 	}()
 	if streamMode {
-		if responses, ok := conv.(*adapters.ResponsesStreamConverter); ok {
+		if responses, ok := conv.(*chatstream.ResponsesStreamConverter); ok {
 			// Each done/completed event retains its official full payload; only
 			// the encoding/writing is incremental to bound transient copies.
 			if !opened {

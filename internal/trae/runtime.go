@@ -215,6 +215,18 @@ func nowSec() float64                   { return float64(time.Now().UnixNano()) 
 func (r *Runtime) Name() string         { return "trae" }
 func (r *Runtime) Prefix() string       { return "trae/" }
 func (r *Runtime) SupportsPortal() bool { return true }
+
+func (r *Runtime) PortalModels(_ context.Context, models map[string]bool, _ bool, _ func(string) bool) []provider.PortalModel {
+	r.mu.Lock()
+	catalog := r.modelsLocked(models)
+	r.mu.Unlock()
+	var out []provider.PortalModel
+	for _, m := range catalog {
+		uids, _ := m.Extra["account_uids"].([]string)
+		out = append(out, provider.NewPortalModel(m.ID, uids, false))
+	}
+	return out
+}
 func (r *Runtime) Close() error {
 	r.mu.Lock()
 	for id, login := range r.logins {
@@ -279,18 +291,21 @@ func (r *Runtime) ensure(ctx context.Context, a *auth.Auth) error {
 func (r *Runtime) Models(context.Context) []provider.CatalogModel {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.modelsLocked()
+	return r.modelsLocked(nil)
 }
 
-func (r *Runtime) modelsLocked() []provider.CatalogModel {
+func (r *Runtime) modelsLocked(requested map[string]bool) []provider.CatalogModel {
 	merged := map[string]provider.CatalogModel{}
 	for id, a := range r.accounts {
 		if !a.Enabled {
 			continue
 		}
 		for _, m := range a.Models {
-			m = displayPricing(a, m)
 			name := "trae/" + strings.ToLower(m.ID)
+			if requested != nil && !requested[name] {
+				continue
+			}
+			m = displayPricing(a, m)
 			entry := merged[name]
 			if entry.ID == "" {
 				entry = provider.CatalogModel{ID: name, Name: m.Name, Context: int(m.ContextWindow), MaxOutput: int(m.MaxTokens), Extra: map[string]any{"account_uids": []string{}}}
@@ -676,7 +691,7 @@ func (r *Runtime) AdminData(context.Context) provider.AdminData {
 	}
 	sort.Slice(data.Accounts, func(i, j int) bool { return text(data.Accounts[i]["id"]) < text(data.Accounts[j]["id"]) })
 	data.Models = []map[string]any{}
-	for _, model := range r.modelsLocked() {
+	for _, model := range r.modelsLocked(nil) {
 		item := map[string]any{"id": model.ID, "name": model.Name, "provider": "trae", "context_length": model.Context, "max_output_tokens": model.MaxOutput, "vision": model.Vision}
 		for key, value := range model.Extra {
 			if key != "account_uids" {

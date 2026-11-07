@@ -11,6 +11,20 @@ import (
 func PortalAccountUID(id string) string { return "qoder:" + id }
 func (r *Runtime) SupportsPortal() bool { return true }
 
+func (r *Runtime) PortalModels(_ context.Context, models map[string]bool, discoverFree bool, _ func(string) bool) []provider.PortalModel {
+	var out []provider.PortalModel
+	for _, m := range r.catalogModels(models) {
+		if models != nil && !models[m.ID] {
+			continue
+		}
+		uids, _ := m.Extra["account_uids"].([]string)
+		factor, _ := m.Extra["price_factor"].(*float64)
+		free := m.Extra["has_free_source"] == true || m.Extra["pricing_known"] == true && factor != nil && *factor == 0
+		out = append(out, provider.NewPortalModel(m.ID, uids, discoverFree && free))
+	}
+	return out
+}
+
 func accountAllowed(ctx context.Context, id, model string) error {
 	call := provider.CurrentInvocation(ctx)
 	if call.Caller.UserID > 0 && !call.Caller.AccountScope[PortalAccountUID(id)] {

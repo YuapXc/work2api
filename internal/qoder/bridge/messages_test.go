@@ -19,7 +19,8 @@ import (
 func TestQoderResponsesKeepStableItemsAndIncompleteUsage(t *testing.T) {
 	frames := []string{
 		`{"choices":[{"delta":{"reasoning_content":"think"}}]}`,
-		`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"lookup","arguments":"{}"}}]}}]}`,
+		`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"lookup","arguments":"{\"query\":"}}]}}]}`,
+		`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a&b\"}"}}]}}]}`,
 		`{"choices":[{"delta":{"content":"answer"},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":8},"completion_tokens_details":{"reasoning_tokens":3}}}`,
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -82,12 +83,16 @@ func TestQoderResponsesKeepStableItemsAndIncompleteUsage(t *testing.T) {
 		if items[0].(map[string]any)["type"] != "reasoning" || items[1].(map[string]any)["type"] != "function_call" || items[2].(map[string]any)["type"] != "message" {
 			t.Fatal("arrival order lost", items)
 		}
-		if items[1].(map[string]any)["call_id"] == "" {
-			t.Fatal("missing generated tool call ID")
+		tool := items[1].(map[string]any)
+		if tool["call_id"] == "" || tool["name"] != "lookup" || tool["arguments"] != `{"query":"a&b"}` {
+			t.Fatal("tool identity or arguments changed", tool)
 		}
 		usage := response["usage"].(map[string]any)
 		if usage["input_tokens"] != float64(10) || usage["output_tokens"] != float64(5) {
 			t.Fatal(usage)
+		}
+		if usage["input_tokens_details"].(map[string]any)["cached_tokens"] != float64(8) || usage["output_tokens_details"].(map[string]any)["reasoning_tokens"] != float64(3) {
+			t.Fatal("token details changed", usage)
 		}
 	}
 	for _, protocol := range []string{"chat", "anthropic"} {

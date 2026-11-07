@@ -82,6 +82,7 @@ func doCompatibleInferenceAttempt(client *http.Client, req *http.Request, from p
 			return saved, nil
 		}
 	}
+	streamwatch.StartAttempt(req.Context())
 	next, nextErr := doInferenceAttempt(client, old, from, remaining)
 	if nextErr != nil {
 		if req.Context().Err() != nil {
@@ -104,7 +105,7 @@ func doInferenceAttempt(client *http.Client, req *http.Request, from protocol.Pr
 	var connected, written, answered atomic.Bool
 	trace := &httptrace.ClientTrace{
 		GotConn:              func(httptrace.GotConnInfo) { connected.Store(true) },
-		WroteRequest:         func(httptrace.WroteRequestInfo) { written.Store(true) },
+		WroteRequest:         func(info httptrace.WroteRequestInfo) { written.Store(info.Err == nil) },
 		GotFirstResponseByte: func() { answered.Store(true) },
 	}
 	var mu sync.Mutex
@@ -154,6 +155,7 @@ func (b *attemptBody) Close() error { b.cancel(); return b.ReadCloser.Close() }
 
 func readInferenceAttempt(client *http.Client, req *http.Request, from protocol.Protocol) (*http.Response, error) {
 	resp, err := client.Do(req)
+	streamwatch.AttemptHTTP(req.Context(), resp)
 	if err != nil || resp.StatusCode/100 != 2 || from == protocol.SystemOne || !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
 		return resp, err
 	}

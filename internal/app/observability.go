@@ -187,7 +187,7 @@ func (s *Server) observeCalls(next http.Handler) http.Handler {
 			return
 		}
 		ctx, t := streamwatch.WithTiming(r.Context())
-		rows := &usageTimingRows{deferWrites: true}
+		rows := &usageTimingRows{}
 		ctx = context.WithValue(ctx, usageTimingKey{}, rows)
 		r = r.WithContext(ctx)
 		var id [16]byte
@@ -208,13 +208,6 @@ func (s *Server) observeCalls(next http.Handler) http.Handler {
 			}
 			snapshot := t.Snapshot()
 			s.calls.record(snapshot, writer.status)
-			rows.mu.Lock()
-			pending := rows.pending
-			rows.pending = nil
-			rows.mu.Unlock()
-			for _, params := range pending {
-				s.o.persistUsage(ctx, params)
-			}
 			s.persistUsageTiming(rows, snapshot, writer.status, strings.HasPrefix(writer.Header().Get("Content-Type"), "text/event-stream"), elapsed)
 		}()
 		next.ServeHTTP(writer, r)

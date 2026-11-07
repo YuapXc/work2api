@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 	"work2api/internal/config"
+	"work2api/internal/core/protocol/chatstream"
 	"work2api/internal/core/provider"
 	"work2api/internal/store"
 	"work2api/internal/streamwatch"
@@ -160,7 +161,7 @@ func TestWorkBuddyToolFinishNormalization(t *testing.T) {
 		client := &failingUpstream{lines: lines}
 		o, acc := newDNSFailoverOrch(t, client)
 		var output strings.Builder
-		converter := adapters.NewAnthropicStreamConverter("test-model")
+		converter := chatstream.NewAnthropicStreamConverter("test-model")
 		_, err := o.openUpstream(context.Background(), acc, map[string]any{}, "test-model", "", func(line string) error { output.WriteString(converter.FeedLine(line)); return nil }, nil)
 		if err != nil || client.calls != 1 {
 			t.Fatal(err, client.calls)
@@ -468,8 +469,8 @@ func TestWorkBuddyImageRecovery(t *testing.T) {
 				body["messages"] = []any{messages[0], messages[3]}
 			}
 			original, _ := json.Marshal(body)
-			d := &wbruntime.RequestDiagnostics{}
-			ctx := context.WithValue(context.Background(), wbruntime.RequestDiagnosticsKey{}, d)
+			d := &requestDiagnostics{}
+			ctx := context.WithValue(context.Background(), requestDiagnosticsKey{}, d)
 			_, err := o.openUpstream(ctx, acc, body, "test-model", "", func(string) error { return nil }, nil)
 			if client.calls != tc.calls {
 				t.Fatalf("calls=%d want=%d err=%v", client.calls, tc.calls, err)
@@ -568,8 +569,8 @@ func TestWorkBuddySelectiveImageRecovery(t *testing.T) {
 			}
 			body := map[string]any{"messages": []any{map[string]any{"role": "user", "content": parts}}}
 			original, _ := json.Marshal(body)
-			d := &wbruntime.RequestDiagnostics{}
-			ctx := context.WithValue(context.Background(), wbruntime.RequestDiagnosticsKey{}, d)
+			d := &requestDiagnostics{}
+			ctx := context.WithValue(context.Background(), requestDiagnosticsKey{}, d)
 			_, err := o.openUpstream(ctx, acc, body, "test-model", "", func(string) error { return nil }, nil)
 			if client.calls != tc.calls || (err == nil) != (tc.calls > tc.deny) {
 				t.Fatalf("calls=%d want=%d err=%v", client.calls, tc.calls, err)

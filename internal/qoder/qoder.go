@@ -320,7 +320,11 @@ func (r *Runtime) bridgeFor(ctx context.Context, acct *account.Account, secret s
 
 // Models returns the active account's cached catalog without network I/O.
 // Until discovery succeeds, it exposes a clearly marked conservative fallback.
-func (r *Runtime) Models(ctx context.Context) []provider.CatalogModel {
+func (r *Runtime) Models(context.Context) []provider.CatalogModel {
+	return r.catalogModels(nil)
+}
+
+func (r *Runtime) catalogModels(requested map[string]bool) []provider.CatalogModel {
 	if !r.Ready() {
 		return nil
 	}
@@ -345,11 +349,16 @@ func (r *Runtime) Models(ctx context.Context) []provider.CatalogModel {
 	defer r.mu.Unlock()
 	out := []provider.CatalogModel{}
 	index := map[string]int{}
+	hasCatalog := false
 	freeSource := func(m provider.CatalogModel) bool {
 		factor, ok := m.Extra["price_factor"].(*float64)
 		return ok && factor != nil && *factor == 0 && m.Extra["pricing_known"] == true
 	}
 	add := func(m provider.CatalogModel, id string) {
+		hasCatalog = true
+		if requested != nil && !requested[m.ID] {
+			return
+		}
 		if i, ok := index[m.ID]; ok {
 			if freeSource(m) {
 				out[i].Extra["has_free_source"] = true
@@ -371,6 +380,9 @@ func (r *Runtime) Models(ctx context.Context) []provider.CatalogModel {
 	}
 	if r.modelCacheLoaded && current != nil && r.modelCacheKey == currentKey {
 		for _, m := range r.modelCache {
+			if requested != nil && !requested[m.ID] {
+				continue
+			}
 			m.Extra = cloneCatalogExtra(m.Extra)
 			m.Extra["catalog_source"] = "live"
 			m.Extra["catalog_stale"] = r.modelCacheStale
@@ -385,7 +397,7 @@ func (r *Runtime) Models(ctx context.Context) []provider.CatalogModel {
 			add(m, snapshot.accountID)
 		}
 	}
-	if len(out) == 0 && !(r.modelCacheLoaded && current != nil && r.modelCacheKey == currentKey) {
+	if !hasCatalog && !(r.modelCacheLoaded && current != nil && r.modelCacheKey == currentKey) {
 		return r.fallbackModels()
 	}
 	return out

@@ -8,9 +8,9 @@ import (
 
 	"work2api/internal/core/protocol"
 	"work2api/internal/core/provider"
+	"work2api/internal/requestdiag"
 	"work2api/internal/store"
 	"work2api/internal/streamwatch"
-	wbruntime "work2api/internal/workbuddy/runtime"
 )
 
 // dispatchRuntime executes the registered default or namespaced provider.
@@ -25,16 +25,12 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 		return s.dispatchModelRoute(w, r, proto, payload, principal)
 	}
 	rawModel := strOr(payload["model"], "")
-	requestedLimits := wbruntime.OutputLimits(payload)
+	requestedLimits := requestdiag.OutputLimits(payload)
 	if rawModel == "" {
 		return false
 	}
 	resolved := s.o.resolveModel(rawModel)
 	rt, ok := s.o.runtimes.Resolve(resolved)
-	if !ok {
-		rt = s.o.wb
-		ok = rt != nil
-	}
 	if !ok {
 		return false
 	}
@@ -120,7 +116,7 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 	}
 	if !report.Recorded {
 		report.RequestedLimits = requestedLimits
-		s.o.logRuntimeUsageDiagnostic(report, string(proto), resolved, t0, principal.AppName, principal.UserID, principal.AppID, wbruntime.UsageDiagnostics(r.Context()), r.Context())
+		s.o.logRuntimeUsageDiagnostic(report, string(proto), resolved, t0, principal.AppName, principal.UserID, principal.AppID, requestdiag.UsageDiagnostics(r.Context()), r.Context())
 	}
 	if !report.Recorded {
 		streamwatch.Outcome(r.Context(), report.Status)
@@ -206,12 +202,25 @@ func (o *Orchestrator) logRuntimeUsageDiagnostic(rep provider.UsageReport, proto
 // each entry shaped like the workbuddy models.Registry entries the WebUI and
 // /v1/models already consume.
 func (o *Orchestrator) runtimeModels(ctx context.Context) []map[string]any {
+	return runtimeModelsFrom(ctx, o.runtimes.Runtimes(), nil)
+}
+
+func runtimeModelsFrom(ctx context.Context, runtimes []provider.Runtime, include func(string) bool) []map[string]any {
 	var out []map[string]any
-	for _, rt := range o.runtimes.Runtimes() {
+	for _, rt := range runtimes {
 		if !rt.Ready() && rt.Prefix() != "" {
 			continue
 		}
 		for _, m := range rt.Models(ctx) {
+			if include != nil {
+				id := m.ID
+				if extraID, ok := m.Extra["id"]; ok {
+					id = str2(extraID)
+				}
+				if !include(id) {
+					continue
+				}
+			}
 			item := map[string]any{
 				"id":         m.ID,
 				"name":       m.Name,

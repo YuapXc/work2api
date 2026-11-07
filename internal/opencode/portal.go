@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+
+	"work2api/internal/core/provider"
 )
 
 func PortalKeyUID(key string) string {
@@ -13,6 +15,15 @@ func PortalKeyUID(key string) string {
 	return "opencode:" + hex.EncodeToString(sum[:])
 }
 func (rt *Runtime) SupportsPortal() bool { return true }
+
+func (rt *Runtime) PortalModels(_ context.Context, models map[string]bool, discoverFree bool, _ func(string) bool) []provider.PortalModel {
+	var out []provider.PortalModel
+	for _, m := range rt.catalogModels(models) {
+		uids, _ := m.Extra["account_uids"].([]string)
+		out = append(out, provider.NewPortalModel(m.ID, uids, discoverFree && m.Extra["upstream_free"] == true))
+	}
+	return out
+}
 
 func (rt *Runtime) routeAccountUIDs(route Route) []string {
 	ids := []string{}

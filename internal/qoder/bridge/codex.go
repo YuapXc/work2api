@@ -5,7 +5,8 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"work2api/internal/workbuddy/adapters"
+
+	"work2api/internal/core/protocol/chatstream"
 )
 
 func (b *Bridge) HandleCodexResponses(w http.ResponseWriter, r *http.Request) {
@@ -36,7 +37,7 @@ func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[
 	tools := ConvertResponsesToolsToOpenAI(req["tools"])
 	incoming := CodexInputToMessages(req["input"], instructions)
 	messages := BuildQoderMessages(b.templateMessages(), incoming, ExtractLatestUserPrompt(incoming), tools != nil)
-	conv := adapters.NewResponsesStreamConverter(model)
+	conv := chatstream.NewResponsesStreamConverter(model)
 	if !stream {
 		conv.SetNonstream()
 	}
@@ -84,8 +85,7 @@ func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[
 		if d.Usage != nil {
 			chunk["usage"] = d.Usage
 		}
-		raw, _ := json.Marshal(chunk)
-		send(conv.FeedLine("data: " + string(raw)))
+		send(conv.FeedChunk(chunk))
 		if writeErr != nil {
 			cancel()
 		}
@@ -111,8 +111,7 @@ func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[
 		if toolsSeen {
 			result.FinishReason = "tool_calls"
 		}
-		raw, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"finish_reason": result.FinishReason}}})
-		send(conv.FeedLine("data: " + string(raw)))
+		send(conv.FeedChunk(map[string]any{"choices": []any{map[string]any{"finish_reason": result.FinishReason}}}))
 	}
 	if stream {
 		err = conv.FinishEvents(func(event map[string]any) error {

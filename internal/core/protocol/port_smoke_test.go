@@ -22,6 +22,45 @@ type terminalOnlyReader struct {
 	reads int
 }
 
+func TestCollapseChatStreamAsPreservesToolAndUsage(t *testing.T) {
+	wire := `data: {"id":"chatcmpl_fixture","choices":[{"delta":{"reasoning_content":"think","content":"text","tool_calls":[{"index":0,"id":"call_fixture","function":{"name":"lookup","arguments":"{\"key\":1}"}}]},"finish_reason":"length"}],"usage":{"prompt_tokens":20,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":5},"completion_tokens_details":{"reasoning_tokens":3}}}` + "\n\ndata: [DONE]\n\n"
+	for _, target := range []Protocol{Chat, Anthropic, Responses} {
+		chat, err := CollapseStream(strings.NewReader(wire), Chat, "model")
+		if err != nil {
+			t.Fatal(err)
+		}
+		previous, err := ConvertResponse(Chat, target, chat)
+		if err != nil {
+			t.Fatal(err)
+		}
+		direct, usage, known, err := CollapseChatStreamAs(t.Context(), strings.NewReader(wire), target, "model", nil)
+		if err != nil || !known || usage.Cached != 5 || usage.Reasoning != 3 || usage.FinishReason != "length" {
+			t.Fatalf("%s usage=%+v known=%v err=%v", target, usage, known, err)
+		}
+		before, after := map[string]any{}, map[string]any{}
+		if json.Unmarshal(previous, &before) != nil || json.Unmarshal(direct, &after) != nil {
+			t.Fatal("invalid response JSON", string(direct))
+		}
+		if target == Responses {
+			for _, doc := range []map[string]any{before, after} {
+				for _, raw := range doc["output"].([]any) {
+					delete(raw.(map[string]any), "id")
+				}
+			}
+		}
+		if !reflect.DeepEqual(before, after) {
+			t.Fatalf("%s output changed\nbefore: %s\nafter: %s", target, previous, direct)
+		}
+	}
+	noUsage := `data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n\n"
+	for _, target := range []Protocol{Responses, Anthropic} {
+		body, _, known, err := CollapseChatStreamAs(t.Context(), strings.NewReader(noUsage), target, "model", nil)
+		if err != nil || known || bytes.Contains(body, []byte(`"usage":`)) != (target == Anthropic) {
+			t.Fatalf("%s usage contract: %s known=%v err=%v", target, body, known, err)
+		}
+	}
+}
+
 func TestCollapseFailureKeepsObservedUsage(t *testing.T) {
 	for _, tail := range []string{"", "data: {bad}\n\n", "data: {\"error\":{\"message\":\"failed\"}}\n\n"} {
 		wire := "data: {\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7,\"completion_tokens_details\":{\"reasoning_tokens\":3}},\"choices\":[]}\n\n" + tail
@@ -29,6 +68,50 @@ func TestCollapseFailureKeepsObservedUsage(t *testing.T) {
 		if err == nil || body != nil || !known || usage.Input != 12 || usage.Output != 7 || !usage.ReasoningKnown || usage.Reasoning != 3 {
 			t.Fatal("failure lost observed usage or returned partial success", string(body), usage, known, err)
 		}
+	}
+}
+
+func TestCollapseResponsesPreservesTerminalOutput(t *testing.T) {
+	const deltas = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"incremental text\"}\n\n"
+	const output = `[{"type":"custom_tool_call","id":"ct_native","call_id":"call_patch","name":"patch","input":"raw patch"},{"type":"function_call","id":"fc_native","call_id":"call_lookup","name":"lookup","arguments":"{\"key\":1}","status":"completed"},{"type":"message","id":"msg_native","role":"assistant","status":"completed","content":[{"type":"output_text","text":"terminal text","annotations":[]}]}]`
+	var wantOutput []any
+	if err := json.Unmarshal([]byte(output), &wantOutput); err != nil {
+		t.Fatal(err)
+	}
+	const toolDelta = `data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_native","call_id":"call_lookup","name":"lookup"}}` + "\n\n" +
+		`data: {"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_native","delta":"{\"key\":1}"}` + "\n\n"
+	for _, prefix := range []string{"", deltas + toolDelta} {
+		wire := prefix + `data: {"type":"response.completed","response":{"id":"resp_native","output":` + output + `,"usage":{"input_tokens":7,"output_tokens":4}}}` + "\n\n"
+		body, usage, known, err := CollapseStreamWithUsage(strings.NewReader(wire), Responses, "test")
+		if err != nil || !known || usage.Input != 7 || usage.Output != 4 || usage.FinishReason != "tool_calls" {
+			t.Fatalf("terminal usage=%+v known=%v err=%v", usage, known, err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(body, &got); err != nil || got["id"] != "resp_native" || !reflect.DeepEqual(got["output"], wantOutput) {
+			t.Fatalf("terminal output changed: %s, err=%v", body, err)
+		}
+	}
+	for _, tc := range []struct {
+		name, terminal, expected string
+	}{
+		{"missing output", `{"type":"response.completed","response":{}}`, `"text":"incremental text"`},
+		{"null output", `{"type":"response.completed","response":{"output":null}}`, `"text":"incremental text"`},
+		{"explicit empty output", `{"type":"response.completed","response":{"output":[]}}`, `"output":[]`},
+		{"incomplete", `{"type":"response.done","response":{"status":"incomplete","output":` + output + `,"incomplete_details":{"reason":"content_filter"}}}`, `"incomplete_details":{"reason":"content_filter"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := CollapseStream(strings.NewReader(deltas+"data: "+tc.terminal+"\n\n"), Responses, "test")
+			if err != nil || !bytes.Contains(body, []byte(tc.expected)) {
+				t.Fatalf("body=%s err=%v", body, err)
+			}
+		})
+	}
+	if _, err := CollapseStream(strings.NewReader(deltas), Responses, "test"); !errors.Is(err, errSSEUnexpectedEOF) {
+		t.Fatalf("disconnected stream was accepted: %v", err)
+	}
+	failed := `data: {"type":"response.failed","response":{"output":` + output + `,"error":{"message":"failed"},"usage":{"input_tokens":7}}}` + "\n\n"
+	if body, usage, known, err := CollapseStreamWithUsage(strings.NewReader(failed), Responses, "test"); err == nil || len(body) != 0 || !known || usage.Input != 7 {
+		t.Fatalf("failed stream body=%s usage=%+v known=%v err=%v", body, usage, known, err)
 	}
 }
 

@@ -1,7 +1,5 @@
 package store
 
-import "encoding/json"
-
 type UsageAttempt struct {
 	UpstreamRequestID string `json:"upstream_request_id,omitempty"`
 	Number            int    `json:"number"`
@@ -25,28 +23,4 @@ type UsagePerformance struct {
 	Attempts          int            `json:"attempts"`
 	Upstream429       int            `json:"upstream_429"`
 	Stages            []UsageAttempt `json:"attempt_stages,omitempty"`
-}
-
-// Target only IDs inserted by this request; preserve existing protocol facts.
-func (d *DB) UpdateUsagePerformance(ids []int64, value UsagePerformance) error {
-	if len(ids) == 0 {
-		return nil
-	}
-	raw, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	tx, err := d.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	for _, id := range ids {
-		if _, err := tx.Exec(`UPDATE usage_logs SET diagnostics=json_set(COALESCE(diagnostics,'{}'),'$.performance',json(?)) WHERE id=?`, string(raw), id); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
 }

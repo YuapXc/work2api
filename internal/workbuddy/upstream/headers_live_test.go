@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"work2api/internal/tokenusage"
 
 	"work2api/internal/workbuddy/credentials"
 	"work2api/internal/workbuddy/reasoning"
@@ -154,7 +155,7 @@ func runLiveConversationHeaders(t *testing.T, site string, probeClients bool) {
 				return nil
 			}
 			if u, ok := chunk["usage"].(map[string]any); ok {
-				usage = upstream.MergeUsage(usage, u)
+				usage = tokenusage.Merge(usage, u)
 			}
 			choices, _ := chunk["choices"].([]any)
 			for _, raw := range choices {

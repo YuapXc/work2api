@@ -627,11 +627,15 @@ func TestRuntimeUsageGetsWholeRequestTiming(t *testing.T) {
 	reasoning, creation := 3, 0
 	known := true
 	s.o.logRuntimeUsageDiagnostic(provider.UsageReport{Status: "ok", TokensKnown: &known, InputTokens: 10, OutputTokens: 5, ReasoningTokens: &reasoning, CacheCreationTokens: &creation, FinishReason: "stop", RequestedLimits: map[string]int{"max_output_tokens": 256}, EffectiveLimits: map[string]int{"max_tokens": 256}}, "responses", "trae/test", time.Now(), "key", user.ID, 1, nil, ctx)
-	if len(rows.ids) != 1 {
+	if len(rows.pending) != 1 {
 		t.Fatal("runtime usage bypassed timing tracker")
 	}
-	s.persistUsageTiming(rows, timing.Snapshot(), 200, true)
-	row, err := s.o.db.GetUsage(int(rows.ids[0]))
+	s.persistUsageTiming(rows, timing.Snapshot(), 200, true, time.Second)
+	_, id, err := s.o.db.UsageRowSpan()
+	if err != nil || id == 0 {
+		t.Fatalf("usage not persisted: id=%d err=%v", id, err)
+	}
+	row, err := s.o.db.GetUsage(int(id))
 	if err != nil {
 		t.Fatal(err)
 	}

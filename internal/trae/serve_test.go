@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -668,12 +669,21 @@ func TestHTTPAndStreamRejectionsRemainRequestLevel(t *testing.T) {
 }
 
 func TestServeRejectionBoundaries(t *testing.T) {
-	for _, scenario := range []string{"http-rate", "sse-input", "after-output", "retry-success", "revoked"} {
+	for _, scenario := range []string{"http-rate", "sse-input", "after-output", "retry-success", "revoked", "dial-failover", "ambiguous-send"} {
 		t.Run(scenario, func(t *testing.T) {
 			var calls atomic.Int32
 			r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
 				n := calls.Add(1)
 				switch scenario {
+				case "dial-failover":
+					io.WriteString(w, "event: output\ndata: {\"response\":\"OK\"}\n\nevent: done\ndata: {}\n\n")
+				case "ambiguous-send":
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					conn.Close()
 				case "http-rate":
 					w.Header().Set("Retry-After", "120")
 					w.WriteHeader(429)
@@ -697,8 +707,18 @@ func TestServeRejectionBoundaries(t *testing.T) {
 				identity := &auth.Auth{UID: uid, Variant: "cn", AccessToken: "fixture"}
 				r.accounts[accountID(uid)] = &accountState{Auth: identity, Enabled: true, Identities: map[string]*auth.Auth{"cn": identity}, Catalogs: map[string][]upstream.ModelInfo{"cn": {{ID: "m", Name: "Model"}}}}
 			}
-			if scenario != "retry-success" {
+			if scenario != "retry-success" && scenario != "dial-failover" && scenario != "ambiguous-send" {
 				delete(r.accounts, accountID("two"))
+			}
+			var dials atomic.Int32
+			if scenario == "dial-failover" {
+				dial := r.transport.DialContext
+				r.transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+					if dials.Add(1) == 1 {
+						return nil, &net.OpError{Op: "dial", Net: network, Err: syscall.ECONNREFUSED}
+					}
+					return dial(ctx, network, addr)
+				}
 			}
 			ctx := context.Background()
 			if scenario == "revoked" {
@@ -709,6 +729,14 @@ func TestServeRejectionBoundaries(t *testing.T) {
 			writer := httptest.NewRecorder()
 			report, err := r.Serve(ctx, provider.ServeRequest{Writer: writer, Protocol: provider.ProtocolChat, Payload: map[string]any{"model": "trae/m", "stream": true, "messages": []any{map[string]any{"role": "user", "content": "hi"}}}})
 			switch scenario {
+			case "dial-failover":
+				if err != nil || dials.Load() != 2 || calls.Load() != 1 || report.Status != "ok" {
+					t.Fatalf("confirmed pre-send failure did not fall back safely: %v %+v", err, report)
+				}
+			case "ambiguous-send":
+				if err == nil || calls.Load() != 1 {
+					t.Fatalf("possibly submitted request was replayed: %v calls=%d", err, calls.Load())
+				}
 			case "http-rate":
 				if err == nil || calls.Load() != 1 || writer.Header().Get("Retry-After") != "120" || r.accounts[accountID("one")].CooldownKind != upstream.ErrSoftRate {
 					t.Fatalf("rate boundary failed: %v", err)

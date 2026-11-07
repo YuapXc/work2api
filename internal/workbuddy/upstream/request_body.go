@@ -11,7 +11,7 @@ import (
 // CLI request gzip follows hub wb_identity.gzip_body. Small bodies and other
 // client identities retain their existing wire representation.
 func encodeRequestBody(ctx context.Context, header http.Header, raw []byte) ([]byte, error) {
-	if len(raw) < 64*1024 || !strings.EqualFold(header.Get("X-IDE-Type"), "CLI") || header.Get("Content-Encoding") != "" {
+	if !canGzipRequest(header, raw) {
 		return raw, ctx.Err()
 	}
 	var compressed bytes.Buffer
@@ -37,4 +37,8 @@ func encodeRequestBody(ctx context.Context, header http.Header, raw []byte) ([]b
 	}
 	header.Set("Content-Encoding", "gzip")
 	return compressed.Bytes(), nil
+}
+
+func canGzipRequest(header http.Header, raw []byte) bool {
+	return len(raw) >= 64*1024 && strings.EqualFold(header.Get("X-IDE-Type"), "CLI") && header.Get("Content-Encoding") == ""
 }

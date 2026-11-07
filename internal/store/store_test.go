@@ -115,11 +115,7 @@ func TestBudgetSamplesPreserveBillingSnapshots(t *testing.T) {
 	paid := 1.0
 	zero := 0.0
 	for _, price := range []*float64{nil, &zero, &paid} {
-		id, err := db.LogUsageWithID(UsageParams{Model: "m", AccountUID: "a", InputTokens: 1000, TokensKnown: &known, Credits: &paid, Status: "ok", Diagnostics: &UsageDiagnostics{BillingDomain: "domestic", BillingCoefficient: price}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := db.UpdateUsagePerformance([]int64{id}, UsagePerformance{HTTPStatus: 200, TotalMS: 1}); err != nil {
+		if err := db.LogUsage(UsageParams{Model: "m", AccountUID: "a", InputTokens: 1000, TokensKnown: &known, Credits: &paid, Status: "ok", Diagnostics: &UsageDiagnostics{BillingDomain: "domestic", BillingCoefficient: price, Performance: &UsagePerformance{HTTPStatus: 200, TotalMS: 1}}}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -255,12 +251,9 @@ func TestUsageDiagnosticsMigrationAndRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	facts := &UsageDiagnostics{FinishReason: "length", RequestedLimits: map[string]int{"max_tokens": 1200}, EffectiveLimits: map[string]int{"max_tokens": 1000}, Compatibility: "identity", Started: true}
+	facts := &UsageDiagnostics{FinishReason: "length", RequestedLimits: map[string]int{"max_tokens": 1200}, EffectiveLimits: map[string]int{"max_tokens": 1000}, Compatibility: "identity", Started: true, Performance: &UsagePerformance{RequestID: "test-request", Attempts: 1, QueueMS: 7}}
 	reasoning, creation := 7, 0
 	if err = db.LogUsage(UsageParams{Model: "new", Status: "incomplete", InputTokens: 20, OutputTokens: 10, ReasoningTokens: &reasoning, CacheCreationTokens: &creation, Diagnostics: facts}); err != nil {
-		t.Fatal(err)
-	}
-	if err = db.UpdateUsagePerformance([]int64{2}, UsagePerformance{RequestID: "test-request", Attempts: 1, QueueMS: 7}); err != nil {
 		t.Fatal(err)
 	}
 	for _, light := range []bool{true, false} {

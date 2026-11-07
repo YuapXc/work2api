@@ -20,7 +20,7 @@ import (
 	"work2api/internal/jsonutil"
 )
 
-func (rt *Runtime) doUpstream(ctx context.Context, route Route, bodies map[Tier][]byte, ids RequestIDs) (*http.Response, Route, error) {
+func (rt *Runtime) doUpstream(ctx context.Context, route Route, bodies routeBody, ids RequestIDs) (*http.Response, Route, error) {
 	resp, effectiveRoute, attempts, err := rt.doUpstreamTiers(ctx, route, bodies, ids, 0)
 	if err != nil || resp == nil || resp.StatusCode != http.StatusBadRequest {
 		return resp, effectiveRoute, err
@@ -36,15 +36,22 @@ func (rt *Runtime) doUpstream(ctx context.Context, route Route, bodies map[Tier]
 	if !isStaleReasoningReference(errBody) {
 		return resp, effectiveRoute, nil
 	}
-	stripped, changed := stripStaleReasoningInputs(effectiveRoute, bodies)
+	stripped, changed := recoverRouteBodies(effectiveRoute, bodies)
 	if !changed {
 		return resp, effectiveRoute, nil
 	}
 	rt.logger.Info("retrying upstream without stale reasoning references", "component", "opencode.upstream", "request_id", ids.Request, "model", route.ID, "tier", effectiveRoute.Tier)
+	originalUID := ""
+	if ids.AccountUID != nil {
+		originalUID = *ids.AccountUID
+	}
 	retryResp, retryRoute, _, retryErr := rt.doUpstreamTiers(ctx, effectiveRoute, stripped, ids, attempts)
 	if retryErr != nil || retryResp == nil || retryResp.StatusCode/100 != 2 {
 		if retryResp != nil {
 			drainAndClose(retryResp.Body)
+		}
+		if ids.AccountUID != nil {
+			*ids.AccountUID = originalUID
 		}
 		fallback := *resp
 		fallback.Body = io.NopCloser(bytes.NewReader(errBody))
@@ -66,53 +73,66 @@ func isStaleReasoningReference(body []byte) bool {
 	return false
 }
 
-func stripStaleReasoningInputs(route Route, bodies map[Tier][]byte) (map[Tier][]byte, bool) {
-	changed := false
-	out := make(map[Tier][]byte, len(bodies))
-	for tier, body := range bodies {
-		if len(body) == 0 || route.ProtocolFor(tier) != protocol.Responses {
-			out[tier] = body
-			continue
-		}
-		var payload map[string]any
-		if err := json.Unmarshal(body, &payload); err != nil {
-			out[tier] = body
-			continue
-		}
-		tierChanged := false
-		if _, ok := payload["previous_response_id"]; ok {
-			delete(payload, "previous_response_id")
-			tierChanged = true
-		}
-		if raw, ok := payload["input"].([]any); ok {
-			kept := make([]any, 0, len(raw))
-			for _, item := range raw {
-				if m, ok := item.(map[string]any); ok && jsonutil.StringAt(m, "type") == "reasoning" {
-					tierChanged = true
-					continue
-				}
-				kept = append(kept, item)
-			}
-			if tierChanged {
-				payload["input"] = kept
-			}
-		}
-		if !tierChanged {
-			out[tier] = body
-			continue
-		}
-		encoded, err := json.Marshal(payload)
-		if err != nil {
-			out[tier] = body
-			continue
-		}
-		out[tier] = encoded
-		changed = true
+func stripStaleReasoningBody(body []byte) ([]byte, bool) {
+	var payload map[string]any
+	if json.Unmarshal(body, &payload) != nil {
+		return body, false
 	}
-	return out, changed
+	_, changed := payload["previous_response_id"]
+	delete(payload, "previous_response_id")
+	if raw, ok := payload["input"].([]any); ok {
+		kept := make([]any, 0, len(raw))
+		for _, item := range raw {
+			if m, ok := item.(map[string]any); ok && jsonutil.StringAt(m, "type") == "reasoning" {
+				changed = true
+				continue
+			}
+			kept = append(kept, item)
+		}
+		if changed {
+			payload["input"] = kept
+		}
+	}
+	if !changed {
+		return body, false
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return body, false
+	}
+	return encoded, true
 }
 
-func (rt *Runtime) doUpstreamTiers(ctx context.Context, route Route, bodies map[Tier][]byte, ids RequestIDs, attemptOffset int) (*http.Response, Route, int, error) {
+func recoverRouteBodies(route Route, bodies routeBody) (routeBody, bool) {
+	if route.Protocol != protocol.Responses {
+		return bodies, false
+	}
+	original, err := bodies(route.Tier)
+	if err != nil {
+		return bodies, false
+	}
+	recovered, changed := stripStaleReasoningBody(original)
+	if !changed {
+		return bodies, false
+	}
+	cache := map[Tier][]byte{route.Tier: recovered}
+	return func(tier Tier) ([]byte, error) {
+		if body, ok := cache[tier]; ok {
+			return body, nil
+		}
+		body, err := bodies(tier)
+		if err != nil {
+			return nil, err
+		}
+		if route.ProtocolFor(tier) == protocol.Responses {
+			body, _ = stripStaleReasoningBody(body)
+		}
+		cache[tier] = body
+		return body, nil
+	}, true
+}
+
+func (rt *Runtime) doUpstreamTiers(ctx context.Context, route Route, bodies routeBody, ids RequestIDs, attemptOffset int) (*http.Response, Route, int, error) {
 	var lastResponse *http.Response
 	var lastErr error
 	effectiveRoute := route
@@ -221,13 +241,16 @@ func bufferedErrorResponse(resp *http.Response) *http.Response {
 
 // doAnonymousUpstream tries every currently available proxy at most once via
 // the shared "public" credential lane.
-func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies map[Tier][]byte, ids RequestIDs, attemptOffset int) (*http.Response, error, int) {
+func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies routeBody, ids RequestIDs, attemptOffset int) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
 	cursor := rt.anonymous.CursorFor(ids.Session)
 	limit := rt.anonymous.Len()
 	attempts := 0
-	body := bodies[TierZen]
+	body, err := bodies(TierZen)
+	if err != nil {
+		return nil, err, 0
+	}
 	if len(body) == 0 {
 		return nil, errors.New("no prepared Zen request body"), 0
 	}
@@ -264,7 +287,6 @@ func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies 
 		if resp != nil {
 			attemptStatus = resp.StatusCode
 		}
-		streamwatch.AttemptHTTP(ctx, resp)
 		streamwatch.AttemptResult(req.Context(), attemptStatus)
 		if ctx.Err() != nil {
 			lastResponse, lastErr = resp, err
@@ -413,7 +435,7 @@ func anonymousTool(proto protocol.Protocol, name string) map[string]any {
 	}
 }
 
-func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies map[Tier][]byte, ids RequestIDs, attemptOffset int) (*http.Response, error, int) {
+func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies routeBody, ids RequestIDs, attemptOffset int) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
 	nodes := rt.zenNodes
@@ -427,10 +449,7 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies map[Ti
 		return nil, fmt.Errorf("no %s nodes configured", route.Tier), 0
 	}
 	attempts := 0
-	body := bodies[route.Tier]
-	if len(body) == 0 {
-		return nil, fmt.Errorf("no prepared %s request body", route.Tier), 0
-	}
+	var body []byte
 	visited := 0
 	for attempts < rt.cfg.Retry.MaxAttempts && visited < nodes.Len()*rt.cfg.Retry.MaxAttempts {
 		if ctx.Err() != nil {
@@ -451,6 +470,16 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies map[Ti
 		call := provider.CurrentInvocation(ctx)
 		if call.Caller.UserID > 0 && !call.Caller.AccountScope[uid] {
 			continue
+		}
+		if body == nil {
+			var err error
+			body, err = bodies(route.Tier)
+			if err != nil {
+				return nil, err, attempts
+			}
+			if len(body) == 0 {
+				return nil, fmt.Errorf("no prepared %s request body", route.Tier), attempts
+			}
 		}
 		if err := provider.CheckDispatch(ctx, provider.AccountRef{Provider: runtimeName, LocalID: uid}, runtimePrefix+route.ID); err != nil {
 			lastErr = err
@@ -480,7 +509,6 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies map[Ti
 		if resp != nil {
 			attemptStatus = resp.StatusCode
 		}
-		streamwatch.AttemptHTTP(ctx, resp)
 		streamwatch.AttemptResult(req.Context(), attemptStatus)
 		if ctx.Err() != nil {
 			lastResponse, lastErr = resp, err

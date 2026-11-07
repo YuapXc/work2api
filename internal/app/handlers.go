@@ -5,10 +5,11 @@ import (
 	"net/http"
 
 	"work2api/internal/core/provider"
+	"work2api/internal/streamwatch"
 	wbruntime "work2api/internal/workbuddy/runtime"
 )
 
-var sseWriter = wbruntime.SSEWriter
+var sseWriter = streamwatch.SSEWriter
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	principal, aerr := s.auth(r)
@@ -160,7 +161,7 @@ func (s *Server) prepareProviderRequest(r *http.Request, payload map[string]any,
 	}
 	rt, ok := s.o.runtimes.Resolve(p.EffectiveModel)
 	if !ok {
-		rt = s.o.wb
+		return r, func() {}, nil
 	}
 	if prepare, ok := rt.(provider.RequestPreparer); ok {
 		body := make(map[string]any, len(payload))

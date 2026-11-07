@@ -18,6 +18,43 @@ func (r *Runtime) Name() string         { return "workbuddy" }
 func (r *Runtime) Prefix() string       { return "" }
 func (r *Runtime) Ready() bool          { return r.Pool != nil && len(r.Pool.Accounts()) > 0 }
 func (r *Runtime) SupportsPortal() bool { return true }
+func (r *Runtime) PortalModels(_ context.Context, models map[string]bool, discoverFree bool, eligible func(string) bool) []provider.PortalModel {
+	var entries []map[string]any
+	if models == nil {
+		entries = r.Catalog.ListCached()
+	} else {
+		for id := range models {
+			if entry, _ := r.Catalog.CachedModel(id); entry != nil {
+				entries = append(entries, entry)
+			}
+		}
+	}
+	var out []provider.PortalModel
+	for _, entry := range entries {
+		id := ToStr(entry["id"])
+		if id == "" || id == "auto" {
+			continue
+		}
+		model := provider.PortalModel{ID: id, Accounts: r.ModelEntryAccountUIDs(entry)}
+		if discoverFree {
+			for uid := range model.Accounts {
+				if !eligible(uid) {
+					continue
+				}
+				a := r.Pool.Get(uid)
+				if a == nil || !a.Enabled || r.authorizationInvalid(uid) {
+					continue
+				}
+				if cost := r.Catalog.AccountCost(a.Profile, uid, id); cost != nil && *cost == 0 {
+					model.FreeSource = true
+					break
+				}
+			}
+		}
+		out = append(out, model)
+	}
+	return out
+}
 func (r *Runtime) Models(ctx context.Context) []provider.CatalogModel {
 	var out []provider.CatalogModel
 	for _, m := range r.Catalog.ListCached() {

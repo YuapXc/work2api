@@ -12,7 +12,6 @@ import (
 	"work2api/internal/qoder/cosy"
 	"work2api/internal/qoder/logger"
 	"work2api/internal/tokenusage"
-	"work2api/internal/workbuddy/upstream"
 )
 
 // ServeResult carries the aggregated outcome of a single Serve* call so the
@@ -31,7 +30,7 @@ type ServeResult struct {
 }
 
 func (r *ServeResult) updateUsage(d Delta, input, output *int) {
-	r.Usage = upstream.MergeUsage(r.Usage, d.Usage)
+	r.Usage = tokenusage.Merge(r.Usage, d.Usage)
 	if d.FinishReason != "" {
 		r.FinishReason = d.FinishReason
 	}
@@ -278,7 +277,6 @@ func (b *Bridge) ServeChat(ctx context.Context, w http.ResponseWriter, req map[s
 			"usage": result.Usage,
 		}
 		logger.Info("[Chat][%s] 完成 finish=%s content_len=%d tool_calls=%d 耗时=%dms", reqID, finishReason, full.Len(), len(toolCallBuf), time.Since(startTime).Milliseconds())
-		logger.Debug("[Chat][%s] 响应体: %s", reqID, func() string { d, _ := json.Marshal(resp); return string(d) }())
 		WriteJSON(w, resp)
 		return result, nil
 	}

@@ -194,7 +194,11 @@ func (rt *Runtime) Prefix() string { return runtimePrefix }
 func (rt *Runtime) Ready() bool    { return rt != nil && rt.ready }
 
 // Models returns the discovered catalog, each ID namespaced "opencode/".
-func (rt *Runtime) Models(ctx context.Context) []provider.CatalogModel {
+func (rt *Runtime) Models(context.Context) []provider.CatalogModel {
+	return rt.catalogModels(nil)
+}
+
+func (rt *Runtime) catalogModels(requested map[string]bool) []provider.CatalogModel {
 	if !rt.Ready() {
 		return nil
 	}
@@ -202,6 +206,9 @@ func (rt *Runtime) Models(ctx context.Context) []provider.CatalogModel {
 	pricingSnapshot := rt.pricing.Snapshot()
 	out := make([]provider.CatalogModel, 0, len(routes))
 	for _, route := range routes {
+		if requested != nil && !requested[runtimePrefix+route.ID] {
+			continue
+		}
 		md := rt.catalog.MetadataForTier(route.ID, route.Tier)
 		decision := rt.catalog.anonymousDecision(route.ID)
 		extra := map[string]any{

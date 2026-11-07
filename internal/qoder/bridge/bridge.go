@@ -633,12 +633,11 @@ func (b *Bridge) callQoderWithOpts(ctx context.Context, agent string, messages [
 		"x-model-source": mcSource,
 	}
 
-	preview := prompt
-	if len(preview) > 80 {
-		preview = preview[:80] + "..."
+	toolCount := 0
+	if list, ok := body["tools"].([]any); ok {
+		toolCount = len(list)
 	}
-	logger.Debug("callQoder model=%s prompt=%s", model, preview)
-	logger.Debug("callQoder request body: %s", func() string { d, _ := json.Marshal(body); return string(d) }())
+	logger.Debug("callQoder model=%s messages=%d tools=%d", model, len(messages), toolCount)
 
 	// ---- SSE 信封重试闸门（第 3 步，参照 hub should_retry_envelope /
 	// aggregate_with_envelope_retry）------------------------------------------

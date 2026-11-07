@@ -42,7 +42,7 @@ func (d Delta) UpdateUsage(input, output *int) {
 func ExtractDelta(dataLine string) Delta {
 	var wrapper map[string]interface{}
 	if err := json.Unmarshal([]byte(dataLine), &wrapper); err != nil {
-		logger.Debug("[delta] unmarshal wrapper failed: %v, raw=%s", err, dataLine)
+		logger.Debug("[delta] unmarshal wrapper failed: %v (%d bytes)", err, len(dataLine))
 		return Delta{}
 	}
 	// ---- 信封状态检查（第 3 步，hub iter_inner_sse 形态） ----
@@ -60,7 +60,7 @@ func ExtractDelta(dataLine string) Delta {
 	}
 	inner, _ := wrapper["body"].(string)
 	if inner == "" {
-		logger.Debug("[delta] no body field, keys=%v, raw=%s", mapKeys(wrapper), dataLine)
+		logger.Debug("[delta] no body field (%d bytes)", len(dataLine))
 		return Delta{}
 	}
 	var innerJSON map[string]interface{}
@@ -114,7 +114,7 @@ func ExtractDelta(dataLine string) Delta {
 	if usage != nil {
 		return Delta{InputTokens: usageIn, OutputTokens: usageOut, HasInputTokens: hasIn, HasOutputTokens: hasOut, Usage: usage}
 	}
-	logger.Debug("[delta] no valid choices found, inner=%s", inner)
+	logger.Debug("[delta] no valid choices found (%d bytes)", len(inner))
 	return Delta{}
 }
 
@@ -173,14 +173,6 @@ func describeUpstreamError(frame map[string]interface{}) string {
 		return "上游返回未知错误"
 	}
 	return truncate(strings.Join(parts, " | "), 500)
-}
-
-func mapKeys(m map[string]interface{}) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
 }
 
 // toEnvelopeStatus 信封 statusCodeValue 可能是 int/float64/str，统一成 int

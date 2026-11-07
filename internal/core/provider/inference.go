@@ -213,6 +213,26 @@ type RequestPreparer interface {
 // providers remain inaccessible until ownership/permissions are implemented.
 type PortalProvider interface{ SupportsPortal() bool }
 
+type PortalModel struct {
+	ID         string
+	Accounts   map[string]bool
+	FreeSource bool
+}
+
+// PortalCatalog supplies channel facts. The gateway applies user and Key policy.
+// A nil models filter requests the complete catalog; other filters use canonical model IDs.
+type PortalCatalog interface {
+	PortalModels(ctx context.Context, models map[string]bool, discoverFree bool, eligibleForFreeEvidence func(uid string) bool) []PortalModel
+}
+
+func NewPortalModel(id string, accounts []string, free bool) PortalModel {
+	scope := make(map[string]bool, len(accounts))
+	for _, uid := range accounts {
+		scope[uid] = true
+	}
+	return PortalModel{ID: id, Accounts: scope, FreeSource: free && len(scope) > 0}
+}
+
 // StateSource declares provider-owned files for coordinated online snapshots.
 type StateSource struct {
 	Path     string

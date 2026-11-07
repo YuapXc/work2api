@@ -11,11 +11,51 @@ import (
 	"time"
 
 	"work2api/internal/core/protocol"
+	"work2api/internal/streamwatch"
 )
 
 type fallbackTransport func(*http.Request) (*http.Response, error)
 
 func (f fallbackTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestInferenceRecordsHeadersBeforeReadingOutput(t *testing.T) {
+	ctx, timing := streamwatch.WithTiming(t.Context())
+	body, release := io.Pipe()
+	defer body.Close()
+	defer release.Close()
+	client := &http.Client{Transport: fallbackTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}, "X-Request-Id": {"fixture"}}, Body: body}, nil
+	})}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://example.test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamwatch.StartAttempt(ctx)
+	result := make(chan error, 1)
+	go func() {
+		resp, err := readInferenceAttempt(client, req, protocol.Chat)
+		if resp != nil {
+			resp.Body.Close()
+		}
+		result <- err
+	}()
+	deadline := time.After(time.Second)
+	for !timing.Snapshot().AttemptStages[0].Finished {
+		select {
+		case <-deadline:
+			t.Fatal("header timing waited for SSE output")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	stage := timing.Snapshot().AttemptStages[0]
+	if stage.HTTPStatus != 200 || stage.UpstreamRequestID != "fixture" {
+		t.Fatal("missing HTTP stage information", stage)
+	}
+	_, err = io.WriteString(release, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+	if err != nil || <-result != nil {
+		t.Fatal("SSE prefix was not released", err)
+	}
+}
 
 func TestInferenceMessagesBetaOnlyForKnownV2Endpoint(t *testing.T) {
 	for _, tc := range []struct {
@@ -60,7 +100,7 @@ func TestTierTransportFailurePreservesRealUpstreamError(t *testing.T) {
 		rt := &Runtime{cfg: cfg, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), transports: transports, zenNodes: keys, goNodes: &nodePool{}, anonymous: newAnonymousPool(true, transports, time.Second), catalog: NewCatalog(TierZen, nil)}
 		uid := ""
 		route := Route{ID: "probe", Tier: TierZen, Protocol: protocol.Chat, Anonymous: true, KeyTiers: []Tier{TierZen}}
-		resp, effective, _, err := rt.doUpstreamTiers(context.Background(), route, map[Tier][]byte{TierZen: []byte(`{"model":"probe","messages":[]}`)}, RequestIDs{Session: "probe", AccountUID: &uid}, 0)
+		resp, effective, _, err := rt.doUpstreamTiers(context.Background(), route, fixtureRouteBodies(map[Tier][]byte{TierZen: []byte(`{"model":"probe","messages":[]}`)}), RequestIDs{Session: "probe", AccountUID: &uid}, 0)
 		if err != nil || resp == nil {
 			t.Fatal("real error replaced by transport failure", err)
 		}
@@ -126,7 +166,7 @@ func TestRequestRejectionStopsAnonymousExitsAndKeyFallback(t *testing.T) {
 		keys, _ := newNodePool([]string{"synthetic-one", "synthetic-two"}, transports, time.Second)
 		rt := &Runtime{cfg: cfg, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), transports: transports, zenNodes: keys, goNodes: &nodePool{}, anonymous: newAnonymousPool(true, transports, time.Second), catalog: NewCatalog(TierZen, nil)}
 		route := Route{ID: "probe", Tier: TierZen, Protocol: protocol.Chat, Anonymous: anonymous, KeyTiers: []Tier{TierZen, TierGo}}
-		resp, _, attempts, err := rt.doUpstreamTiers(context.Background(), route, map[Tier][]byte{TierZen: []byte(`{"model":"probe","messages":[]}`)}, RequestIDs{Session: "probe"}, 0)
+		resp, _, attempts, err := rt.doUpstreamTiers(context.Background(), route, fixtureRouteBodies(map[Tier][]byte{TierZen: []byte(`{"model":"probe","messages":[]}`)}), RequestIDs{Session: "probe"}, 0)
 		if err != nil || resp == nil {
 			t.Fatal("missing original rejection", err)
 		}

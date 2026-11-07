@@ -56,6 +56,7 @@ type Principal struct {
 	// before). Keeps queue accounting and post-wait model authorization aligned.
 	EffectiveModel string
 	RouteModel     string // logical route; channel/account permissions remain physical
+	routeFacts     *routeRequestFacts
 	quota          *portalQuotaReservation
 }
 
@@ -159,6 +160,19 @@ func (o *Orchestrator) genAPIKey() string {
 }
 
 func (o *Orchestrator) checkAPIKey(authorization, xAPIKey string) (*Principal, *apiError) {
+	p, aerr := o.checkAPIKeyIdentity(authorization, xAPIKey)
+	if aerr != nil {
+		return nil, aerr
+	}
+	if p.UserID > 0 {
+		if aerr := o.attachPortalScope(p); aerr != nil {
+			return nil, aerr
+		}
+	}
+	return p, nil
+}
+
+func (o *Orchestrator) checkAPIKeyIdentity(authorization, xAPIKey string) (*Principal, *apiError) {
 	token := ""
 	if strings.HasPrefix(authorization, "Bearer ") {
 		token = strings.TrimSpace(authorization[7:])
@@ -173,10 +187,23 @@ func (o *Orchestrator) checkAPIKey(authorization, xAPIKey string) (*Principal, *
 	if err != nil || app == nil {
 		return nil, errBody(401, "invalid api key", "auth_error")
 	}
-	return o.principalForApp(app)
+	return o.principalIdentityForApp(app)
 }
 
 func (o *Orchestrator) principalForApp(app map[string]any) (*Principal, *apiError) {
+	p, aerr := o.principalIdentityForApp(app)
+	if aerr != nil {
+		return nil, aerr
+	}
+	if p.UserID > 0 {
+		if aerr := o.attachPortalScope(p); aerr != nil {
+			return nil, aerr
+		}
+	}
+	return p, nil
+}
+
+func (o *Orchestrator) principalIdentityForApp(app map[string]any) (*Principal, *apiError) {
 	name, _ := app["name"].(string)
 	id, _ := app["id"].(int64)
 	userID, _ := app["user_id"].(int64)
@@ -185,13 +212,7 @@ func (o *Orchestrator) principalForApp(app map[string]any) (*Principal, *apiErro
 		return nil, errBody(503, "密钥权限查询失败", "server_error")
 	}
 	policy, _ := app["model_policy"].(string)
-	p := &Principal{AppName: name, AppID: id, AllowedModels: allowed, UserID: userID, ModelPolicy: policy}
-	if userID > 0 {
-		if aerr := o.attachPortalScope(p); aerr != nil {
-			return nil, aerr
-		}
-	}
-	return p, nil
+	return &Principal{AppName: name, AppID: id, AllowedModels: allowed, UserID: userID, ModelPolicy: policy}, nil
 }
 
 // attachPortalScope computes the scheduling scope and permission model set for
@@ -199,6 +220,10 @@ func (o *Orchestrator) principalForApp(app map[string]any) (*Principal, *apiErro
 // every authenticated request. Withdrawal and global model disable take effect
 // without an authorization cache.
 func (o *Orchestrator) attachPortalScope(p *Principal) *apiError {
+	return o.attachPortalScopeForModels(p, nil)
+}
+
+func (o *Orchestrator) attachPortalScopeForModels(p *Principal, models []string) *apiError {
 	if !o.cfg.PortalEnabled {
 		return errBody(403, "用户服务已关闭", "portal_disabled")
 	}
@@ -224,7 +249,7 @@ func (o *Orchestrator) attachPortalScope(p *Principal) *apiError {
 	if err != nil {
 		return errBody(503, "模型授权查询失败", "server_error")
 	}
-	defaults, catalog := o.defaultModelAccessIn(settings, excluded, nil)
+	defaults, catalog := o.defaultModelAccessIn(settings, excluded, nil, models)
 	aliases := parseModelAliases(settings["model_aliases"])
 	resolve := func(model string) string {
 		if real, ok := aliases[model]; ok {
@@ -420,7 +445,8 @@ func (s *Server) prepareModel(principal *Principal, payload map[string]any) *api
 	if route, err := s.o.modelRoute(model); err != nil {
 		return errBody(503, "统一模型配置暂不可用", "server_error")
 	} else if route != nil {
-		members, aerr := s.routeCandidates(principal, *route, payload)
+		facts := inspectRouteRequest(payload)
+		members, aerr := s.routeCandidatesWithFacts(principal, *route, facts, s.physicalCatalogForMembers(route.Members))
 		if aerr != nil {
 			return aerr
 		}
@@ -428,6 +454,7 @@ func (s *Server) prepareModel(principal *Principal, payload map[string]any) *api
 			return errBody(403, "统一模型没有符合权限和请求能力的可用成员", "model_not_allowed")
 		}
 		principal.RouteModel, principal.EffectiveModel = model, model
+		principal.routeFacts = &facts
 		return nil
 	}
 	principal.EffectiveModel = s.o.resolveModel(model)
@@ -520,7 +547,9 @@ func (o *Orchestrator) runOnce(ctx context.Context, acc *pool.Account, body map[
 func (o *Orchestrator) invocationContext(ctx context.Context) context.Context {
 	call := provider.CurrentInvocation(ctx)
 	if call.Provider == "" {
-		call.Provider = o.wb.Name()
+		if rt, ok := o.runtimes.Resolve(""); ok {
+			call.Provider = rt.Name()
+		}
 	}
 	if p, ok := ctx.Value(principalContextKey{}).(*Principal); ok {
 		call.Caller = p.SessionCaller()
@@ -533,8 +562,12 @@ func (o *Orchestrator) invocationContext(ctx context.Context) context.Context {
 					return err
 				}
 			}
-			if call.Caller.UserID > 0 && ref.Provider != "workbuddy" && ref.Provider != "trae" && ref.Provider != "qoder" && ref.Provider != "opencode" {
-				return errBody(403, "当前账号渠道不支持共享调用", "permission_error")
+			if call.Caller.UserID > 0 {
+				rt, _ := o.runtimes.ByName(ref.Provider)
+				portal, ok := rt.(provider.PortalProvider)
+				if ref.Provider != call.Provider || !ok || !portal.SupportsPortal() {
+					return errBody(403, "当前账号渠道不支持共享调用", "permission_error")
+				}
 			}
 			if err := ctx.Err(); err != nil {
 				return err

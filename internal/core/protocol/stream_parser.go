@@ -11,16 +11,17 @@ import (
 )
 
 type bridgeStreamParser struct {
-	generationCtx     context.Context
-	rewrite           func(map[string]any) error
-	protocol          Protocol
-	started           bool
-	tools             map[string]bool
-	toolIDs           map[string]string
-	toolNames         map[string]string
-	toolOrder         []string
-	responseArgs      map[string]bool
-	responseReasoning map[string]bool
+	generationCtx            context.Context
+	rewrite                  func(map[string]any) error
+	protocol                 Protocol
+	started                  bool
+	tools                    map[string]bool
+	toolIDs                  map[string]string
+	toolNames                map[string]string
+	toolOrder                []string
+	responseArgs             map[string]bool
+	responseReasoning        map[string]bool
+	captureResponsesTerminal func(map[string]any)
 }
 
 func (parser *bridgeStreamParser) Parse(eventName, data string) ([]bridgeStreamEvent, error) {
@@ -319,8 +320,11 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 			}
 			return events
 		}
-		stop := "stop"
-		if typeName == "response.incomplete" {
+		if parser.captureResponsesTerminal != nil {
+			parser.captureResponsesTerminal(response)
+		}
+		var stop string
+		if typeName == "response.incomplete" || jsonutil.StringAt(response, "status") == "incomplete" {
 			stop = canonicalResponsesIncomplete(jsonutil.StringAt(response, "incomplete_details", "reason"))
 		} else {
 			stop = parser.responsesCompletedStop(response)
@@ -344,7 +348,8 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 func (parser *bridgeStreamParser) responsesCompletedStop(response map[string]any) string {
 	for _, raw := range jsonutil.SliceAt(response, "output") {
 		item, _ := raw.(map[string]any)
-		if jsonutil.StringAt(item, "type") == "function_call" {
+		kind := jsonutil.StringAt(item, "type")
+		if kind == "function_call" || (kind == "custom_tool_call" && parser.captureResponsesTerminal != nil) {
 			return "tool_calls"
 		}
 	}

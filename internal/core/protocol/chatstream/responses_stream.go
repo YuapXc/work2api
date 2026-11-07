@@ -1,4 +1,4 @@
-package adapters
+package chatstream
 
 import (
 	"encoding/json"
@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"work2api/internal/identity"
 	"work2api/internal/tokenusage"
-	"work2api/internal/workbuddy/upstream"
 )
 
 // ResponsesStreamConverter converts a Chat SSE stream into a Responses API
@@ -63,12 +63,12 @@ func NewResponsesStreamConverter(model string) *ResponsesStreamConverter {
 		model = "unknown"
 	}
 	return &ResponsesStreamConverter{
-		respID:      randID("resp_"),
-		msgID:       randID("msg_"),
+		respID:      identity.RandomID("resp", 12),
+		msgID:       identity.RandomID("msg", 12),
 		model:       model,
 		createdAt:   time.Now().Unix(),
 		toolCalls:   map[int]*respToolCall{},
-		reasoningID: randID("rs_"), reasoningIdx: -1, messageIdx: -1,
+		reasoningID: identity.RandomID("rs", 12), reasoningIdx: -1, messageIdx: -1,
 	}
 }
 
@@ -195,7 +195,7 @@ func (c *ResponsesStreamConverter) processChunk(chunk map[string]any) string {
 		c.emittedCreated = true
 	}
 	if u, ok := chunk["usage"].(map[string]any); ok && u != nil {
-		c.usage = upstream.MergeUsage(c.usage, u)
+		c.usage = tokenusage.Merge(c.usage, u)
 	}
 
 	choices, _ := chunk["choices"].([]any)
@@ -271,7 +271,7 @@ func (c *ResponsesStreamConverter) processChunk(chunk map[string]any) string {
 				}
 				slot, exists := c.toolCalls[idx]
 				if !exists {
-					slot = &respToolCall{fcID: randID("fc_"), id: randID("call_"), outputIdx: len(c.items)}
+					slot = &respToolCall{fcID: identity.RandomID("fc", 12), id: identity.RandomID("call", 12), outputIdx: len(c.items)}
 					c.items = append(c.items, responseOutputItem{kind: "function_call", tool: idx})
 					c.toolCalls[idx] = slot
 					c.toolOrder = append(c.toolOrder, idx)

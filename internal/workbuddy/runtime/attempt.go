@@ -142,6 +142,7 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 	if client == nil {
 		client = upstream.Shared()
 	}
+	var prepared *upstream.PreparedStreamBody
 	for retry := 0; retry < 2; retry++ {
 		if retry > 0 {
 			streamwatch.StartAttempt(ctx)
@@ -159,14 +160,25 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 			b.remaining--
 		}
 		normalizer := &toolFinishNormalizer{}
-		err = client.StreamUpstream(ctx, headers, body, url, func(line string) error {
+		yield := func(line string) error {
 			for _, normalized := range normalizer.lines(ctx, line) {
 				if e := wrapped(normalized); e != nil {
 					return e
 				}
 			}
 			return nil
-		})
+		}
+		if reusable, ok := client.(*upstream.Client); ok {
+			if prepared == nil {
+				prepared, err = upstream.PrepareStreamBody(body)
+				if err != nil {
+					return started, err
+				}
+			}
+			err = reusable.StreamPrepared(ctx, headers, prepared, url, yield)
+		} else {
+			err = client.StreamUpstream(ctx, headers, body, url, yield)
+		}
 		var rejected *upstream.UpstreamError
 		if started || ctx.Err() != nil || !errors.As(err, &rejected) || rejected.StatusCode != 401 {
 			return started, err

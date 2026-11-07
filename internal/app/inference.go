@@ -37,7 +37,7 @@ func (o *Orchestrator) recordUsage(ctx context.Context, params store.UsageParams
 		o.accountHealth.observe(name, params)
 	}
 	if ctx != nil {
-		if rows, ok := ctx.Value(usageTimingKey{}).(*usageTimingRows); ok && rows.deferWrites {
+		if rows, ok := ctx.Value(usageTimingKey{}).(*usageTimingRows); ok {
 			if params.Timestamp <= 0 {
 				params.Timestamp = float64(time.Now().UnixNano()) / 1e9
 			}
@@ -54,14 +54,11 @@ func (o *Orchestrator) recordUsage(ctx context.Context, params store.UsageParams
 			return
 		}
 	}
-	o.persistUsage(ctx, params)
+	o.persistUsage(params)
 }
 
-func (o *Orchestrator) persistUsage(ctx context.Context, params store.UsageParams) {
-	id, err := o.db.LogUsageWithID(params)
-	if err == nil {
-		trackUsageTiming(ctx, id)
-	} else {
+func (o *Orchestrator) persistUsage(params store.UsageParams) {
+	if err := o.db.LogUsage(params); err != nil {
 		log.Printf("保存调用日志失败: %v", err)
 	}
 }

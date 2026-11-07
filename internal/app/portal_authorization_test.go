@@ -729,6 +729,46 @@ func TestPortalDispatchRejectsAliasTargetChangeAfterValidation(t *testing.T) {
 	}
 }
 
+func TestPortalDispatchReadsOnlyRelevantModelsAndRevalidates(t *testing.T) {
+	s, u, appID, key := portalAuthorizeFixture(t)
+	portalGrant(t, s, u, "group", "test-account", []string{"model-a", "model-b"})
+	unrelated := &portalFixtureRuntime{}
+	if err := s.o.runtimes.Register(unrelated); err != nil {
+		t.Fatal(err)
+	}
+	p := portalKeyPrincipal(t, s, key)
+	if unrelated.catalogReads != 1 || len(p.ModelScopes["model-b"]) == 0 {
+		t.Fatal("initial authorization did not build the full scope")
+	}
+	payload := map[string]any{"model": "model-a"}
+	if err := s.prepareModel(p, payload); err != nil {
+		t.Fatal(err.Body)
+	}
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	r.Header.Set("Authorization", "Bearer "+key)
+	w := httptest.NewRecorder()
+	r, ok := s.refreshPortalRequest(w, r, p, payload)
+	if !ok || unrelated.catalogReads != 1 || len(p.ModelScopes) != 1 || !p.AccountScope["test-account"] {
+		t.Fatal("outbound revalidation widened or lost scope", w.Code, p.ModelScopes, unrelated.catalogReads)
+	}
+	check := r.Context().Value(portalDispatchCheckKey{}).(func(string, string) *apiError)
+	if err := check("test-account", "model-a"); err != nil || unrelated.catalogReads != 1 {
+		t.Fatal("authorized dispatch failed or visited an unrelated channel", err)
+	}
+	if err := s.o.db.SaveSettings(map[string]string{"portal_disabled_models": `["model-a"]`}); err != nil {
+		t.Fatal(err)
+	}
+	if err := check("test-account", "model-a"); err == nil || err.Status != 403 {
+		t.Fatal("model disable missed by outbound revalidation", err)
+	}
+	if _, err := s.o.db.DeleteApp(appID); err != nil {
+		t.Fatal(err)
+	}
+	if err := check("test-account", "model-a"); err == nil || err.Status != 401 {
+		t.Fatal("Key revocation missed by outbound revalidation", err)
+	}
+}
+
 type portalCatalogCredential struct {
 	pool.Credential
 	models string
@@ -963,6 +1003,49 @@ func TestMediaHTTPTaskOwnershipAndSingleSubmit(t *testing.T) {
 }
 
 type decisionFixtureRuntime struct{}
+
+type portalFixtureRuntime struct {
+	decisionFixtureRuntime
+	catalogReads int
+}
+
+func (*portalFixtureRuntime) Name() string         { return "portalfixture" }
+func (*portalFixtureRuntime) Prefix() string       { return "portalfixture/" }
+func (*portalFixtureRuntime) SupportsPortal() bool { return true }
+
+func (r *portalFixtureRuntime) PortalModels(context.Context, map[string]bool, bool, func(string) bool) []provider.PortalModel {
+	r.catalogReads++
+	return nil
+}
+
+func TestDispatchRechecksPortalRuntimeCapabilityAndAccount(t *testing.T) {
+	o := &Orchestrator{runtimes: provider.NewRegistry()}
+	for _, rt := range []provider.Runtime{&portalFixtureRuntime{}, &decisionFixtureRuntime{}} {
+		if err := o.runtimes.Register(rt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var validated bool
+	ctx := context.WithValue(t.Context(), portalDispatchCheckKey{}, func(uid, model string) *apiError {
+		validated = uid == "account" && model == "portalfixture/model"
+		return errBody(403, "revoked", "model_not_allowed")
+	})
+	call := provider.Invocation{Provider: "decisionfixture", Caller: provider.Caller{UserID: 1}}
+	check := func(name string) error {
+		invocation := o.invocationContext(provider.WithInvocation(ctx, call))
+		return provider.CheckDispatch(invocation, provider.AccountRef{Provider: name, LocalID: "account"}, "portalfixture/model")
+	}
+	if err := check("decisionfixture"); err == nil || validated {
+		t.Fatal("runtime without portal capability reached account validation", err)
+	}
+	if err := check("portalfixture"); err == nil || validated {
+		t.Fatal("cross-provider dispatch reached account validation", err)
+	}
+	call.Provider = "portalfixture"
+	if err := check("portalfixture"); err == nil || !validated {
+		t.Fatal("portal runtime did not enforce account revocation", err)
+	}
+}
 
 func (*decisionFixtureRuntime) Name() string   { return "decisionfixture" }
 func (*decisionFixtureRuntime) Prefix() string { return "decisionfixture/" }

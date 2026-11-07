@@ -18,7 +18,6 @@ import (
 
 	"work2api/internal/core/provider"
 	"work2api/internal/store"
-	wbruntime "work2api/internal/workbuddy/runtime"
 )
 
 func physicalModel(id string) string {
@@ -47,6 +46,24 @@ func (o *Orchestrator) modelRoute(model string) (*store.ModelRoute, error) {
 func (s *Server) physicalCatalog() map[string]map[string]any {
 	out := map[string]map[string]any{}
 	for _, entry := range s.o.runtimeModels(context.Background()) {
+		out[physicalModel(str2(entry["id"]))] = entry
+	}
+	return out
+}
+
+func (s *Server) physicalCatalogForMembers(members []string) map[string]map[string]any {
+	selected := make(map[string]bool, len(members))
+	channels := make(map[string]bool, len(members))
+	var runtimes []provider.Runtime
+	for _, member := range members {
+		selected[member] = true
+		if rt, ok := s.o.runtimes.Resolve(member); ok && !channels[rt.Name()] {
+			channels[rt.Name()] = true
+			runtimes = append(runtimes, rt)
+		}
+	}
+	out := make(map[string]map[string]any, len(members))
+	for _, entry := range runtimeModelsFrom(context.Background(), runtimes, func(id string) bool { return selected[physicalModel(id)] }) {
 		out[physicalModel(str2(entry["id"]))] = entry
 	}
 	return out
@@ -116,6 +133,26 @@ func (s *Server) routeCandidates(p *Principal, route store.ModelRoute, payload m
 	return s.routeCandidatesIn(p, route, payload, s.physicalCatalog())
 }
 func (s *Server) routeCandidatesIn(p *Principal, route store.ModelRoute, payload map[string]any, catalog map[string]map[string]any) ([]string, *apiError) {
+	return s.routeCandidatesWithFacts(p, route, inspectRouteRequest(payload), catalog)
+}
+
+type routeRequestFacts struct {
+	hasImages       bool
+	requestedOutput int
+}
+
+func inspectRouteRequest(payload map[string]any) routeRequestFacts {
+	return routeRequestFacts{requestHasImages(payload), firstInt(payload, "max_tokens", "max_output_tokens", "max_completion_tokens")}
+}
+
+func (p *Principal) routeRequestFacts(payload map[string]any) routeRequestFacts {
+	if p.routeFacts != nil {
+		return *p.routeFacts
+	}
+	return inspectRouteRequest(payload)
+}
+
+func (s *Server) routeCandidatesWithFacts(p *Principal, route store.ModelRoute, facts routeRequestFacts, catalog map[string]map[string]any) ([]string, *apiError) {
 	if p == nil {
 		p = &Principal{}
 	}
@@ -154,8 +191,6 @@ func (s *Server) routeCandidatesIn(p *Principal, route store.ModelRoute, payload
 		}
 	}
 	out := []string{}
-	hasImages := requestHasImages(payload)
-	requestedOutput := firstInt(payload, "max_tokens", "max_output_tokens", "max_completion_tokens")
 	explicitMembers := map[string]bool{}
 	for _, allowed := range p.AllowedModels {
 		if allowed != route.Model {
@@ -190,11 +225,11 @@ func (s *Server) routeCandidatesIn(p *Principal, route store.ModelRoute, payload
 				continue
 			}
 		}
-		if hasImages && !modelHasVision(entry) {
+		if facts.hasImages && !modelHasVision(entry) {
 			continue
 		}
 		if max := firstInt(entry, "max_output_tokens", "max_output"); max > 0 {
-			if requestedOutput > max {
+			if facts.requestedOutput > max {
 				continue
 			}
 		}
@@ -657,7 +692,8 @@ func (s *Server) dispatchModelRoute(w http.ResponseWriter, r *http.Request, prot
 		writeAPIErr(w, errBody(503, "统一模型配置不可用", "model_unavailable"))
 		return true
 	}
-	members, aerr := s.routeCandidates(p, *route, payload)
+	facts := p.routeRequestFacts(payload)
+	members, aerr := s.routeCandidatesWithFacts(p, *route, facts, s.physicalCatalogForMembers(route.Members))
 	if aerr != nil {
 		writeAPIErr(w, aerr)
 		return true
@@ -696,7 +732,7 @@ func (s *Server) dispatchModelRoute(w http.ResponseWriter, r *http.Request, prot
 			writeAPIErr(w, errBody(503, "统一模型配置不可用", "model_unavailable"))
 			return true
 		}
-		freshMembers, permissionErr := s.routeCandidates(p, *current, payload)
+		freshMembers, permissionErr := s.routeCandidatesWithFacts(p, *current, facts, s.physicalCatalogForMembers(current.Members))
 		if permissionErr != nil {
 			writeAPIErr(w, permissionErr)
 			return true
@@ -727,7 +763,7 @@ func (s *Server) dispatchModelRoute(w http.ResponseWriter, r *http.Request, prot
 			writeJSON(w, status, doc)
 			return true
 		}
-		if diagnostic := wbruntime.Diagnostic(req.Context()); diagnostic != nil {
+		if diagnostic := diagnostic(req.Context()); diagnostic != nil {
 			diagnostic.RequestedModel = route.Model
 			diagnostic.PhysicalModel = member
 		}

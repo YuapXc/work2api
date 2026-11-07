@@ -2,17 +2,44 @@ package trae
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"work2api/internal/core/provider"
 	"work2api/internal/trae/auth"
 	"work2api/internal/trae/upstream"
 )
+
+func (r *Runtime) sendPreparedChat(ctx context.Context, identity *auth.Auth, body []byte) (io.ReadCloser, int, []byte, http.Header, error, bool) {
+	var connected, handshakeFailed atomic.Bool
+	trace := &httptrace.ClientTrace{
+		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
+		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+			handshakeFailed.Store(err != nil && (transientConnectError(err) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)))
+		},
+	}
+	stream, status, raw, headers, err := r.client(httptrace.WithClientTrace(ctx, trace)).ChatPreparedStreamWithHeaders(identity, body)
+	var dial *net.OpError
+	var dns *net.DNSError
+	beforeSend := err != nil && ctx.Err() == nil && !connected.Load() && (handshakeFailed.Load() ||
+		!errors.As(err, &dns) && errors.As(err, &dial) && dial.Op == "dial" && transientConnectError(dial))
+	return stream, status, raw, headers, err, beforeSend
+}
+
+func transientConnectError(err error) bool {
+	var timeout net.Error
+	return errors.As(err, &timeout) && timeout.Timeout() || errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET)
+}
 
 func retryable(kind upstream.ErrKind) bool {
 	return kind == upstream.ErrSoftRate || kind == upstream.ErrServer || kind == upstream.ErrSessionDead || kind == upstream.ErrPlanLimit

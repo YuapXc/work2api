@@ -241,12 +241,12 @@ func TestResponsesMinimumBudgetKeepsInvalidAndLargeValues(t *testing.T) {
 	rt := &Runtime{cfg: defaultConfig()}
 	for _, n := range []float64{0, 1, 2.5, 15, 16, 1024} {
 		input := map[string]any{"model": "test", "input": "hi", "max_output_tokens": n}
-		bodies, err := rt.prepareRouteBodies(protocol.Responses, Route{Tier: TierZen, Protocol: protocol.Responses}, input)
+		body, _, err := rt.prepareRouteBody(protocol.Responses, Route{Tier: TierZen, Protocol: protocol.Responses}, input, false, TierZen)
 		if err != nil {
 			t.Fatal(err)
 		}
 		var actual map[string]any
-		if err := json.Unmarshal(bodies[TierZen], &actual); err != nil {
+		if err := json.Unmarshal(body, &actual); err != nil {
 			t.Fatal(err)
 		}
 		want := n
@@ -858,7 +858,7 @@ func TestPortalKeyFilteringDoesNotConsumeUpstreamAttempts(t *testing.T) {
 	route := Route{ID: "paid-model", Tier: TierZen, Protocol: protocol.Chat}
 	bodies := map[Tier][]byte{TierZen: []byte(`{"model":"paid-model"}`)}
 	accountUID := ""
-	resp, e, attempts := rt.doKeyUpstream(ctx, route, bodies, RequestIDs{AccountUID: &accountUID}, 0)
+	resp, e, attempts := rt.doKeyUpstream(ctx, route, fixtureRouteBodies(bodies), RequestIDs{AccountUID: &accountUID}, 0)
 	if e != nil || resp == nil || calls != 1 || attempts != 1 || accountUID != uid {
 		t.Fatal("authorized key starved by scope filtering", e, calls, attempts, accountUID)
 	}
@@ -868,7 +868,7 @@ func TestPortalKeyFilteringDoesNotConsumeUpstreamAttempts(t *testing.T) {
 	revoked := provider.WithInvocation(context.Background(), provider.Invocation{Caller: provider.Caller{UserID: 1, AccountScope: map[string]bool{uid: true}}, Check: func(context.Context, provider.AccountRef, string) error {
 		return provider.NewAPIError(403, "revoked", "forbidden")
 	}})
-	if resp, e, _ = rt.doKeyUpstream(revoked, route, bodies, RequestIDs{}, 0); resp != nil || e == nil || calls != 0 {
+	if resp, e, _ = rt.doKeyUpstream(revoked, route, fixtureRouteBodies(bodies), RequestIDs{}, 0); resp != nil || e == nil || calls != 0 {
 		t.Fatal("revoked credential dispatched", resp, e, calls)
 	}
 	if got := toStringSlice([]string{"kept-key"}); len(got) != 1 || got[0] != "kept-key" {
@@ -902,7 +902,7 @@ func TestSingleAllowedKeyRetainsTransientRetryBudget(t *testing.T) {
 		t.Fatal(e)
 	}
 	rt := &Runtime{cfg: Config{Retry: RetryConfig{MaxAttempts: 2}, Upstream: UpstreamConfig{Zen: "https://upstream.invalid"}}, zenNodes: nodes, transports: transports, catalog: NewCatalog(TierZen, nil)}
-	resp, e, attempts := rt.doKeyUpstream(context.Background(), Route{ID: "paid-model", Tier: TierZen, Protocol: protocol.Chat}, map[Tier][]byte{TierZen: []byte(`{}`)}, RequestIDs{}, 0)
+	resp, e, attempts := rt.doKeyUpstream(context.Background(), Route{ID: "paid-model", Tier: TierZen, Protocol: protocol.Chat}, fixtureRouteBodies(map[Tier][]byte{TierZen: []byte(`{}`)}), RequestIDs{}, 0)
 	if e != nil || resp == nil || resp.StatusCode != 200 || attempts != 2 || calls != 2 {
 		t.Fatal("single-key transient retries changed", e, attempts, calls)
 	}
@@ -938,7 +938,7 @@ func TestSSEHeadFailureUsesExistingRetryBudget(t *testing.T) {
 			t.Fatal(e)
 		}
 		rt := &Runtime{cfg: Config{Retry: RetryConfig{MaxAttempts: 2}, Upstream: UpstreamConfig{Zen: "https://upstream.invalid"}}, zenNodes: nodes, transports: transports, catalog: NewCatalog(TierZen, nil)}
-		resp, e, attempts := rt.doKeyUpstream(context.Background(), Route{ID: "model", Tier: TierZen, Protocol: protocol.Chat}, map[Tier][]byte{TierZen: []byte(`{}`)}, RequestIDs{}, 0)
+		resp, e, attempts := rt.doKeyUpstream(context.Background(), Route{ID: "model", Tier: TierZen, Protocol: protocol.Chat}, fixtureRouteBodies(map[Tier][]byte{TierZen: []byte(`{}`)}), RequestIDs{}, 0)
 		if e != nil || resp == nil {
 			t.Fatal(kind, e)
 		}
@@ -1014,8 +1014,8 @@ func BenchmarkFreeShapeEncoding(b *testing.B) {
 		return json.Marshal(decoded)
 	}
 	after := func() ([]byte, error) {
-		bodies, err := rt.prepareRouteBodies(protocol.Chat, route, input)
-		return bodies[TierZen], err
+		body, _, err := rt.prepareRouteBody(protocol.Chat, route, input, true, TierZen)
+		return body, err
 	}
 	a, err := before()
 	if err != nil {
@@ -1048,17 +1048,27 @@ func TestFreeTierRecoveryPreservesShapedToolBody(t *testing.T) {
 		map[string]any{"type": "reasoning", "id": "rs_expired", "encrypted_content": "opaque"},
 		map[string]any{"type": "message", "role": "user", "content": "continue"},
 	}}
-	bodies, err := rt.prepareRouteBodies(protocol.Responses, route, input)
+	bodies, limits, err := rt.prepareRouteBodiesWithLimits(protocol.Responses, route, input, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	recovered, changed := stripStaleReasoningInputs(route, bodies)
-	if !changed || len(recovered) != 2 {
-		t.Fatal("expected recovery for both tiers", changed, len(recovered))
+	recovered, changed := recoverRouteBodies(route, bodies)
+	if !changed {
+		t.Fatal("expected recovery for both tiers")
+	}
+	if _, ready := limits[TierGo]; ready {
+		t.Fatal("fallback tier prepared before first use")
 	}
 	for _, tier := range []Tier{TierZen, TierGo} {
 		var payload map[string]any
-		if err := json.Unmarshal(recovered[tier], &payload); err != nil {
+		body, err := recovered(tier)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if again, err := recovered(tier); err != nil || len(again) == 0 || len(body) == 0 || &again[0] != &body[0] {
+			t.Fatal("encoded body was not reused", tier, err)
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
 			t.Fatal(err)
 		}
 		tools, _ := payload["tools"].([]any)
@@ -1073,4 +1083,8 @@ func TestFreeTierRecoveryPreservesShapedToolBody(t *testing.T) {
 	if input["stream"] != nil || input["previous_response_id"] != "expired" {
 		t.Fatal("caller payload mutated", input)
 	}
+}
+
+func fixtureRouteBodies(bodies map[Tier][]byte) routeBody {
+	return func(tier Tier) ([]byte, error) { return bodies[tier], nil }
 }

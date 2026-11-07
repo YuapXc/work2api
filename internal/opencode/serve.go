@@ -179,14 +179,20 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 	var responseBody []byte
 	var usage protocol.Usage
 	var known bool
+	responseProtocol := upstreamRoute.Protocol
 	// Free models (and the anonymous lane) are force-streamed upstream even when
 	// the client asked for a single JSON document; collapse the SSE back.
 	if upstreamRoute.Anonymous || free {
 		watch := streamwatch.NewWatch(resp.Body, ctx, 0, 0)
 		defer watch.Close()
-		if upstreamRoute.Protocol == protocol.Chat && aliasWriter != nil {
-			responseBody, usage, known, err = protocol.CollapseStreamWithRewrite(ctx, watch.Reader(resp.Body), protocol.Chat, model, aliasWriter.rewriteEvent)
-			w = aliasWriter.ResponseWriter
+		if upstreamRoute.Protocol == protocol.Chat {
+			var rewrite func(map[string]any) error
+			if aliasWriter != nil {
+				rewrite = aliasWriter.rewriteEvent
+				w = aliasWriter.ResponseWriter
+			}
+			responseBody, usage, known, err = protocol.CollapseChatStreamAs(ctx, watch.Reader(resp.Body), external, model, rewrite)
+			responseProtocol = external
 		} else {
 			responseBody, usage, known, err = protocol.CollapseStreamWithUsageContext(ctx, watch.Reader(resp.Body), upstreamRoute.Protocol, model)
 		}
@@ -205,8 +211,8 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 		}
 		usage, known = protocol.ResponseUsage(upstreamRoute.Protocol, responseBody)
 	}
-	if external != upstreamRoute.Protocol {
-		responseBody, err = protocol.ConvertResponse(upstreamRoute.Protocol, external, responseBody)
+	if external != responseProtocol {
+		responseBody, err = protocol.ConvertResponse(responseProtocol, external, responseBody)
 		if err != nil {
 			rt.logger.Warn("response protocol conversion failed", "component", "opencode.conversion", "request_id", ids.Request, "model", model, "error", err)
 			protocol.WriteError(w, external, http.StatusBadGateway, "unsupported upstream response", "upstream_error", ids.Request)
@@ -233,11 +239,7 @@ func (rt *Runtime) serveSystemOne(ctx context.Context, w http.ResponseWriter, ex
 		protocol.WriteError(w, external, http.StatusBadRequest, "request contains unsupported JSON values", "invalid_request_error", "")
 		return provider.UsageReport{Status: "error", Error: "bad payload"}, nil
 	}
-	bodies := make(map[Tier][]byte, len(route.KeyTiers)+1)
-	bodies[route.Tier] = body
-	for _, tier := range route.KeyTiers {
-		bodies[tier] = body
-	}
+	bodies := func(Tier) ([]byte, error) { return body, nil }
 	requestCtx, cancel := context.WithTimeout(ctx, time.Duration(rt.cfg.Retry.TimeoutSeconds)*time.Second)
 	defer cancel()
 	resp, upstreamRoute, err := rt.doUpstream(requestCtx, route, bodies, ids)
@@ -310,89 +312,88 @@ func (w flushingWriter) Write(data []byte) (int, error) {
 	return n, err
 }
 
-func (rt *Runtime) prepareRouteBodies(from protocol.Protocol, route Route, input map[string]any) (map[Tier][]byte, error) {
-	bodies, _, err := rt.prepareRouteBodiesWithLimits(from, route, input, rt.catalog != nil && rt.catalog.IsFreeModel(route.ID))
-	return bodies, err
+type routeBody func(Tier) ([]byte, error)
+
+func (rt *Runtime) prepareRouteBodiesWithLimits(from protocol.Protocol, route Route, input map[string]any, free bool) (routeBody, map[Tier]map[string]int, error) {
+	type prepared struct {
+		body []byte
+		err  error
+	}
+	cache := make(map[Tier]prepared, len(route.KeyTiers)+1)
+	limits := make(map[Tier]map[string]int, len(route.KeyTiers)+1)
+	get := func(tier Tier) ([]byte, error) {
+		if p, ok := cache[tier]; ok {
+			return p.body, p.err
+		}
+		body, effective, err := rt.prepareRouteBody(from, route, input, free, tier)
+		cache[tier] = prepared{body, err}
+		limits[tier] = effective
+		return body, err
+	}
+	if _, err := get(route.Tier); err != nil {
+		return nil, nil, err
+	}
+	return get, limits, nil
 }
 
-func (rt *Runtime) prepareRouteBodiesWithLimits(from protocol.Protocol, route Route, input map[string]any, free bool) (map[Tier][]byte, map[Tier]map[string]int, error) {
-	tiers := make([]Tier, 0, len(route.KeyTiers)+1)
-	seen := make(map[Tier]bool, len(route.KeyTiers)+1)
-	addTier := func(tier Tier) {
-		if tier != TierZen && tier != TierGo || seen[tier] {
-			return
-		}
-		seen[tier] = true
-		tiers = append(tiers, tier)
-	}
-	addTier(route.Tier)
-	for _, tier := range route.KeyTiers {
-		addTier(tier)
-	}
-	if len(tiers) == 0 {
+func (rt *Runtime) prepareRouteBody(from protocol.Protocol, route Route, input map[string]any, free bool, tier Tier) ([]byte, map[string]int, error) {
+	if tier != TierZen && tier != TierGo {
 		return nil, nil, errors.New("no usable upstream tier")
 	}
-	bodies := make(map[Tier][]byte, len(tiers))
-	limits := make(map[Tier]map[string]int, len(tiers))
-	for _, tier := range tiers {
-		proto := route.ProtocolFor(tier)
-		baseURL := rt.cfg.Upstream.Zen
-		if tier == TierGo {
-			baseURL = rt.cfg.Upstream.Go
+	proto := route.ProtocolFor(tier)
+	baseURL := rt.cfg.Upstream.Zen
+	if tier == TierGo {
+		baseURL = rt.cfg.Upstream.Go
+	}
+	upstreamPayload, err := protocol.PrepareRequest(from, proto, input, baseURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("prepare %s upstream request: %w", tier, err)
+	}
+	// Only this endpoint requires a minimum Responses budget; never change
+	// public protocol conversion or larger caller-provided limits.
+	if proto == protocol.Responses {
+		var n float64
+		switch v := upstreamPayload["max_output_tokens"].(type) {
+		case int:
+			n = float64(v)
+		case float64:
+			n = v
+		case json.Number:
+			n, _ = v.Float64()
 		}
-		upstreamPayload, err := protocol.PrepareRequest(from, proto, input, baseURL)
-		if err != nil {
-			if tier != route.Tier {
-				continue
-			}
-			return nil, nil, fmt.Errorf("prepare %s upstream request: %w", tier, err)
-		}
-		// Only this endpoint requires a minimum Responses budget; never change
-		// public protocol conversion or larger caller-provided limits.
-		if proto == protocol.Responses {
-			var n float64
-			switch v := upstreamPayload["max_output_tokens"].(type) {
-			case int:
-				n = float64(v)
-			case float64:
-				n = v
-			case json.Number:
-				n, _ = v.Float64()
-			}
-			if n > 0 && n < 16 && math.Trunc(n) == n {
-				upstreamPayload["max_output_tokens"] = 16
-			}
-		}
-		if effort := rt.cfg.ForcedEffort(jsonutil.StringAt(upstreamPayload, "model")); effort != "" {
-			protocol.ForcedEffort(proto, upstreamPayload, effort)
-		}
-		if (route.Anonymous && tier == TierZen) || free {
-			shapeFreePayload(upstreamPayload, proto)
-		}
-		encoded, err := json.Marshal(upstreamPayload)
-		if err != nil {
-			return nil, nil, errors.New("request contains unsupported JSON values")
-		}
-		bodies[tier] = encoded
-		for _, key := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
-			var n float64
-			switch value := upstreamPayload[key].(type) {
-			case float64:
-				n = value
-			case int:
-				n = float64(value)
-			case json.Number:
-				n, _ = value.Float64()
-			}
-			if n > 0 && n <= 1<<30 && n == float64(int(n)) {
-				if limits[tier] == nil {
-					limits[tier] = map[string]int{}
-				}
-				limits[tier][key] = int(n)
-			}
+		if n > 0 && n < 16 && math.Trunc(n) == n {
+			upstreamPayload["max_output_tokens"] = 16
 		}
 	}
-	return bodies, limits, nil
+	if effort := rt.cfg.ForcedEffort(jsonutil.StringAt(upstreamPayload, "model")); effort != "" {
+		protocol.ForcedEffort(proto, upstreamPayload, effort)
+	}
+	if (route.Anonymous && tier == TierZen) || free {
+		shapeFreePayload(upstreamPayload, proto)
+	}
+	encoded, err := json.Marshal(upstreamPayload)
+	if err != nil {
+		return nil, nil, errors.New("request contains unsupported JSON values")
+	}
+	var limits map[string]int
+	for _, key := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
+		var n float64
+		switch value := upstreamPayload[key].(type) {
+		case float64:
+			n = value
+		case int:
+			n = float64(value)
+		case json.Number:
+			n, _ = value.Float64()
+		}
+		if n > 0 && n <= 1<<30 && n == float64(int(n)) {
+			if limits == nil {
+				limits = map[string]int{}
+			}
+			limits[key] = int(n)
+		}
+	}
+	return encoded, limits, nil
 }
 
 // copyErrorResponse relays an upstream error to the client and returns the

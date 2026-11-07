@@ -319,7 +319,6 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 			"usage":   result.anthropicUsage(),
 		}
 		logger.Info("[Claude][%s] 完成 stop=%s content_len=%d tool_calls=%d 耗时=%dms", reqID, stopReason, full.Len(), len(toolCallMerged), time.Since(startTime).Milliseconds())
-		logger.Debug("[Claude][%s] 响应体: %s", reqID, func() string { d, _ := json.Marshal(resp); return string(d) }())
 		WriteJSON(w, resp)
 		return result, nil
 	}

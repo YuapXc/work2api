@@ -15,6 +15,7 @@ import (
 	"time"
 	"work2api/internal/config"
 	"work2api/internal/core/provider"
+	"work2api/internal/requestdiag"
 	"work2api/internal/store"
 	"work2api/internal/workbuddy/billing"
 	"work2api/internal/workbuddy/credentials"
@@ -447,7 +448,7 @@ func (r *Runtime) Configure(cfg *config.Config, db *store.DB, sessions *SessionR
 	}
 }
 func (r *Runtime) RunOnce(ctx context.Context, acc *pool.Account, body map[string]any, sink func(string) error) (bool, error) {
-	started, err := r.Stream(ctx, acc, body, sink, AttemptOptions{Ratelimit: r.cfg.Ratelimit && !r.cfg.ModelLimitsDisabled, Interval: r.cfg.RatelimitInterval, LocalNetworkFailure: LocalNetworkFailure, Observe: func(line string) { Diagnostic(ctx).ObserveChunk(upstream.DecodeFrame(ctx, line)) }, OnAttempt: func(ref provider.AccountRef) { r.Sessions.Attempt(ctx, ref.LocalID) }})
+	started, err := r.Stream(ctx, acc, body, sink, AttemptOptions{Ratelimit: r.cfg.Ratelimit && !r.cfg.ModelLimitsDisabled, Interval: r.cfg.RatelimitInterval, LocalNetworkFailure: LocalNetworkFailure, Observe: func(line string) { requestdiag.Diagnostic(ctx).ObserveChunk(upstream.DecodeFrame(ctx, line)) }, OnAttempt: func(ref provider.AccountRef) { r.Sessions.Attempt(ctx, ref.LocalID) }})
 	var dispatch *provider.DispatchError
 	if errors.As(err, &dispatch) {
 		return started, provider.NewAPIError(dispatch.Status, dispatch.Message, dispatch.Type)

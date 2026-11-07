@@ -21,20 +21,38 @@ func (s *Server) refreshPortalRequest(w http.ResponseWriter, r *http.Request, p 
 	}
 	scope := p.AccountScope
 	admittedModel := p.EffectiveModel
+	routeName := p.RouteModel
+	var routeFacts routeRequestFacts
+	if p.RouteModel != "" {
+		routeFacts = p.routeRequestFacts(payload)
+	}
 	refresh := func(uid, actualModel string) *apiError {
-		fresh, aerr := s.o.checkAPIKey(r.Header.Get("Authorization"), r.Header.Get("X-Api-Key"))
+		fresh, aerr := s.o.checkAPIKeyIdentity(r.Header.Get("Authorization"), r.Header.Get("X-Api-Key"))
 		if aerr != nil {
 			return aerr
 		}
 		if fresh.AppID != p.AppID || fresh.UserID != p.UserID {
 			return errBody(403, "密钥归属已改变", "auth_error")
 		}
-		if p.RouteModel != "" {
-			route, err := s.o.modelRoute(p.RouteModel)
+		var route *store.ModelRoute
+		var requested []string
+		if routeName != "" {
+			var err error
+			route, err = s.o.modelRoute(routeName)
 			if err != nil || route == nil {
 				return errBody(403, "统一模型配置已撤销", "model_not_allowed")
 			}
-			members, aerr := s.routeCandidates(fresh, *route, payload)
+			requested = route.Members
+		} else if model := strOr(payload["model"], ""); model != "" {
+			requested = []string{model}
+		}
+		if fresh.UserID > 0 {
+			if aerr := s.o.attachPortalScopeForModels(fresh, requested); aerr != nil {
+				return aerr
+			}
+		}
+		if route != nil {
+			members, aerr := s.routeCandidatesWithFacts(fresh, *route, routeFacts, s.physicalCatalogForMembers(route.Members))
 			if aerr != nil {
 				return aerr
 			}
@@ -53,14 +71,15 @@ func (s *Server) refreshPortalRequest(w http.ResponseWriter, r *http.Request, p 
 				}
 				fresh.AccountScope = fresh.ModelScopes[s.o.resolveModel(actualModel)]
 			}
-			fresh.RouteModel, fresh.EffectiveModel = p.RouteModel, p.RouteModel
+			fresh.RouteModel, fresh.EffectiveModel = routeName, routeName
+			fresh.routeFacts = &routeFacts
 		} else if aerr := s.prepareModel(fresh, payload); aerr != nil {
 			return aerr
 		}
 		if admittedModel != "" && fresh.EffectiveModel != admittedModel {
 			return errBody(403, "模型映射已改变，请重新发起请求", "model_not_allowed")
 		}
-		if p.RouteModel == "" && actualModel != "" && s.o.resolveModel(strOr(payload["model"], "")) != s.o.resolveModel(actualModel) {
+		if routeName == "" && actualModel != "" && s.o.resolveModel(strOr(payload["model"], "")) != s.o.resolveModel(actualModel) {
 			return errBody(403, "模型映射已改变，请重新发起请求", "model_not_allowed")
 		}
 		if fresh.UserID > 0 && uid != "" && !fresh.AccountScope[uid] {

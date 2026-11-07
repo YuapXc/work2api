@@ -15,10 +15,10 @@ import (
 // supporting public credentials, retaining the channel's normal selection.
 func (o *Orchestrator) defaultModelAccess(settings map[string]string) (map[string]bool, map[string]map[string]bool) {
 	excluded, err := o.db.PrivatePoolExcludedUIDs()
-	return o.defaultModelAccessIn(settings, excluded, err)
+	return o.defaultModelAccessIn(settings, excluded, err, nil)
 }
 
-func (o *Orchestrator) defaultModelAccessIn(settings map[string]string, excluded map[string]bool, exclusionErr error) (map[string]bool, map[string]map[string]bool) {
+func (o *Orchestrator) defaultModelAccessIn(settings map[string]string, excluded map[string]bool, exclusionErr error, requested []string) (map[string]bool, map[string]map[string]bool) {
 	policy := store.DefaultPolicy(settings)
 	aliases := parseModelAliases(settings["model_aliases"])
 	resolve := func(m string) string {
@@ -29,54 +29,40 @@ func (o *Orchestrator) defaultModelAccessIn(settings map[string]string, excluded
 	}
 	defaults := map[string]bool{}
 	catalog := map[string]map[string]bool{}
-	for _, entry := range o.wb.Catalog.ListCached() {
-		id := str2(entry["id"])
-		if id != "" && id != "auto" {
-			catalog[id] = o.modelEntryAccountUIDs(entry)
-			if policy.Mode == "auto" {
-				for uid := range catalog[id] {
-					if a := o.wb.Pool.Get(uid); a != nil && a.Enabled && exclusionErr == nil && !excluded[uid] {
-						if m := o.manager(uid); m != nil && m.AuthorizationInvalid() {
-							continue
-						}
-						if cost := o.wb.Catalog.AccountCost(a.Profile, uid, id); cost != nil && *cost == 0 {
-							defaults[id] = true
-						}
-					}
+	discoverFree := policy.Mode == "auto"
+	eligibleForFreeEvidence := func(uid string) bool { return exclusionErr == nil && !excluded[uid] }
+	var selected map[string]map[string]bool
+	if requested != nil {
+		selected = map[string]map[string]bool{}
+		for _, model := range requested {
+			id := resolve(model)
+			if rt, ok := o.runtimes.Resolve(id); ok {
+				name := rt.Name()
+				if selected[name] == nil {
+					selected[name] = map[string]bool{}
 				}
+				selected[name][id] = true
 			}
 		}
 	}
-	if o.runtimes != nil {
-		for _, rt := range o.runtimes.Runtimes() {
-			eligible, ok := rt.(provider.PortalProvider)
-			if !ok || !eligible.SupportsPortal() {
+	for _, rt := range o.runtimes.Runtimes() {
+		models := selected[rt.Name()]
+		if selected != nil && len(models) == 0 {
+			continue
+		}
+		portal, ok := rt.(provider.PortalProvider)
+		source, hasCatalog := rt.(provider.PortalCatalog)
+		if !ok || !portal.SupportsPortal() || !hasCatalog {
+			continue
+		}
+		for _, model := range source.PortalModels(context.Background(), models, discoverFree, eligibleForFreeEvidence) {
+			if models != nil && !models[model.ID] {
 				continue
 			}
-			if rt.Name() != "workbuddy" {
-				for _, m := range rt.Models(context.Background()) {
-					uids, _ := m.Extra["account_uids"].([]string)
-					scope := map[string]bool{}
-					for _, uid := range uids {
-						scope[uid] = true
-					}
-					catalog[m.ID] = scope
-					if policy.Mode == "auto" && len(scope) > 0 {
-						if rt.Name() == "opencode" && m.Extra["upstream_free"] == true {
-							defaults[m.ID] = true
-						}
-						if rt.Name() == "qoder" && m.Extra["has_free_source"] == true {
-							defaults[m.ID] = true
-						}
-						if rt.Name() == "qoder" && m.Extra["pricing_known"] == true {
-							if factor, ok := m.Extra["price_factor"].(*float64); ok && factor != nil && *factor == 0 {
-								defaults[m.ID] = true
-							}
-						}
-					}
-				}
+			catalog[model.ID] = model.Accounts
+			if discoverFree && model.FreeSource {
+				defaults[model.ID] = true
 			}
-
 		}
 	}
 	for _, m := range policy.Include {
