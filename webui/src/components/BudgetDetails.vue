@@ -2,7 +2,7 @@
 import { ref } from 'vue'
 import WModal from './ui/WModal.vue'
 import type { Overview } from '@/types'
-import { abbr, credits } from '@/lib/format'
+import { abbr, credits, dt } from '@/lib/format'
 
 defineProps<{ prediction?: Overview['prediction'] }>()
 const open = ref(false)
@@ -20,15 +20,16 @@ const cost = (value: number) => new Intl.NumberFormat('zh-CN', { maximumSignific
           <span class="font-medium">{{ channel.label }}</span>
           <span class="mono text-brand">{{ channel.predicted_tokens == null ? '暂不可估算' : abbr(channel.predicted_tokens, 2) + ' Tokens' }}</span>
         </div>
-        <p v-if="channel.reason" class="mt-1 text-small text-faint">{{ channel.reason }}</p>
-        <details v-if="channel.free_models.length" class="mt-2 text-small"><summary class="cursor-pointer text-live">免费模型 · {{ channel.free_models.length }}</summary><p class="mt-1 break-words text-muted">{{ channel.free_models.join('、') }}</p></details>
+        <p v-if="channel.partial" class="mt-1 text-small text-warn">部分余额已计入</p>
+        <p v-else-if="channel.reason" class="mt-1 text-small text-faint">{{ channel.reason }}</p>
+        <details v-if="channel.free_models.length" class="mt-2 text-small"><summary class="cursor-pointer text-live">目录免费模型 · {{ channel.free_models.length }}</summary><p class="mt-1 break-words text-muted">{{ channel.free_models.join('、') }}</p></details>
         <div v-for="(pool, index) in channel.pools" :key="index" class="mt-3 min-w-0 rounded-lg border border-line bg-elevated p-3 text-small">
           <div class="flex flex-wrap justify-between gap-2">
             <span class="break-words text-muted">{{ pool.label }}<span class="ml-2 whitespace-nowrap text-micro text-faint">{{ pool.account_count }} 个账号</span></span>
             <span class="mono whitespace-nowrap">{{ pool.predicted_tokens == null ? '—' : abbr(pool.predicted_tokens, 2) + ' Tokens' }}</span>
           </div>
-          <p class="mt-1 text-muted">参与估算余额 {{ pool.remaining == null ? '未知' : credits(pool.remaining) + ' ' + pool.unit }}</p>
-          <p v-if="pool.known_balances < pool.account_count" class="mt-1 text-micro text-warn">已计入 {{ pool.known_balances }}/{{ pool.account_count }} 个账号的有效余额</p>
+          <p class="mt-1 text-muted">有效余额 {{ pool.remaining == null ? '未知' : credits(pool.remaining) + ' ' + pool.unit }}</p>
+          <p v-if="pool.known_balances < pool.eligible_accounts" class="mt-1 text-micro text-warn">已取得 {{ pool.known_balances }}/{{ pool.eligible_accounts }} 个账号的余额</p>
           <details v-if="pool.models.length" class="mt-2 text-micro text-faint">
             <summary class="cursor-pointer">模型构成与成本</summary>
             <div class="mt-2 max-h-64 overflow-auto rounded-md border border-line">
@@ -40,7 +41,10 @@ const cost = (value: number) => new Intl.NumberFormat('zh-CN', { maximumSignific
           </details>
           <details class="mt-2 text-micro text-faint">
             <summary class="cursor-pointer">账号余额与计算依据</summary>
-            <div v-for="(account, accountIndex) in pool.accounts" :key="accountIndex" class="mt-2 flex min-w-0 items-start justify-between gap-3"><span class="min-w-0 break-words">{{ account.label }}</span><span class="shrink-0">{{ !account.included ? (account.reason || '余额未知') : credits(account.remaining ?? 0) + ' ' + pool.unit }}</span></div>
+            <div v-for="(account, accountIndex) in pool.accounts" :key="accountIndex" class="mt-2">
+              <div class="flex min-w-0 items-start justify-between gap-3"><span class="min-w-0 break-words">{{ account.label }}</span><span class="shrink-0">{{ !account.included ? (account.reason || '余额未知') : credits(account.remaining) + ' ' + pool.unit }}</span></div>
+              <p v-if="account.included && account.expires_at && account.expiring > 0" class="mt-0.5">{{ dt(account.expires_at) }} 到期 · {{ credits(account.expiring) }} {{ pool.unit }}</p>
+            </div>
             <template v-if="pool.status === 'estimated'"><p class="mt-2">近 {{ pool.window_days }} 天消费样本 · {{ pool.samples }} 次付费调用</p><p class="mt-1">每{{ pool.unit }}约 {{ abbr(pool.tokens_per_unit || 0) }} Tokens</p></template>
             <p v-if="pool.excluded_credits > 0" class="mt-1">未计入过期或适用范围未确认额度 {{ credits(pool.excluded_credits) }}</p>
           </details>
@@ -53,6 +57,6 @@ const cost = (value: number) => new Intl.NumberFormat('zh-CN', { maximumSignific
       </article>
       </div>
       <p v-if="!prediction?.providers?.length" class="py-6 text-center text-small text-faint">暂无续航明细，请等待概览数据刷新。</p>
-      <details class="mt-3 text-micro text-faint"><summary class="cursor-pointer">估算说明</summary><p class="mt-2">已覆盖 {{ prediction?.estimated_pools ?? 0 }}/{{ prediction?.total_pools ?? 0 }} 个计费组。至少 5 次、1,000 Tokens 的有效付费样本才输出预测；模型比例优先近 7 天，各模型消费不足时参考近 30 天。同价账号共享样本，不同费率与可用范围分开估算；模型组合、缓存、价格与到期时间会影响实际续航。</p></details>
+      <details class="mt-3 text-micro text-faint"><summary class="cursor-pointer">估算说明</summary><p class="mt-2">按近 7 天模型占比和实测付费成本估算。样本不足时参考近 30 天；占用量或估算消耗一半以上的模型也需要足够样本。相同计费规则可共享成本样本，余额按适用范围分别统计。</p></details>
   </WModal>
 </template>

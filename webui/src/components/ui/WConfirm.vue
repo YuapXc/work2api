@@ -3,13 +3,18 @@
 import WModal from './WModal.vue'
 import WButton from './WButton.vue'
 import { confirmState, resolveConfirm } from '@/lib/confirm'
+import { watch } from 'vue'
+import { useRoute } from 'vue-router'
+
+const route = useRoute()
+watch(() => route.path, () => { if (confirmState.open) resolveConfirm(false) })
 </script>
 
 <template>
-  <WModal :open="confirmState.open" size="sm" :title="confirmState.title" @update:open="(v) => !v && resolveConfirm(false)">
+  <WModal :open="confirmState.open" confirmation size="sm" :title="confirmState.title" @update:open="(v) => !v && resolveConfirm(false)">
     <p v-if="confirmState.body" class="text-small text-muted">{{ confirmState.body }}</p>
     <template #footer>
-      <WButton variant="subtle" @click="resolveConfirm(false)">{{ confirmState.cancelText || '取消' }}</WButton>
+      <WButton variant="subtle" autofocus @click="resolveConfirm(false)">{{ confirmState.cancelText || '取消' }}</WButton>
       <WButton :variant="confirmState.tone === 'danger' ? 'danger' : 'primary'" @click="resolveConfirm(true)">
         {{ confirmState.okText || '确定' }}
       </WButton>

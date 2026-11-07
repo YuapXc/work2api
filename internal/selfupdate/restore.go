@@ -231,7 +231,7 @@ func restoreBackup(archive, digest, target, data, db string, validateOnly bool) 
 		}
 		relative, _ := filepath.Rel(data, path)
 		first := strings.Split(filepath.ToSlash(relative), "/")[0]
-		if first == ".updates" || first == "backups" || first == "logs" {
+		if first == ".updates" || first == ".usage-exports" || first == "backups" || first == "logs" {
 			if entry.IsDir() {
 				return filepath.SkipDir
 			}

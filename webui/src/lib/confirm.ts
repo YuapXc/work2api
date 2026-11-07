@@ -18,8 +18,12 @@ interface ConfirmState extends ConfirmOptions {
 export const confirmState = reactive<ConfirmState>({ open: false, title: '' })
 
 export function confirm(opts: ConfirmOptions): Promise<boolean> {
+  if (confirmState.open) return Promise.resolve(false)
   return new Promise((resolve) => {
-    Object.assign(confirmState, opts, { open: true, _resolve: resolve })
+    Object.assign(confirmState, {
+      body: undefined, okText: undefined, cancelText: undefined, tone: undefined,
+      ...opts, open: true, _resolve: resolve,
+    })
   })
 }
 

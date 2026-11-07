@@ -10,25 +10,29 @@ const tone: Record<string, string> = {
 
 <template>
   <Teleport to="body">
-    <div class="pointer-events-none fixed bottom-5 right-5 z-[60] flex flex-col gap-2">
+    <div class="pointer-events-none fixed bottom-5 right-5 z-[60] flex max-w-[calc(100vw-2.5rem)] flex-col gap-2" aria-live="polite">
       <TransitionGroup name="toast">
-        <div
+        <button
           v-for="t in toasts.items"
           :key="t.id"
-          class="glass pointer-events-auto flex max-w-sm items-start gap-2.5 rounded-lg border-l-2 px-3.5 py-2.5 shadow-glass"
+          type="button"
+          class="glass pointer-events-auto flex max-w-sm items-start gap-2.5 rounded-lg border-l-2 px-3.5 py-2.5 text-left shadow-glass"
           :class="tone[t.tone]"
           @click="dismiss(t.id)"
         >
-          <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-current" />
-          <span class="text-small text-ink">{{ t.text }}</span>
-        </div>
+          <span aria-hidden="true" class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-current" />
+          <span class="min-w-0 break-words text-small text-ink">{{ t.text }}</span>
+        </button>
       </TransitionGroup>
     </div>
   </Teleport>
 </template>
 
 <style scoped>
-.toast-enter-active, .toast-leave-active { transition: all 0.25s ease; }
+.toast-enter-active, .toast-leave-active { transition: opacity 0.25s ease, transform 0.25s ease; }
 .toast-enter-from { opacity: 0; transform: translateX(16px); }
 .toast-leave-to { opacity: 0; transform: translateX(16px); }
+@media (prefers-reduced-motion: reduce) {
+  .toast-enter-active, .toast-leave-active { transition: none; }
+}
 </style>

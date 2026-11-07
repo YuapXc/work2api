@@ -55,7 +55,7 @@ async function refresh() {
  finally { if (alive) loading.value = false }
 }
 function schedule() {
- timer = setTimeout(async () => { if (alive && !document.hidden && !failed.value) await refresh(); if (alive) schedule() }, 5000)
+ timer = setTimeout(async () => { if (alive && !document.hidden) await refresh(); if (alive) schedule() }, failed.value ? 30000 : 5000)
 }
 async function loadOptions() {
  const id = selectedID.value
@@ -88,7 +88,7 @@ async function apply(action: 'switch' | 'reselect' | 'cancel') {
  finally { if (alive) saving.value = false }
 }
 function keydown(event: KeyboardEvent) {
- if (!selectedID.value) return
+ if (!selectedID.value || event.defaultPrevented) return
  if (event.key === 'Escape') { event.preventDefault(); close() }
  if (event.key === 'Tab') {
   const elements = Array.from(drawer.value?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex="0"]') || []).filter(el => el.getClientRects().length)

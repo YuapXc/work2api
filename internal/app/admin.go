@@ -72,6 +72,7 @@ func (s *Server) mountAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/usage/recent", s.adminUsageRecent)
 	mux.HandleFunc("GET /admin/usage/filters", s.adminUsageFilters)
 	mux.HandleFunc("GET /admin/usage/{id}", s.adminUsageDetail)
+	s.mountUsageExport(mux)
 	mux.HandleFunc("GET /admin/models", s.adminModels)
 	mux.HandleFunc("GET /admin/models/catalog", s.adminModelCatalog)
 	mux.HandleFunc("GET /admin/model-routes", s.adminModelRoutes)

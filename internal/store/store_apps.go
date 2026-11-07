@@ -470,19 +470,27 @@ func (d *DB) UserDailyUsage(userID int64, dayStart float64) (requests, inputToke
 // scanRows scans all rows into []map[string]any with driver-native types,
 // mirroring Python's sqlite3.Row → dict.
 func scanRows(rows *sql.Rows) ([]map[string]any, error) {
-	cols, err := rows.Columns()
+	out := []map[string]any{}
+	err := visitRows(rows, func(row map[string]any) error { out = append(out, row); return nil })
 	if err != nil {
 		return nil, err
 	}
-	out := []map[string]any{}
+	return out, rows.Err()
+}
+
+func visitRows(rows *sql.Rows, visit func(map[string]any) error) error {
+	cols, err := rows.Columns()
+	if err != nil {
+		return err
+	}
+	vals := make([]any, len(cols))
+	ptrs := make([]any, len(cols))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
 	for rows.Next() {
-		vals := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range vals {
-			ptrs[i] = &vals[i]
-		}
 		if err := rows.Scan(ptrs...); err != nil {
-			return nil, err
+			return err
 		}
 		m := make(map[string]any, len(cols))
 		for i, c := range cols {
@@ -494,9 +502,11 @@ func scanRows(rows *sql.Rows) ([]map[string]any, error) {
 				m[c] = v
 			}
 		}
-		out = append(out, m)
+		if err := visit(m); err != nil {
+			return err
+		}
 	}
-	return out, rows.Err()
+	return nil
 }
 
 func str(v any) string {

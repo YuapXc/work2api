@@ -257,7 +257,7 @@ func (o *Orchestrator) runBackup(ctx context.Context) (err error) {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if path == filepath.Join(o.cfg.DataDir, ".updates") || path == root || (path != source && (d.Name() == ".git" || d.Name() == "logs")) {
+			if path == filepath.Join(o.cfg.DataDir, ".updates") || path == filepath.Join(o.cfg.DataDir, usageExportDir) || path == root || (path != source && (d.Name() == ".git" || d.Name() == "logs")) {
 				if d.IsDir() {
 					return filepath.SkipDir
 				}

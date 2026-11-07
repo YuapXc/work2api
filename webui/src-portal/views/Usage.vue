@@ -14,13 +14,17 @@ defineProps<{ me: Me }>()
 const records=ref<UsageRecord[]>([])
 const page=ref(1), total=ref(0), logsLoading=ref(false), logsError=ref('')
 const model=ref(''), protocol=ref(''), status=ref('')
+let appliedFilters = { model: '', protocol: '', status: '' }
 const detail=ref<UsageRecord|null>(null), detailOpen=ref(false), detailLoading=ref(false), detailError=ref('')
 let version=0, detailVersion=0, disposed=false
 onUnmounted(()=>{disposed=true;version++;detailVersion++})
 async function loadLogs(reset=false) {
- if(reset)page.value=1
+ if(reset) {
+  page.value=1
+  appliedFilters = {model:model.value.trim(),protocol:protocol.value,status:status.value}
+ }
  const current=++version;logsLoading.value=true;logsError.value=''
- try { const result=await api.usageRecords(page.value,{model:model.value.trim(),protocol:protocol.value,status:status.value});if(disposed || current!==version)return;records.value=result.records;total.value=result.total }
+ try { const result=await api.usageRecords(page.value,appliedFilters);if(disposed || current!==version)return;records.value=result.records;total.value=result.total }
  catch(e:any){if(!disposed && current===version)logsError.value=e?.message || '加载调用记录失败'}
  finally{if(!disposed && current===version)logsLoading.value=false}
 }

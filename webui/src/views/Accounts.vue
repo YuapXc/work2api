@@ -86,14 +86,17 @@ async function runAccountCheck() {
   try { checkResult.value = await api.checkAccount(row.provider, row.id); await load() }
   finally { checking.value = false }
 }
+let confirmingAccountTest = false
 async function runAccountTest() {
   const row = checkTarget.value; const model = checkModel.value
-  if (!row || !model || testing.value || checking.value) return
-  testing.value = true
+  if (!row || !model || confirmingAccountTest || testing.value || checking.value) return
+  confirmingAccountTest = true
   try {
     if (!await confirm({ title: '真实调用测试', body: '会使用选定账号实际调用该模型，可能消耗额度。只发送最小测试内容，不会换号；不会加入用户用量和续航估算。', okText: '开始测试' })) return
+    if (!checkOpen.value || checkTarget.value?.key !== row.key || checkModel.value !== model) return
+    testing.value = true
     modelTestResult.value = await api.testAccount(row.provider, row.id, model); await load()
-  } finally { testing.value = false }
+  } finally { confirmingAccountTest = false; testing.value = false }
 }
 let checkPoll: ReturnType<typeof setInterval> | null = null
 let checkPollRunning = false
@@ -880,6 +883,7 @@ onMounted(() => {
 })
 // 组件卸载时停掉可能残留的扫码轮询/悬浮层关闭定时器，避免离开页面后仍在轮询
 onUnmounted(() => {
+  checkOpen.value = false
   if (checkPoll) clearInterval(checkPoll)
   loadVersion++
   stopPoll()
@@ -1018,7 +1022,9 @@ async function saveConfig() {
             <template v-if="row.raw.credits_remaining != null">
               <span class="mono text-ink">{{ fmtCredits(row.raw.credits_remaining) }}</span>
               <span v-if="row.raw.credits_total != null" class="mono text-faint"> / {{ fmtCredits(row.raw.credits_total) }}</span>
+              <span v-if="row.provider === 'qoder' && row.raw.quota_unit && row.raw.quota_unit !== 'credits'" class="ml-1 text-micro text-faint">{{ row.raw.quota_unit }}</span>
             </template>
+            <span v-else-if="row.raw.quota_mixed_units" class="text-muted" title="资源包的计量单位不同，明细按资源包列出">分项额度</span>
             <span v-else-if="row.raw.tier" class="text-muted">{{ row.raw.key_count }} {{ row.raw.tier === 'anonymous' ? '个入口' : '个密钥' }}</span>
             <span v-else class="text-faint">未上报</span>
             <div v-if="row.raw.quota_refresh_failed || row.raw.quota_stale || row.raw.plan" class="mt-1 flex justify-end gap-2 text-micro text-faint"><button v-if="row.raw.quota_reauthorize" type="button" class="text-warn hover:underline" @click="reauthorizeAccount(row)">需重新授权</button><span v-else-if="row.raw.quota_refresh_failed" class="text-warn" :title="row.raw.quota_updated_at ? '最后成功：' + dt(row.raw.quota_updated_at) : '尚未成功获取额度'">刷新失败</span><span v-else-if="row.raw.quota_stale">缓存过期</span><span v-if="row.raw.plan" :title="`上游账号套餐：${row.raw.plan}；不代表模型调用免费`">套餐：{{ String(row.raw.plan).toLowerCase() === 'free' ? '免费' : row.raw.plan }}</span></div>

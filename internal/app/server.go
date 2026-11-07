@@ -21,10 +21,11 @@ import (
 
 // Server is the HTTP surface over an Orchestrator.
 type Server struct {
-	updater   *selfupdate.Manager
-	calls     callMonitor
-	resources resourceMonitor
-	o         *Orchestrator
+	updater      *selfupdate.Manager
+	calls        callMonitor
+	resources    resourceMonitor
+	usageExports usageExportQueue
+	o            *Orchestrator
 	// adminSessions + loginLimiter back the WebUI login (HttpOnly cookie
 	// sessions). In-memory only: restart signs everyone out.
 	sessions                                                    *adminSessionManager
@@ -80,6 +81,7 @@ type principalContextKey struct{}
 
 // NewServer builds the HTTP server.
 func NewServer(o *Orchestrator) *Server {
+	clearOldUsageExports(o.cfg.DataDir)
 	bodyLimit := int64(positiveOr(int(o.cfg.RequestBodyBudget), config.DefaultRequestBodyBudget))
 	if o.cfg.ModelLimitsDisabled {
 		bodyLimit = max(int64(0), o.cfg.RequestBodyBudget)
@@ -116,7 +118,7 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) stateGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/admin/backups" {
+		if r.URL.Path != "/admin/backups" && !(strings.HasPrefix(r.URL.Path, "/admin/usage/exports/") && strings.HasSuffix(r.URL.Path, "/download")) {
 			leave := statebackup.Enter()
 			defer leave()
 		}

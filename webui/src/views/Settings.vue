@@ -33,13 +33,15 @@ const s = reactive<Record<string, string>>({
 const accountChecks = ref(true)
 const keepalive = ref(true)
 const maintenanceProviders = ref<ProviderSummary[]>([])
+const maintenanceFailed = ref(false)
 const maintenanceValues = reactive<Record<string, boolean>>({})
 const backupEnabled = ref(false)
 const backingUp = ref(false)
 const backup = ref<{ status: string; last_success: number | null }>({ status: '', last_success: null })
+const backupFailed = ref(false)
 async function createBackup() {
   backingUp.value = true
-  try { backup.value = await api.createBackup(); toast.success('完整备份已保存到服务器数据目录') }
+  try { backup.value = await api.createBackup(); backupFailed.value = false; toast.success('完整备份已保存到服务器数据目录') }
   finally { backingUp.value = false }
 }
 const costAware = ref(true)
@@ -57,12 +59,15 @@ async function load() {
     for (const k of Object.keys(s)) if (data[k] != null) s[k] = String(data[k])
     accountChecks.value = String(data.account_check_enabled ?? '1') === '1'
     keepalive.value = String(data.keepalive_enabled ?? '1') === '1'
-    maintenanceProviders.value = (await api.getProviders()).providers.filter(p => p.maintenance?.length)
+    const [providers, backupStatus] = await Promise.allSettled([api.getProviders(), api.backupStatus()])
+    maintenanceFailed.value = providers.status === 'rejected'
+    maintenanceProviders.value = providers.status === 'fulfilled' ? providers.value.providers.filter(p => p.maintenance?.length) : []
     for (const p of maintenanceProviders.value) for (const option of p.maintenance || []) {
       maintenanceValues[option.key] = String(data[option.key] ?? (option.default ? '1' : '0')) === '1'
     }
     backupEnabled.value = String(data.backup_enabled ?? '0') === '1'
-    backup.value = await api.backupStatus()
+    backupFailed.value = backupStatus.status === 'rejected'
+    if (backupStatus.status === 'fulfilled') backup.value = backupStatus.value
     costAware.value = String(data.cost_aware_routing ?? '1') === '1'
     alertOn.value = String(data.alert_enabled ?? '0') === '1'
     aaEnabled.value = !!data.aa_enabled
@@ -153,6 +158,7 @@ onMounted(load)
             <div class="flex items-center justify-between gap-3"><div><label for="account-checks" class="text-small text-ink">定时账号检查</label><p class="text-micro text-faint">只读验证，复用近期维护结果；不会定时调用模型或启用已停用账号。</p></div><WToggle id="account-checks" v-model="accountChecks" /></div>
             <div class="grid grid-cols-[1fr_9rem] items-center gap-3"><label class="text-small text-muted">检查间隔（分）</label><WInput v-model="s.account_check_interval_min" placeholder="30" :disabled="!accountChecks" /></div>
           </div>
+          <p v-if="maintenanceFailed" role="status" class="text-small text-warn">渠道维护选项暂不可用，保存其他设置时会保留当前维护配置。</p>
           <div v-for="p in maintenanceProviders" :key="p.name" class="space-y-3 rounded-lg border border-line p-3">
             <div class="text-small font-medium text-ink">{{ p.display_name }} 维护</div>
             <div v-for="option in p.maintenance" :key="option.key" class="flex items-center justify-between gap-3">
@@ -182,7 +188,8 @@ onMounted(load)
             <WToggle v-model="backupEnabled" />
           </div>
           <p class="text-micro text-faint">开关在保存设置后生效。有调用或数据操作时稍后重试；捕获快照期间短暂协调数据访问。服务器反代、证书等额外文件需通过 BACKUP_EXTRA_PATHS 配置。</p>
-          <p class="text-micro text-muted">最近成功：{{ backup.last_success ? new Date(backup.last_success * 1000).toLocaleString() : '暂无' }} · {{ ({ running: '备份中', failed: '失败，请查看服务日志', complete: '完成' } as Record<string, string>)[backup.status] || '未执行' }}</p>
+          <p v-if="backupFailed" role="status" class="text-micro text-warn">备份状态暂不可用。</p>
+          <p v-else class="text-micro text-muted">最近成功：{{ backup.last_success ? new Date(backup.last_success * 1000).toLocaleString() : '暂无' }} · {{ ({ running: '备份中', failed: '失败，请查看服务日志', complete: '完成' } as Record<string, string>)[backup.status] || '未执行' }}</p>
           <WButton :loading="backingUp" @click="createBackup">立即备份</WButton>
         </div>
       </WCard>

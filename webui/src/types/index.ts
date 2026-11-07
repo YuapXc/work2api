@@ -331,6 +331,7 @@ export interface Overview {
   recent: UsageRecord[]
   prediction?: {
     predicted_tokens: number | null
+    partial: boolean
     estimated_pools: number
     total_pools: number
     error?: string
@@ -338,6 +339,7 @@ export interface Overview {
       provider: string
       label: string
       predicted_tokens: number | null
+      partial: boolean
       estimated_pools: number
       free_models: string[]
       reason?: string
@@ -358,7 +360,8 @@ export interface Overview {
         scope: string
         account_count: number
         known_balances: number
-        accounts: { label: string; remaining: number | null; included: boolean; reason: string; stale: boolean; deferred: boolean }[]
+        eligible_accounts: number
+        accounts: { label: string; remaining: number | null; included: boolean; reason: string; stale: boolean; deferred: boolean; expires_at: number | null; expiring: number }[]
         models: { model: string; token_share: number; credits_per_million_tokens: number | null; samples: number; window_days: number }[]
         missing_models: string[]
       }[]

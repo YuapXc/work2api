@@ -1,9 +1,9 @@
 <script setup lang="ts">
-// 贡献账号：WorkBuddy 扫码（设备授权流程）。弹出授权链接，用户在新窗口
-// 打开登录后这里轮询；完成即获得资格。也可随时撤回（立即撤回贡献调度）。
+// 门户账号授权、导入和共享状态。
 import { ref, watch, onMounted, onUnmounted } from 'vue'
 import { api, PortalAPIError, fmtTime, type ContributionInfo, type Me } from '../api'
 import { toast } from '../../src/lib/toast'
+import { confirm } from '../../src/lib/confirm'
 import WButton from '../../src/components/ui/WButton.vue'
 import WInput from '../../src/components/ui/WInput.vue'
 
@@ -121,7 +121,7 @@ async function cancelPoll() {
 
 async function revoke(c: ContributionInfo) {
   if (rowBusy.value.has(c.id) || refreshing.value === c.id) return
-  if (!confirm('撤回贡献后，该账号仅供你本人使用。其他用户正在执行的请求可以完成，后续请求不能再选中该账号。确定撤回贡献？')) return
+  if (!await confirm({ title: '撤回贡献？', body: '该账号将仅供你本人使用。其他用户正在执行的请求可以完成。', okText: '撤回贡献' }) || disposed) return
   rowBusy.value.add(c.id)
   try {
     await api.revokeContribution(c.id)
@@ -145,7 +145,7 @@ const statusText: Record<string, string> = {
 }
 async function share(c: ContributionInfo) {
   if (rowBusy.value.has(c.id) || refreshing.value === c.id) return
-  if (!confirm('重新贡献后，获授权用户可使用此账号并消耗它的额度。你仍保留本人使用权，账号原有停用和冷却状态不会被清除。确认重新贡献？')) return
+  if (!await confirm({ title: '重新贡献账号？', body: '获授权用户可以使用此账号并消耗额度。你仍保留本人使用权，现有停用和冷却状态继续生效。', okText: '重新贡献' }) || disposed) return
   rowBusy.value.add(c.id)
   try { await api.shareContribution(c.id); if (disposed) return; await load(); emit('refresh'); toast.success('已重新贡献') }
   catch (e: any) { if (!disposed) toast.error(e?.message || '重新贡献失败') } finally { rowBusy.value.delete(c.id) }

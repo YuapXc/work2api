@@ -14,12 +14,27 @@ import (
 // log writes, without allowing unbounded parallel full-history scans. Memory
 // and custom URI databases retain their original connection semantics.
 func (d *DB) openAnalytics(path string) {
-	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file:") {
+	reader, err := newReadOnlyAnalytics(path)
+	if err == nil && reader != nil {
+		err = reader.Ping()
+	}
+	if err != nil {
+		if reader != nil {
+			_ = reader.Close()
+		}
+		log.Printf("统计只读连接不可用，沿用主连接: %v", err)
 		return
+	}
+	d.analyticsDB = reader
+}
+
+func newReadOnlyAnalytics(path string) (*sql.DB, error) {
+	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file:") {
+		return nil, nil
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return
+		return nil, err
 	}
 	name := filepath.ToSlash(abs)
 	if !strings.HasPrefix(name, "/") {
@@ -31,16 +46,8 @@ func (d *DB) openAnalytics(path string) {
 	reader, err := sql.Open("sqlite", u.String())
 	if err == nil {
 		reader.SetMaxOpenConns(1)
-		err = reader.Ping()
 	}
-	if err != nil {
-		if reader != nil {
-			_ = reader.Close()
-		}
-		log.Printf("统计只读连接不可用，沿用主连接: %v", err)
-		return
-	}
-	d.analyticsDB = reader
+	return reader, err
 }
 
 func (d *DB) analyticsReader() (*sql.DB, func()) {

@@ -1,11 +1,9 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { api } from '@/api/client'
+import { api, type UsageExport } from '@/api/client'
 import type { UsageSummary, UsagePoint, UsageRecord } from '@/types'
-import { toast } from '@/lib/toast'
-import { int, abbr, dt, pct } from '@/lib/format'
-import { tokensKnown } from '@/lib/usage-log'
+import { int, abbr, pct } from '@/lib/format'
 import WPage from '@/components/ui/WPage.vue'
 import WCard from '@/components/ui/WCard.vue'
 import WTabs from '@/components/ui/WTabs.vue'
@@ -163,46 +161,83 @@ async function openDetail(id: number) {
   finally {if(!disposed && version===detailVersion)detailLoading.value=false}
 }
 
-// 导出 CSV（遍历全部分页）
-const exporting = ref(false)
-async function exportCSV() {
-  exporting.value = true
-  try {
-    const exportFilters={...filters.value}
-    const all: UsageRecord[] = []
-    let p = 1
-    for (;;) {
-      const res = await api.usageRecent(p, 100, exportFilters)
-      all.push(...(res.records || []))
-      if (all.length >= (res.total || 0) || !res.records?.length) break
-      p++
-    }
-    const head = ['时间','请求标识','调用模型','实际模型','协议','Key','账号','输入Tokens','输出Tokens','缓存读取Tokens','最终命中消耗','消耗渠道','总耗时ms','排队ms','账号等待ms','首响应ms','首生成ms','生成阶段耗时ms','上游尝试次数','客户端HTTP状态','结果','结束原因']
-    const cell=(v: unknown) => {
-      let text=String(v ?? '')
-      if(typeof v==='string' && /^[=+@\-\t\r]/.test(text))text="'"+text
-      return '"'+text.replace(/"/g,'""')+'"'
-    }
-    const lines = all.map(r=>{
-      const p=r.diagnostics?.performance, known=tokensKnown(r)
-      const physical=r.diagnostics?.physical_model || r.model
-      const channel=physical.includes('/')?physical.split('/')[0]:'workbuddy'
-      return [dt(r.ts,'YYYY-MM-DD HH:mm:ss'),p?.request_id,r.diagnostics?.requested_model || r.model,physical,r.protocol,r.app_name,r.account_uid,
-        known?r.input_tokens:null,known?r.output_tokens:null,r.cached_tokens,r.credit_known?r.credits:null,channel,p?.total_ms ?? r.latency_ms,
-        p?.queue_ms,p?.account_wait_ms,p?.first_byte_ms,p?.first_generation_ms,p?.generation_ms,p?.attempts,p?.http_status,r.status,r.diagnostics?.finish_reason].map(cell).join(',')
-    })
-    const blob = new Blob(['﻿' + [head.join(','), ...lines].join('\n')], { type: 'text/csv;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `usage-${dt(Date.now() / 1000, 'YYYYMMDD-HHmm')}.csv`
-    a.click()
-    URL.revokeObjectURL(url)
-    toast.success(`已导出 ${all.length} 条`)
-  } finally {
-    exporting.value = false
+const exportJob = ref<UsageExport | null>(null)
+const exportStarting = ref(false)
+const exportCancelling = ref(false)
+const exportPollingFailed = ref(false)
+const exportActive = computed(() => exportJob.value?.status === 'running' || exportJob.value?.status === 'cancelling')
+let exportTimer: ReturnType<typeof setTimeout> | undefined
+let exportPoll: AbortController | undefined
+
+function stopExportPoll() {
+  clearTimeout(exportTimer)
+  exportPoll?.abort()
+  exportPoll = undefined
+}
+
+function updateExportJob(job: UsageExport) {
+  exportJob.value = job
+  clearTimeout(exportTimer)
+  if (exportActive.value) {
+    exportTimer = setTimeout(() => { void pollExport() }, 1000)
+  } else if (job.status === 'ready' && job.expires_at) {
+    exportTimer = setTimeout(() => {
+      exportJob.value = { ...job, status: 'failed', error: '导出任务已过期，请重新导出。' }
+    }, Math.max(0, job.expires_at - Date.now()))
   }
 }
+
+async function pollExport() {
+  const id = exportJob.value?.id
+  if (!id || exportPoll || disposed || exportCancelling.value) return
+  const controller = new AbortController()
+  exportPoll = controller
+  exportPollingFailed.value = false
+  try {
+    const job = await api.usageExport(id, controller.signal)
+    if (disposed || exportPoll !== controller || exportJob.value?.id !== id) return
+    updateExportJob(job)
+  } catch (error: any) {
+    if (disposed || controller.signal.aborted || exportJob.value?.id !== id) return
+    if (error?.response?.status === 404) exportJob.value = { id, count: 0, status: 'failed', error: '导出任务已过期，请重新导出。' }
+    else exportPollingFailed.value = true
+  } finally {
+    if (exportPoll === controller) exportPoll = undefined
+  }
+}
+
+async function exportCSV() {
+  if (exportStarting.value || exportActive.value) return
+  exportStarting.value = true
+  exportPollingFailed.value = false
+  try {
+    const job = await api.startUsageExport({ ...filters.value, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC' })
+    if (disposed) { void api.cancelUsageExport(job.id).catch(() => {}); return }
+    updateExportJob(job)
+  } catch { /* The API client presents the server error. */ }
+  finally { exportStarting.value = false }
+}
+
+async function cancelExport() {
+  const id = exportJob.value?.id
+  if (!id || exportCancelling.value) return
+  exportCancelling.value = true
+  stopExportPoll()
+  try {
+    const job = await api.cancelUsageExport(id)
+    if (!disposed) updateExportJob(job)
+  } catch { exportPollingFailed.value = true }
+  finally { exportCancelling.value = false }
+}
+
+onUnmounted(() => {
+  stopExportPoll()
+  if (exportActive.value && exportJob.value) {
+    void fetch('/admin/usage/exports/' + encodeURIComponent(exportJob.value.id), {
+      method: 'DELETE', credentials: 'same-origin', keepalive: true,
+    }).catch(() => {})
+  }
+})
 
 function loadTab(value: string) {
   if (value === 'analytics') void loadAnalytics().catch(() => {})
@@ -284,11 +319,24 @@ onMounted(() => loadTab(tab.value))
         <WSelect v-model="filters.status" :options="filterOpts.statuses.map((s) => ({ value: s, label: s }))" placeholder="全部状态" class="w-28" @update:model-value="applyFilter" />
         <WButton variant="subtle" size="sm" @click="resetFilter">重置</WButton>
         <div class="ml-auto flex items-center gap-2">
-          <WButton variant="ghost" size="sm" :loading="exporting" @click="exportCSV"><WIcon name="download" :size="15" /> 导出</WButton>
+          <WButton variant="ghost" size="sm" :loading="exportStarting" :disabled="exportActive" @click="exportCSV"><WIcon name="download" :size="15" /> 导出</WButton>
           <WButton variant="ghost" size="sm" @click="loadLogs"><WIcon name="refresh" :size="15" /> 刷新</WButton>
         </div>
       </div>
 
+      <div v-if="exportJob" class="mb-3 flex flex-wrap items-center gap-2 text-small text-muted" role="status">
+        <template v-if="exportActive">
+          <span>{{ exportJob.status === 'cancelling' ? '正在取消导出…' : '正在生成 CSV…' }}</span>
+          <WButton v-if="exportJob.status === 'running'" size="sm" :loading="exportCancelling" @click="cancelExport">取消导出</WButton>
+          <WButton v-if="exportPollingFailed" size="sm" @click="pollExport">重试读取状态</WButton>
+        </template>
+        <template v-else-if="exportJob.status === 'ready'">
+          <span>CSV 已就绪，共 {{ int(exportJob.count) }} 条，最多保留 15 分钟。</span>
+          <a :href="'/admin/usage/exports/' + encodeURIComponent(exportJob.id) + '/download'" download target="_blank" rel="noopener" class="text-brand hover:underline">下载 CSV</a>
+        </template>
+        <span v-else-if="exportJob.status === 'cancelled'">已取消导出。</span>
+        <span v-else class="text-fault">{{ exportJob.error || '导出失败，请重试。' }}</span>
+      </div>
       <p v-if="logError" class="mb-3 text-small text-fault">{{ logError }}</p>
       <WCard flush>
         <WSpinner v-if="logLoading && !records.length" center label="加载中" />

@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -29,6 +30,135 @@ import (
 	"work2api/internal/streamwatch"
 	"work2api/internal/trae"
 )
+
+func TestAdminUsageExportMatchesGroupedLogsAndCleansUp(t *testing.T) {
+	s, _ := portalFixture(t)
+	s.o.cfg.AdminToken = "fixture-export-token"
+	s.o.cfg.DataDir = t.TempDir()
+	for _, mgr := range s.o.wb.Managers {
+		s.o.cfg.DBPath = filepath.Join(filepath.Dir(mgr.Path()), "test.db")
+		break
+	}
+	t.Cleanup(s.CloseUsageExports)
+	handler := s.Handler()
+	owner := &http.Cookie{Name: cookieName, Value: s.sessions.create()}
+	other := &http.Cookie{Name: cookieName, Value: s.sessions.create()}
+	request := func(method, path, body string, session *http.Cookie, byteRange string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, "http://localhost"+path, strings.NewReader(body))
+		r.RemoteAddr = "127.0.0.1:41000"
+		r.Header.Set("Sec-Fetch-Site", "same-origin")
+		if session != nil {
+			r.AddCookie(session)
+		}
+		if byteRange != "" {
+			r.Header.Set("Range", byteRange)
+		}
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+	zero, zeroMS, zeroCost := 0, int64(0), float64(0)
+	known, unknown := true, false
+	p := store.UsageParams{
+		Timestamp: float64(time.Date(2026, 11, 7, 19, 15, 0, 0, time.UTC).Unix()),
+		Model:     "test", Protocol: "responses", AppName: "  =formula", AccountUID: "test-account",
+		InputTokens: 12, OutputTokens: 7, TokensKnown: &known, CachedTokens: &zero, Credits: &zeroCost,
+		InputContent: "search-needle", Status: "error", Error: "private error",
+		Diagnostics: &store.UsageDiagnostics{RequestedModel: "group/test", PhysicalModel: "trae/test",
+			Performance: &store.UsagePerformance{RequestID: strings.Repeat("a", 32), FirstGenerationMS: &zeroMS, HTTPStatus: 200}},
+	}
+	insert := func(p store.UsageParams) {
+		t.Helper()
+		if err := s.o.db.LogUsage(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert(p)
+	p.Status = "ok"
+	p.Diagnostics.FinishReason = "stop"
+	insert(p)
+	p.Diagnostics = &store.UsageDiagnostics{RequestedModel: "group/test", PhysicalModel: "opencode/test"}
+	p.TokensKnown, p.CachedTokens, p.Credits = &unknown, nil, nil
+	insert(p)
+	p.InputContent = "other"
+	insert(p)
+
+	const base = "/admin/usage/exports"
+	const filters = `{"protocol":"responses","model":"group/test","search":"search-needle","timezone":"Asia/Shanghai"}`
+	start := func() usageExport {
+		t.Helper()
+		w := request("POST", base, filters, owner, "")
+		var job usageExport
+		if w.Code != 202 || json.Unmarshal(w.Body.Bytes(), &job) != nil || job.ID == "" {
+			t.Fatalf("start: %d %s", w.Code, w.Body)
+		}
+		return job
+	}
+	job := start()
+	path := base + "/" + job.ID
+	download := path + "/download"
+	s.usageExports.mu.Lock()
+	done := s.usageExports.job.done
+	csvPath := s.usageExports.job.path
+	s.usageExports.mu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("export did not finish")
+	}
+	w := request("GET", path, "", owner, "")
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &job) != nil || job.Status != "ready" || job.Count != 2 || job.Expired() {
+		t.Fatalf("export status: %d %s", w.Code, w.Body)
+	}
+	list := request("GET", "/admin/usage/recent?group=request&protocol=responses&model=group%2Ftest&search=search-needle", "", owner, "")
+	if list.Code != 200 || !strings.Contains(list.Body.String(), `"total":2`) {
+		t.Fatalf("grouped list: %d %s", list.Code, list.Body)
+	}
+	if w := request("GET", download, "", nil, ""); w.Code != 401 {
+		t.Fatalf("unauthenticated download: %d", w.Code)
+	}
+	if w := request("GET", download, "", other, ""); w.Code != 404 {
+		t.Fatalf("another admin session downloaded export: %d", w.Code)
+	}
+	if w := request("GET", download, "", owner, "bytes=0-2"); w.Code != 206 || w.Body.String() != "\ufeff" {
+		t.Fatalf("range: %d %q", w.Code, w.Body.String())
+	}
+	w = request("GET", download, "", owner, "")
+	content := w.Body.String()
+	if w.Code != 200 || w.Header().Get("Cache-Control") != "no-store" ||
+		!strings.HasPrefix(w.Header().Get("Content-Disposition"), "attachment;") || !strings.HasPrefix(content, "\ufeff") ||
+		strings.Contains(content, "search-needle") || strings.Contains(content, "private error") {
+		t.Fatalf("download: %d %v %q", w.Code, w.Header(), content)
+	}
+	rows, err := csv.NewReader(strings.NewReader(strings.TrimPrefix(content, "\ufeff"))).ReadAll()
+	if err != nil || len(rows) != 3 || len(rows[0]) != 22 ||
+		rows[1][3] != "opencode/test" || rows[1][7] != "" || rows[1][10] != "" ||
+		rows[2][0] != "2026-11-08 03:15:00" || rows[2][3] != "trae/test" || rows[2][5] != "'  =formula" ||
+		rows[2][7] != "12" || rows[2][9] != "0" || rows[2][10] != "0" || rows[2][16] != "0" || rows[2][21] != "stop" {
+		t.Fatalf("CSV: %v %v", rows, err)
+	}
+	if w := request("DELETE", path, "", owner, ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"status":"cancelled"`) {
+		t.Fatalf("cancel: %d %s", w.Code, w.Body)
+	}
+	if _, err := os.Stat(csvPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cancel did not remove file: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	seen := 0
+	err = s.o.db.VisitUsageExport(ctx, s.o.cfg.DBPath, "responses", "group/test", nil, "", "search-needle", func(_ map[string]any) error {
+		seen++
+		if seen == 1 {
+			p.InputContent = "search-needle"
+			return s.o.db.LogUsage(p)
+		}
+		return nil
+	})
+	if err != nil || seen != 2 {
+		t.Fatalf("export snapshot changed during concurrent log write: %d rows, %v", seen, err)
+	}
+}
 
 func TestTraeOAuthCallbackBindsProductOwnerAndTask(t *testing.T) {
 	s, u := portalFixture(t)

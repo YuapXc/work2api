@@ -118,6 +118,7 @@ func main() {
 		sched.Start()
 	}
 	srv := app.NewServer(orch)
+	defer srv.CloseUsageExports()
 	gate := &drainGate{draining: updating}
 	executable, _ := os.Executable()
 	executable, _ = filepath.EvalSymlinks(executable)

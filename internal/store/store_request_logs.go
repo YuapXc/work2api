@@ -28,6 +28,33 @@ func (d *DB) UsageRequestsContext(ctx context.Context, userID *int64, limit, off
 	if offset < 0 {
 		offset = 0
 	}
+	cte, where, args := usageRequestQuery(userID, protocol, model, appName, status, search)
+	db, release := d.analyticsReader()
+	defer release()
+	params := append(append([]any{}, args...), limit, offset)
+	rows, err := db.QueryContext(ctx, cte+"SELECT "+usageLightCols+",logged_attempts,COUNT(*) OVER() AS filtered_total FROM final "+where+" ORDER BY id DESC LIMIT ? OFFSET ?", params...)
+	if err != nil {
+		return nil, 0, err
+	}
+	result, err := scanRows(rows)
+	rows.Close()
+	var total int
+	// Empty pages beyond the end still report their true filtered total.
+	if err == nil && len(result) == 0 && offset > 0 {
+		err = db.QueryRowContext(ctx, cte+"SELECT COUNT(*) FROM final "+where, args...).Scan(&total)
+	}
+	for _, row := range result {
+		if count, ok := row["filtered_total"].(int64); ok {
+			total = int(count)
+		}
+		delete(row, "filtered_total")
+		decodeUsageDiagnostics(row)
+		row["credit_known"] = row["credits"] != nil
+	}
+	return result, total, err
+}
+
+func usageRequestQuery(userID *int64, protocol, model string, appName *string, status, search string) (string, string, []any) {
 	scope, args := "", []any{}
 	if userID != nil {
 		scope = "WHERE user_id=?"
@@ -44,31 +71,37 @@ func (d *DB) UsageRequestsContext(ctx context.Context, userID *int64, limit, off
 		}
 		filters = append(filters, model, model, model)
 	}
-	args = append(args, filters...)
-	db, release := d.analyticsReader()
-	defer release()
-	params := append(append([]any{}, args...), limit, offset)
-	rows, err := db.QueryContext(ctx, cte+"SELECT "+usageLightCols+",logged_attempts,COUNT(*) OVER() AS filtered_total FROM final "+where+" ORDER BY id DESC LIMIT ? OFFSET ?", params...)
+	return cte, where, append(args, filters...)
+}
+
+// VisitUsageExport reads the grouped snapshot once, using a private reader for file databases.
+func (d *DB) VisitUsageExport(ctx context.Context, path, protocol, model string, appName *string, status, search string, visit func(map[string]any) error) error {
+	db, err := newReadOnlyAnalytics(path)
 	if err != nil {
-		return nil, 0, err
+		return err
 	}
-	result, err := scanRows(rows)
-	rows.Close()
-	var total int
-	// Empty pages beyond the end still report their true filtered total.
-	// Normal pages perform grouping once instead of two complete CTE scans.
-	if err == nil && len(result) == 0 && offset > 0 {
-		err = db.QueryRowContext(ctx, cte+"SELECT COUNT(*) FROM final "+where, args...).Scan(&total)
-	}
-	for _, row := range result {
-		if count, ok := row["filtered_total"].(int64); ok {
-			total = int(count)
+	if db == nil {
+		db = d.db
+	} else {
+		defer db.Close()
+		if _, err := db.ExecContext(ctx, "PRAGMA temp_store=FILE"); err != nil {
+			return err
 		}
-		delete(row, "filtered_total")
-		decodeUsageDiagnostics(row)
-		row["credit_known"] = row["credits"] != nil
 	}
-	return result, total, err
+	cte, where, args := usageRequestQuery(nil, protocol, model, appName, status, search)
+	const columns = "ts,model,protocol,account_uid,input_tokens,output_tokens,total_tokens,latency_ms,status,credits,app_name,tokens_known,cached_tokens,diagnostics"
+	rows, err := db.QueryContext(ctx, cte+"SELECT "+columns+" FROM final "+where+" ORDER BY id DESC", args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	if err := visitRows(rows, func(row map[string]any) error {
+		decodeUsageDiagnostics(row)
+		return visit(row)
+	}); err != nil {
+		return err
+	}
+	return rows.Err()
 }
 
 // Ownership is checked by SQL before any data or retry history is returned.

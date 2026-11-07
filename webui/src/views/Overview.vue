@@ -149,12 +149,13 @@ onUnmounted(() => {
             </span>
           </div>
           <div class="mt-4">
-            <div class="text-micro uppercase tracking-wide text-faint">预计可服务 Tokens</div>
+            <div class="text-micro uppercase tracking-wide text-faint">预计付费续航 · Tokens</div>
             <div class="mono mt-1 text-4xl font-semibold leading-none text-brand">
               {{ pred?.predicted_tokens != null ? abbr(pred.predicted_tokens, 2) : '—' }}
             </div>
             <div class="mt-2 flex flex-wrap gap-x-6 gap-y-1 text-small text-muted">
-              <span>按近期付费调用估算</span>
+              <span v-if="pred?.partial" class="text-warn">部分余额已计入</span>
+              <span v-else>按近期付费调用估算</span>
               <BudgetDetails :prediction="pred" />
             </div>
           </div>

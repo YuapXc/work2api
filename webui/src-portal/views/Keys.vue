@@ -4,6 +4,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { api, fmtTokens, fmtTime, type KeyInfo, type Me } from '../api'
 import { toast } from '../../src/lib/toast'
+import { confirm } from '../../src/lib/confirm'
 import ModelSelectionActions from '../../src/components/ModelSelectionActions.vue'
 import WInputSearch from '../../src/components/ui/WInput.vue'
 import WButton from '../../src/components/ui/WButton.vue'
@@ -17,7 +18,7 @@ const loading = ref(true)
 const newName = ref('')
 const creating = ref(false)
 const newPolicy = ref<'follow' | 'fixed'>('follow')
-const freshKey = ref('')
+const freshKey = ref<{ id: number; key: string } | null>(null)
 const revealedKeys = ref<Record<number, string>>({})
 const showModelsOf = ref<number | null>(null)
 const savingModels = ref(false)
@@ -27,13 +28,17 @@ const modelSearch = ref('')
 const visibleModels = computed(() => [...new Set([...props.me.available_models, ...draftModels.value])].filter(m => m.toLowerCase().includes(modelSearch.value.trim().toLowerCase())))
 const rowBusy = ref(new Set<number>())
 let disposed = false
-onUnmounted(() => { disposed = true; freshKey.value = ''; revealedKeys.value = {} })
+let loadVersion = 0
+onUnmounted(() => { disposed = true; freshKey.value = null; revealedKeys.value = {} })
 const loadError = ref('')
 
 async function load() {
+  const version = ++loadVersion
   loading.value = true
   loadError.value = ''
-  try { const result = await api.keys(); if (!disposed) keys.value = result.keys } catch (e: any) { loadError.value = e?.message || '加载密钥失败' } finally { loading.value = false }
+  try { const result = await api.keys(); if (!disposed && version === loadVersion) keys.value = result.keys }
+  catch (e: any) { if (!disposed && version === loadVersion) loadError.value = e?.message || '加载密钥失败' }
+  finally { if (!disposed && version === loadVersion) loading.value = false }
 }
 onMounted(load)
 
@@ -45,7 +50,7 @@ async function create() {
   try {
     const res = await api.createKey(name, newPolicy.value === 'fixed' ? props.me.available_models : undefined, newPolicy.value)
     if (disposed) return
-    freshKey.value = res.key
+    freshKey.value = res
     newName.value = ''
     await load()
     toast.success('Key 已创建')
@@ -79,11 +84,12 @@ async function toggle(k: KeyInfo) {
 
 async function remove(k: KeyInfo) {
   if (rowBusy.value.has(k.id)) return
-  if (!confirm(`确定删除 Key「${k.name}」？删除后使用该 Key 的应用将立即失效。`)) return
+  if (!await confirm({ title: `删除 Key「${k.name}」？`, body: '删除后，使用该 Key 的应用将立即失效。', tone: 'danger', okText: '删除' }) || disposed || rowBusy.value.has(k.id)) return
   rowBusy.value.add(k.id)
   try {
     await api.deleteKey(k.id)
     delete revealedKeys.value[k.id]
+    if (freshKey.value?.id === k.id) freshKey.value = null
     await load()
     toast.success('已删除')
   } catch (e: any) { toast.error(e?.message || '删除失败') } finally { rowBusy.value.delete(k.id) }
@@ -138,8 +144,8 @@ async function saveModels(k: KeyInfo, selected: string[], policy: "follow" | "fi
       <p v-if="!me.available_models.length" class="mt-3 text-small text-muted">当前暂无可用模型，仍可创建跟随权限的 Key，待模型开放后使用。</p>
       <div v-if="freshKey" class="mt-4 rounded-xl border border-brand/40 bg-brand/8 p-4">
         <div class="text-micro text-brand">Key 已创建，也可在下方随时查看或复制：</div>
-        <code class="mono mt-1.5 block break-all text-small text-ink">{{ freshKey }}</code>
-        <button class="mt-2 text-micro text-brand hover:underline" @click="freshKey = ''">隐藏</button>
+        <code class="mono mt-1.5 block break-all text-small text-ink">{{ freshKey.key }}</code>
+        <button class="mt-2 text-micro text-brand hover:underline" @click="freshKey = null">隐藏</button>
       </div>
     </div>
 

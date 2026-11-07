@@ -91,6 +91,14 @@ export function setUserToken(token: string) {
 export interface ModelRoute { id: number; model: string; name: string; enabled: boolean; members: string[]; revision: number }
 export interface RouteMember { id: string; name?: string; provider: string; vision?: boolean; context_length?: number; max_output_tokens?: number }
 
+export interface UsageExport {
+  id: string
+  status: 'running' | 'cancelling' | 'ready' | 'cancelled' | 'failed'
+  count: number
+  error?: string
+  expires_at?: number
+}
+
 export const api = {
  updateStatus: () => http.get<unknown, import('@/types').UpdateStatus>('/admin/update'),
  updateCheck: () => http.post<unknown, import('@/types').UpdateStatus>('/admin/update/check'),
@@ -141,6 +149,12 @@ export const api = {
       `/admin/usage/timeseries?granularity=${granularity}&points=${points}${model ? `&model=${encodeURIComponent(model)}` : ''}`,
     ),
   // 服务端分页：page/page_size + 筛选条件，返回 records + total（总数驱动分页器）
+  startUsageExport: (input: { protocol?: string; model?: string; app_name?: string; status?: string; search?: string; timezone: string }) =>
+    http.post<unknown, UsageExport>('/admin/usage/exports', input),
+  usageExport: (id: string, signal?: AbortSignal) =>
+    http.get<unknown, UsageExport>(`/admin/usage/exports/${encodeURIComponent(id)}`, { signal }),
+  cancelUsageExport: (id: string) =>
+    http.delete<unknown, UsageExport>(`/admin/usage/exports/${encodeURIComponent(id)}`),
   usageRecent: (page = 1, pageSize = 20, filters: { protocol?: string; model?: string; app_name?: string; status?: string; search?: string } = {}) => {
     const p = new URLSearchParams({ page: String(page), page_size: String(pageSize), light: '1', group: 'request' })
     if (filters.protocol) p.set('protocol', filters.protocol)
