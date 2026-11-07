@@ -441,7 +441,7 @@ func extractBucket(data map[string]interface{}, key string) *QuotaBucket {
 	} else if v, ok := obj["reset_time"].(string); ok {
 		resetTime = v
 	}
-	return &QuotaBucket{Used: used, Total: total, Remaining: remaining, ResetTime: resetTime}
+	return &QuotaBucket{Used: used, Total: total, Remaining: remaining, ResetTime: resetTime, Unit: strGet(obj, "unit")}
 }
 
 func toFloat(m map[string]interface{}, key string) float64 {

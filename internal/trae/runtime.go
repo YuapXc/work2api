@@ -681,9 +681,7 @@ func (r *Runtime) AdminData(context.Context) provider.AdminData {
 		row["products"] = products
 		data.Accounts = append(data.Accounts, row)
 		budget := provider.CreditBudget(row, "credits", label, "积分", float64(time.Now().Unix()))
-		if budget.Reason == "" {
-			budget.Reason = "缺少逐次调用消费依据"
-		}
+		budget.EstimateUnavailable = "缺少逐次调用消费依据"
 		data.Budgets = append(data.Budgets, budget)
 		actions := map[string]provider.ResourceAction{"rename": {Label: "别名", Enabled: true}, "enabled": {Label: "启用", Enabled: true}, "priority": {Label: "优先级", Enabled: true}, "delete": {Label: "删除", Enabled: true, Confirmation: "删除网关导入的账号凭据？"}}
 		data.Resources = append(data.Resources, provider.ResourceMetadata(row, "account", actions))

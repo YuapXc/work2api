@@ -35,6 +35,8 @@ type Account struct {
 	Nickname       string
 
 	CooldownUntil   float64
+	otherCooldown   float64
+	creditRevision  uint64
 	FailureCount    int
 	CreditsRemain   *float64
 	CreditsTotal    *float64
@@ -91,9 +93,14 @@ func (a *Account) HealthyFor(now float64, free bool) bool {
 	return a.CallableFor(free) && a.CooldownUntil <= now
 }
 
-func (a *Account) markFailure(cooldownSeconds float64) {
+func (a *Account) markFailure(cooldownSeconds float64, credit bool) {
+	now := nowSec()
+	until := now + cooldownSeconds
 	a.FailureCount++
-	a.CooldownUntil = float64(time.Now().UnixNano())/1e9 + cooldownSeconds
+	if !credit {
+		a.otherCooldown = max(a.otherCooldown, until)
+	}
+	a.CooldownUntil = max(a.CooldownUntil, until)
 }
 
 func (a *Account) markSuccess() {
@@ -103,9 +110,10 @@ func (a *Account) markSuccess() {
 
 // Pool holds the accounts.
 type Pool struct {
-	mu           sync.Mutex
-	accounts     []*Account
-	projectAuths string
+	mu             sync.Mutex
+	accounts       []*Account
+	projectAuths   string
+	creditRevision uint64
 }
 
 // New builds a pool from uid→credential managers.
@@ -290,14 +298,14 @@ func pkgFloat(p map[string]any, key string) (float64, bool) {
 // earliestPackageExpiry), so daysToExpiry's fallback to it stays consistent;
 // nearestExpiry is still preferred because it needs no stored round-trip and
 // pairs with expiringWithin for the in-window amount.
-func (a *Account) nearestExpiry() *float64 {
+func (a *Account) nearestExpiry(now float64) *float64 {
 	var best *float64
 	for _, p := range a.CreditPackages {
 		if rem, ok := pkgFloat(p, "remain"); !ok || rem <= 0 {
 			continue
 		}
 		exp, ok := pkgFloat(p, "expire_at")
-		if !ok || exp <= 0 {
+		if !ok || exp <= now {
 			continue
 		}
 		if best == nil || exp < *best {
@@ -318,7 +326,7 @@ func (a *Account) expiringWithin(now, windowDays float64) float64 {
 	var sum float64
 	for _, p := range a.CreditPackages {
 		exp, ok := pkgFloat(p, "expire_at")
-		if !ok || exp <= 0 || exp > limit {
+		if !ok || exp <= now || exp > limit {
 			continue
 		}
 		if rem, ok := pkgFloat(p, "remain"); ok && rem > 0 {
@@ -332,10 +340,10 @@ func (a *Account) expiringWithin(now, windowDays float64) float64 {
 // package data is available yet (e.g. before the first credit refresh) does it
 // fall back to the account-level cycle boundary.
 func daysToExpiry(a *Account, now float64) float64 {
-	if e := a.nearestExpiry(); e != nil {
+	if e := a.nearestExpiry(now); e != nil {
 		return (*e - now) / 86400.0
 	}
-	if a.CreditsExpireAt == nil || *a.CreditsExpireAt == 0 {
+	if a.CreditsExpireAt == nil || *a.CreditsExpireAt <= now {
 		return math.Inf(1)
 	}
 	return (*a.CreditsExpireAt - now) / 86400.0
@@ -460,7 +468,38 @@ func (p *Pool) ClearCooldown(uid string) {
 	for _, a := range p.accounts {
 		if a.UID == uid {
 			a.CooldownUntil = 0
+			a.otherCooldown = 0
+			a.creditRevision = 0
 			a.FailureCount = 0
+			return
+		}
+	}
+}
+
+func (p *Pool) CreditRevision(uid string) uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, a := range p.accounts {
+		if a.UID == uid {
+			return a.creditRevision
+		}
+	}
+	return 0
+}
+
+// A balance reading can clear only the credit rejection it started after.
+func (p *Pool) ClearCreditCooldown(uid string, revision uint64) {
+	if revision == 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, a := range p.accounts {
+		if a.UID == uid && a.creditRevision == revision {
+			a.CooldownUntil = a.otherCooldown
+			if a.CooldownUntil <= nowSec() {
+				a.FailureCount = 0
+			}
 			return
 		}
 	}
@@ -533,14 +572,27 @@ func (p *Pool) OnSuccess(uid string) {
 
 // OnFailure marks an account's request as failed and cools it down.
 func (p *Pool) OnFailure(uid string, cooldownSeconds float64) {
+	p.onFailure(uid, cooldownSeconds, false)
+}
+
+func (p *Pool) OnCreditExhaustion(uid string, cooldownSeconds float64) uint64 {
+	return p.onFailure(uid, cooldownSeconds, true)
+}
+
+func (p *Pool) onFailure(uid string, cooldownSeconds float64, credit bool) uint64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, a := range p.accounts {
 		if a.UID == uid {
-			a.markFailure(cooldownSeconds)
-			return
+			if credit {
+				p.creditRevision++
+				a.creditRevision = p.creditRevision
+			}
+			a.markFailure(cooldownSeconds, credit)
+			return a.creditRevision
 		}
 	}
+	return 0
 }
 
 // AllAccounts returns display snapshots of all accounts.

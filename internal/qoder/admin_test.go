@@ -15,6 +15,7 @@ import (
 	"work2api/internal/qoder/account"
 	"work2api/internal/qoder/bridge"
 	"work2api/internal/qoder/checkin"
+	"work2api/internal/qoder/localcred"
 )
 
 func TestGlobalAccountCheckinDoesNotSendTokenToCN(t *testing.T) {
@@ -88,7 +89,25 @@ func TestCatalogEmptySnapshotAndAccountIsolation(t *testing.T) {
 	}
 	r.modelCache = []provider.CatalogModel{{ID: "qoder/authorized", Extra: map[string]any{"enable": true}}}
 	r.markCatalogStale(r.modelCacheKey)
-	got := r.Models(context.Background())
+	other := &account.Account{ID: "catalog-two", Region: account.Region("cn")}
+	if err := account.Save(other); err != nil {
+		t.Fatal(err)
+	}
+	if err := account.SaveSecret(other.ID, "other-secret"); err != nil {
+		t.Fatal(err)
+	}
+	otherKey := modelCatalogKey(other, "other-secret")
+	r.accountModels = map[[32]byte]accountModelSnapshot{otherKey: {
+		accountID: other.ID, catalog: []provider.CatalogModel{{ID: "qoder/other"}},
+	}}
+	byAccount := map[string]map[string]provider.CatalogModel{}
+	got := r.catalogModels(nil, byAccount)
+	if len(got) != 2 || len(byAccount[a.ID]) != 1 || len(byAccount[other.ID]) != 1 ||
+		byAccount[a.ID]["qoder/authorized"].ID == "" || byAccount[other.ID]["qoder/other"].ID == "" {
+		t.Fatalf("account catalogs were merged into each other: %#v", byAccount)
+	}
+	delete(r.accountModels, otherKey)
+	got = r.Models(context.Background())
 	if len(got) != 1 || got[0].Extra["catalog_stale"] != true {
 		t.Fatal("last trusted snapshot not retained as stale", got)
 	}
@@ -96,6 +115,16 @@ func TestCatalogEmptySnapshotAndAccountIsolation(t *testing.T) {
 	if r.modelCache[0].Extra["enable"] != true {
 		t.Fatal("catalog caller mutated runtime cache")
 	}
+	local := &account.Account{ID: "qoder-local-cn", Region: account.RegionCN}
+	r.localOnce.Do(func() {})
+	r.localCreds = []localcred.Credential{{Region: "cn", DeviceToken: "desktop-secret"}}
+	localKey := modelCatalogKey(local, "desktop-secret")
+	r.accountModels[localKey] = accountModelSnapshot{accountID: local.ID, catalog: []provider.CatalogModel{{ID: "qoder/desktop"}}}
+	got = r.Models(context.Background())
+	if len(got) != 2 || got[1].ID != "qoder/desktop" {
+		t.Fatal("non-active desktop account catalog was lost", got)
+	}
+	delete(r.accountModels, localKey)
 	if err := account.SaveSecret(a.ID, "rotated-secret"); err != nil {
 		t.Fatal(err)
 	}
@@ -146,6 +175,12 @@ func TestQuotaEntryIncludesEveryCreditBucket(t *testing.T) {
 	}
 	if empty := buildQuotaEntry(&account.QuotaInfo{}); len(empty.packages) != 0 || empty.remaining != 0 {
 		t.Fatal("absent buckets created phantom credits")
+	}
+	q.UserQuota.Unit, q.AddonQuota.Unit = "tokens", "Credits"
+	mixed := buildQuotaEntry(q)
+	if !mixed.mixed || mixed.unit != "" || mixed.remaining != 0 || mixed.total != 0 ||
+		mixed.packages[0]["unit"] != "tokens" || mixed.packages[1]["unit"] != "Credits" {
+		t.Fatalf("mixed quota units were summed or dropped: %+v", mixed)
 	}
 }
 
@@ -293,6 +328,37 @@ func TestPrivateFailoverEligibilityAndAffinityInvalidation(t *testing.T) {
 	}
 }
 
+func TestQoderImportSeparatesRegionsWithSameLocalID(t *testing.T) {
+	root := account.DataRoot()
+	account.SetDataRoot(t.TempDir())
+	defer account.SetDataRoot(root)
+	first := &account.Account{ID: "same", UpstreamID: "uid", Email: "fixture@example.invalid", Region: account.RegionGlobal}
+	if err := account.ImportAndActivate(first, "global-secret"); err != nil {
+		t.Fatal(err)
+	}
+	second := *first
+	second.Region = account.RegionCN
+	if err := account.ImportAndActivate(&second, "cn-secret"); err == nil {
+		t.Fatal("direct import replaced an account from another region")
+	}
+	if err := account.CanonicalIdentity(&second); err != nil || second.ID == first.ID {
+		t.Fatal("canonical import did not separate the regions", err)
+	}
+	if err := account.ImportAndActivate(&second, "cn-secret"); err != nil {
+		t.Fatal(err)
+	}
+	reimport := *first
+	reimport.Region = account.RegionCN
+	if err := account.CanonicalIdentity(&reimport); err != nil || reimport.ID != second.ID {
+		t.Fatal("reimport did not reuse the regional account", err)
+	}
+	global, _ := account.GetSecret(first.ID)
+	cn, _ := account.GetSecret(second.ID)
+	if global != "global-secret" || cn != "cn-secret" {
+		t.Fatal("cross-region import overwrote a stored credential")
+	}
+}
+
 func TestClaudeSessionAffinityUsesCallerScope(t *testing.T) {
 	h := http.Header{}
 	h.Set("X-Claude-Code-Session-Id", "cc-session")
@@ -393,5 +459,23 @@ func TestAccountCheckReusesCredentialScopedReadOnlyCatalog(t *testing.T) {
 	}
 	if r.CheckAccountIdentity(a.ID) == revision {
 		t.Fatal("new credential reused old check generation")
+	}
+}
+
+func TestCatalogRefreshWaitsOnlyForMatchingCredential(t *testing.T) {
+	a := &account.Account{ID: "a", Region: account.RegionCN}
+	key := modelCatalogKey(a, "secret-a")
+	otherKey := modelCatalogKey(&account.Account{ID: "b", Region: account.RegionCN}, "secret-b")
+	r := &Runtime{
+		accountModels: map[[32]byte]accountModelSnapshot{otherKey: {expires: time.Now().Add(time.Minute)}},
+		modelRefresh:  map[[32]byte]*modelCatalogFlight{key: {done: make(chan struct{})}},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := r.refreshAccountCatalog(ctx, nil, "", otherKey, false); err != nil {
+		t.Fatalf("another account blocked a cached catalog: %v", err)
+	}
+	if err := r.refreshAccountCatalog(ctx, a, "secret-a", key, true); err != context.DeadlineExceeded {
+		t.Fatalf("matching catalog refresh was not shared: %v", err)
 	}
 }

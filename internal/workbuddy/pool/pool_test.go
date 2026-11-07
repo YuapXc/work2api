@@ -18,6 +18,30 @@ func TestExhaustedAccountsNeverUseCooldownFallback(t *testing.T) {
 	}
 }
 
+func TestQuotaRefreshOnlyClearsEarlierCreditCooldown(t *testing.T) {
+	a := &Account{UID: "a", Enabled: true}
+	p := &Pool{accounts: []*Account{a}}
+	p.OnFailure(a.UID, 60)
+	other := a.CooldownUntil
+	older := p.OnCreditExhaustion(a.UID, 3600)
+	current := p.OnCreditExhaustion(a.UID, 3600)
+	credit := a.CooldownUntil
+	p.ClearCreditCooldown(a.UID, older)
+	if a.CooldownUntil != credit {
+		t.Fatal("older balance reading cleared a newer credit rejection")
+	}
+	p.ClearCreditCooldown(a.UID, current)
+	if a.CooldownUntil != other || a.Healthy(nowSec()) {
+		t.Fatal("recovering credit cleared an unrelated cooldown")
+	}
+	p.ClearCooldown(a.UID)
+	current = p.OnCreditExhaustion(a.UID, 3600)
+	p.ClearCreditCooldown(a.UID, current)
+	if !a.Healthy(nowSec()) {
+		t.Fatal("replenished account stayed in credit cooldown")
+	}
+}
+
 func uids(as []*Account) []string {
 	out := make([]string, len(as))
 	for i, a := range as {
@@ -107,6 +131,27 @@ func TestPickCostBlindWhenNil(t *testing.T) {
 // pkgWith builds a one-package credit list for tests.
 func pkgWith(remain, expireAt float64) []map[string]any {
 	return []map[string]any{{"remain": remain, "expire_at": expireAt}}
+}
+
+func TestExpiryPriorityIgnoresExpiredPackages(t *testing.T) {
+	now := nowSec()
+	past, soon := now-3600, now+86400
+	a := &Account{CreditsExpireAt: &past, CreditPackages: append(pkgWith(1000, past), pkgWith(20, soon)...)}
+	if days := daysToExpiry(a, now); days != 1 {
+		t.Fatalf("expiry priority picked an expired package: %v days", days)
+	}
+	if amount := a.expiringWithin(now, 7); amount != 20 {
+		t.Fatalf("expired balance affected expiry priority: %v", amount)
+	}
+	p := &Pool{accounts: []*Account{
+		{UID: "old", Enabled: true, CreditsExpireAt: &past, CreditPackages: pkgWith(1000, past)},
+		{UID: "soon", Enabled: true, CreditsExpireAt: &soon, CreditPackages: pkgWith(20, soon)},
+	}}
+	for i := 0; i < 20; i++ {
+		if got := p.Pick(nil, map[string]float64{"old": 1, "soon": 1}, 7); got == nil || got.UID != "soon" {
+			t.Fatalf("expired cache outranked a live expiring package: %v", got)
+		}
+	}
 }
 
 // TestPickPrefersLargerExpiringPile: same cost, both expiring within the window

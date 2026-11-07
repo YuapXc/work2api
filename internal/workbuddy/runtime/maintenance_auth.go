@@ -55,7 +55,7 @@ func (r *Runtime) prepareBillingMaintenance(ctx context.Context, acc *pool.Accou
 	if err != nil {
 		return err
 	}
-	_, err = r.billingGuard().Recover(ctx, acc.UID, identity, func(ctx context.Context) error { return r.refreshCreditsFor(ctx, r.db, acc) })
+	_, err = r.billingGuard().Recover(ctx, acc.UID, identity, func(ctx context.Context) error { return r.refreshCreditsFor(ctx, r.db, acc, mgr) })
 	return err
 }
 func (r *Runtime) checkinAccount(ctx context.Context, acc *pool.Account) (billing.CheckinResult, error) {

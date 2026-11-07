@@ -60,6 +60,7 @@ const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
 // running intl proxy would otherwise break domestic billing calls.
 var httpClient = httpclient.New(20 * time.Second)
 var errIncompleteBilling = errors.New("额度明细分页未完成")
+var billingTimezone = time.FixedZone("UTC+8", 8*60*60)
 
 func billingHeaders(ctx context.Context, mgr Credential) (map[string]string, error) {
 	var h map[string]string
@@ -174,7 +175,7 @@ func parseTS(raw any, isMs bool) *float64 {
 	}
 	if isMs {
 		f := num(raw) / 1000.0
-		if f == 0 {
+		if f <= 0 || math.IsNaN(f) || math.IsInf(f, 0) {
 			return nil
 		}
 		return &f
@@ -183,25 +184,19 @@ func parseTS(raw any, isMs bool) *float64 {
 	if !ok {
 		return nil
 	}
-	t, err := time.ParseInLocation("2006-01-02 15:04:05", strings.TrimSpace(s), time.Local)
+	s = strings.TrimSpace(s)
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", s, billingTimezone)
 	if err != nil {
-		return nil
+		t, err = time.Parse(time.RFC3339, s)
+		if err != nil {
+			return nil
+		}
 	}
 	f := float64(t.Unix())
+	if f <= 0 {
+		return nil
+	}
 	return &f
-}
-
-func minTS(a, b *float64) *float64 {
-	if a == nil {
-		return b
-	}
-	if b == nil {
-		return a
-	}
-	if *b < *a {
-		return b
-	}
-	return a
 }
 
 func summarize(accounts []any) (remain, total float64) {
@@ -230,8 +225,12 @@ func summarize(accounts []any) (remain, total float64) {
 }
 
 func summarizePackages(accounts []any) []map[string]any {
-	groups := map[string]map[string]any{}
-	var order []string
+	type packageKey struct {
+		code   string
+		expiry float64
+	}
+	groups := map[packageKey]map[string]any{}
+	var order []packageKey
 	for _, a := range accounts {
 		acct, ok := a.(map[string]any)
 		if !ok {
@@ -257,47 +256,45 @@ func summarizePackages(accounts []any) []map[string]any {
 		} else {
 			remain, used, tot = capRemain, capUsed, capSize
 		}
-		key := str(acct["PackageCode"])
-		if key == "" {
-			key = str(acct["SubProductCode"])
+		code := str(acct["PackageCode"])
+		if code == "" {
+			code = str(acct["SubProductCode"])
 		}
-		if key == "" {
-			key = "other"
+		if code == "" {
+			code = "other"
+		}
+		expiry := parseTS(acct["DeductionEndTime"], true)
+		if expiry == nil {
+			expiry = parseTS(acct["ExpiredTime"], false)
+		}
+		if expiry == nil {
+			expiry = parseTS(acct["CycleEndTime"], false)
+		}
+		key := packageKey{code: code}
+		if expiry != nil {
+			key.expiry = *expiry
 		}
 		g, exists := groups[key]
 		if !exists {
 			name := str(acct["PackageName"])
 			if name == "" {
-				name = key
+				name = code
 			}
-			g = map[string]any{"name": name, "remain": 0.0, "used": 0.0, "total": 0.0, "expire_at": (*float64)(nil)}
+			g = map[string]any{"name": name, "remain": 0.0, "used": 0.0, "total": 0.0, "expire_at": nil}
+			if expiry != nil {
+				g["expire_at"] = *expiry
+			}
 			groups[key] = g
 			order = append(order, key)
 		}
 		g["remain"] = g["remain"].(float64) + math.Max(remain, 0)
 		g["used"] = g["used"].(float64) + math.Max(used, 0)
 		g["total"] = g["total"].(float64) + math.Max(tot, 0)
-		if remain > 0 {
-			cur, _ := g["expire_at"].(*float64)
-			for _, kv := range []struct {
-				key  string
-				isMs bool
-			}{{"CycleEndTime", false}, {"ExpiredTime", false}, {"DeductionEndTime", true}} {
-				cur = minTS(cur, parseTS(acct[kv.key], kv.isMs))
-			}
-			g["expire_at"] = cur
-		}
 	}
 	var out []map[string]any
 	for _, k := range order {
 		g := groups[k]
 		if g["total"].(float64) > 0 {
-			// normalize expire_at to a plain value for JSON
-			if ea, _ := g["expire_at"].(*float64); ea != nil {
-				g["expire_at"] = *ea
-			} else {
-				g["expire_at"] = nil
-			}
 			out = append(out, g)
 		}
 	}
@@ -313,10 +310,8 @@ func summarizePackages(accounts []any) []map[string]any {
 // earliestPackageExpiry returns the soonest real per-package expiry among
 // packages that still hold a positive balance — the truthful "credits will
 // actually vanish" time. This is used for the account-level ExpireAt instead of
-// summarize()'s min over CycleEndTime/ExpiredTime/DeductionEndTime, which
-// upstream fills with a rolling daily-cycle boundary that reads as the same
-// near-date for every account and is not a real expiry. Returns nil when no
-// package with a balance carries a known expiry.
+// a rolling boundary from an account summary. Returns nil when no package
+// with a balance carries a known expiry.
 func earliestPackageExpiry(pkgs []map[string]any) *float64 {
 	var best *float64
 	for _, g := range pkgs {
@@ -336,7 +331,7 @@ func earliestPackageExpiry(pkgs []map[string]any) *float64 {
 }
 
 func fetchNewCredits(ctx context.Context, mgr Credential) *Credit {
-	now := time.Now()
+	now := time.Now().In(billingTimezone)
 	dayStart := now.Format("2006-01-02") + " 00:00:00"
 	dayEnd := now.Format("2006-01-02") + " 23:59:59"
 	base := mgr.Endpoint() + "/billing/meter"
@@ -377,7 +372,7 @@ func fetchNewCredits(ctx context.Context, mgr Credential) *Credit {
 
 func fetchOldCredits(ctx context.Context, mgr Credential) *Credit {
 	url := mgr.Endpoint() + "/v2/billing/meter/get-user-resource"
-	now := time.Now()
+	now := time.Now().In(billingTimezone)
 	body := map[string]any{
 		"PageNumber": 1, "PageSize": 100, "ProductCode": "p_tcaca", "Status": []int{0, 3},
 		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),

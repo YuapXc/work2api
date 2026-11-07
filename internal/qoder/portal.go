@@ -13,7 +13,7 @@ func (r *Runtime) SupportsPortal() bool { return true }
 
 func (r *Runtime) PortalModels(_ context.Context, models map[string]bool, discoverFree bool, _ func(string) bool) []provider.PortalModel {
 	var out []provider.PortalModel
-	for _, m := range r.catalogModels(models) {
+	for _, m := range r.catalogModels(models, nil) {
 		if models != nil && !models[m.ID] {
 			continue
 		}

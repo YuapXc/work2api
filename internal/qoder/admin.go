@@ -126,7 +126,8 @@ func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 	}
 
 	models := []map[string]any{}
-	for _, m := range r.Models(ctx) {
+	byAccount := map[string]map[string]provider.CatalogModel{}
+	for _, m := range r.catalogModels(nil, byAccount) {
 		row := map[string]any{"id": m.ID, "name": m.Name, "context": m.Context, "max_output": m.MaxOutput}
 		for k, v := range m.Extra {
 			row[k] = v
@@ -144,9 +145,23 @@ func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 			domain += "/" + fmt.Sprint(row["id"])
 		}
 		budget := provider.CreditBudget(row, domain, label+" · "+region, "额度", float64(time.Now().Unix()))
-		for _, model := range models {
-			if id, ok := model["id"].(string); ok {
-				budget.Models = append(budget.Models, id)
+		budget.ModelCosts = map[string]float64{}
+		for id, model := range byAccount[budget.AccountID] {
+			budget.Models = append(budget.Models, id)
+			if price, ok := model.Extra["price_factor"].(*float64); ok && price != nil && model.Extra["pricing_known"] == true {
+				budget.ModelCosts[id] = *price
+				if *price == 0 {
+					budget.FreeModels = append(budget.FreeModels, id)
+				}
+			}
+		}
+		if len(budget.Models) == 0 {
+			budget.EstimateUnavailable = "未取得该账号的模型目录"
+		}
+		if row["quota_mixed_units"] == true || row["quota_unit"] != nil && row["quota_unit"] != "credits" {
+			budget.EstimateUnavailable = "额度单位与逐次消费无法直接换算"
+			if unit, ok := row["quota_unit"].(string); ok {
+				budget.Unit = unit
 			}
 		}
 		d.Budgets = append(d.Budgets, budget)
@@ -204,8 +219,11 @@ func (r *Runtime) accountRow(id, label, region, source, authMode string, active 
 		if q.ts.IsZero() {
 			return row
 		}
-		row["credits_remaining"] = q.remaining
-		row["credits_total"] = q.total
+		if q.mixed {
+			row["quota_mixed_units"] = true
+		} else if q.unit != "" {
+			row["credits_remaining"], row["credits_total"], row["quota_unit"] = q.remaining, q.total, q.unit
+		}
 		row["plan"] = q.plan
 		row["quota_exceeded"] = q.exceeded
 		if q.expiresAt > 0 {
@@ -298,8 +316,6 @@ func (r *Runtime) refreshQuotaContext(ctx context.Context, id, source, region st
 func buildQuotaEntry(q *account.QuotaInfo) quotaEntry {
 	e := quotaEntry{plan: q.Plan, exceeded: q.IsQuotaExceeded, expiresAt: quotaExpirySeconds(q.ExpiresAt), ts: time.Now()}
 	if q.UserQuota != nil {
-		e.remaining += q.UserQuota.Remaining
-		e.total += q.UserQuota.Total
 		pkg := quotaBucketPackage("订阅额度", q.UserQuota)
 		if e.expiresAt > 0 {
 			pkg["expire_at"] = float64(e.expiresAt)
@@ -307,16 +323,12 @@ func buildQuotaEntry(q *account.QuotaInfo) quotaEntry {
 		e.packages = append(e.packages, pkg)
 	}
 	if q.AddonQuota != nil {
-		e.remaining += q.AddonQuota.Remaining
-		e.total += q.AddonQuota.Total
 		e.packages = append(e.packages, quotaBucketPackage("加油包", q.AddonQuota))
 	}
 	// 专属资源包（活动赠送）与订阅/加油包并存：漏掉它会让显示的积分比实际少
 	// 一截（buddy-proxy #51 实测 2000+2000 只显示 2000）。每个包单独一行明细，
 	// 过期时间用包自带的（比账号级的更早）。
 	for _, p := range q.DedicatedPackages {
-		e.remaining += p.Remaining
-		e.total += p.Total
 		pkg := map[string]any{"name": p.Label, "remain": p.Remaining, "used": p.Used, "total": p.Total, "budget_restricted": true}
 		if p.Description != "" {
 			pkg["description"] = p.Description
@@ -328,6 +340,20 @@ func buildQuotaEntry(q *account.QuotaInfo) quotaEntry {
 			pkg["expire_at"] = float64(expiry)
 		}
 		e.packages = append(e.packages, pkg)
+	}
+	for _, pkg := range e.packages {
+		unit, _ := pkg["unit"].(string)
+		unit = strings.ToLower(strings.TrimSpace(unit))
+		if unit == "" {
+			unit = "credits"
+		}
+		if e.unit != "" && e.unit != unit {
+			e.mixed, e.unit, e.remaining, e.total = true, "", 0, 0
+			break
+		}
+		e.unit = unit
+		e.remaining += pkg["remain"].(float64)
+		e.total += pkg["total"].(float64)
 	}
 	return e
 }
@@ -349,6 +375,9 @@ func quotaBucketPackage(name string, bucket *account.QuotaBucket) map[string]any
 	pkg := map[string]any{"name": name, "remain": bucket.Remaining, "used": bucket.Used, "total": bucket.Total}
 	if bucket.ResetTime != "" {
 		pkg["reset_time"] = bucket.ResetTime
+	}
+	if bucket.Unit != "" {
+		pkg["unit"] = bucket.Unit
 	}
 	return pkg
 }

@@ -10,6 +10,7 @@ import (
 	"work2api/internal/core/provider"
 	"work2api/internal/requestdiag"
 	"work2api/internal/streamwatch"
+	"work2api/internal/workbuddy/credentials"
 	"work2api/internal/workbuddy/pool"
 	"work2api/internal/workbuddy/siterouting"
 	"work2api/internal/workbuddy/upstream"
@@ -51,6 +52,10 @@ func (o *Runtime) MarkDailyModelLimit(acc *pool.Account, model string, raw []byt
 // 这是账号池处罚的**唯一权威点**：handler 侧的错误日志一律 updatePool:false。
 
 func (o *Runtime) PenalizeAccount(acc *pool.Account, model string, ue *upstream.UpstreamError) ErrAction {
+	return o.penalizeAccount(acc, model, ue, o.Manager(acc.UID))
+}
+
+func (o *Runtime) penalizeAccount(acc *pool.Account, model string, ue *upstream.UpstreamError, mgr *credentials.Manager) ErrAction {
 	// 6004 每日模型上限：上游给了明确重置时间，按 (账号,模型) 冷却到该时刻。
 	if o.MarkDailyModelLimit(acc, model, ue.Raw) {
 		return ErrAction{Rotate: true, ModelScoped: true, Reason: "该模型今日已达上限"}
@@ -71,6 +76,13 @@ func (o *Runtime) PenalizeAccount(acc *pool.Account, model string, ue *upstream.
 		_ = o.db.SetModelCooldown(acc.UID, model, until, act.Reason)
 	case act.FailFast:
 		// 请求自身的问题：不罚号、不换号，透传原文
+	case kind == ErrHardCredit && act.Cooldown > 0:
+		if o.Manager(acc.UID) == mgr {
+			revision := o.Pool.OnCreditExhaustion(acc.UID, act.Cooldown)
+			if ue.StatusCode == 402 || BusinessCode(string(ue.Raw), "14018") {
+				o.queueCreditRecheck(acc, mgr, revision)
+			}
+		}
 	case act.Cooldown > 0:
 		o.Pool.OnFailure(acc.UID, act.Cooldown)
 	default:
@@ -480,6 +492,7 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 			d.BillingDomain = siterouting.ProfileSite(acc.Profile)
 			d.BillingCoefficient = o.Catalog.AccountCost(acc.Profile, acc.UID, model)
 		}
+		attemptManager := o.Manager(acc.UID)
 		started, err := o.RunOnce(ctx, acc, attemptBody, sink)
 		if d := requestdiag.Diagnostic(ctx); d != nil {
 			d.ErrorKind = DiagnosticErrorKind(ctx, err)
@@ -587,7 +600,7 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 		}
 
 		// 分类并对该账号施加处罚（禁用/负缓存/冷却/不罚），返回是否应换号。
-		act := o.PenalizeAccount(acc, model, ue)
+		act := o.penalizeAccount(acc, model, ue, attemptManager)
 		if act.FailFast || !act.Rotate {
 			return acc, err
 		}

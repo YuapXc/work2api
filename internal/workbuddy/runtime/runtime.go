@@ -39,6 +39,8 @@ type Runtime struct {
 	maintenanceGuard *provider.MaintenanceGuard
 	creditStates     map[string]creditState
 	creditRefresh    map[string]*provider.RefreshGate
+	creditRechecks   creditRecheckQueue
+	creditQuery      func(context.Context, billing.Credential) (*billing.Credit, error)
 	modelRefresh     provider.RefreshGate
 	MaintenanceMu    sync.Mutex
 	maintenance      *maintenanceState
@@ -60,13 +62,14 @@ type Runtime struct {
 }
 
 type creditState struct {
-	Identity     string
-	Manager      *credentials.Manager
-	Updated      float64
-	Failed       bool
-	Kind         string
-	Reauthorize  bool
-	LoginExpired bool
+	Identity       string
+	Manager        *credentials.Manager
+	Updated        float64
+	CreditRevision uint64
+	Failed         bool
+	Kind           string
+	Reauthorize    bool
+	LoginExpired   bool
 }
 
 func New(cfg *config.Config, db *store.DB) (*Runtime, error) {
@@ -155,6 +158,7 @@ func (r *Runtime) SetManager(uid string, mgr *credentials.Manager) {
 
 // Close retires refresh workers without removing the original credential files.
 func (r *Runtime) Close() error {
+	r.creditRechecks.close()
 	r.ManagerMu.RLock()
 	managers := make([]*credentials.Manager, 0, len(r.Managers))
 	for _, mgr := range r.Managers {
@@ -301,6 +305,13 @@ func (r *Runtime) enhanceBody(body map[string]any) map[string]any {
 }
 
 func (r *Runtime) RefreshCreditsFor(ctx context.Context, db *store.DB, acc *pool.Account) {
+	r.refreshCreditsForManager(ctx, db, acc, r.Manager(acc.UID), 0)
+}
+
+func (r *Runtime) refreshCreditsForManager(ctx context.Context, db *store.DB, acc *pool.Account, mgr *credentials.Manager, revision uint64) bool {
+	if mgr == nil {
+		return false
+	}
 	r.creditMu.Lock()
 	if r.creditRefresh == nil {
 		r.creditRefresh = map[string]*provider.RefreshGate{}
@@ -311,46 +322,63 @@ func (r *Runtime) RefreshCreditsFor(ctx context.Context, db *store.DB, acc *pool
 		r.creditRefresh[acc.UID] = gate
 	}
 	r.creditMu.Unlock()
-	_ = gate.Do(ctx, fmt.Sprintf("%p", r.Manager(acc.UID)), func(ctx context.Context) error {
-		mgr := r.Manager(acc.UID)
-		if mgr == nil {
-			return nil
+	ranRefresh := false
+	_ = gate.Do(ctx, fmt.Sprintf("%p", mgr), func(ctx context.Context) error {
+		ranRefresh = true
+		if r.Manager(acc.UID) != mgr {
+			return provider.ErrMaintenancePaused
+		}
+		if revision > 0 {
+			r.creditMu.Lock()
+			state := r.creditStates[acc.UID]
+			r.creditMu.Unlock()
+			if state.Manager == mgr && state.CreditRevision >= max(revision, r.Pool.CreditRevision(acc.UID)) {
+				return nil
+			}
 		}
 		identity, err := mgr.MaintenanceIdentity()
 		if err != nil {
 			return err
 		}
-		ran, err := r.billingGuard().Recover(ctx, acc.UID, identity, func(ctx context.Context) error { return r.refreshCreditsFor(ctx, db, acc) })
+		ran, err := r.billingGuard().Recover(ctx, acc.UID, identity, func(ctx context.Context) error { return r.refreshCreditsFor(ctx, db, acc, mgr) })
 		if err != nil || ran {
 			return err
 		}
-		return r.refreshCreditsFor(ctx, db, acc)
+		return r.refreshCreditsFor(ctx, db, acc, mgr)
 	})
+	return ranRefresh
 }
-func (r *Runtime) refreshCreditsFor(ctx context.Context, db *store.DB, acc *pool.Account) error {
-	mgr := r.Manager(acc.UID)
-	if mgr == nil {
-		return nil
+func (r *Runtime) refreshCreditsFor(ctx context.Context, db *store.DB, acc *pool.Account, mgr *credentials.Manager) error {
+	if r.Manager(acc.UID) != mgr {
+		return provider.ErrMaintenancePaused
 	}
 	if _, err := mgr.GetHeadersContext(ctx); err != nil {
 		r.observeBilling(acc.UID, mgr, err)
 		return err
 	}
 	identity, _ := mgr.MaintenanceIdentity()
-	cr, err := billing.FetchCredits(ctx, mgr)
+	creditRevision := r.Pool.CreditRevision(acc.UID)
+	query := r.creditQuery
+	if query == nil {
+		query = billing.FetchCredits
+	}
+	cr, err := query(ctx, mgr)
 	var queryErr *billing.QueryError
 	if errors.As(err, &queryErr) && (queryErr.Kind == "unauthorized" || queryErr.Kind == "login_expired") && ctx.Err() == nil {
 		if refreshErr := mgr.RefreshBillingAuthorization(ctx); refreshErr == nil {
 			identity, _ = mgr.MaintenanceIdentity()
-			cr, err = billing.FetchCredits(ctx, mgr)
+			cr, err = query(ctx, mgr)
 		} else {
 			err = refreshErr
 		}
 	}
 	r.AccountMu.Lock()
 	defer r.AccountMu.Unlock()
-	if ctx.Err() != nil || r.Manager(acc.UID) != mgr {
+	if ctx.Err() != nil {
 		return ctx.Err()
+	}
+	if r.Manager(acc.UID) != mgr {
+		return provider.ErrMaintenancePaused
 	}
 	currentIdentity, _ := mgr.MaintenanceIdentity()
 	if currentIdentity != identity {
@@ -365,6 +393,7 @@ func (r *Runtime) refreshCreditsFor(ctx context.Context, db *store.DB, acc *pool
 		state = creditState{Manager: mgr}
 	}
 	state.Identity = identity
+	state.CreditRevision = creditRevision
 	state.Failed = err != nil
 	state.Reauthorize = false
 	state.LoginExpired = errors.Is(err, credentials.ErrLoginRequired)
@@ -396,9 +425,8 @@ func (r *Runtime) refreshCreditsFor(ctx context.Context, db *store.DB, acc *pool
 		fields["credits_expire_at"] = ""
 	}
 	_ = db.SetAccountState(acc.UID, fields)
-	// 仅在余额 > 0 时自动解冻：余额耗尽的账号不该被 credit 刷新顺手解冻
 	if cr.Remain > 0 {
-		r.Pool.ClearCooldown(acc.UID)
+		r.Pool.ClearCreditCooldown(acc.UID, creditRevision)
 	}
 	return nil
 }

@@ -193,37 +193,24 @@ func (r *Runtime) nextAccountBridge(ctx context.Context, region account.Region, 
 		}
 		tried[acct.ID] = true
 		probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		b, e := r.bridgeFor(probeCtx, acct, secret)
-		if e == nil && !snapshot.expires.After(time.Now()) {
-			var models []bridge.QoderModel
-			models, e = b.ListAvailableModelsContext(probeCtx)
-			if e == nil {
-				snapshot.models = make(map[string]bool)
-				snapshot.expires = time.Now().Add(5 * time.Minute)
-				for _, m := range models {
-					if m.Enable {
-						snapshot.models[m.Key] = true
-					}
-				}
+		var probeErr error
+		if !snapshot.expires.After(time.Now()) {
+			probeErr = r.refreshAccountCatalog(probeCtx, acct, secret, key, false)
+			if probeErr == nil {
 				r.mu.Lock()
-				if r.accountModels == nil {
-					r.accountModels = make(map[[32]byte]accountModelSnapshot)
-				}
-				// Bound cache cardinality across credential reimports.
-				for id, value := range r.accountModels {
-					if !value.expires.After(time.Now()) && len(value.catalog) == 0 {
-						delete(r.accountModels, id)
-					}
-				}
-				r.accountModels[key] = snapshot
+				snapshot = r.accountModels[key]
 				r.mu.Unlock()
 			}
+		}
+		var b *bridge.Bridge
+		if probeErr == nil && snapshot.models[model] {
+			b, probeErr = r.bridgeFor(probeCtx, acct, secret)
 		}
 		cancel()
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		if e != nil || !snapshot.models[model] || account.IsGatewayHidden(acct.ID) {
+		if probeErr != nil || b == nil || account.IsGatewayHidden(acct.ID) {
 			continue
 		}
 		// Re-read native identity after network waits: deletion/reimport must

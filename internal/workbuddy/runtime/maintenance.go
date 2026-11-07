@@ -6,13 +6,120 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"work2api/internal/statebackup"
+	"work2api/internal/workbuddy/credentials"
+	"work2api/internal/workbuddy/pool"
 	"work2api/internal/workbuddy/siterouting"
 )
 
 const (
-	checkinMaxRetry = 3
+	checkinMaxRetry       = 3
+	creditRecheckInterval = time.Minute
+	creditRecheckTimeout  = 20 * time.Second
+	creditRecheckBacklog  = 32
 )
+
+type creditRecheck struct {
+	account   *pool.Account
+	manager   *credentials.Manager
+	requested float64
+	revision  uint64
+}
+
+type creditRecheckQueue struct {
+	mu      sync.Mutex
+	pending []creditRecheck
+	recent  map[string]creditRecheck
+	cancel  context.CancelFunc
+	done    chan struct{}
+	closed  bool
+}
+
+func (r *Runtime) queueCreditRecheck(acc *pool.Account, mgr *credentials.Manager, revision uint64) {
+	if revision == 0 || mgr == nil || r.db == nil || r.Manager(acc.UID) != mgr {
+		return
+	}
+	now := nowSec()
+	q := &r.creditRechecks
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed || len(q.pending) >= creditRecheckBacklog {
+		return
+	}
+	for uid, last := range q.recent {
+		if now-last.requested >= creditRecheckInterval.Seconds() {
+			delete(q.recent, uid)
+		}
+	}
+	if last := q.recent[acc.UID]; last.manager == mgr {
+		return
+	}
+	if q.recent == nil {
+		q.recent = make(map[string]creditRecheck)
+	}
+	job := creditRecheck{account: acc, manager: mgr, requested: now, revision: revision}
+	q.recent[acc.UID] = job
+	q.pending = append(q.pending, job)
+	if q.done == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		q.cancel, q.done = cancel, make(chan struct{})
+		go r.runCreditRechecks(ctx)
+	}
+}
+
+func (r *Runtime) runCreditRechecks(ctx context.Context) {
+	q := &r.creditRechecks
+	for {
+		q.mu.Lock()
+		if q.closed || len(q.pending) == 0 {
+			q.cancel()
+			close(q.done)
+			q.cancel, q.done = nil, nil
+			q.mu.Unlock()
+			return
+		}
+		job := q.pending[0]
+		q.pending[0] = creditRecheck{}
+		q.pending = q.pending[1:]
+		q.mu.Unlock()
+
+		if nowSec()-job.requested >= creditRecheckInterval.Seconds() {
+			continue
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, creditRecheckTimeout)
+		leave := statebackup.Enter()
+		r.recheckCredits(probeCtx, job)
+		leave()
+		cancel()
+	}
+}
+
+func (r *Runtime) recheckCredits(ctx context.Context, job creditRecheck) {
+	uid := job.account.UID
+	if ctx.Err() != nil || r.Manager(uid) != job.manager {
+		return
+	}
+	if ran := r.refreshCreditsForManager(ctx, r.db, job.account, job.manager, job.revision); ran || ctx.Err() != nil {
+		return
+	}
+	// A manual or periodic read that began before the rejection cannot settle it.
+	r.refreshCreditsForManager(ctx, r.db, job.account, job.manager, job.revision)
+}
+
+func (q *creditRecheckQueue) close() {
+	q.mu.Lock()
+	q.closed, q.pending, q.recent = true, nil, nil
+	done := q.done
+	if q.cancel != nil {
+		q.cancel()
+	}
+	q.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+}
 
 type maintenanceState struct {
 	r                 *Runtime

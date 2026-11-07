@@ -119,4 +119,17 @@ func TestEarliestPackageExpiry(t *testing.T) {
 	}
 }
 
+func TestPackagesKeepSeparateBalancesAndUseBillingTimezone(t *testing.T) {
+	first := time.Date(2026, 11, 7, 16, 0, 0, 0, time.UTC)
+	later := first.Add(24 * time.Hour)
+	packages := summarizePackages([]any{
+		map[string]any{"PackageCode": "bonus", "CapacityRemain": 10.0, "CapacitySize": 10.0, "ExpiredTime": "2026-11-08 00:00:00"},
+		map[string]any{"PackageCode": "bonus", "CapacityRemain": 30.0, "CapacitySize": 30.0, "CycleEndTime": "2026-11-08 00:00:00", "DeductionEndTime": float64(later.UnixMilli())},
+	})
+	if len(packages) != 2 || packages[0]["remain"] != 30.0 || packages[0]["expire_at"] != float64(later.Unix()) ||
+		packages[1]["remain"] != 10.0 || packages[1]["expire_at"] != float64(first.Unix()) {
+		t.Fatalf("packages: %#v", packages)
+	}
+}
+
 func ptr(v float64) *float64 { return &v }

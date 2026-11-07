@@ -53,7 +53,7 @@ const fallbackContextWindow = 180000
 // expensive to build (session bootstrap + jobToken exchange), so one is cached
 // per account id.
 type Runtime struct {
-	modelRefresh         provider.RefreshGate
+	modelRefresh         map[[32]byte]*modelCatalogFlight
 	checkinFlight        *checkinFlight
 	maintenanceMu        sync.Mutex
 	autoWindow           string
@@ -99,6 +99,8 @@ type bridgeInitialization struct {
 type quotaEntry struct {
 	remaining float64
 	total     float64
+	unit      string
+	mixed     bool
 	plan      string
 	exceeded  bool
 	expiresAt int64
@@ -321,10 +323,10 @@ func (r *Runtime) bridgeFor(ctx context.Context, acct *account.Account, secret s
 // Models returns the active account's cached catalog without network I/O.
 // Until discovery succeeds, it exposes a clearly marked conservative fallback.
 func (r *Runtime) Models(context.Context) []provider.CatalogModel {
-	return r.catalogModels(nil)
+	return r.catalogModels(nil, nil)
 }
 
-func (r *Runtime) catalogModels(requested map[string]bool) []provider.CatalogModel {
+func (r *Runtime) catalogModels(requested map[string]bool, byAccount map[string]map[string]provider.CatalogModel) []provider.CatalogModel {
 	if !r.Ready() {
 		return nil
 	}
@@ -339,6 +341,10 @@ func (r *Runtime) catalogModels(requested map[string]bool) []provider.CatalogMod
 		if sec, e := account.GetSecret(a.ID); e == nil && sec != "" {
 			valid[a.ID] = modelCatalogKey(a, sec)
 		}
+	}
+	for _, local := range r.detectLocal() {
+		a := &account.Account{ID: "qoder-local-" + local.Region, Region: account.NormalizeRegion(local.Region)}
+		valid[a.ID] = modelCatalogKey(a, local.DeviceToken)
 	}
 	currentKey := [32]byte{}
 	if current != nil {
@@ -358,6 +364,14 @@ func (r *Runtime) catalogModels(requested map[string]bool) []provider.CatalogMod
 		hasCatalog = true
 		if requested != nil && !requested[m.ID] {
 			return
+		}
+		if byAccount != nil {
+			if byAccount[id] == nil {
+				byAccount[id] = map[string]provider.CatalogModel{}
+			}
+			if _, exists := byAccount[id][m.ID]; !exists {
+				byAccount[id][m.ID] = m
+			}
 		}
 		if i, ok := index[m.ID]; ok {
 			if freeSource(m) {
@@ -415,8 +429,11 @@ func (r *Runtime) RefreshModels(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if a, _, e := r.pickAccount(); e == nil && strings.HasPrefix(a.ID, "qoder-local-") {
-		accounts = append(accounts, *a)
+	localSecrets := map[string]string{}
+	for _, local := range r.detectLocal() {
+		a := account.Account{ID: "qoder-local-" + local.Region, Region: account.NormalizeRegion(local.Region)}
+		accounts = append(accounts, a)
+		localSecrets[a.ID] = local.DeviceToken
 	}
 	var failures []error
 	for i := range accounts {
@@ -424,16 +441,15 @@ func (r *Runtime) RefreshModels(ctx context.Context) error {
 		if account.IsGatewayHidden(a.ID) {
 			continue
 		}
-		secret, e := account.GetSecret(a.ID)
-		if strings.HasPrefix(a.ID, "qoder-local-") {
-			_, secret, e = r.pickAccount()
+		secret := localSecrets[a.ID]
+		if secret == "" && !strings.HasPrefix(a.ID, "qoder-local-") {
+			secret, _ = account.GetSecret(a.ID)
 		}
-		if e != nil || secret == "" {
+		if secret == "" {
 			continue
 		}
 		key := modelCatalogKey(a, secret)
-		e = r.modelRefresh.Do(ctx, fmt.Sprintf("%x", key), func(ctx context.Context) error { return r.refreshAccountModels(ctx, a, secret, key) })
-		if e != nil {
+		if e := r.refreshAccountCatalog(ctx, a, secret, key, true); e != nil {
 			failures = append(failures, e)
 		}
 		if ctx.Err() != nil {
@@ -442,7 +458,57 @@ func (r *Runtime) RefreshModels(ctx context.Context) error {
 	}
 	return errors.Join(failures...)
 }
+
+type modelCatalogFlight struct {
+	done chan struct{}
+	err  error
+}
+
+func (r *Runtime) refreshAccountCatalog(ctx context.Context, acct *account.Account, secret string, key [32]byte, force bool) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	if flight := r.modelRefresh[key]; flight != nil {
+		r.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-flight.done:
+			return flight.err
+		}
+	}
+	if !force && r.accountModels[key].expires.After(time.Now()) {
+		r.mu.Unlock()
+		return nil
+	}
+	if r.modelRefresh == nil {
+		r.modelRefresh = make(map[[32]byte]*modelCatalogFlight)
+	}
+	flight := &modelCatalogFlight{done: make(chan struct{})}
+	r.modelRefresh[key] = flight
+	r.mu.Unlock()
+
+	finished := false
+	defer func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		flight.err = err
+		if !finished {
+			flight.err = errors.New("Qoder 模型目录刷新未完成")
+		}
+		delete(r.modelRefresh, key)
+		close(flight.done)
+	}()
+	err = r.refreshAccountModels(ctx, acct, secret, key)
+	finished = true
+	return err
+}
+
 func (r *Runtime) refreshAccountModels(ctx context.Context, acct *account.Account, secret string, key [32]byte) error {
+	r.mu.Lock()
+	generation := r.bridgeGeneration[acct.ID]
+	r.mu.Unlock()
 	b, err := r.bridgeFor(ctx, acct, secret)
 	if err != nil {
 		r.markCatalogStale(key)
@@ -456,10 +522,12 @@ func (r *Runtime) refreshAccountModels(ctx context.Context, acct *account.Accoun
 		return fmt.Errorf("qoder model discovery failed: %v", err)
 	}
 	out := make([]provider.CatalogModel, 0, len(models))
+	available := make(map[string]bool, len(models))
 	for _, m := range models {
 		if !m.Enable {
 			continue
 		}
+		available[m.Key] = true
 		ctxWin := m.ContextWindow
 		if ctxWin == 0 {
 			ctxWin = m.MaxInputTokens
@@ -495,28 +563,33 @@ func (r *Runtime) refreshAccountModels(ctx context.Context, acct *account.Accoun
 		}
 		out = append(out, entry)
 	}
-	current, currentSecret, _ := r.pickAccount()
+	current, currentSecret := r.checkCredential(acct.ID)
+	if current == nil || modelCatalogKey(current, currentSecret) != key {
+		return errors.New("Qoder 账号凭据已变更")
+	}
+	active, activeSecret, _ := r.pickAccount()
+	updateActive := active != nil && modelCatalogKey(active, activeSecret) == key
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.bridgeGeneration[acct.ID] != generation {
+		return errors.New("Qoder 账号凭据已变更")
+	}
 	if r.accountModels == nil {
 		r.accountModels = map[[32]byte]accountModelSnapshot{}
 	}
-	available := map[string]bool{}
-	for _, m := range models {
-		if m.Enable {
-			available[m.Key] = true
+	now := time.Now()
+	for id, snapshot := range r.accountModels {
+		if id != key && snapshot.accountID == acct.ID && !snapshot.expires.After(now) {
+			delete(r.accountModels, id)
 		}
 	}
-	r.accountModels[key] = accountModelSnapshot{models: available, catalog: out, accountID: acct.ID, expires: time.Now().Add(5 * time.Minute)}
-	r.mu.Unlock()
-	if current == nil || modelCatalogKey(current, currentSecret) != key {
-		return nil
+	r.accountModels[key] = accountModelSnapshot{models: available, catalog: out, accountID: acct.ID, expires: now.Add(5 * time.Minute)}
+	if updateActive {
+		r.modelCache = out
+		r.modelCacheKey = key
+		r.modelCacheLoaded = true
+		r.modelCacheStale = false
 	}
-	r.mu.Lock()
-	r.modelCache = out
-	r.modelCacheKey = key
-	r.modelCacheLoaded = true
-	r.modelCacheStale = false
-	r.mu.Unlock()
 	return nil
 }
 

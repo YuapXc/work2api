@@ -256,6 +256,9 @@ func ImportAndActivate(a *Account, secret string, activate ...bool) (err error) 
 	}
 	found := false
 	for i := range accounts {
+		if strings.EqualFold(accounts[i].ID, a.ID) && NormalizeRegion(string(accounts[i].Region)) != NormalizeRegion(string(a.Region)) {
+			return fmt.Errorf("account identity collision across Qoder regions")
+		}
 		if accounts[i].ID == a.ID {
 			previous := accounts[i]
 			previous.Region, previous.AuthMode = a.Region, a.AuthMode

@@ -261,6 +261,15 @@ func TestBudgetPredictionFallbackAndUnknownBalances(t *testing.T) {
 	if !budget.Deferred || budget.Reason != "" || budget.Remaining == nil || *budget.Remaining != 50 || budget.Excluded != 50 {
 		t.Fatalf("budget=%#v", budget)
 	}
+	row["credit_packages"] = append(row["credit_packages"].([]map[string]any),
+		map[string]any{"remain": 10.0, "expire_at": 150.0},
+		map[string]any{"remain": 15.0, "expire_at": 150.0},
+		map[string]any{"remain": 20.0, "expire_at": 180.0},
+	)
+	budget = provider.CreditBudget(row, "domain", "label", "credits", 100)
+	if budget.ExpiresAt == nil || *budget.ExpiresAt != 150 || budget.Expiring != 25 {
+		t.Fatalf("earliest live balance=%#v", budget)
+	}
 	row["enabled"] = false
 	if provider.CreditBudget(row, "domain", "label", "credits", 100).Reason == "" {
 		t.Fatal("disabled account budget included")
@@ -274,7 +283,7 @@ func TestBudgetPredictionPoolsSameTariffsBeforeApplyingModelMix(t *testing.T) {
 		accounts = append(accounts, provider.BudgetPool{AccountID: uid, Domain: "domestic", DomainLabel: "国内", Unit: "积分", Remaining: &balance, Models: []string{"cheap", "expensive"}, ModelCosts: map[string]float64{"cheap": .1, "expensive": 1}})
 	}
 	data := map[string]provider.AdminData{"workbuddy": {Budgets: accounts}}
-	samples := []store.BudgetSample{{AccountUID: "a", Model: "cheap", Recent: true, Credits: 9, Tokens: 9000, Calls: 9}, {AccountUID: "b", Model: "expensive", Recent: true, Credits: 10, Tokens: 1000, Calls: 1}}
+	samples := []store.BudgetSample{{AccountUID: "a", Model: "cheap", Recent: true, Credits: 9, Tokens: 9000, Calls: 9}, {AccountUID: "b", Model: "expensive", Recent: true, Credits: 10, Tokens: 1000, Calls: 5}}
 	out := estimateBudgets(data, samples)
 	pools := out["providers"].([]map[string]any)[0]["pools"].([]map[string]any)
 	if len(pools) != 1 || pools[0]["account_count"] != 3 || pools[0]["remaining"] != 300.0 || out["predicted_tokens"] != int64(157894) {
@@ -303,6 +312,10 @@ func TestBudgetPredictionPoolsSameTariffsBeforeApplyingModelMix(t *testing.T) {
 	accounts[2].Models = []string{"cheap"}
 	if len(groupedBudgets("workbuddy", accounts)) != 2 {
 		t.Fatal("different applicability merged")
+	}
+	samples[1].Calls = 1
+	if estimateBudgets(data, samples)["predicted_tokens"] != nil {
+		t.Fatal("one expensive call supplied most of the estimated cost")
 	}
 }
 
@@ -358,6 +371,10 @@ func TestBudgetPredictionUsesRecentMixWithPerModelFallback(t *testing.T) {
 	if out["predicted_tokens"] != int64(52631) {
 		t.Fatalf("model fallback=%#v", out)
 	}
+	samples = append(samples, store.BudgetSample{AccountUID: "a", Model: "cheap", Recent: true, ZeroTokens: 1e9, ZeroCalls: 25})
+	if out := estimateBudgets(data, samples); out["predicted_tokens"] != int64(52631) {
+		t.Fatalf("zero-cost promotion changed paid model mix: %#v", out)
+	}
 	samples = append(samples, store.BudgetSample{AccountUID: "a", Model: "unknown", Recent: true, UnknownTokens: 1000, UnknownCalls: 1})
 	out = estimateBudgets(data, samples)
 	if out["predicted_tokens"] != nil {
@@ -366,6 +383,37 @@ func TestBudgetPredictionUsesRecentMixWithPerModelFallback(t *testing.T) {
 	row := out["providers"].([]map[string]any)[0]["pools"].([]map[string]any)[0]
 	if !reflect.DeepEqual(row["missing_models"], []string{"unknown"}) {
 		t.Fatal(row)
+	}
+}
+
+func TestBudgetPredictionSharesStampedRatesAndReportsPartialOrEmpty(t *testing.T) {
+	balance, zero, price := 10.0, 0.0, .5
+	regular := provider.BudgetPool{AccountID: "regular", Domain: "domestic", Unit: "credits", Remaining: &balance, Models: []string{"m", "other"}, ModelCosts: map[string]float64{"m": price}}
+	restricted := regular
+	restricted.AccountID, restricted.Models = "restricted", []string{"m"}
+	data := map[string]provider.AdminData{"workbuddy": {Budgets: []provider.BudgetPool{regular, restricted}}}
+	samples := []store.BudgetSample{
+		{AccountUID: "regular", Model: "m", Recent: true, Domain: "domestic", Coefficient: &price, Credits: 5, Tokens: 5000, Calls: 5},
+		{AccountUID: "restricted", Model: "m", Recent: true, UnknownTokens: 1000, UnknownCalls: 1},
+	}
+	if out := estimateBudgets(data, samples); out["total_pools"] != 2 || out["predicted_tokens"] != int64(20000) || out["partial"] != false {
+		t.Fatalf("same rate should calibrate two separate balances: %#v", out)
+	}
+	data["trae"] = provider.AdminData{Ready: true, Budgets: []provider.BudgetPool{{AccountID: "t", Remaining: &balance, EstimateUnavailable: "unknown billing"}}}
+	if out := estimateBudgets(data, samples); out["partial"] != true {
+		t.Fatalf("unpriced balance must be marked partial: %#v", out)
+	}
+	delete(data, "trae")
+	regular.Remaining = &zero
+	restricted.Remaining = &zero
+	data["workbuddy"] = provider.AdminData{Budgets: []provider.BudgetPool{regular, restricted}}
+	if out := estimateBudgets(data, nil); out["predicted_tokens"] != int64(0) || out["partial"] != false {
+		t.Fatalf("known empty balances: %#v", out)
+	}
+	restricted.Remaining = nil
+	data["workbuddy"] = provider.AdminData{Budgets: []provider.BudgetPool{regular, restricted}}
+	if out := estimateBudgets(data, nil); out["predicted_tokens"] != nil {
+		t.Fatalf("unknown balance must not count as empty: %#v", out)
 	}
 }
 

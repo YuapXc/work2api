@@ -91,6 +91,7 @@ type QuotaBucket struct {
 	Total     float64 `json:"total"`
 	Remaining float64 `json:"remaining"`
 	ResetTime string  `json:"reset_time,omitempty"`
+	Unit      string  `json:"unit,omitempty"`
 }
 
 // CanonicalIdentity keeps OAuth and PAT imports of the same verified identity
@@ -101,8 +102,11 @@ func CanonicalIdentity(a *Account, stable ...bool) error {
 		return err
 	}
 	email := strings.ToLower(strings.TrimSpace(a.Email))
+	region := NormalizeRegion(string(a.Region))
+	otherRegionID := false
 	for _, old := range list {
-		if NormalizeRegion(string(old.Region)) != NormalizeRegion(string(a.Region)) {
+		if NormalizeRegion(string(old.Region)) != region {
+			otherRegionID = otherRegionID || strings.EqualFold(old.ID, a.ID)
 			continue
 		}
 		if old.ID == a.ID && a.UpstreamID != "" && old.UpstreamID != "" && old.UpstreamID != a.UpstreamID && (email == "" || !strings.EqualFold(old.Email, email)) {
@@ -113,12 +117,15 @@ func CanonicalIdentity(a *Account, stable ...bool) error {
 			return nil
 		}
 	}
-	if len(stable) > 0 && stable[0] && (a.UpstreamID != "" || email != "") {
+	if otherRegionID || len(stable) > 0 && stable[0] && (a.UpstreamID != "" || email != "") {
+		if a.UpstreamID == "" && email == "" {
+			return fmt.Errorf("account identity collision across Qoder regions")
+		}
 		identity := "uid:" + a.UpstreamID
 		if email != "" {
 			identity = "email:" + email
 		}
-		a.ID = fmt.Sprintf("qoder-%x", sha256.Sum256([]byte(string(a.Region)+":"+identity)))
+		a.ID = fmt.Sprintf("qoder-%x", sha256.Sum256([]byte(string(region)+":"+identity)))
 	}
 	return nil
 }

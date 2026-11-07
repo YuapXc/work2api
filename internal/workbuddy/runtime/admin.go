@@ -263,8 +263,8 @@ func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 				}
 			}
 		}
-		if len(budget.Models) == 0 && budget.Reason == "" {
-			budget.Reason = "没有已确认可调用模型"
+		if len(budget.Models) == 0 {
+			budget.EstimateUnavailable = "没有已确认可调用模型"
 		}
 		budgets = append(budgets, budget)
 	}

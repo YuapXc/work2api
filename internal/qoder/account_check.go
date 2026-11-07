@@ -68,7 +68,7 @@ func (r *Runtime) CheckAccount(ctx context.Context, id string, force bool) provi
 		result.CheckedAt = cached.expires.Add(-5 * time.Minute).Unix()
 		return result
 	}
-	err := r.modelRefresh.Do(ctx, fmt.Sprintf("%x", key), func(ctx context.Context) error { return r.refreshAccountModels(ctx, a, s, key) })
+	err := r.refreshAccountCatalog(ctx, a, s, key, true)
 	if err != nil {
 		return provider.Checked("warning", "模型目录授权", "目录验证未通过，请核实授权或网络；未判定整号失效")
 	}
