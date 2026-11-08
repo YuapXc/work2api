@@ -18,7 +18,8 @@ func ResponsesRequestToChat(body map[string]any) (map[string]any, error) {
 	case string:
 		messages = append(messages, map[string]any{"role": "user", "content": inp})
 	case []any:
-		converted, err := convertInputItems(inp)
+		model, _ := body["model"].(string)
+		converted, err := convertInputItems(inp, strings.HasPrefix(strings.ToLower(model), "deepseek"))
 		if err != nil {
 			return nil, err
 		}
@@ -87,19 +88,23 @@ func ResponsesRequestToChat(body map[string]any) (map[string]any, error) {
 	return chat, nil
 }
 
-func convertInputItems(items []any) ([]any, error) {
+func convertInputItems(items []any, replayThinking bool) ([]any, error) {
 	var messages []any
 	var pendingAssistantContent any = nil
 	pendingSet := false
 	var pendingToolCalls []any
+	var pendingReasoning strings.Builder
 
 	flushAssistant := func() {
-		if pendingSet || len(pendingToolCalls) > 0 {
+		if pendingSet || len(pendingToolCalls) > 0 || pendingReasoning.Len() > 0 {
 			content := pendingAssistantContent
 			if content == nil {
 				content = ""
 			}
 			msg := map[string]any{"role": "assistant", "content": content}
+			if pendingReasoning.Len() > 0 {
+				msg["reasoning_content"] = pendingReasoning.String()
+			}
 			if len(pendingToolCalls) > 0 {
 				calls := make([]any, len(pendingToolCalls))
 				copy(calls, pendingToolCalls)
@@ -109,6 +114,7 @@ func convertInputItems(items []any) ([]any, error) {
 			pendingAssistantContent = nil
 			pendingSet = false
 			pendingToolCalls = nil
+			pendingReasoning.Reset()
 		}
 	}
 
@@ -119,6 +125,25 @@ func convertInputItems(items []any) ([]any, error) {
 		}
 		itemType, hasType := item["type"].(string)
 		role, _ := item["role"].(string)
+		if itemType == "reasoning" {
+			if !replayThinking {
+				continue
+			}
+			if pendingSet || len(pendingToolCalls) > 0 {
+				flushAssistant()
+			}
+			for _, key := range []string{"summary", "content"} {
+				parts, _ := item[key].([]any)
+				for _, raw := range parts {
+					part, _ := raw.(map[string]any)
+					if part["type"] == "summary_text" || part["type"] == "reasoning_text" || part["type"] == "text" {
+						text, _ := part["text"].(string)
+						pendingReasoning.WriteString(text)
+					}
+				}
+			}
+			continue
+		}
 
 		// simple message {"role":"user","content":...} with no type
 		if !hasType && (role == "user" || role == "system" || role == "developer") {
@@ -148,7 +173,9 @@ func convertInputItems(items []any) ([]any, error) {
 			continue
 		}
 		if itemType == "message" && role == "assistant" {
-			flushAssistant()
+			if pendingSet || len(pendingToolCalls) > 0 {
+				flushAssistant()
+			}
 			content, err := responsesContentWithImages(item["content"])
 			if err != nil {
 				return nil, err
@@ -158,7 +185,9 @@ func convertInputItems(items []any) ([]any, error) {
 			continue
 		}
 		if !hasType && role == "assistant" {
-			flushAssistant()
+			if pendingSet || len(pendingToolCalls) > 0 {
+				flushAssistant()
+			}
 			content, err := responsesContentWithImages(item["content"])
 			if err != nil {
 				return nil, err

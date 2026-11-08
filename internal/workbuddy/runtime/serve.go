@@ -167,6 +167,12 @@ type converter interface {
 }
 
 func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload map[string]any, principal *provider.Caller, protocol string) {
+	if protocol == "anthropic" {
+		r = r.WithContext(context.WithValue(r.Context(), messagesRequestKey{}, payload))
+		if beta := r.Header.Get("Anthropic-Beta"); beta != "" {
+			r = r.WithContext(context.WithValue(r.Context(), messagesBetaKey{}, beta))
+		}
+	}
 	var chatBody map[string]any
 	var cvErr error
 	if protocol == "anthropic" {
@@ -236,8 +242,33 @@ func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload
 		}
 		return send(chunk)
 	}
+	var nativeResult nativeMessageResult
+	nativeResponse := false
 	sink := func(line string) error {
-		evt := conv.FeedChunk(upstream.DecodeFrame(r.Context(), line))
+		chunk := upstream.DecodeFrame(r.Context(), line)
+		if event, ok := chunk[upstream.NativeEvent].(map[string]any); ok && protocol == "anthropic" {
+			if !nativeResponse {
+				if messages, ok := conv.(*chatstream.AnthropicStreamConverter); ok {
+					messages.SetObserveOnly(provider.LogCapturePolicy{Enabled: principal.UserID == 0, Limit: o.cfg.UsageContentMaxBytes})
+				}
+			}
+			nativeResponse = true
+			if !streamMode {
+				nativeResult.observe(event)
+			} else {
+				raw, err := json.Marshal(event)
+				if err != nil {
+					return err
+				}
+				if err := writeChunk("event: " + ToStr(event["type"]) + "\ndata: " + string(raw) + "\n\n"); err != nil {
+					return err
+				}
+			}
+		}
+		evt := conv.FeedChunk(chunk)
+		if nativeResponse {
+			return nil
+		}
 		if evt != "" && streamMode {
 			return writeChunk(evt)
 		}
@@ -295,6 +326,9 @@ func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload
 		o.LogUsage(args)
 	}()
 	if streamMode {
+		if nativeResponse {
+			return
+		}
 		if responses, ok := conv.(*chatstream.ResponsesStreamConverter); ok {
 			// Each done/completed event retains its official full payload; only
 			// the encoding/writing is incremental to bound transient copies.
@@ -325,6 +359,10 @@ func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload
 		} else {
 			deliveryErr = writeChunk(conv.Finish())
 		}
+		return
+	}
+	if nativeResponse {
+		writeJSON(w, 200, nativeResult.message)
 		return
 	}
 	writeJSON(w, 200, conv.GetNonstreamResponse())

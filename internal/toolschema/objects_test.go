@@ -52,3 +52,46 @@ func TestToolSchemaShapesPreserveContracts(t *testing.T) {
 		t.Fatal("source mutated")
 	}
 }
+
+func TestWorkBuddySchemaPreservesConstraints(t *testing.T) {
+	for _, raw := range []string{
+		`{"type":"object","required":["x"],"properties":{"x":{"enum":[1,"one",null]},"y":false},"additionalProperties":false}`,
+		`{"type":["integer","string"],"enum":[1,1.5,"x"],"anyOf":[{"const":1}],"allOf":[{"description":"keep"}]}`,
+		`{"enum":[],"description":"unchanged"}`,
+		`{"properties":{"x":{"pattern":"\\0"},"y":{"pattern":"\\\\0"},"z":{"pattern":"\\01"}},"const":{"pattern":"\\0"},"description":"\\0"}`,
+		`{"oneOf":[{"type":"object"},{"type":"object"}]}`,
+	} {
+		var source map[string]any
+		if err := json.Unmarshal([]byte(raw), &source); err != nil {
+			t.Fatal(err)
+		}
+		before, _ := json.Marshal(source)
+		out := workBuddySchema(source)
+		after, _ := json.Marshal(source)
+		if string(before) != string(after) {
+			t.Fatal("mutated source")
+		}
+		if !reflect.DeepEqual(out, workBuddySchema(out)) {
+			t.Fatalf("not idempotent: %s", raw)
+		}
+		m := out.(map[string]any)
+		for _, key := range []string{"required", "additionalProperties", "description", "const", "anyOf"} {
+			if !reflect.DeepEqual(source[key], m[key]) {
+				t.Fatalf("changed %s", key)
+			}
+		}
+		if values, ok := source["enum"].([]any); ok && len(values) == 0 {
+			if !reflect.DeepEqual(m["not"], map[string]any{}) {
+				t.Fatal("empty enum widened")
+			}
+		}
+	}
+	var source map[string]any
+	json.Unmarshal([]byte(`{"properties":{"x":{"pattern":"\\0"},"y":{"pattern":"\\\\0"},"z":{"pattern":"\\01"}}}`), &source)
+	fields := workBuddySchema(source).(map[string]any)["properties"].(map[string]any)
+	for key, want := range map[string]string{"x": `\u0000`, "y": `\\0`, "z": `\01`} {
+		if fields[key].(map[string]any)["pattern"] != want {
+			t.Fatal(key, fields[key])
+		}
+	}
+}

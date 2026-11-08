@@ -42,6 +42,8 @@ type Runtime struct {
 	creditRechecks   creditRecheckQueue
 	creditQuery      func(context.Context, billing.Credential) (*billing.Credit, error)
 	modelRefresh     provider.RefreshGate
+	toolTailMu       sync.RWMutex
+	toolTailModels   map[string]bool
 	MaintenanceMu    sync.Mutex
 	maintenance      *maintenanceState
 	Pool             *pool.Pool

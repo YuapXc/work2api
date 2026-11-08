@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -203,6 +204,68 @@ func TestStableSessionAcrossProtocolHandlers(t *testing.T) {
 	v, ok := o.sessions.View(key)
 	if !ok || v.Requests != 6 || v.AgentRequests != 3 || v.Running != 0 || v.Waiting != 0 || v.UID != acc.UID || len(o.sessions.Views()) != 1 {
 		t.Fatalf("fragmented or duplicated requests: %+v", v)
+	}
+}
+
+func TestWorkBuddyNativeMessagesAcrossPublicProtocols(t *testing.T) {
+	for _, kind := range []string{"chat", "anthropic", "responses"} {
+		for _, stream := range []bool{false, true} {
+			t.Run(kind+fmt.Sprint(stream), func(t *testing.T) {
+				o, _ := newDNSFailoverOrch(t, &failingUpstream{})
+				o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: mediaAppTransport(func(r *http.Request) (*http.Response, error) {
+					return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"code":0,"data":{"models":[{"id":"claude-test","credits":1}],"agents":[{"name":"cli","models":["claude-test"]}]}}`))}, nil
+				})})
+				o.wb.Catalog.Refresh()
+				calls := 0
+				o.wb.UpstreamClient = upstream.NewClient(&http.Client{Transport: mediaAppTransport(func(r *http.Request) (*http.Response, error) {
+					calls++
+					if r.URL.Path != "/v1/messages" {
+						t.Error("native endpoint not selected")
+					}
+					var sent map[string]any
+					if err := json.NewDecoder(r.Body).Decode(&sent); err != nil {
+						t.Fatal(err)
+					}
+					if kind == "anthropic" {
+						if sent["output_config"].(map[string]any)["effort"] != "high" {
+							t.Error("effort lost")
+						}
+					}
+					return &http.Response{Request: r, StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"id":"msg_native","type":"message","role":"assistant","model":"claude-test","content":[{"type":"thinking","thinking":"reason","signature":"opaque-signature"},{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":7,"output_tokens":5}}`))}, nil
+				})})
+				if _, err := o.db.CreateApp("native", o.hashKey("native-key"), "", "", "", "", 0); err != nil {
+					t.Fatal(err)
+				}
+				s := NewServer(o)
+				body := map[string]any{"model": "claude-test", "stream": stream, "max_tokens": 256, "messages": []any{map[string]any{"role": "user", "content": "hello"}}}
+				path := "/v1/chat/completions"
+				if kind == "anthropic" {
+					path = "/v1/messages"
+					body["thinking"] = map[string]any{"type": "adaptive"}
+					body["output_config"] = map[string]any{"effort": "high"}
+				}
+				if kind == "responses" {
+					path = "/v1/responses"
+					delete(body, "messages")
+					body["input"] = "hello"
+				}
+				raw, _ := json.Marshal(body)
+				r := httptest.NewRequest("POST", path, strings.NewReader(string(raw)))
+				r.Header.Set("Authorization", "Bearer native-key")
+				w := httptest.NewRecorder()
+				handler := http.HandlerFunc(s.handleChat)
+				if kind != "chat" {
+					handler = func(w http.ResponseWriter, r *http.Request) { s.handleConverted(w, r, kind) }
+				}
+				s.requestGuard(handler).ServeHTTP(w, r)
+				if w.Code != 200 || calls != 1 || !strings.Contains(w.Body.String(), "OK") || strings.Contains(w.Body.String(), upstream.NativeEvent) {
+					t.Fatal(w.Code, calls, w.Body.String())
+				}
+				if kind == "anthropic" && !strings.Contains(w.Body.String(), "opaque-signature") {
+					t.Fatal("native signature lost", w.Body.String())
+				}
+			})
+		}
 	}
 }
 
@@ -505,6 +568,37 @@ func TestAccountSpecificFreeRoutingAndLiveRevocation(t *testing.T) {
 		for _, raw := range row["accounts"].([]map[string]any) {
 			if raw["uid"] == "free" && raw["healthy"] != (row["id"] == "test-model") {
 				t.Fatal("model status ignored per-model entitlement", row)
+			}
+		}
+	}
+	until := nowSec() + 3600
+	if err := o.db.SetModelCooldown("free", "test-model", until, "该模型今日已达上限"); err != nil {
+		t.Fatal(err)
+	}
+	o.wb.AttachModelAccounts(rows)
+	foundCooldown := false
+	for _, row := range rows {
+		for _, account := range row["accounts"].([]map[string]any) {
+			if account["uid"] != "free" || row["id"] != "test-model" {
+				continue
+			}
+			foundCooldown = true
+			if account["healthy"] != false || account["model_cooldown"] != true || account["model_cooldown_until"] != until || account["model_cooldown_reason"] != "该模型今日已达上限" {
+				t.Fatal("model cooldown details lost", account)
+			}
+		}
+	}
+	if !foundCooldown {
+		t.Fatal("model account missing")
+	}
+	if err := o.db.SetModelCooldown("free", "test-model", nowSec()-1, "expired"); err != nil {
+		t.Fatal(err)
+	}
+	o.wb.AttachModelAccounts(rows)
+	for _, row := range rows {
+		for _, account := range row["accounts"].([]map[string]any) {
+			if account["uid"] == "free" && row["id"] == "test-model" && (account["model_cooldown"] != false || account["model_cooldown_until"] != float64(0) || account["model_cooldown_reason"] != "") {
+				t.Fatal("expired cooldown remained visible", account)
 			}
 		}
 	}

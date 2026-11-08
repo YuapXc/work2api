@@ -749,19 +749,58 @@ func TestCustomToolsRoundTrip(t *testing.T) {
 }
 
 func TestCustomToolsRejectMalformedInput(t *testing.T) {
-	for _, args := range []string{`{"input":7}`, `{"input":"patch","extra":1}`, `{"input":`} {
-		recorder := httptest.NewRecorder()
-		w := NewCustomToolWriter(recorder, map[string]bool{"apply_patch": true}, 1<<20)
-		w.Header().Set("Content-Type", "text/event-stream")
-		for _, event := range []map[string]any{
-			{"type": "response.output_item.added", "item": map[string]any{"type": "function_call", "id": "fc_1", "name": "apply_patch"}},
-			{"type": "response.function_call_arguments.done", "item_id": "fc_1", "arguments": args},
-		} {
-			data, _ := json.Marshal(event)
-			_, _ = w.Write(append(append([]byte("data: "), data...), '\n', '\n'))
-		}
-		if w.Finish() == nil || !strings.Contains(recorder.Body.String(), `"type":"response.failed"`) || strings.Contains(recorder.Body.String(), `"type":"response.custom_tool_call_input.done"`) {
-			t.Fatal("invalid input became executable", recorder.Body.String())
+	for _, withMetadata := range []bool{false, true} {
+		for _, args := range []string{`{"input":7}`, `{"input":"patch","extra":1}`, `{"input":`} {
+			recorder := httptest.NewRecorder()
+			w := NewCustomToolWriter(recorder, map[string]bool{"apply_patch": true}, 1<<20)
+			w.Header().Set("Content-Type", "text/event-stream")
+			if withMetadata {
+				_, _ = w.Write([]byte("data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_original\",\"created_at\":1700000000,\"model\":\"fixture\",\"usage\":{\"input_tokens\":42}}}\n\n"))
+			}
+			for _, event := range []map[string]any{
+				{"type": "response.output_item.added", "item": map[string]any{"type": "function_call", "id": "fc_1", "name": "apply_patch"}},
+				{"type": "response.function_call_arguments.done", "item_id": "fc_1", "arguments": args},
+			} {
+				data, _ := json.Marshal(event)
+				_, _ = w.Write(append(append([]byte("data: "), data...), '\n', '\n'))
+			}
+			if w.Finish() == nil || !strings.Contains(recorder.Body.String(), `"type":"response.failed"`) || strings.Contains(recorder.Body.String(), `"type":"response.custom_tool_call_input.done"`) {
+				t.Fatal("invalid input became executable", recorder.Body.String())
+			}
+			sequence, failures := 0, 0
+			if err := readSSE(strings.NewReader(recorder.Body.String()), func(_ string, data string) error {
+				var event map[string]any
+				if err := json.Unmarshal([]byte(data), &event); err != nil {
+					return err
+				}
+				if jsonutil.IntAt(event, "sequence_number") != sequence {
+					t.Fatal("non-monotonic sequence", event)
+				}
+				sequence++
+				if event["type"] != "response.failed" {
+					return nil
+				}
+				failures++
+				response := jsonutil.MapAt(event, "response")
+				if jsonutil.StringAt(response, "id") == "" || jsonutil.IntAt(response, "created_at") <= 0 || response["object"] != "response" || response["status"] != "failed" {
+					t.Fatal("incomplete failed response", response)
+				}
+				if _, ok := response["model"].(string); !ok {
+					t.Fatal("missing model", response)
+				}
+				if output, ok := response["output"].([]any); !ok || len(output) != 0 {
+					t.Fatal("invalid tool leaked", response)
+				}
+				if withMetadata && (response["id"] != "resp_original" || jsonutil.IntAt(response, "created_at") != 1700000000 || response["model"] != "fixture" || jsonutil.IntAt(response, "usage", "input_tokens") != 42) {
+					t.Fatal("response identity or usage lost", response)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if failures != 1 {
+				t.Fatal("failure was lost or duplicated", recorder.Body.String())
+			}
 		}
 	}
 }

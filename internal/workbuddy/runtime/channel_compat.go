@@ -100,9 +100,8 @@ const (
 //
 // The upstream check reads every system message, not just the leading one, and
 // DSH keeps earlier system prompts in history once the prompt changes, so the
-// rewrite walks the whole conversation. Only `system`/`developer` text is
-// touched: a user, assistant or tool message that merely quotes the sentence is
-// conversation content, not a client declaration, and is left byte-identical.
+// rewrite walks system/developer text and known opening declarations in
+// assistant history. User/tool text and quoted assistant content stay intact.
 // The rewrite is idempotent and never mutates the caller's body.
 func NeutralizeChannelFingerprints(body map[string]any) (map[string]any, bool) {
 	return transformSystemText(body, neutralizeClientTemplates)
@@ -120,13 +119,17 @@ func transformSystemText(body map[string]any, transform func(string) string) (ma
 		if !ok {
 			continue
 		}
-		if role, _ := message["role"].(string); role != "system" && role != "developer" {
+		role, _ := message["role"].(string)
+		apply := transform
+		if role == "assistant" {
+			apply = neutralizeAssistantDeclaration
+		} else if role != "system" && role != "developer" {
 			continue
 		}
 		var content any
 		switch value := message["content"].(type) {
 		case string:
-			rewritten := transform(value)
+			rewritten := apply(value)
 			if rewritten == value {
 				continue
 			}
@@ -143,7 +146,7 @@ func transformSystemText(body map[string]any, transform func(string) string) (ma
 				if !ok {
 					continue
 				}
-				rewritten := transform(text)
+				rewritten := apply(text)
 				if rewritten == text {
 					continue
 				}
@@ -185,6 +188,14 @@ func transformSystemText(body map[string]any, transform func(string) string) (ma
 	}
 	out["messages"] = copyMessages
 	return out, true
+}
+
+func neutralizeAssistantDeclaration(text string) string {
+	padding := text[:len(text)-len(strings.TrimLeft(text, " \t\r\n"))]
+	if value, changed := CompatibleIdentity(text[len(padding):]); changed {
+		return padding + value
+	}
+	return text
 }
 
 func neutralizeClientTemplates(text string) string {

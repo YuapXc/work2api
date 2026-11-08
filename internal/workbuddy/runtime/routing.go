@@ -469,7 +469,7 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 		streamwatch.StartAttempt(ctx)
 		attemptBody := body
 		level := 0
-		if o.cfg.ChannelIdentityCompat {
+		if o.cfg.ChannelIdentityCompat && nativeMessagesEndpoint(acc.Profile, model) == "" {
 			level = o.Sessions.Compatibility(sessionKey, acc.UID, maxCompatLevel, getFingerprint)
 			level = max(level, requestCompatLevel)
 			if acc.UID == compatUID {
@@ -529,7 +529,7 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 			return acc, err
 		}
 		if started {
-			if denied || (upstreamErr && ClassifyUpstream(ue.StatusCode, ue.Raw, ue.Header) == ErrImageInvalid) {
+			if denied || (upstreamErr && (ClassifyUpstream(ue.StatusCode, ue.Raw, ue.Header) == ErrImageInvalid || (nativeMessagesEndpoint(acc.Profile, model) != "" && BusinessCode(string(ue.Raw), "11159")))) {
 				return acc, err
 			}
 			// 流已开始又中断：软冷却（可能是上游中途掉线），不重试已开始的流。
@@ -548,7 +548,7 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 		}
 		// Recover only explicit 11135 errors before any output. Never penalize an
 		// account or cache this request-local, lossy fallback.
-		if imageRecoveryStage < 2 && ue.StatusCode == 400 && BusinessCode(string(ue.Raw), "11135") && attempt+1 < maxFailoverAttempts && recoveryAvailable(ctx) {
+		if nativeMessagesEndpoint(acc.Profile, model) == "" && imageRecoveryStage < 2 && ue.StatusCode == 400 && BusinessCode(string(ue.Raw), "11135") && attempt+1 < maxFailoverAttempts && recoveryAvailable(ctx) {
 			var reduced map[string]any
 			fixed, count := 0, 0
 			mode := "partial"
@@ -584,7 +584,7 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 			_, metadataMatch := compatibleBody(2)
 			log.Printf("渠道拒绝诊断: profile=%s model=%s compatibility=%s compat_enabled=%t metadata_enabled=%t identity_match=%t metadata_match=%t started=%t attempt=%d", acc.Profile, model, CompatibilityName(level), o.cfg.ChannelIdentityCompat, o.cfg.ChannelMetadataCompat, identityMatch, metadataMatch, started, attempt+1)
 		}
-		if denied && o.cfg.ChannelIdentityCompat && compatTries < 2 && attempt+1 < maxFailoverAttempts && recoveryAvailable(ctx) {
+		if nativeMessagesEndpoint(acc.Profile, model) == "" && denied && o.cfg.ChannelIdentityCompat && compatTries < 2 && attempt+1 < maxFailoverAttempts && recoveryAvailable(ctx) {
 			for next := level + 1; next <= maxCompatLevel; next++ {
 				if _, matched := compatibleBody(next); matched {
 					compatUID, compatLevel = acc.UID, next

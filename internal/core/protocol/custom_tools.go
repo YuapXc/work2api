@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
+	"work2api/internal/identity"
 	"work2api/internal/jsonutil"
 )
 
@@ -138,7 +140,7 @@ type CustomToolWriter struct {
 	committed      bool
 	sequence       int
 	failure        error
-	responseID     string
+	responseMeta   map[string]any
 	responseLength int
 }
 
@@ -286,9 +288,24 @@ func (w *CustomToolWriter) fail(err error) error {
 	w.failure = err
 	w.buffer.Reset()
 	if w.stream() {
-		data, _ := json.Marshal(map[string]any{"type": "response.failed", "sequence_number": w.sequence, "response": map[string]any{"id": w.responseID, "object": "response", "status": "failed", "output": []any{}, "error": map[string]any{"code": "invalid_tool_arguments", "message": err.Error()}}})
+		response := copyCustomMap(w.responseMeta)
+		if jsonutil.StringAt(response, "id") == "" {
+			response["id"] = identity.RandomID("resp", 12)
+		}
+		if jsonutil.IntAt(response, "created_at") <= 0 {
+			response["created_at"] = time.Now().Unix()
+		}
+		if _, ok := response["model"].(string); !ok {
+			response["model"] = ""
+		}
+		response["object"], response["parallel_tool_calls"] = "response", true
+		response["tool_choice"], response["tools"] = "auto", []any{}
+		response["status"], response["output"] = "failed", []any{}
+		response["error"] = map[string]any{"code": "invalid_tool_arguments", "message": err.Error()}
+		data, _ := json.Marshal(map[string]any{"type": "response.failed", "sequence_number": w.sequence, "response": response})
+		w.sequence++
 		w.commit()
-		_, _ = w.ResponseWriter.Write(append(append([]byte("data: "), data...), '\n', '\n'))
+		_, _ = w.ResponseWriter.Write(append(append([]byte("event: response.failed\ndata: "), data...), '\n', '\n'))
 		w.Flush()
 	}
 	return err
@@ -352,10 +369,21 @@ func (w *CustomToolWriter) inputEvents(id string, index any, input string) []map
 }
 func (w *CustomToolWriter) restoreEvent(event map[string]any) ([]map[string]any, error) {
 	events := []map[string]any{}
+	if response := jsonutil.MapAt(event, "response"); response != nil {
+		for _, key := range []string{"id", "created_at", "model", "usage"} {
+			if value := response[key]; value != nil {
+				if key == "id" && jsonutil.StringAt(response, key) == "" || key == "created_at" && jsonutil.IntAt(response, key) <= 0 {
+					continue
+				}
+				if w.responseMeta == nil {
+					w.responseMeta = make(map[string]any, 4)
+				}
+				w.responseMeta[key] = value
+			}
+		}
+	}
 	id := jsonutil.StringAt(event, "item_id")
 	switch jsonutil.StringAt(event, "type") {
-	case "response.created":
-		w.responseID = jsonutil.StringAt(event, "response", "id")
 	case "response.output_item.added", "response.output_item.done":
 		item := jsonutil.MapAt(event, "item")
 		custom := jsonutil.StringAt(item, "type") == "function_call" && w.names[jsonutil.StringAt(item, "name")]

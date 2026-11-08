@@ -1,13 +1,193 @@
 package runtime
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+	"work2api/internal/toolschema"
 	"work2api/internal/workbuddy/adapters"
+	"work2api/internal/workbuddy/credentials"
+	"work2api/internal/workbuddy/pool"
+	"work2api/internal/workbuddy/reasoning"
+	"work2api/internal/workbuddy/siterouting"
 	"work2api/internal/workbuddy/upstream"
 )
+
+func TestLiveDomesticSchemaToolRoundTrip(t *testing.T) {
+	if os.Getenv("WORK2API_LIVE_CN_SCHEMA") != "1" {
+		t.Skip("explicit domestic synthetic tool verification only")
+	}
+	var mgr *credentials.Manager
+	for _, file := range append(credentials.FindAuthFiles(filepath.Join("..", "..", "..", "auths"), ""), credentials.FindAuthFiles("", "")...) {
+		candidate := credentials.NewManager(file)
+		if siterouting.ProfileSite(candidate.Profile()) != siterouting.Domestic {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+		_, err := candidate.GetChatHeadersContext(ctx)
+		cancel()
+		if err == nil {
+			mgr = candidate
+			break
+		}
+	}
+	if mgr == nil {
+		t.Fatal("domestic credential unavailable")
+	}
+	var tools any
+	json.Unmarshal([]byte(`[{"type":"function","function":{"name":"echo_check","description":"Echo a synthetic value.","parameters":{"type":"object","required":["value"],"properties":{"value":{"enum":["ok",1]},"unused":false},"additionalProperties":false}}}]`), &tools)
+	body := reasoning.Sanitize(upstream.BuildUpstreamBody(map[string]any{"model": "deepseek-v4.1-flash", "max_tokens": 128, "thinking": map[string]any{"type": "disabled"}, "tools": toolschema.WorkBuddyTools(tools), "tool_choice": map[string]any{"type": "function", "function": map[string]any{"name": "echo_check"}}, "messages": []any{map[string]any{"role": "system", "content": "Use echo_check once with value ok; after its result, reply exactly OK."}, map[string]any{"role": "user", "content": "Run the synthetic echo check."}}}), nil)
+	endpoint, _ := siterouting.ChatURLForProfile(mgr.Profile())
+	var message map[string]any
+	for i := 0; i < 2; i++ {
+		ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+		headers, err := mgr.GetChatHeadersContext(ctx)
+		if err != nil {
+			cancel()
+			t.Fatal("credential preparation failed")
+		}
+		start := time.Now()
+		reply, err := upstream.CollectStream("deepseek-v4.1-flash", func(yield upstream.LineFunc) error {
+			return upstream.Shared().StreamUpstream(ctx, headers, body, endpoint, yield)
+		})
+		cancel()
+		if err != nil {
+			t.Fatalf("domestic synthetic tool round %d failed: %T", i+1, err)
+		}
+		choices, _ := reply["choices"].([]any)
+		if len(choices) != 1 {
+			t.Fatal("missing response")
+		}
+		choice := choices[0].(map[string]any)
+		message, _ = choice["message"].(map[string]any)
+		if i == 0 {
+			calls, _ := message["tool_calls"].([]any)
+			if len(calls) != 1 {
+				t.Fatal("missing tool call")
+			}
+			call := calls[0].(map[string]any)
+			fn := call["function"].(map[string]any)
+			var args map[string]any
+			if fn["name"] != "echo_check" || json.Unmarshal([]byte(ToStr(fn["arguments"])), &args) != nil || args["value"] != "ok" {
+				t.Fatal("tool contract failed")
+			}
+			body["messages"] = append(body["messages"].([]any), message, map[string]any{"role": "tool", "tool_call_id": call["id"], "content": "ok"})
+			delete(body, "tool_choice")
+		} else if choice["finish_reason"] != "stop" || strings.TrimSpace(ToStr(message["content"])) != "OK" {
+			t.Fatal("tool result round did not complete")
+		}
+		t.Logf("domestic_schema_tool round=%d completed=true elapsed_ms=%d", i+1, time.Since(start).Milliseconds())
+	}
+}
+
+func TestLiveDomesticConversationGrouping(t *testing.T) {
+	if os.Getenv("WORK2API_LIVE_CN_GROUPING") != "1" {
+		t.Skip("explicit domestic synthetic verification only")
+	}
+	var mgr *credentials.Manager
+	for _, file := range append(credentials.FindAuthFiles(filepath.Join("..", "..", "..", "auths"), ""), credentials.FindAuthFiles("", "")...) {
+		candidate := credentials.NewManager(file)
+		if siterouting.ProfileSite(candidate.Profile()) != siterouting.Domestic {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+		_, err := candidate.GetChatHeadersContext(ctx)
+		cancel()
+		if err == nil {
+			mgr = candidate
+			break
+		}
+	}
+	if mgr == nil {
+		t.Fatal("domestic credential unavailable")
+	}
+	body := reasoning.Sanitize(upstream.BuildUpstreamBody(map[string]any{"model": "deepseek-v4.1-flash", "max_tokens": 32, "thinking": map[string]any{"type": "disabled"}, "messages": []any{map[string]any{"role": "system", "content": "Answer briefly."}, map[string]any{"role": "user", "content": "Reply exactly OK."}}}), nil)
+	request := (&http.Request{Header: http.Header{"X-Claude-Code-Session-Id": []string{"synthetic-grouping-check"}}}).WithContext(t.Context())
+	request = WithRequestSessionIdentity(request, body)
+	url, _ := siterouting.ChatURLForProfile(mgr.Profile())
+	var conversation, turn, physical string
+	for i := 0; i < 2; i++ {
+		ctx, cancel := context.WithTimeout(request.Context(), 60*time.Second)
+		headers, err := mgr.GetChatHeadersContext(ctx)
+		if err != nil {
+			cancel()
+			t.Fatal("credential preparation failed")
+		}
+		applyUpstreamConversation(ctx, &pool.Account{UID: "synthetic", Profile: mgr.Profile()}, headers, "deepseek-v4.1-flash")
+		if i > 0 && (conversation != headers["X-Conversation-ID"] || turn != headers["X-Conversation-Request-ID"] || physical == headers["X-Request-ID"]) {
+			cancel()
+			t.Fatal("conversation/turn grouping or physical request uniqueness failed")
+		}
+		conversation, turn, physical = headers["X-Conversation-ID"], headers["X-Conversation-Request-ID"], headers["X-Request-ID"]
+		start := time.Now()
+		reply, err := upstream.CollectStream("deepseek-v4.1-flash", func(yield upstream.LineFunc) error {
+			return upstream.Shared().StreamUpstream(ctx, headers, body, url, yield)
+		})
+		cancel()
+		if err != nil {
+			t.Fatalf("domestic grouping request %d did not complete: %T", i+1, err)
+		}
+		choices, _ := reply["choices"].([]any)
+		if len(choices) != 1 {
+			t.Fatal("missing response")
+		}
+		choice := choices[0].(map[string]any)
+		message, _ := choice["message"].(map[string]any)
+		if choice["finish_reason"] != "stop" || strings.TrimSpace(ToStr(message["content"])) != "OK" {
+			t.Fatal("incomplete synthetic response")
+		}
+		t.Logf("domestic_grouping request=%d completed=true elapsed_ms=%d", i+1, time.Since(start).Milliseconds())
+	}
+}
+
+func TestUpstreamConversationAndTurnIsolation(t *testing.T) {
+	makeBody := func(messages []any) map[string]any { return map[string]any{"messages": messages} }
+	user := map[string]any{"role": "user", "content": "same question"}
+	base := makeBody([]any{user})
+	loop := makeBody([]any{user, map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{"id": "c1"}}}, map[string]any{"role": "tool", "content": "output"}, map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "content": "ignored"}, map[string]any{"type": "text", "text": "<system-reminder>notice</system-reminder>"}}}})
+	if requestTurnFingerprint(base) != requestTurnFingerprint(loop) {
+		t.Fatal("tool round started another user turn")
+	}
+	loop["messages"] = append(loop["messages"].([]any), user)
+	if requestTurnFingerprint(base) == requestTurnFingerprint(loop) {
+		t.Fatal("repeated user question collapsed")
+	}
+	stamp := func(body map[string]any, scope, agent, uid string) map[string]string {
+		r := &http.Request{Header: http.Header{}}
+		r.Header.Set("X-Claude-Code-Session-Id", "session")
+		r.Header.Set("Authorization", scope)
+		r.Header.Set("X-Claude-Code-Agent-Id", agent)
+		r = WithRequestSessionIdentity(r.WithContext(context.Background()), body)
+		headers := map[string]string{"X-Request-ID": "physical-request", "X-Conversation-Message-ID": "physical-request", "X-Conversation-Request-ID": "random", "X-Conversation-ID": "random"}
+		applyUpstreamConversation(r.Context(), &pool.Account{UID: uid, Profile: "cn-cli"}, headers, "deepseek-v4.1-flash")
+		return headers
+	}
+	a, b := stamp(base, "key-a", "", "account-a"), stamp(base, "key-a", "", "account-a")
+	if !reflect.DeepEqual(a, b) || a["X-Conversation-ID"] == "random" || a["X-Request-ID"] != "physical-request" || a["X-Conversation-Request-ID"] == "physical-request" {
+		t.Fatal("identity grouping or per-request identifiers lost", a, b)
+	}
+	next := stamp(loop, "key-a", "", "account-a")
+	if a["X-Conversation-ID"] != next["X-Conversation-ID"] || a["X-Conversation-Request-ID"] == next["X-Conversation-Request-ID"] {
+		t.Fatal("conversation and turn confused")
+	}
+	for _, other := range []map[string]string{stamp(base, "key-b", "", "account-a"), stamp(base, "key-a", "subagent", "account-a"), stamp(base, "key-a", "", "account-b")} {
+		if a["X-Conversation-ID"] == other["X-Conversation-ID"] || a["X-Conversation-Request-ID"] == other["X-Conversation-Request-ID"] {
+			t.Fatal("identity crossed principal, subagent or account")
+		}
+	}
+	image := func(data string) map[string]any {
+		return makeBody([]any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "image", "source": map[string]any{"data": data}}}}})
+	}
+	if requestTurnFingerprint(image("one")) == requestTurnFingerprint(image("two")) {
+		t.Fatal("image-only turns collapsed")
+	}
+}
 
 func TestHarnessIdentityCompatibilityIsNarrow(t *testing.T) {
 	const intro = "You are an AI agent powered by DeepSeek Harness."
@@ -381,6 +561,49 @@ func TestBuddyProxyDSHCompatibilityParity(t *testing.T) {
 		out, changed := NeutralizeChannelFingerprints(body)
 		if changed || !reflect.DeepEqual(body, out) {
 			t.Fatal("broadened upstream verified trigger", intro)
+		}
+	}
+}
+
+func TestAssistantDeclarationCompatibilityPreservesBusinessContent(t *testing.T) {
+	const intro = "You are an AI agent powered by DeepSeek Harness."
+	const tail = "\nAvailable skills: read, patch. Working directory: /srv/DSH/project"
+	arguments := `{"text":"` + intro + `"}`
+	body := map[string]any{"messages": []any{
+		map[string]any{"role": "assistant", "content": []any{
+			map[string]any{"type": "text", "text": "Quoted: " + intro},
+			map[string]any{"type": "text", "text": intro + tail, "cache_control": map[string]any{"type": "ephemeral"}},
+			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://example.invalid/DSH.png"}},
+		}, "tool_calls": []any{map[string]any{"function": map[string]any{"name": "read", "arguments": arguments}}}},
+		map[string]any{"role": "user", "content": intro},
+		map[string]any{"role": "tool", "content": intro},
+	}}
+	before, _ := json.Marshal(body)
+	out, changed := NeutralizeChannelFingerprints(body)
+	if !changed {
+		t.Fatal("assistant declaration not adapted")
+	}
+	messages := out["messages"].([]any)
+	assistant := messages[0].(map[string]any)
+	blocks := assistant["content"].([]any)
+	if blocks[1].(map[string]any)["text"] != "You are a coding assistant."+tail {
+		t.Fatal("instructions lost", blocks)
+	}
+	original := body["messages"].([]any)[0].(map[string]any)
+	if !reflect.DeepEqual(blocks[0], original["content"].([]any)[0]) || !reflect.DeepEqual(blocks[2], original["content"].([]any)[2]) || !reflect.DeepEqual(assistant["tool_calls"], original["tool_calls"]) || !reflect.DeepEqual(messages[1:], body["messages"].([]any)[1:]) || !reflect.DeepEqual(blocks[1].(map[string]any)["cache_control"], original["content"].([]any)[1].(map[string]any)["cache_control"]) {
+		t.Fatal("business content changed")
+	}
+	after, _ := json.Marshal(body)
+	if string(before) != string(after) {
+		t.Fatal("request mutated")
+	}
+	if _, again := NeutralizeChannelFingerprints(out); again {
+		t.Fatal("not idempotent")
+	}
+	for _, text := range []string{"Quoted: " + intro, "```\n" + intro + "\n```", "My path is /srv/DSH/project", "DeepSeek Harness Web GUI", "Tokens prefixed with @ are paths the user explicitly referenced."} {
+		untouched := map[string]any{"messages": []any{map[string]any{"role": "assistant", "content": text}}}
+		if _, changed := NeutralizeChannelFingerprints(untouched); changed {
+			t.Fatal("ordinary history changed", text)
 		}
 	}
 }

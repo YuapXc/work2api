@@ -2,8 +2,133 @@ package upstream
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 )
+
+type BusinessFault struct{ Code, Message string }
+
+// Only explicit error fields and known envelopes are traversed, never arbitrary
+// prose, request messages, tool arguments or user-controlled numeric substrings.
+func ParseBusinessFault(raw []byte) BusinessFault {
+	if len(raw) > 1<<20 {
+		return BusinessFault{}
+	}
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return BusinessFault{}
+	}
+	budget := 64
+	var walk func(any, int) BusinessFault
+	walk = func(value any, depth int) BusinessFault {
+		if depth > 8 || budget <= 0 {
+			return BusinessFault{}
+		}
+		budget--
+		if text, ok := value.(string); ok {
+			if len(text) > 64<<10 || !strings.HasPrefix(strings.TrimSpace(text), "{") {
+				return BusinessFault{}
+			}
+			var next any
+			if json.Unmarshal([]byte(text), &next) != nil {
+				return BusinessFault{}
+			}
+			return walk(next, depth+1)
+		}
+		node, ok := value.(map[string]any)
+		if !ok {
+			return BusinessFault{}
+		}
+		normal := make(map[string]any, len(node))
+		for key, v := range node {
+			normal[strings.ToLower(key)] = v
+		}
+		message, _ := normal["msg"].(string)
+		if message == "" {
+			message, _ = normal["message"].(string)
+		}
+		fallback := BusinessFault{}
+		for _, key := range []string{"error", "detail", "details", "cause", "data"} {
+			found := walk(normal[key], depth+1)
+			if found.Code != "" {
+				if found.Message == "" {
+					found.Message = message
+				}
+				if n, e := strconv.Atoi(found.Code); e == nil && n >= 400 && n <= 599 {
+					fallback = found
+					continue
+				}
+				return found
+			}
+		}
+		for _, key := range []string{"internal_code", "code", "errcode", "error_code"} {
+			code := ""
+			switch v := normal[key].(type) {
+			case string:
+				code = strings.TrimSpace(v)
+			case float64:
+				if n := int64(v); v == float64(n) {
+					code = strconv.FormatInt(n, 10)
+				}
+			}
+			if code == "11-128" {
+				code = "11128"
+			}
+			if n, e := strconv.Atoi(code); e == nil && n > 0 {
+				if n >= 400 && n <= 599 && fallback.Code != "" {
+					return fallback
+				}
+				return BusinessFault{Code: code, Message: message}
+			}
+		}
+		return fallback
+	}
+	return walk(value, 0)
+}
+
+func (e *UpstreamError) Normalized() *UpstreamError {
+	status := e.StatusCode
+	fault := ParseBusinessFault(e.Raw)
+	switch fault.Code {
+	case "11101", "11133", "11135", "11150", "11153", "11159":
+		status = 400
+	case "11128":
+		if status != 403 && status != 429 && (status < 500 || e.HTTPStatus == 200) {
+			status = 400
+		}
+	case "11102":
+		if status != 404 {
+			status = 400
+		}
+	case "11115":
+		if status != 413 && status != 404 {
+			status = 400
+		}
+	case "12153":
+		status = 401
+	case "11140", "14017":
+		status = 403
+	case "6004":
+		status = 429
+	case "14018":
+		if status != 429 {
+			status = 402
+		}
+	default:
+		if n, err := strconv.Atoi(fault.Code); err == nil && n >= 400 && n <= 599 && status >= 500 {
+			status = n
+		}
+	}
+	if status == e.StatusCode {
+		return e
+	}
+	copy := *e
+	copy.StatusCode = status
+	if copy.HTTPStatus == 0 {
+		copy.HTTPStatus = e.StatusCode
+	}
+	return &copy
+}
 
 // ValidateChoiceCount reflects the single-response contract of our three adapters.
 // n counts alternative answers to one request, not concurrent agent requests.
@@ -33,9 +158,9 @@ func (s *completionState) observe(chunk map[string]any) error {
 	if chunk == nil {
 		return invalidStream("上游响应不是 JSON 对象")
 	}
-	if chunk["error"] != nil || !codeOK(chunk["code"]) {
+	if chunk["error"] != nil || !codeOK(chunk["code"]) || !codeOK(chunk["errCode"]) || !codeOK(chunk["error_code"]) {
 		raw, _ := json.Marshal(chunk)
-		return &UpstreamError{StatusCode: 502, Raw: raw}
+		return (&UpstreamError{StatusCode: 502, HTTPStatus: 200, Raw: raw}).Normalized()
 	}
 	if usage := chunk["usage"]; usage != nil {
 		if _, ok := usage.(map[string]any); !ok {
@@ -44,6 +169,10 @@ func (s *completionState) observe(chunk map[string]any) error {
 	}
 	choices, ok := chunk["choices"].([]any)
 	if !ok || len(choices) > 1 || (len(choices) == 0 && chunk["usage"] == nil) {
+		raw, _ := json.Marshal(chunk)
+		if ParseBusinessFault(raw).Code != "" {
+			return (&UpstreamError{StatusCode: 502, HTTPStatus: 200, Raw: raw}).Normalized()
+		}
 		return invalidStream("上游 choices 格式不符合单回复协议")
 	}
 	if len(choices) == 0 {

@@ -54,6 +54,35 @@ func TestMessagesStreamingCaptureDoesNotTruncateWireOrNonstream(t *testing.T) {
 	}
 }
 
+func TestNativeMessagesObserverKeepsBoundedLogsAndCompleteUsage(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		c := NewAnthropicStreamConverter("m")
+		c.SetObserveOnly(provider.LogCapturePolicy{Enabled: enabled, Limit: 16})
+		chunk := map[string]any{"choices": []any{map[string]any{"delta": map[string]any{
+			"content": strings.Repeat("answer", 1000), "reasoning_content": strings.Repeat("reason", 1000),
+			"tool_calls": []any{map[string]any{"index": 0, "id": "c1", "function": map[string]any{"name": "test", "arguments": strings.Repeat("x", 6000)}}},
+		}, "finish_reason": "tool_calls"}}, "usage": map[string]any{"prompt_tokens": 70, "completion_tokens": 50, "total_tokens": 120}}
+		if c.FeedChunk(chunk) != "" || c.Finish() != "" {
+			t.Fatal("observer emitted duplicate wire events")
+		}
+		if c.textContent.Len() != 0 || c.thinkingContent.Len() != 0 {
+			t.Fatal("observer retained full reply")
+		}
+		if len(c.TextContent()) > 16 || len(c.Reasoning()) > 16 || c.toolUses[0].args.Len() > 16 {
+			t.Fatal("observer exceeded log budget")
+		}
+		if enabled && (c.TextContent() == "" || c.Reasoning() == "") {
+			t.Fatal("lost enabled diagnostic content")
+		}
+		if !enabled && (c.TextContent() != "" || c.Reasoning() != "" || c.toolUses[0].args.Len() != 0) {
+			t.Fatal("retained disabled diagnostics")
+		}
+		if c.Usage()["total_tokens"] != 120 || c.CompletionStatus() != "completed" {
+			t.Fatal("lost completion metrics", c.Usage(), c.CompletionStatus())
+		}
+	}
+}
+
 func TestAnthropicStreamThinking(t *testing.T) {
 	c := NewAnthropicStreamConverter("glm-5.3-flash")
 	var out strings.Builder

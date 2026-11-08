@@ -14,13 +14,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"hash"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"work2api/internal/core/provider"
 	"work2api/internal/requestdiag"
 	"work2api/internal/store"
+	"work2api/internal/workbuddy/pool"
 )
 
 // Keep account affinity isolated between users and models; retain only a bounded hash.
@@ -44,24 +47,140 @@ func ScopedSessionKey(p SessionPrincipal, model, key string) string {
 	return hex.EncodeToString(hash[:])
 }
 
-type RequestSessionIdentity struct{ Key, Agent string }
+type RequestSessionIdentity struct{ Key, Agent, Turn, Scope string }
 type RequestSessionIdentityKey struct{}
 
 // Resolve once from the original request, before conversion or queueing.
 func WithRequestSessionIdentity(r *http.Request, body map[string]any) *http.Request {
 	r = r.WithContext(context.WithValue(r.Context(), requestdiag.RequestDiagnosticsKey{}, &requestdiag.RequestDiagnostics{UsageDiagnostics: store.UsageDiagnostics{RequestedLimits: requestdiag.OutputLimits(body)}}))
 	identity := RequestSessionIdentity{}
+	scope := sha256.Sum256([]byte(r.Header.Get("Authorization") + "\x00" + r.Header.Get("X-Api-Key")))
+	identity.Scope = hex.EncodeToString(scope[:])
 	if value := provider.HeaderSessionID(r.Header); value != "" {
 		identity.Key = "sid:" + value
 	}
 	if identity.Key == "" {
 		identity.Key = ExtractSessionKey(body)
 	}
+	if identity.Key != "" {
+		identity.Turn = requestTurnFingerprint(body)
+	}
 	if value := BoundedSessionID(r.Header.Get("X-Claude-Code-Agent-Id")); value != "" {
 		sum := sha256.Sum256([]byte(value))
 		identity.Agent = hex.EncodeToString(sum[:])[:16]
 	}
 	return r.WithContext(context.WithValue(r.Context(), RequestSessionIdentityKey{}, identity))
+}
+
+func requestTurnFingerprint(body map[string]any) string {
+	items, _ := body["messages"].([]any)
+	if items == nil {
+		if text, ok := body["input"].(string); ok {
+			body = map[string]any{"messages": []any{map[string]any{"role": "user", "content": text}}}
+			items = body["messages"].([]any)
+		} else {
+			items, _ = body["input"].([]any)
+		}
+	}
+	for i := len(items) - 1; i >= 0; i-- {
+		message, _ := items[i].(map[string]any)
+		if message["role"] != "user" {
+			continue
+		}
+		h := sha256.New()
+		count := 0
+		writeText := func(text string) {
+			trimmed := strings.TrimSpace(text)
+			if trimmed == "" || strings.HasPrefix(trimmed, "<system-reminder") && strings.HasSuffix(trimmed, "</system-reminder>") {
+				return
+			}
+			count++
+			hashIdentityValue(h, text, 0)
+		}
+		if text, ok := message["content"].(string); ok {
+			writeText(text)
+		}
+		if blocks, ok := message["content"].([]any); ok {
+			for _, raw := range blocks {
+				block, _ := raw.(map[string]any)
+				switch block["type"] {
+				case "text", "input_text":
+					text, _ := block["text"].(string)
+					writeText(text)
+				case "image", "image_url", "input_image", "input_audio", "file", "input_file", "video_url":
+					count++
+					hashIdentityValue(h, block, 0)
+				}
+			}
+		}
+		if count > 0 {
+			hashIdentityValue(h, strconv.Itoa(i), 0)
+			return hex.EncodeToString(h.Sum(nil))
+		}
+	}
+	return ""
+}
+
+func hashIdentityValue(h hash.Hash, value any, depth int) {
+	if depth > 12 {
+		return
+	}
+	switch v := value.(type) {
+	case string:
+		h.Write([]byte("s" + strconv.Itoa(len(v)) + ":"))
+		var chunk [4096]byte
+		for len(v) > 0 {
+			n := copy(chunk[:], v)
+			h.Write(chunk[:n])
+			v = v[n:]
+		}
+	case map[string]any:
+		h.Write([]byte("{"))
+		keys := make([]string, 0, len(v))
+		for key := range v {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			hashIdentityValue(h, key, depth+1)
+			hashIdentityValue(h, v[key], depth+1)
+		}
+		h.Write([]byte("}"))
+	case []any:
+		h.Write([]byte("["))
+		for _, item := range v {
+			hashIdentityValue(h, item, depth+1)
+		}
+		h.Write([]byte("]"))
+	default:
+		data, _ := json.Marshal(value)
+		h.Write(data)
+		h.Write([]byte(";"))
+	}
+}
+
+func applyUpstreamConversation(ctx context.Context, acc *pool.Account, headers map[string]string, model string) {
+	identity, ok := ctx.Value(RequestSessionIdentityKey{}).(RequestSessionIdentity)
+	if !ok || identity.Key == "" {
+		return
+	}
+	key := ""
+	if call, _ := ctx.Value(SessionCallKey{}).(*SessionCall); call != nil {
+		key = call.Key
+	}
+	if key == "" {
+		key = provider.ScopedSessionID(provider.CurrentInvocation(ctx).Caller, nil, "workbuddy", model, identity.Scope+"\x00"+identity.Key)
+	}
+	account := acc.Profile + "\x00" + acc.UID + "\x00" + headers["X-User-Id"] + "\x00" + headers["X-Enterprise-Id"]
+	conv := sha256.Sum256([]byte("workbuddy-conversation\x00" + account + "\x00" + key + "\x00" + identity.Agent))
+	conv[6] = (conv[6] & 15) | 64
+	conv[8] = (conv[8] & 63) | 128
+	id := hex.EncodeToString(conv[:16])
+	headers["X-Conversation-ID"] = id[:8] + "-" + id[8:12] + "-" + id[12:16] + "-" + id[16:20] + "-" + id[20:]
+	if identity.Turn != "" {
+		turn := sha256.Sum256([]byte("workbuddy-turn\x00" + id + "\x00" + identity.Turn))
+		headers["X-Conversation-Request-ID"] = hex.EncodeToString(turn[:16])
+	}
 }
 
 func RequestSessionKey(r *http.Request, p SessionPrincipal, model string, body map[string]any) string {

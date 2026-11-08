@@ -15,9 +15,10 @@ import (
 // AnthropicStreamConverter converts an OpenAI Chat SSE stream into an Anthropic
 // Messages SSE event stream in real time.
 type AnthropicStreamConverter struct {
-	msgID     string
-	model     string
-	createdAt int64
+	observeOnly bool
+	msgID       string
+	model       string
+	createdAt   int64
 
 	nonstream    bool
 	emittedStart bool
@@ -205,7 +206,7 @@ func (c *AnthropicStreamConverter) processChunk(chunk map[string]any) string {
 			// thinking 与 text 交替时按 Anthropic 语义切换 block：开 thinking 前先
 			// 关掉打开中的 text block，正文出现时先关 thinking 再开新 text。
 			if reasoning, ok := delta["reasoning_content"].(string); ok && reasoning != "" {
-				if c.thinkingLog != nil && !c.nonstream {
+				if c.thinkingLog != nil && (!c.nonstream || c.observeOnly) {
 					c.thinkingLog.WriteString(reasoning)
 				} else {
 					c.thinkingContent.WriteString(reasoning)
@@ -235,7 +236,7 @@ func (c *AnthropicStreamConverter) processChunk(chunk map[string]any) string {
 				content += refusal
 			}
 			if content != "" {
-				if c.textLog != nil && !c.nonstream {
+				if c.textLog != nil && (!c.nonstream || c.observeOnly) {
 					c.textLog.WriteString(content)
 				} else {
 					c.textContent.WriteString(content)
@@ -293,7 +294,7 @@ func (c *AnthropicStreamConverter) processChunk(chunk map[string]any) string {
 				}
 				if fn != nil {
 					if args, ok := fn["arguments"].(string); ok && args != "" {
-						if c.logPolicy != nil && !c.nonstream {
+						if c.logPolicy != nil && (!c.nonstream || c.observeOnly) {
 							c.appendToolLog(slot, args)
 						} else {
 							slot.args.WriteString(args)
@@ -329,7 +330,13 @@ func (c *AnthropicStreamConverter) processChunk(chunk map[string]any) string {
 	return events.String()
 }
 
-func (c *AnthropicStreamConverter) SetNonstream() { c.nonstream = true }
+func (c *AnthropicStreamConverter) SetNonstream() { c.nonstream = true; c.observeOnly = false }
+
+// SetObserveOnly captures bounded diagnostics when native events own delivery.
+func (c *AnthropicStreamConverter) SetObserveOnly(p provider.LogCapturePolicy) {
+	c.nonstream, c.observeOnly = true, true
+	c.SetStreamingLogPolicy(p)
+}
 
 func (c *AnthropicStreamConverter) appendToolLog(slot *toolUseSlot, args string) {
 	p := *c.logPolicy
@@ -426,7 +433,7 @@ func (c *AnthropicStreamConverter) ToolsSummaryLimited(limit int) string {
 
 // TextContent returns the accumulated assistant text (for usage logging).
 func (c *AnthropicStreamConverter) TextContent() string {
-	if c.textLog != nil && !c.nonstream {
+	if c.textLog != nil && (!c.nonstream || c.observeOnly) {
 		return c.textLog.String()
 	}
 	return c.textContent.String()
@@ -434,7 +441,7 @@ func (c *AnthropicStreamConverter) TextContent() string {
 
 // Reasoning returns the accumulated thinking text (for usage logging).
 func (c *AnthropicStreamConverter) Reasoning() string {
-	if c.thinkingLog != nil && !c.nonstream {
+	if c.thinkingLog != nil && (!c.nonstream || c.observeOnly) {
 		return c.thinkingLog.String()
 	}
 	return c.thinkingContent.String()

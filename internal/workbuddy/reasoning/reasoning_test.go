@@ -1,10 +1,56 @@
 package reasoning
 
 import (
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestWorkBuddyDeepseekReasoningReplay(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		fields map[string]any
+		want   string
+	}{
+		{"alias", map[string]any{"reasoning_content": "recorded thought"}, "recorded thought"},
+		{"canonical wins", map[string]any{"reasoning": "canonical", "reasoning_content": "alias"}, "canonical"},
+		{"details", map[string]any{"reasoning_details": []any{map[string]any{"text": "first"}, map[string]any{"summary": "second"}}}, "firstsecond"},
+		{"empty", map[string]any{"reasoning_content": ""}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			message := map[string]any{"role": "assistant", "content": "answer", "tool_calls": []any{map[string]any{"id": "c1", "function": map[string]any{"name": "report", "arguments": `{"value":"recorded thought"}`}}}}
+			for key, value := range tc.fields {
+				message[key] = value
+			}
+			body := Body{"model": "deepseek-v4.1-flash", "messages": []any{map[string]any{"role": "user", "content": "keep", "reasoning_content": "user data"}, message, map[string]any{"role": "tool", "tool_call_id": "c1", "content": "result"}}}
+			before, _ := json.Marshal(body)
+			out := BackfillReasoningContent(body)
+			got := out["messages"].([]any)[1].(map[string]any)
+			if got["reasoning"] != tc.want || got["content"] != "answer" || !reflect.DeepEqual(got["tool_calls"], message["tool_calls"]) {
+				t.Fatal("reasoning or tool contract changed", got)
+			}
+			if _, exists := got["reasoning_content"]; exists {
+				t.Fatal("duplicate replay text")
+			}
+			after, _ := json.Marshal(body)
+			if string(before) != string(after) || !reflect.DeepEqual(out["messages"].([]any)[0], body["messages"].([]any)[0]) {
+				t.Fatal("source request mutated")
+			}
+			if !reflect.DeepEqual(BackfillReasoningContent(out), out) {
+				t.Fatal("not idempotent")
+			}
+			body["model"] = "other-model"
+			if !reflect.DeepEqual(BackfillReasoningContent(body), body) {
+				t.Fatal("other model changed")
+			}
+		})
+	}
+	opaque := Body{"model": "deepseek-v4.1-flash", "messages": []any{map[string]any{"role": "assistant", "reasoning_details": []any{map[string]any{"type": "reasoning.encrypted", "data": "opaque"}}}}}
+	if !reflect.DeepEqual(BackfillReasoningContent(opaque), opaque) {
+		t.Fatal("opaque reasoning interpreted as text")
+	}
+}
 
 func TestRepairToolHistoryMatchesOnlyExactIDs(t *testing.T) {
 	call := func(id, name string) any {

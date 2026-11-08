@@ -2,6 +2,7 @@
 package toolschema
 
 import (
+	"encoding/json"
 	"reflect"
 	"strings"
 )
@@ -146,6 +147,17 @@ func copyMap(s map[string]any) map[string]any {
 // lowering occurs before these provider boundaries; namespaces are supported
 // here as well for direct callers. No descriptions or argument data are changed.
 func Tools(value any) any {
+	return mapTools(value, ObjectUnions)
+}
+
+// WorkBuddyTools adapts valid JSON schemas to the vendor's accepted spelling.
+// Unlike permissive upstream repairs, it keeps type/enum intersections and
+// never weakens tuples, root unions, required fields or empty enums.
+func WorkBuddyTools(value any) any {
+	return mapTools(value, workBuddySchema)
+}
+
+func mapTools(value any, normalize func(any) any) any {
 	list, ok := value.([]any)
 	if !ok {
 		return value
@@ -158,7 +170,7 @@ func Tools(value any) any {
 		}
 		next := tool
 		if tool["type"] == "namespace" {
-			nested := Tools(tool["tools"])
+			nested := mapTools(tool["tools"], normalize)
 			if reflectSlice(tool["tools"]) != reflectSlice(nested) {
 				next = copyMap(tool)
 				next["tools"] = nested
@@ -169,7 +181,7 @@ func Tools(value any) any {
 				fn = tool
 			}
 			old := fn["parameters"]
-			mended := ObjectUnions(old)
+			mended := normalize(old)
 			if oldMap, ok := old.(map[string]any); ok && changedMap(oldMap, mended.(map[string]any)) {
 				nf := copyMap(fn)
 				nf["parameters"] = mended
@@ -192,6 +204,233 @@ func Tools(value any) any {
 		return value
 	}
 	return out
+}
+
+func workBuddySchema(schema any) any {
+	root, _ := schema.(map[string]any)
+	budget := 100000
+	var walk func(any, int, bool) any
+	walk = func(value any, depth int, keepBool bool) any {
+		if depth > 64 || budget <= 0 {
+			return value
+		}
+		budget--
+		if b, ok := value.(bool); ok {
+			if keepBool || depth == 0 {
+				return value
+			}
+			if b {
+				return map[string]any{}
+			}
+			return map[string]any{"not": map[string]any{}}
+		}
+		node, ok := value.(map[string]any)
+		if !ok {
+			return value
+		}
+		if depth > 0 && (node["$id"] != nil || node["id"] != nil) {
+			return value
+		}
+		out := node
+		set := func(key string, value any) {
+			if reflectMap(out) == reflectMap(node) {
+				out = copyMap(node)
+			}
+			out[key] = value
+		}
+		remove := func(key string) {
+			if reflectMap(out) == reflectMap(node) {
+				out = copyMap(node)
+			}
+			delete(out, key)
+		}
+		if _, typed := node["type"]; !typed {
+			if branches, ok := node["oneOf"].([]any); ok && len(branches) > 0 {
+				all := true
+				for _, branch := range branches {
+					if !objectBranch(root, branch, nil) {
+						all = false
+						break
+					}
+				}
+				if all {
+					set("type", "object")
+				}
+			}
+		}
+		if pattern, ok := node["pattern"].(string); ok && strings.Contains(pattern, `\0`) {
+			var text strings.Builder
+			for i := 0; i < len(pattern); i++ {
+				if pattern[i] == '\\' && i+1 < len(pattern) {
+					if pattern[i+1] == '\\' {
+						text.WriteString(pattern[i : i+2])
+						i++
+						continue
+					}
+					if pattern[i+1] == '0' && (i+2 == len(pattern) || pattern[i+2] < '0' || pattern[i+2] > '9') {
+						text.WriteString(`\u0000`)
+						i++
+						continue
+					}
+				}
+				text.WriteByte(pattern[i])
+			}
+			if fixed := text.String(); fixed != pattern {
+				set("pattern", fixed)
+			}
+		}
+		if values, ok := node["enum"].([]any); ok {
+			if len(values) == 0 {
+				remove("enum")
+				set("not", map[string]any{})
+			} else {
+				declared, valid := schemaTypes(node["type"])
+				nonNull := 0
+				for _, kind := range declared {
+					if kind != "null" {
+						nonNull++
+					}
+				}
+				if valid && (len(declared) == 0 || nonNull > 1) {
+					kinds := map[string][]any{}
+					var order []string
+					for _, v := range values {
+						kind := enumKind(v)
+						if kind == "" {
+							valid = false
+							break
+						}
+						if _, ok := kinds[kind]; !ok {
+							order = append(order, kind)
+						}
+						kinds[kind] = append(kinds[kind], v)
+					}
+					if valid && len(order) == 1 && len(declared) == 0 {
+						set("type", order[0])
+					} else if valid {
+						all, hasAll := out["allOf"].([]any)
+						if out["allOf"] == nil || hasAll {
+							all = append([]any(nil), all...)
+							if len(declared) > 0 {
+								branches := make([]any, 0, len(declared))
+								for _, kind := range declared {
+									branches = append(branches, map[string]any{"type": kind})
+								}
+								all = append(all, map[string]any{"anyOf": branches})
+								remove("type")
+							}
+							branches := make([]any, 0, len(order))
+							for _, kind := range order {
+								branches = append(branches, map[string]any{"type": kind, "enum": kinds[kind]})
+							}
+							all = append(all, map[string]any{"anyOf": branches})
+							remove("enum")
+							set("allOf", all)
+						}
+					}
+				}
+			}
+		}
+		for _, key := range []string{"items", "additionalItems", "unevaluatedItems", "contains", "not", "if", "then", "else", "propertyNames", "additionalProperties", "unevaluatedProperties"} {
+			if child, exists := out[key]; exists {
+				next := walk(child, depth+1, key == "additionalProperties" || key == "unevaluatedProperties")
+				if !sameSchema(child, next) {
+					set(key, next)
+				}
+			}
+		}
+		for _, key := range []string{"anyOf", "oneOf", "allOf", "prefixItems"} {
+			if list, ok := out[key].([]any); ok {
+				var next []any
+				for i, child := range list {
+					fixed := walk(child, depth+1, false)
+					if !sameSchema(child, fixed) {
+						if next == nil {
+							next = append([]any(nil), list...)
+						}
+						next[i] = fixed
+					}
+				}
+				if next != nil {
+					set(key, next)
+				}
+			}
+		}
+		for _, key := range []string{"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"} {
+			if fields, ok := out[key].(map[string]any); ok {
+				var next map[string]any
+				for name, child := range fields {
+					fixed := walk(child, depth+1, false)
+					if !sameSchema(child, fixed) {
+						if next == nil {
+							next = copyMap(fields)
+						}
+						next[name] = fixed
+					}
+				}
+				if next != nil {
+					set(key, next)
+				}
+			}
+		}
+		return out
+	}
+	return walk(schema, 0, false)
+}
+
+func sameSchema(a, b any) bool {
+	if left, ok := a.(map[string]any); ok {
+		right, ok := b.(map[string]any)
+		return ok && reflectMap(left) == reflectMap(right)
+	}
+	return reflect.DeepEqual(a, b)
+}
+
+func schemaTypes(value any) ([]string, bool) {
+	if value == nil {
+		return nil, true
+	}
+	var raw []any
+	switch v := value.(type) {
+	case string:
+		raw = []any{v}
+	case []any:
+		raw = v
+	default:
+		return nil, false
+	}
+	var out []string
+	for _, v := range raw {
+		s, ok := v.(string)
+		if !ok {
+			return nil, false
+		}
+		switch s {
+		case "string", "number", "integer", "object", "array", "boolean", "null":
+			out = append(out, s)
+		default:
+			return nil, false
+		}
+	}
+	return out, true
+}
+
+func enumKind(value any) string {
+	switch value.(type) {
+	case nil:
+		return "null"
+	case string:
+		return "string"
+	case bool:
+		return "boolean"
+	case float64, float32, int, int64, json.Number:
+		return "number"
+	case map[string]any:
+		return "object"
+	case []any:
+		return "array"
+	}
+	return ""
 }
 
 func reflectMap(m map[string]any) uintptr { return reflect.ValueOf(m).Pointer() }

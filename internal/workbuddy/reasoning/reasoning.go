@@ -430,7 +430,8 @@ func InjectThinking(body Body) Body {
 	return body
 }
 
-// BackfillReasoningContent enforces DeepSeek multi-turn consistency.
+// WorkBuddy reads DeepSeek's tool-round history from reasoning, not the
+// OpenAI-compatible reasoning_content spelling returned to clients.
 func BackfillReasoningContent(body Body) Body {
 	if !isDeepseek(body["model"]) {
 		return body
@@ -439,36 +440,55 @@ func BackfillReasoningContent(body Body) Body {
 	if !ok {
 		return body
 	}
-	var assistants []map[string]any
-	for _, m := range msgs {
-		if mm, ok := m.(map[string]any); ok && mm["role"] == "assistant" {
-			assistants = append(assistants, mm)
-		}
-	}
-	hasTrace := func(m map[string]any) bool {
-		rc, _ := m["reasoning_content"].(string)
-		r, _ := m["reasoning"].(string)
-		return rc != "" || r != ""
-	}
-	traced := false
-	for _, m := range assistants {
-		if hasTrace(m) {
-			traced = true
-			break
-		}
-	}
-	if !traced {
-		return body
-	}
-	for _, m := range assistants {
-		if _, ok := m["reasoning_content"].(string); ok {
+	var copied []any
+	for i, raw := range msgs {
+		m, ok := raw.(map[string]any)
+		if !ok || m["role"] != "assistant" {
 			continue
 		}
-		if reason, ok := m["reasoning"].(string); ok {
-			m["reasoning_content"] = reason
-		} else {
-			m["reasoning_content"] = ""
+		reason, _ := m["reasoning"].(string)
+		alias, hasAlias := m["reasoning_content"].(string)
+		if reason == "" {
+			reason = alias
 		}
+		var detailsText strings.Builder
+		if reason == "" {
+			if details, ok := m["reasoning_details"].([]any); ok {
+				for _, raw := range details {
+					detail, _ := raw.(map[string]any)
+					text, _ := detail["text"].(string)
+					if text == "" {
+						text, _ = detail["summary"].(string)
+					}
+					detailsText.WriteString(text)
+				}
+			}
+			reason = detailsText.String()
+		}
+		if !hasAlias && detailsText.Len() == 0 {
+			continue
+		}
+		if copied == nil {
+			copied = append([]any(nil), msgs...)
+		}
+		next := make(map[string]any, len(m)+1)
+		for key, value := range m {
+			next[key] = value
+		}
+		next["reasoning"] = reason
+		delete(next, "reasoning_content")
+		if detailsText.Len() > 0 {
+			delete(next, "reasoning_details")
+		}
+		copied[i] = next
+	}
+	if copied != nil {
+		next := make(Body, len(body))
+		for key, value := range body {
+			next[key] = value
+		}
+		next["messages"] = copied
+		return next
 	}
 	return body
 }

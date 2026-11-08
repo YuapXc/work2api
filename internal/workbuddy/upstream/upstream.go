@@ -40,6 +40,7 @@ var passthroughBodyKeys = map[string]struct{}{
 // UpstreamError carries a non-200 upstream status and its raw body.
 type UpstreamError struct {
 	StatusCode int
+	HTTPStatus int // Original transport status; StatusCode may describe an SSE business failure.
 	Raw        []byte
 	// Header carries the upstream response headers (Retry-After 等) for error
 	// classification. Nil for synthesized errors (invalid stream / bad JSON).
@@ -182,7 +183,7 @@ func (c *Client) StreamPrepared(ctx context.Context, headers map[string]string, 
 		if err != nil {
 			return err
 		}
-		return &UpstreamError{StatusCode: resp.StatusCode, Raw: raw, Header: resp.Header}
+		return (&UpstreamError{StatusCode: resp.StatusCode, HTTPStatus: resp.StatusCode, Raw: raw, Header: resp.Header}).Normalized()
 	}
 
 	// Upstream sometimes answers a stream request with a single JSON object.
@@ -403,7 +404,7 @@ func scanEventLine(data []byte, atEOF bool) (int, []byte, error) {
 // CollectStream aggregates a standard OpenAI SSE stream into a single
 // chat.completion object. producer drives the stream via a LineFunc.
 func CollectStream(fallbackModel string, produce func(yield LineFunc) error) (map[string]any, error) {
-	var contentParts, reasoningParts, refusalParts strings.Builder
+	var contentParts, reasoningParts, refusalParts, signatureParts strings.Builder
 	model := ""
 	finishReason := ""
 	var usage map[string]any
@@ -446,6 +447,9 @@ func CollectStream(fallbackModel string, produce func(yield LineFunc) error) (ma
 			if s, ok := delta["content"].(string); ok {
 				contentParts.WriteString(s)
 			}
+			if s, ok := delta["reasoning_signature"].(string); ok {
+				signatureParts.WriteString(s)
+			}
 			if s, ok := delta["reasoning_content"].(string); ok {
 				reasoningParts.WriteString(s)
 			}
@@ -468,6 +472,9 @@ func CollectStream(fallbackModel string, produce func(yield LineFunc) error) (ma
 	}
 	if reasoningParts.Len() > 0 {
 		message["reasoning_content"] = reasoningParts.String()
+	}
+	if signatureParts.Len() > 0 {
+		message["reasoning_signature"] = signatureParts.String()
 	}
 	if len(state.tools) > 0 {
 		order := make([]int, 0, len(state.tools))

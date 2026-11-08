@@ -6,9 +6,70 @@ import (
 	"strings"
 	"testing"
 	"work2api/internal/core/protocol/chatstream"
+	"work2api/internal/workbuddy/reasoning"
 
 	"work2api/internal/workbuddy/upstream"
 )
+
+func TestDeepseekHistoryReplayAcrossAdapters(t *testing.T) {
+	for _, model := range []string{"deepseek-v4.1-flash", "other-model"} {
+		for _, protocol := range []string{"messages", "responses"} {
+			var input map[string]any
+			convert := AnthropicRequestToChat
+			if protocol == "messages" {
+				input = map[string]any{"model": model, "messages": []any{
+					map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "thinking", "thinking": "first", "signature": "opaque-signature"}, map[string]any{"type": "redacted_thinking", "data": "opaque"}, map[string]any{"type": "tool_use", "id": "c1", "name": "report", "input": map[string]any{"value": 1}}}},
+					map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": "c1", "content": "one"}}},
+					map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "thinking", "thinking": "second"}, map[string]any{"type": "text", "text": "answer"}, map[string]any{"type": "tool_use", "id": "c2", "name": "report", "input": map[string]any{"value": 2}}}},
+					map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": "c2", "content": "two"}}},
+				}}
+			} else {
+				convert = ResponsesRequestToChat
+				input = map[string]any{"model": model, "input": []any{
+					map[string]any{"type": "reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": "first"}}, "encrypted_content": "opaque"},
+					map[string]any{"type": "function_call", "call_id": "c1", "name": "report", "arguments": `{"value":1}`},
+					map[string]any{"type": "function_call_output", "call_id": "c1", "output": "one"},
+					map[string]any{"type": "reasoning", "content": []any{map[string]any{"type": "reasoning_text", "text": "second"}}},
+					map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "answer"}}},
+					map[string]any{"type": "function_call", "call_id": "c2", "name": "report", "arguments": `{"value":2}`},
+					map[string]any{"type": "function_call_output", "call_id": "c2", "output": "two"},
+					map[string]any{"type": "reasoning", "encrypted_content": "unreadable"},
+				}}
+			}
+			before, _ := json.Marshal(input)
+			chat, err := convert(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			chat = reasoning.BackfillReasoningContent(chat)
+			messages := chat["messages"].([]any)
+			if len(messages) != 4 {
+				t.Fatal("thinking split from tools or phantom message", protocol, messages)
+			}
+			for i, want := range []string{"first", "second"} {
+				message := messages[i*2].(map[string]any)
+				if model == "deepseek-v4.1-flash" && message["reasoning"] != want {
+					t.Fatal("thinking lost or assigned to wrong round", protocol, message)
+				}
+				if model == "other-model" && message["reasoning"] != nil {
+					t.Fatal("unverified model changed")
+				}
+				call := message["tool_calls"].([]any)[0].(map[string]any)
+				if call["id"] != []string{"c1", "c2"}[i] || call["function"].(map[string]any)["arguments"] != []string{`{"value":1}`, `{"value":2}`}[i] {
+					t.Fatal("tool contract changed")
+				}
+			}
+			wire, _ := json.Marshal(chat)
+			if strings.Contains(string(wire), "opaque") || strings.Contains(string(wire), "unreadable") {
+				t.Fatal("opaque payload converted to plaintext")
+			}
+			after, _ := json.Marshal(input)
+			if string(before) != string(after) {
+				t.Fatal("source mutated")
+			}
+		}
+	}
+}
 
 func TestUpstreamRefusalSurvivesAdapters(t *testing.T) {
 	for _, first := range []bool{true, false} {

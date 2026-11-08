@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"work2api/internal/workbuddy/upstream"
 )
 
 // ErrKind 是上游错误的语义分类。
@@ -124,6 +125,9 @@ func IsModelBlocked(status int, text, lower string) bool {
 	if (status != 400 && status != 404) || text == "" {
 		return false
 	}
+	if fault := upstream.ParseBusinessFault([]byte(text)); fault.Code == "11102" || strings.Contains(strings.ToLower(fault.Message), "service info not found") {
+		return true
+	}
 	if !strings.Contains(text, "11102") && !strings.Contains(lower, "service info not found") {
 		return false
 	}
@@ -161,6 +165,9 @@ func IsChannelDenied(status int, text string) bool {
 	if (status != 400 && status != 403) || !BusinessCode(text, "11128", "11-128") {
 		return false
 	}
+	if strings.Contains(strings.ToLower(upstream.ParseBusinessFault([]byte(text)).Message), "first message is not system prompt") {
+		return false
+	}
 	root := JsonRoot(text)
 	nodes := []map[string]any{root}
 	if inner, ok := root["error"].(map[string]any); ok {
@@ -183,19 +190,10 @@ func HasBusinessEnvelope(text string) bool {
 
 // Only explicit business-code fields may invalidate a credential.
 func BusinessCode(text string, wanted ...string) bool {
-	root := JsonRoot(text)
-	nodes := []map[string]any{root}
-	if inner, ok := root["error"].(map[string]any); ok {
-		nodes = append(nodes, inner)
-	}
-	for _, node := range nodes {
-		for _, key := range []string{"code", "errCode", "error_code"} {
-			code := strings.TrimSpace(ToStr(node[key]))
-			for _, want := range wanted {
-				if code == want {
-					return true
-				}
-			}
+	code := upstream.ParseBusinessFault([]byte(text)).Code
+	for _, want := range wanted {
+		if code == strings.ReplaceAll(want, "11-128", "11128") {
+			return true
 		}
 	}
 	return false
@@ -288,6 +286,8 @@ func ClampFloat(v, lo, hi float64) float64 {
 
 // ClassifyUpstream 把上游响应分类为 ErrKind。判定顺序即语义优先级，改前先读上游注释。
 func ClassifyUpstream(status int, raw []byte, _ http.Header) ErrKind {
+	status = (&upstream.UpstreamError{StatusCode: status, Raw: raw}).Normalized().StatusCode
+	fault := upstream.ParseBusinessFault(raw)
 	text := string(raw)
 	lower := strings.ToLower(text)
 	switch {
@@ -303,7 +303,7 @@ func ClassifyUpstream(status int, raw []byte, _ http.Header) ErrKind {
 		return ErrSessionDead
 	case status >= 400 && (BusinessCode(text, "11140") || BusinessCode(text, "14017") || HitFold(text, lower, AccountFaultMarkers)):
 		return ErrAccountFault
-	case status == 429 && CodeMarker(lower, "14018"):
+	case status == 429 && fault.Code == "14018":
 		return ErrHardCredit
 	case status == 429:
 		return ErrSoftRate
@@ -311,7 +311,7 @@ func ClassifyUpstream(status int, raw []byte, _ http.Header) ErrKind {
 		return ErrHardCredit
 	case HitFold(text, lower, RateMarkers):
 		return ErrSoftRate
-	case PromptTooLongStatuses[status] && (HitFold(text, lower, PromptTooLongMarkers) || CodeMarker(lower, "11115")):
+	case PromptTooLongStatuses[status] && (fault.Code == "11115" || HitFold(text, lower, PromptTooLongMarkers) || CodeMarker(lower, "11115")):
 		return ErrPromptTooLong
 	case status == 404:
 		return ErrNotFound
@@ -319,13 +319,13 @@ func ClassifyUpstream(status int, raw []byte, _ http.Header) ErrKind {
 		return ErrServer
 	case IsWAFBlocked(status, text):
 		return ErrWAFBlock
-	case status == 400 && (HitFold(text, lower, InvalidImageMarkers) || CodeMarker(lower, "11135")):
+	case status == 400 && (fault.Code == "11135" || HitFold(text, lower, InvalidImageMarkers) || CodeMarker(lower, "11135")):
 		return ErrImageInvalid
 	case status >= 400:
 		if HitLower(lower, ContentBlockedMarkers) {
 			return ErrContentBlocked
 		}
-		if HitFold(text, lower, BadParamsMarkers) || CodeMarker(lower, "11101") {
+		if fault.Code == "11101" || HitFold(text, lower, BadParamsMarkers) || CodeMarker(lower, "11101") {
 			return ErrBadParams
 		}
 		return ErrClient

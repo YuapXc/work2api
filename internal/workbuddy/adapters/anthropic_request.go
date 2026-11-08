@@ -43,7 +43,8 @@ func AnthropicRequestToChat(body map[string]any) (map[string]any, error) {
 			if !ok {
 				continue
 			}
-			converted, err := convertAnthropicMessage(mm, catalog)
+			model, _ := body["model"].(string)
+			converted, err := convertAnthropicMessage(mm, catalog, strings.HasPrefix(strings.ToLower(model), "deepseek"))
 			if err != nil {
 				return nil, err
 			}
@@ -253,7 +254,7 @@ func contentWithImages(blocks any, catalog map[string]map[string]any) (any, erro
 	}
 }
 
-func convertAnthropicMessage(msg map[string]any, catalog map[string]map[string]any) ([]any, error) {
+func convertAnthropicMessage(msg map[string]any, catalog map[string]map[string]any, replayThinking bool) ([]any, error) {
 	role, _ := msg["role"].(string)
 	content := msg["content"]
 
@@ -311,6 +312,7 @@ func convertAnthropicMessage(msg map[string]any, catalog map[string]map[string]a
 
 	case "assistant":
 		var textParts []string
+		var thinking strings.Builder
 		var toolCalls []any
 		for _, b := range blocks {
 			block, ok := b.(map[string]any)
@@ -318,6 +320,11 @@ func convertAnthropicMessage(msg map[string]any, catalog map[string]map[string]a
 				continue
 			}
 			switch block["type"] {
+			case "thinking":
+				if replayThinking {
+					text, _ := block["thinking"].(string)
+					thinking.WriteString(text)
+				}
 			case "text":
 				t, _ := block["text"].(string)
 				textParts = append(textParts, t)
@@ -340,6 +347,9 @@ func convertAnthropicMessage(msg map[string]any, catalog map[string]map[string]a
 			}
 		}
 		out := map[string]any{"role": "assistant", "content": strings.Join(textParts, "")}
+		if thinking.Len() > 0 {
+			out["reasoning_content"] = thinking.String()
+		}
 		if len(toolCalls) > 0 {
 			out["tool_calls"] = toolCalls
 		}

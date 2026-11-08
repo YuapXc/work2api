@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"work2api/internal/workbuddy/upstream"
 )
 
 // Cooldown durations (seconds) used outside the error classifier (token-refresh
@@ -30,14 +31,11 @@ var LimitResetRe = regexp.MustCompile(`(?i)(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d
 // DailyModelLimit detects the upstream per-day model limit (code=6004) and
 // returns its explicit UTC+8 reset time.
 func DailyModelLimit(raw []byte, now float64) (float64, string, bool) {
-	var data map[string]any
-	if json.Unmarshal(raw, &data) != nil {
+	fault := upstream.ParseBusinessFault(raw)
+	if fault.Code != "6004" {
 		return 0, "", false
 	}
-	if ToStr(data["code"]) != "6004" {
-		return 0, "", false
-	}
-	message := ToStr(data["msg"])
+	message := fault.Message
 	m := LimitResetRe.FindStringSubmatch(message)
 	if m == nil {
 		return 0, "", false

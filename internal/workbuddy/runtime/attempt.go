@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"reflect"
 	"strings"
 	"work2api/internal/core/provider"
@@ -73,6 +74,17 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 	}
 	ref := provider.AccountRef{Provider: "workbuddy", LocalID: acc.UID}
 	model, _ := body["model"].(string)
+	shapeKey := acc.Profile + "\x00" + model
+	r.toolTailMu.RLock()
+	knownShape := r.toolTailModels[shapeKey]
+	r.toolTailMu.RUnlock()
+	shaped, learnShape := false, false
+	if knownShape && nativeMessagesEndpoint(acc.Profile, model) == "" {
+		if next, ok := replyAfterToolResults(body); ok {
+			body = next
+			shaped = true
+		}
+	}
 	if err := provider.CheckDispatch(ctx, ref, model); err != nil {
 		return false, err
 	}
@@ -83,7 +95,7 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 	if err := provider.CheckDispatch(ctx, ref, model); err != nil {
 		return false, err
 	}
-	if tools := toolschema.Tools(body["tools"]); reflectToolsChanged(body["tools"], tools) {
+	if tools := toolschema.WorkBuddyTools(body["tools"]); reflectToolsChanged(body["tools"], tools) {
 		copyBody := make(map[string]any, len(body))
 		for k, v := range body {
 			copyBody[k] = v
@@ -92,11 +104,33 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 		body = copyBody
 	}
 	url, _ := siterouting.ChatURLForProfile(acc.Profile)
+	nativeURL := nativeMessagesEndpoint(acc.Profile, model)
+	var nativeBody map[string]any
+	if nativeURL != "" {
+		if err := upstream.ValidateChoiceCount(body); err != nil {
+			return false, err
+		}
+		nativeBody, err = nativeMessagesBody(ctx, body)
+		if err != nil {
+			return false, err
+		}
+		if body["max_tokens"] == nil && body["max_completion_tokens"] == nil && r.Catalog != nil {
+			if limit := r.Catalog.MaxOutputTokens(model); limit > 0 {
+				nativeBody["max_tokens"] = limit
+			}
+		}
+	}
 	started := false
 	var responseBytes int64
 	var preamble []string
 	preambleBytes := 0
 	wrapped := func(line string) error {
+		if nativeBody != nil && ctx.Value(messagesRequestKey{}) == nil {
+			chunk := upstream.DecodeFrame(ctx, line)
+			if _, exists := chunk[upstream.NativeEvent]; exists {
+				return nil // Native-only metadata never crosses the Chat/Responses contract.
+			}
+		}
 		responseBytes += int64(len(line))
 		if limit := streamwatch.ResponseLimit(ctx); limit > 0 && responseBytes > limit {
 			return streamwatch.ErrResponseTooLarge
@@ -143,7 +177,14 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 		client = upstream.Shared()
 	}
 	var prepared *upstream.PreparedStreamBody
-	for retry := 0; retry < 2; retry++ {
+	authorizationRetried := false
+	signatureRetried := false
+	imageStage, maxTransmissions := 0, 3
+	if nativeBody != nil {
+		maxTransmissions = 5
+	}
+	for retry := 0; retry < maxTransmissions; retry++ {
+		applyUpstreamConversation(ctx, acc, headers, model)
 		if retry > 0 {
 			streamwatch.StartAttempt(ctx)
 		}
@@ -168,7 +209,18 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 			}
 			return nil
 		}
-		if reusable, ok := client.(*upstream.Client); ok {
+		if nativeBody != nil {
+			if beta, _ := ctx.Value(messagesBetaKey{}).(string); beta != "" {
+				headers["anthropic-beta"] = beta
+			}
+			nativeClient, ok := client.(interface {
+				StreamMessages(context.Context, map[string]string, map[string]any, string, upstream.LineFunc) error
+			})
+			if !ok {
+				return started, errors.New("upstream transport does not support native Messages")
+			}
+			err = nativeClient.StreamMessages(ctx, headers, nativeBody, nativeURL, wrapped)
+		} else if reusable, ok := client.(*upstream.Client); ok {
 			if prepared == nil {
 				prepared, err = upstream.PrepareStreamBody(body)
 				if err != nil {
@@ -180,16 +232,73 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 			err = client.StreamUpstream(ctx, headers, body, url, yield)
 		}
 		var rejected *upstream.UpstreamError
+		if errors.As(err, &rejected) {
+			rejected = rejected.Normalized()
+			err = rejected
+		}
+		if nativeBody != nil && !started && ctx.Err() == nil && rejected != nil && rejected.StatusCode == 400 && BusinessCode(string(rejected.Raw), "11135") && imageStage < 2 && recoveryAvailable(ctx) {
+			next, fixed, removed := nativeBody, 0, 0
+			if imageStage == 0 && recoveryAvailable(ctx, 2) {
+				next, fixed, removed = recoverNativeImages(nativeBody, rejected.Raw, false)
+				imageStage = 1
+			}
+			if fixed+removed == 0 {
+				next, fixed, removed = recoverNativeImages(nativeBody, rejected.Raw, true)
+				imageStage = 2
+			}
+			if fixed+removed > 0 {
+				nativeBody = next
+				preamble, preambleBytes, responseBytes = nil, 0, 0
+				continue
+			}
+		}
+		if nativeBody != nil && !started && ctx.Err() == nil && rejected != nil && !signatureRetried && recoveryAvailable(ctx) && upstream.ParseBusinessFault(rejected.Raw).Code == "11159" {
+			if next := withoutMessagesThinking(nativeBody, true); reflect.ValueOf(next).Pointer() != reflect.ValueOf(nativeBody).Pointer() {
+				nativeBody, signatureRetried = next, true
+				preamble, preambleBytes, responseBytes = nil, 0, 0
+				continue
+			}
+		}
+		if err == nil && learnShape {
+			r.toolTailMu.Lock()
+			if r.toolTailModels == nil {
+				r.toolTailModels = map[string]bool{}
+			}
+			if len(r.toolTailModels) >= 256 {
+				for key := range r.toolTailModels {
+					delete(r.toolTailModels, key)
+					break
+				}
+			}
+			r.toolTailModels[shapeKey] = true
+			r.toolTailMu.Unlock()
+		}
+		if nativeBody == nil && !started && ctx.Err() == nil && rejected != nil && rejected.StatusCode == 400 && BusinessCode(string(rejected.Raw), "11153") && !shaped && recoveryAvailable(ctx) {
+			if next, ok := replyAfterToolResults(body); ok {
+				streamwatch.AttemptResult(ctx, rejected.StatusCode)
+				body, prepared = next, nil
+				shaped, learnShape = true, true
+				headers, err = r.headers(ctx, acc, opts.LocalNetworkFailure)
+				if err != nil {
+					return started, err
+				}
+				preamble = nil
+				preambleBytes = 0
+				responseBytes = 0
+				continue
+			}
+		}
 		if started || ctx.Err() != nil || !errors.As(err, &rejected) || rejected.StatusCode != 401 {
 			return started, err
 		}
-		if retry != 0 {
+		if authorizationRetried {
 			return started, chatAuthorizationError("凭据续期后仍未通过调用鉴权，请重新授权或核实账号权限")
 		}
 
 		if !recoveryAvailable(ctx) {
 			return started, chatAuthorizationError("上游鉴权未通过，本次恢复已结束，请核实账号授权")
 		}
+		authorizationRetried = true
 		streamwatch.AttemptResult(ctx, 401)
 		mgr := r.Manager(acc.UID)
 		if mgr == nil {
@@ -213,6 +322,32 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 		responseBytes = 0
 	}
 	return started, err
+}
+
+func replyAfterToolResults(body map[string]any) (map[string]any, bool) {
+	messages, _ := body["messages"].([]any)
+	i := len(messages) - 1
+	for i >= 0 {
+		message, _ := messages[i].(map[string]any)
+		if message["role"] != "user" {
+			break
+		}
+		i--
+	}
+	if i < 0 || i == len(messages)-1 {
+		return body, false
+	}
+	message, _ := messages[i].(map[string]any)
+	if message["role"] != "tool" {
+		return body, false
+	}
+	next := make([]any, 0, len(messages)+1)
+	next = append(next, messages[:i+1]...)
+	next = append(next, map[string]any{"role": "assistant", "content": ""})
+	next = append(next, messages[i+1:]...)
+	out := maps.Clone(body)
+	out["messages"] = next
+	return out, true
 }
 
 func reflectToolsChanged(a, b any) bool {

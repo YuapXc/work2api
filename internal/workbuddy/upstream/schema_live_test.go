@@ -25,6 +25,60 @@ import (
 	"work2api/internal/workbuddy/upstream"
 )
 
+func TestBusinessFaultTransportNormalization(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want int
+	}{
+		{`{"error":{"code":11135,"message":"Image not recognized"}}`, 400},
+		{`{"error":{"code":400,"details":"{\"code\":11128}"}}`, 400},
+		{`{"error":{"code":"11-128"}}`, 400},
+		{`{"errCode":11135}`, 400}, {`{"details":"{\"code\":11135}"}`, 400},
+		{`{"code":12153}`, 401}, {`{"code":6004}`, 429}, {`{"code":11115}`, 400}, {`{"code":11153}`, 400},
+	} {
+		for _, mode := range []string{"http", "json", "sse"} {
+			t.Run(mode+tc.raw, func(t *testing.T) {
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					if mode == "http" {
+						w.WriteHeader(400)
+					}
+					if mode == "sse" {
+						w.Header().Set("Content-Type", "text/event-stream")
+						fmt.Fprintf(w, "data: %s\n\n", tc.raw)
+					} else {
+						io.WriteString(w, tc.raw)
+					}
+				}))
+				defer srv.Close()
+				err := upstream.NewClient(srv.Client()).StreamUpstream(context.Background(), nil, map[string]any{"model": "test"}, srv.URL, func(string) error { return nil })
+				var remote *upstream.UpstreamError
+				if !errors.As(err, &remote) || remote.StatusCode != tc.want {
+					t.Fatalf("%v %#v", err, remote)
+				}
+				wantHTTP := 200
+				if mode == "http" {
+					wantHTTP = 400
+				}
+				if remote.HTTPStatus != wantHTTP {
+					t.Fatal("lost transport status", remote)
+				}
+			})
+		}
+	}
+	for _, raw := range []string{`{"message":"code 11128","requestId":"11135"}`, `{"messages":[{"code":11128}]}`, `{"arguments":{"code":11135}}`, strings.Repeat("x", 1<<20+1)} {
+		if upstream.ParseBusinessFault([]byte(raw)).Code != "" {
+			t.Fatal("parsed unrelated content")
+		}
+	}
+	for _, code := range []string{"11135", "11153"} {
+		e := (&upstream.UpstreamError{StatusCode: 403, Raw: []byte(`{"code":` + code + `}`)}).Normalized()
+		if e.StatusCode != 400 || e.HTTPStatus != 403 {
+			t.Fatal(e)
+		}
+	}
+}
+
 // Explicitly paid, synthetic comparison only: two tool calls and one result
 // round trip at most. No user content, credentials, or identifiers are printed.
 func TestLiveKimiObjectUnionCompatibility(t *testing.T) {
