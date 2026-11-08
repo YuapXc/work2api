@@ -90,7 +90,7 @@ func (e *UpstreamError) Normalized() *UpstreamError {
 	status := e.StatusCode
 	fault := ParseBusinessFault(e.Raw)
 	switch fault.Code {
-	case "11101", "11133", "11135", "11150", "11153", "11159":
+	case "11101", "11133", "11135", "11150", "11151", "11153", "11159":
 		status = 400
 	case "11128":
 		if status != 403 && status != 429 && (status < 500 || e.HTTPStatus == 200) {

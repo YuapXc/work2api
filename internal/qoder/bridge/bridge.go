@@ -321,7 +321,7 @@ func dropRetiredModels(models []QoderModel) []QoderModel {
 
 func decodeModelCatalog(resp map[string]interface{}) ([]QoderModel, error) {
 	valid := false
-	for _, category := range []string{"assistant", "developer", "chat"} {
+	for _, category := range []string{"assistant", "developer", "chat", "app"} {
 		if _, ok := resp[category].([]interface{}); ok {
 			valid = true
 		}
@@ -335,14 +335,35 @@ func decodeModelCatalog(resp map[string]interface{}) ([]QoderModel, error) {
 func parseQoderModels(resp map[string]interface{}) []QoderModel {
 	// 按优先级尝试多个分类
 	categories := []string{"assistant", "developer", "chat"}
+	var primary []interface{}
 	for _, cat := range categories {
 		rawList, _ := resp[cat].([]interface{})
-		out := extractModels(rawList)
 		if len(rawList) > 0 {
-			return out
+			primary = rawList
+			break
 		}
 	}
-	return nil
+	merged := append([]interface{}(nil), primary...)
+	seen := map[string]bool{}
+	for _, raw := range primary {
+		m, _ := raw.(map[string]interface{})
+		seen[strings.TrimSpace(StrVal(m, "key"))] = true
+	}
+	app, _ := resp["app"].([]interface{})
+	for _, raw := range app {
+		m, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		key := strings.TrimSpace(StrVal(m, "key"))
+		enabled, _ := m["enable"].(bool)
+		if key == "" || key == "auto" || key == "default" || seen[key] || !enabled {
+			continue
+		}
+		merged = append(merged, raw)
+		seen[key] = true
+	}
+	return extractModels(merged)
 }
 
 func extractModels(rawList []interface{}) []QoderModel {

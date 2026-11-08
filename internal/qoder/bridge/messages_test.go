@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -587,5 +588,148 @@ func TestQoderNativeReasoningControlsReachUpstream(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestQoderStreamReadLifecycle(t *testing.T) {
+	for _, mode := range []string{"last-line", "early-stop", "cancel", "read-error"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			opened := make(chan struct{})
+			closed := make(chan struct{})
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				defer close(closed)
+				if mode == "read-error" {
+					w.Header().Set("Content-Length", "100")
+				}
+				if mode == "cancel" {
+					w.WriteHeader(200)
+					w.(http.Flusher).Flush()
+					close(opened)
+					<-r.Context().Done()
+					return
+				}
+				io.WriteString(w, "data: first\n\n")
+				if mode == "early-stop" {
+					w.(http.Flusher).Flush()
+					<-r.Context().Done()
+					return
+				}
+				if mode == "last-line" {
+					io.WriteString(w, "data: final")
+				}
+			}))
+			defer func() { cancel(); srv.Close() }()
+			sess, err := cosy.NewSession(cosy.AuthIdentity{Uid: "fixture", UserType: "personal_standard"}, "fixture", "fixture", "fixture")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode == "cancel" {
+				go func() {
+					select {
+					case <-opened:
+						cancel()
+					case <-ctx.Done():
+					}
+				}()
+			}
+			var lines []string
+			err = NewBearerClient(sess).openStreamLines(ctx, srv.URL+"/chat", map[string]any{"fixture": true}, nil, func(line string) bool { lines = append(lines, line); return mode != "early-stop" })
+			switch mode {
+			case "last-line":
+				if err != nil || len(lines) != 2 || lines[1] != "data: final" {
+					t.Fatal(lines, err)
+				}
+			case "early-stop":
+				if err != nil || len(lines) != 1 {
+					t.Fatal(lines, err)
+				}
+			case "cancel":
+				if !errors.Is(err, context.Canceled) || len(lines) != 0 {
+					t.Fatal(lines, err)
+				}
+			case "read-error":
+				if !errors.Is(err, io.ErrUnexpectedEOF) || len(lines) != 1 {
+					t.Fatal(lines, err)
+				}
+			}
+			select {
+			case <-closed:
+			case <-time.After(time.Second):
+				t.Fatal("body left open")
+			}
+			if calls.Load() != 1 {
+				t.Fatal("read lifecycle replayed POST", calls.Load())
+			}
+		})
+	}
+}
+func legacyLineDispatchForBenchmark(ctx context.Context, body io.ReadCloser, onLine func(string) bool) error {
+	watch := streamwatch.NewWatch(body, ctx, 0, 0)
+	defer watch.Close()
+	defer body.Close()
+	lines := make(chan string)
+	errs := make(chan error, 1)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		buffer, release := streamwatch.BorrowLineBuffer()
+		defer release()
+		s := bufio.NewScanner(watch.Reader(body))
+		s.Buffer(buffer, streamwatch.DefaultMaxLineBytes)
+		for s.Scan() {
+			select {
+			case lines <- s.Text():
+			case <-ctx.Done():
+				errs <- ctx.Err()
+				return
+			case <-done:
+				return
+			}
+		}
+		errs <- s.Err()
+	}()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-errs:
+			if watch.Err() != nil {
+				return watch.Err()
+			}
+			return err
+		case line := <-lines:
+			if line != "" && !onLine(line) {
+				return nil
+			}
+		}
+	}
+}
+func BenchmarkQoderStreamReadDispatch(b *testing.B) {
+	wire := strings.Repeat("data: {\"fixture\":\"synthetic line dispatch\"}\n\n", 1000)
+	for _, legacy := range []bool{true, false} {
+		name := "direct"
+		if legacy {
+			name = "channel"
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				count := 0
+				callback := func(string) bool { count++; return true }
+				body := io.NopCloser(strings.NewReader(wire))
+				var err error
+				if legacy {
+					err = legacyLineDispatchForBenchmark(context.Background(), body, callback)
+				} else {
+					err = readStreamLines(context.Background(), body, callback)
+				}
+				if err != nil || count != 1000 {
+					b.Fatal(count, err)
+				}
+			}
+		})
 	}
 }

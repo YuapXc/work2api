@@ -13,6 +13,7 @@ import (
 	"work2api/internal/workbuddy/credentials"
 	"work2api/internal/workbuddy/pool"
 	"work2api/internal/workbuddy/ratelimit"
+	"work2api/internal/workbuddy/reasoning"
 	"work2api/internal/workbuddy/siterouting"
 	"work2api/internal/workbuddy/upstream"
 )
@@ -179,6 +180,7 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 	var prepared *upstream.PreparedStreamBody
 	authorizationRetried := false
 	signatureRetried := false
+	emptyTextRetried := false
 	imageStage, maxTransmissions := 0, 3
 	if nativeBody != nil {
 		maxTransmissions = 5
@@ -235,6 +237,20 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 		if errors.As(err, &rejected) {
 			rejected = rejected.Normalized()
 			err = rejected
+		}
+		if nativeBody == nil && !started && ctx.Err() == nil && rejected != nil && rejected.StatusCode == 400 && BusinessCode(string(rejected.Raw), "11151") && !emptyTextRetried && recoveryAvailable(ctx) {
+			if next, changed := reasoning.GuardEmptyTextParts(body, true); changed {
+				emptyTextRetried = true
+				maxTransmissions++
+				streamwatch.AttemptResult(ctx, rejected.StatusCode)
+				body, prepared = next, nil
+				headers, err = r.headers(ctx, acc, opts.LocalNetworkFailure)
+				if err != nil {
+					return started, err
+				}
+				preamble, preambleBytes, responseBytes = nil, 0, 0
+				continue
+			}
 		}
 		if nativeBody != nil && !started && ctx.Err() == nil && rejected != nil && rejected.StatusCode == 400 && BusinessCode(string(rejected.Raw), "11135") && imageStage < 2 && recoveryAvailable(ctx) {
 			next, fixed, removed := nativeBody, 0, 0

@@ -6,6 +6,23 @@ import (
 	"testing"
 )
 
+func TestAppSceneEnrichesWithoutOverridingPrimary(t *testing.T) {
+	var raw map[string]any
+	json.Unmarshal([]byte(`{"assistant":[{"key":"old","enable":true,"price_factor":0.5},{"key":"blocked","enable":false}],"chat":[{"key":"old","enable":true,"price_factor":9}],"app":[{"key":"old","enable":true,"price_factor":99},{"key":"blocked","enable":true},{"key":"lmodel","enable":true,"is_vl":true,"max_input_tokens":1000000,"thinking_config":{"enabled":{"efforts":{"low":{},"high":{},"xhigh":{}}},"disabled":{}}},{"key":"auto","enable":true},{"key":"default","enable":true},{"key":"disabled","enable":false}]}`), &raw)
+	models, err := decodeModelCatalog(raw)
+	if err != nil || len(models) != 2 {
+		t.Fatal(models, err)
+	}
+	if *models[0].PriceFactor != 0.5 || models[1].Key != "lmodel" || !models[1].IsVL || models[1].ContextWindow != 1000000 || !models[1].thinking.canDisable {
+		t.Fatal(models)
+	}
+	raw["app"] = "bad"
+	models, err = decodeModelCatalog(raw)
+	if err != nil || len(models) != 1 {
+		t.Fatal("optional app broke primary", models, err)
+	}
+}
+
 func TestContextTiersUseDeterministicDefaults(t *testing.T) {
 	var raw map[string]any
 	json.Unmarshal([]byte(`{"assistant":[{"key":"m","enable":true,"context_config":{"1M":{"token_count":1000000},"200K":{"token_count":200000,"is_default":true},"400K":{"token_count":400000}}}]}`), &raw)

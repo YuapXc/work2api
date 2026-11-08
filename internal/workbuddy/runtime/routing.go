@@ -529,19 +529,28 @@ func (o *Runtime) OpenUpstreamScoped(ctx context.Context, acc *pool.Account, bod
 			return acc, err
 		}
 		if started {
+			if upstreamErr {
+				kind := ClassifyUpstream(ue.StatusCode, ue.Raw, ue.Header)
+				if kind == ErrEmptyText {
+					return acc, err
+				}
+				if kind == ErrModelProvider || kind == ErrModelRate {
+					o.penalizeAccount(acc, model, ue, attemptManager)
+					return acc, err
+				}
+			}
 			if denied || (upstreamErr && (ClassifyUpstream(ue.StatusCode, ue.Raw, ue.Header) == ErrImageInvalid || (nativeMessagesEndpoint(acc.Profile, model) != "" && BusinessCode(string(ue.Raw), "11159")))) {
 				return acc, err
 			}
-			// 流已开始又中断：软冷却（可能是上游中途掉线），不重试已开始的流。
-			if !LocalNetworkFailure(err) {
+			// Transport failures do not establish account failure; never replay started output.
+			if !transportFailure(err) {
 				o.Pool.OnFailure(acc.UID, CooldownSoft)
 			}
 			return acc, err
 		}
 		if !upstreamErr {
-			// Typed DNS/local routing failures are not account failures. Fail
-			// promptly without poisoning healthy accounts or retrying the same path.
-			if !LocalNetworkFailure(err) {
+			// Fail transport errors without penalizing accounts or replaying the request.
+			if !transportFailure(err) {
 				o.Pool.OnFailure(acc.UID, CooldownSoft)
 			}
 			return acc, err

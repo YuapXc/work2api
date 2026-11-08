@@ -282,18 +282,26 @@ func SanitizeChatChunkWithRole(line string, chunk map[string]any, sentRole *bool
 	if !ok || len(choices) == 0 {
 		return line
 	}
+	changed, filtered := strings.IndexByte(line, '\n') >= 0 || strings.IndexByte(line, '\r') >= 0, false
 	var kept []any
-	for _, ch := range choices {
+	for i, ch := range choices {
 		choice, ok := ch.(map[string]any)
 		if !ok {
-			kept = append(kept, ch)
+			if filtered {
+				kept = append(kept, ch)
+			}
 			continue
+		}
+		if finish, ok := choice["finish_reason"].(string); ok && finish == "" {
+			choice["finish_reason"] = nil
+			changed = true
 		}
 		if delta, ok := choice["delta"].(map[string]any); ok {
 			if sentRole != nil {
 				if role, ok := delta["role"].(string); ok && role != "" {
 					if *sentRole {
 						delete(delta, "role")
+						changed = true
 					} else {
 						*sentRole = true
 					}
@@ -301,30 +309,58 @@ func SanitizeChatChunkWithRole(line string, chunk map[string]any, sentRole *bool
 			}
 			if fn, ok := delta["function_call"].(map[string]any); ok && len(fn) <= 2 && IsEmptyVal(fn["name"]) && IsEmptyVal(fn["arguments"]) {
 				delete(delta, "function_call")
+				changed = true
 			}
 			for _, k := range []string{"content", "reasoning_content", "refusal", "function_call", "tool_calls", "reasoning"} {
 				if v, has := delta[k]; has && IsEmptyVal(v) {
 					delete(delta, k)
+					changed = true
 				}
 			}
-			if len(delta) > 0 {
-				choice["delta"] = delta
-			} else if choice["finish_reason"] != nil && choice["finish_reason"] != "" {
-				delete(choice, "delta")
-			} else {
-				continue
+			if calls, ok := delta["tool_calls"].([]any); ok {
+				for _, raw := range calls {
+					call, _ := raw.(map[string]any)
+					fn, _ := call["function"].(map[string]any)
+					if name, ok := fn["name"].(string); ok && name == "" {
+						delete(fn, "name")
+						changed = true
+					}
+				}
+			}
+			if len(delta) == 0 {
+				if choice["finish_reason"] != nil && choice["finish_reason"] != "" {
+					delete(choice, "delta")
+					changed = true
+				} else {
+					if !filtered {
+						kept = append([]any{}, choices[:i]...)
+						filtered = true
+					}
+					changed = true
+					continue
+				}
 			}
 		}
-		kept = append(kept, choice)
+		if filtered {
+			kept = append(kept, ch)
+		}
 	}
-	if len(kept) == 0 && chunk["usage"] == nil {
-		return ""
+	if filtered {
+		if len(kept) == 0 && chunk["usage"] == nil {
+			return ""
+		}
+		if kept == nil {
+			kept = []any{}
+		}
+		chunk["choices"] = kept
 	}
-	if kept == nil {
-		kept = []any{}
+	if !changed {
+		return line
 	}
-	chunk["choices"] = kept
-	b, _ := json.Marshal(chunk)
+	b, err := json.Marshal(chunk)
+	if err != nil {
+		return line
+	}
 	return "data: " + string(b)
 }
 

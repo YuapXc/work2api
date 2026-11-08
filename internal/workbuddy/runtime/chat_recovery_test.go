@@ -146,7 +146,7 @@ func TestNativeMessagesTransportAndSignatureRecovery(t *testing.T) {
 }
 
 func TestToolTailRecoveryBoundaries(t *testing.T) {
-	for _, mode := range []string{"success", "failure", "started", "budget", "auth"} {
+	for _, mode := range []string{"success", "failure", "started", "budget", "auth", "auth_empty"} {
 		t.Run(mode, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "auth.info")
 			raw, _ := json.Marshal(map[string]any{"auth": map[string]any{"accessToken": "fixture", "refreshToken": "r", "domain": "www.workbuddy.cn", "expiresAt": time.Now().Add(time.Hour).UnixMilli()}, "account": map[string]any{"uid": "fixture"}})
@@ -176,6 +176,15 @@ func TestToolTailRecoveryBoundaries(t *testing.T) {
 					status = 401
 					payload = `{"code":12153}`
 				}
+				if mode == "auth_empty" {
+					if calls == 2 {
+						payload = `{"code":11151}`
+					}
+					if calls == 3 {
+						status = 401
+						payload = `{"code":12153}`
+					}
+				}
 				if mode == "started" {
 					ct = "text/event-stream"
 					payload = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: {\"error\":{\"code\":11153}}\n\n"
@@ -184,7 +193,7 @@ func TestToolTailRecoveryBoundaries(t *testing.T) {
 			})
 			old := http.DefaultTransport
 			var clientTransport http.RoundTripper = transport
-			if mode == "auth" {
+			if mode == "auth" || mode == "auth_empty" {
 				srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 					resp, e := transport.RoundTrip(req)
 					if e != nil {
@@ -214,6 +223,9 @@ func TestToolTailRecoveryBoundaries(t *testing.T) {
 			p := pool.New(map[string]pool.Credential{"fixture": mgr}, "")
 			rt := &Runtime{Managers: map[string]*credentials.Manager{"fixture": mgr}, Pool: p, UpstreamClient: upstream.NewClient(&http.Client{Transport: clientTransport})}
 			body := map[string]any{"model": "m", "messages": []any{map[string]any{"role": "tool", "tool_call_id": "c1", "content": "result"}, map[string]any{"role": "user", "content": "continue"}}}
+			if mode == "auth_empty" {
+				body["messages"].([]any)[0].(map[string]any)["content"] = `[{"type":"text","text":""}]`
+			}
 			before, _ := json.Marshal(body)
 			budget := &recoveryBudget{remaining: 5}
 			if mode == "budget" {
@@ -225,7 +237,7 @@ func TestToolTailRecoveryBoundaries(t *testing.T) {
 			if string(before) != string(after) {
 				t.Fatal("input mutated")
 			}
-			success := mode == "success" || mode == "auth"
+			success := mode == "success" || mode == "auth" || mode == "auth_empty"
 			if success {
 				if err != nil || !started {
 					t.Fatal(started, err)
@@ -240,6 +252,9 @@ func TestToolTailRecoveryBoundaries(t *testing.T) {
 			if mode == "auth" {
 				want = 3
 			}
+			if mode == "auth_empty" {
+				want = 4
+			}
 			if calls != want || budget.remaining != func() int {
 				if mode == "budget" {
 					return 0
@@ -251,7 +266,7 @@ func TestToolTailRecoveryBoundaries(t *testing.T) {
 			if (len(rt.toolTailModels) > 0) != success {
 				t.Fatal("learned unsuccessful repair")
 			}
-			if mode == "auth" && refreshes != 1 {
+			if (mode == "auth" || mode == "auth_empty") && refreshes != 1 {
 				t.Fatal("authorization recovery lost", refreshes)
 			}
 			if mode == "success" {
@@ -280,7 +295,7 @@ func TestToolTailRecoveryBoundaries(t *testing.T) {
 }
 
 func TestWrappedBusinessErrorClassification(t *testing.T) {
-	for code, want := range map[string]ErrKind{"11128": ErrChannelDenied, "11135": ErrImageInvalid, "11115": ErrPromptTooLong, "11101": ErrBadParams, "12153": ErrSessionDead, "6004": ErrSoftRate, "14018": ErrHardCredit, "11102": ErrModelBlocked} {
+	for code, want := range map[string]ErrKind{"11128": ErrChannelDenied, "11135": ErrImageInvalid, "11115": ErrPromptTooLong, "11101": ErrBadParams, "12153": ErrSessionDead, "6004": ErrModelRate, "14018": ErrHardCredit, "11102": ErrModelBlocked} {
 		raw := []byte(`{"error":{"code":400,"details":"{\"code\":` + code + `}"}}`)
 		if got := ClassifyUpstream(400, raw, nil); got != want {
 			t.Fatal(code, got, want)
@@ -402,5 +417,130 @@ func TestChat401LastRecoverySlotDoesNotRefreshOrReplay(t *testing.T) {
 	remote, ok := err.(*upstream.UpstreamError)
 	if !ok || remote.StatusCode != 401 || !strings.Contains(string(remote.Raw), "授权") || strings.Contains(string(remote.Raw), "private upstream") || sends.Load() != 1 {
 		t.Fatalf("lost final auth error or replayed: sends=%d err=%v", sends.Load(), err)
+	}
+}
+
+func TestStreamSanitizerPreservesUnchangedFramesAndToolFragments(t *testing.T) {
+	normal := `data: { "choices": [{"index":0,"delta":{"content":"text"},"finish_reason":null}],"extension":9007199254740993 }`
+	var chunk map[string]any
+	json.Unmarshal([]byte(normal[6:]), &chunk)
+	role := false
+	if out := SanitizeChatChunkWithRole(normal, chunk, &role); out != normal {
+		t.Fatal("unchanged frame reencoded", out)
+	}
+	multiline := "data: {\n\"choices\":[{\"delta\":{\"content\":\"text\"},\"finish_reason\":null}]}"
+	if out := SanitizeChatSSE(multiline); strings.ContainsAny(out, "\r\n") || !strings.Contains(out, `"content":"text"`) {
+		t.Fatal("multiline JSON leaked into single-line SSE", out)
+	}
+	first := `data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call","function":{"name":"lookup","arguments":"{"}}]},"finish_reason":""}]}`
+	clean := SanitizeChatSSEWithRole(first, &role)
+	var decoded map[string]any
+	json.Unmarshal([]byte(clean[6:]), &decoded)
+	choice := decoded["choices"].([]any)[0].(map[string]any)
+	if choice["finish_reason"] != nil || !role || !strings.Contains(clean, `"name":"lookup"`) {
+		t.Fatal("first fragment changed", clean)
+	}
+	next := `data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"}"}}],"content":"","reasoning_content":""},"finish_reason":null}]}`
+	clean = SanitizeChatSSEWithRole(next, &role)
+	if strings.Contains(clean, `"name"`) || !strings.Contains(clean, `"arguments":"}"`) || strings.Contains(clean, "reasoning_content") {
+		t.Fatal("argument fragment corrupted", clean)
+	}
+	if out := SanitizeChatSSE(`data: {"choices":[{"delta":{"content":""},"finish_reason":""}],"usage":{"total_tokens":1}}`); !strings.Contains(out, `"choices":[]`) || !strings.Contains(out, `"total_tokens":1`) {
+		t.Fatal("usage-only frame lost", out)
+	}
+	if out := SanitizeChatSSE(`data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}`); !strings.Contains(out, "assistant") {
+		t.Fatal("first role lost")
+	}
+}
+func BenchmarkStreamSanitizerPassThrough(b *testing.B) {
+	line := `data: {"id":"fixture","choices":[{"index":0,"delta":{"content":"` + strings.Repeat("chunk", 40) + `"},"finish_reason":null}]}`
+	var chunk map[string]any
+	json.Unmarshal([]byte(line[6:]), &chunk)
+	role := true
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		SanitizeChatChunkWithRole(line, chunk, &role)
+	}
+}
+func TestEmptyTextRecoveryIsRequestLocalAndBudgeted(t *testing.T) {
+	for _, mode := range []string{"success", "failure", "started", "budget", "other", "plain", "shape"} {
+		t.Run(mode, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "auth.info")
+			raw, _ := json.Marshal(map[string]any{"auth": map[string]any{"accessToken": "fixture", "domain": "www.workbuddy.cn", "expiresAt": time.Now().Add(time.Hour).UnixMilli()}, "account": map[string]any{"uid": "fixture"}})
+			if err := os.WriteFile(path, raw, 0600); err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			tr := maintenanceTransport(func(req *http.Request) (*http.Response, error) {
+				calls++
+				var sent map[string]any
+				if err := json.NewDecoder(req.Body).Decode(&sent); err != nil {
+					t.Fatal(err)
+				}
+				messages := sent["messages"].([]any)
+				text := messages[0].(map[string]any)["content"].(string)
+				if calls == 1 && text != `[{"type":"text","text":""}]` && mode != "plain" {
+					t.Fatal("premature string rewrite", text)
+				}
+				status, ct, payload := 200, "application/json", `{"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}]}`
+				if calls == 1 || mode == "failure" {
+					status = 400
+					payload = `{"code":11151,"msg":"empty text"}`
+				}
+				if mode == "other" {
+					payload = `{"code":11101}`
+				}
+				if mode == "started" {
+					status = 200
+					ct = "text/event-stream"
+					payload = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: {\"error\":{\"code\":11151}}\n\n"
+				}
+				if calls == 2 && (mode == "success" || mode == "shape") && !strings.Contains(text, `"text":" "`) {
+					t.Fatal("missing repair", text)
+				}
+				if mode == "shape" && calls == 2 {
+					status = 400
+					payload = `{"code":11153}`
+				}
+				if mode == "shape" && calls == 3 && len(messages) != 3 {
+					t.Fatal("shape repair lost")
+				}
+				return &http.Response{Request: req, StatusCode: status, Header: http.Header{"Content-Type": []string{ct}}, Body: io.NopCloser(strings.NewReader(payload))}, nil
+			})
+			mgr := credentials.NewManager(path)
+			p := pool.New(map[string]pool.Credential{"fixture": mgr}, "")
+			rt := &Runtime{Managers: map[string]*credentials.Manager{"fixture": mgr}, Pool: p, UpstreamClient: upstream.NewClient(&http.Client{Transport: tr})}
+			text := `[{"type":"text","text":""}]`
+			if mode == "plain" {
+				text = "ordinary result"
+			}
+			body := map[string]any{"model": "m", "messages": []any{map[string]any{"role": "tool", "tool_call_id": "c1", "content": text}, map[string]any{"role": "user", "content": "continue"}}}
+			before, _ := json.Marshal(body)
+			slots := 5
+			if mode == "budget" {
+				slots = 1
+			}
+			budget := &recoveryBudget{remaining: slots}
+			ctx := context.WithValue(context.Background(), recoveryBudgetKey{}, budget)
+			_, err := rt.Stream(ctx, p.Get("fixture"), body, func(string) error { return nil }, AttemptOptions{})
+			want := 1
+			if mode == "success" || mode == "failure" {
+				want = 2
+			}
+			if mode == "shape" {
+				want = 3
+			}
+			if calls != want || budget.remaining != slots-want || (err == nil) != (mode == "success" || mode == "shape") {
+				t.Fatal(mode, calls, budget.remaining, err)
+			}
+			after, _ := json.Marshal(body)
+			if string(after) != string(before) {
+				t.Fatal("source mutated")
+			}
+			if kind := ClassifyUpstream(502, []byte(`{"error":{"code":11151}}`), nil); kind != ErrEmptyText || !ActionFor(kind, nil, nil, 0).FailFast {
+				t.Fatal("11151 causes futile account rotation", kind)
+			}
+		})
 	}
 }

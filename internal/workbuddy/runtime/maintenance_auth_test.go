@@ -22,6 +22,34 @@ import (
 	"work2api/internal/workbuddy/upstream"
 )
 
+func TestModelFaultDoesNotCoolOtherModels(t *testing.T) {
+	db, err := store.New(filepath.Join(t.TempDir(), "fault.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, tc := range []struct {
+		status int
+		raw    string
+		kind   ErrKind
+	}{{500, `{"code":11134}`, ErrModelProvider}, {502, `{"error":{"code":"11134"}}`, ErrModelProvider}, {429, `{"code":6004,"msg":"switch models"}`, ErrModelRate}} {
+		mgrPath := filepath.Join(t.TempDir(), "auth.info")
+		if err := os.WriteFile(mgrPath, []byte(`{"auth":{"accessToken":"fixture","domain":"www.codebuddy.cn"},"account":{"uid":"fixture"}}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		mgr := credentials.NewManager(mgrPath)
+		p := pool.New(map[string]pool.Credential{"fixture": mgr}, "")
+		r := &Runtime{Pool: p, Managers: map[string]*credentials.Manager{"fixture": mgr}, db: db, Cooldowns: map[string]CooldownEntry{}}
+		if got := ClassifyUpstream(tc.status, []byte(tc.raw), nil); got != tc.kind {
+			t.Fatal(got, tc.kind)
+		}
+		act := r.PenalizeAccount(p.Get("fixture"), "m", &upstream.UpstreamError{StatusCode: tc.status, Raw: []byte(tc.raw)})
+		if !act.ModelScoped || !act.Rotate || p.Get("fixture").CooldownUntil > nowSec() || !p.Get("fixture").Enabled || r.Cooldowns["fixture|m"].Until <= nowSec() {
+			t.Fatal("account-wide penalty", act)
+		}
+	}
+}
+
 func TestDisabledAccountEntersMaintenanceWithoutReenabling(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "account.json")
 	if err := os.WriteFile(path, []byte(`{"auth":{"accessToken":"fixture","refreshToken":"refresh","domain":"www.workbuddy.cn","expiresAt":1},"account":{"uid":"fixture"}}`), 0600); err != nil {

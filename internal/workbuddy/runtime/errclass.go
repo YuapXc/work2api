@@ -26,11 +26,14 @@ type ErrKind string
 
 const (
 	ErrNone           ErrKind = "none"
-	ErrHardCredit     ErrKind = "hard_credit"     // 积分耗尽（402 / 429+14018）→ 冷却到次日 04:00
-	ErrSoftRate       ErrKind = "soft_rate"       // 限流 → 短冷却
-	ErrSessionDead    ErrKind = "session_dead"    // 登录态失效（401+12153）→ 禁用
-	ErrNotFound       ErrKind = "not_found"       // 404 偶发 → 短冷却
-	ErrServer         ErrKind = "server"          // 上游 5xx
+	ErrHardCredit     ErrKind = "hard_credit"  // 积分耗尽（402 / 429+14018）→ 冷却到次日 04:00
+	ErrSoftRate       ErrKind = "soft_rate"    // 限流 → 短冷却
+	ErrSessionDead    ErrKind = "session_dead" // 登录态失效（401+12153）→ 禁用
+	ErrNotFound       ErrKind = "not_found"    // 404 偶发 → 短冷却
+	ErrServer         ErrKind = "server"       // 上游 5xx
+	ErrModelProvider  ErrKind = "model_provider_fault"
+	ErrModelRate      ErrKind = "model_rate"
+	ErrEmptyText      ErrKind = "empty_text"
 	ErrChannelDenied  ErrKind = "channel_denied"  // 11128 请求风控 → 有限兼容/换授权账号，不施加共享冷却
 	ErrContentBlocked ErrKind = "content_blocked" // 内容策略拦截 → 不罚号，透传
 	ErrBadParams      ErrKind = "bad_params"      // 请求体畸形（11101）→ 不罚号，仍轮转
@@ -297,6 +300,10 @@ func ClassifyUpstream(status int, raw []byte, _ http.Header) ErrKind {
 		return ErrChannelDenied
 	case IsModelBlocked(status, text, lower):
 		return ErrModelBlocked
+	case status >= 500 && fault.Code == "11134":
+		return ErrModelProvider
+	case status == 429 && fault.Code == "6004":
+		return ErrModelRate
 	case status == 402:
 		return ErrHardCredit
 	case status >= 400 && (BusinessCode(text, "12153") || HitFold(text, lower, SessionDeadMarkers)):
@@ -321,6 +328,8 @@ func ClassifyUpstream(status int, raw []byte, _ http.Header) ErrKind {
 		return ErrWAFBlock
 	case status == 400 && (fault.Code == "11135" || HitFold(text, lower, InvalidImageMarkers) || CodeMarker(lower, "11135")):
 		return ErrImageInvalid
+	case status == 400 && fault.Code == "11151":
+		return ErrEmptyText
 	case status >= 400:
 		if HitLower(lower, ContentBlockedMarkers) {
 			return ErrContentBlocked
@@ -336,6 +345,8 @@ func ClassifyUpstream(status int, raw []byte, _ http.Header) ErrKind {
 // ActionFor 把 ErrKind 映射为处置策略（运营决策，与分类解耦）。
 func ActionFor(kind ErrKind, raw []byte, headers http.Header, now float64) ErrAction {
 	switch kind {
+	case ErrEmptyText:
+		return ErrAction{FailFast: true, Reason: "请求包含上游不接受的空文本片段（11151）"}
 	case ErrHardCredit:
 		return ErrAction{Rotate: true, Cooldown: MaxFloat(60.0, NextDay4am(now)-now), Reason: "余额不足"}
 	case ErrSoftRate:
@@ -353,6 +364,10 @@ func ActionFor(kind ErrKind, raw []byte, headers http.Header, now float64) ErrAc
 		return ErrAction{Rotate: true, Cooldown: SoftCooldownSec, Reason: "账号级故障（试用未激活）"}
 	case ErrServer:
 		return ErrAction{Rotate: true, Cooldown: ServerCooldown, Reason: "上游 5xx"}
+	case ErrModelProvider:
+		return ErrAction{Rotate: true, Cooldown: SoftCooldownSec, ModelScoped: true, Reason: "上游模型服务暂时不可用（11134）"}
+	case ErrModelRate:
+		return ErrAction{Rotate: true, Cooldown: SoftRateCooldown(string(raw), headers, now), ModelScoped: true, Reason: "当前模型暂时限流（6004，未返回有效重置时间）"}
 	case ErrChannelDenied:
 		// The same envelope also covers input-dependent policy decisions. Exclude
 		// within this request; do not cool the shared model for unrelated users.

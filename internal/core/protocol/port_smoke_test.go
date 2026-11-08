@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,191 @@ import (
 	"work2api/internal/jsonutil"
 	"work2api/internal/streamwatch"
 )
+
+func BenchmarkBase64AlphabetCheck(b *testing.B) {
+	value := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{255, 254, 253}, 350000))
+	for _, legacy := range []bool{true, false} {
+		b.Run(fmt.Sprintf("legacy-%t", legacy), func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(value)))
+			for b.Loop() {
+				var found bool
+				if legacy {
+					found = strings.ContainsAny(value, "-_")
+				} else {
+					found = strings.IndexByte(value, '-') >= 0 || strings.IndexByte(value, '_') >= 0
+				}
+				if found {
+					b.Fatal("standard fixture changed")
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkRequestNormalization(b *testing.B) {
+	for _, fixture := range []struct {
+		count         int
+		blocks, image bool
+	}{{256, false, false}, {2048, false, false}, {2048, true, false}, {256, true, true}} {
+		count := fixture.count
+		messages := make([]any, count)
+		for i := range messages {
+			role := "user"
+			if i%2 == 1 {
+				role = "assistant"
+			}
+			messages[i] = map[string]any{"role": role, "content": strings.Repeat("synthetic context ", 128)}
+			if fixture.blocks {
+				messages[i].(map[string]any)["content"] = []any{map[string]any{"type": "text", "text": strings.Repeat("synthetic context ", 128)}}
+			}
+		}
+		if fixture.image {
+			messages[0].(map[string]any)["content"] = []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64," + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{255, 254, 253}, 350000))}}}
+		}
+		tools := make([]any, 170)
+		for i := range tools {
+			tools[i] = map[string]any{"type": "function", "function": map[string]any{"name": fmt.Sprintf("tool_%d", i), "description": strings.Repeat("tool description ", 32), "parameters": map[string]any{"type": "object", "properties": map[string]any{"value": map[string]any{"type": "string"}}, "required": []any{"value"}}}}
+		}
+		body := NormalizeInput(Chat, map[string]any{"model": "fixture", "messages": messages, "tools": tools})
+		for _, mode := range []string{"scan-only", "single", "duplicate"} {
+			b.Run(fmt.Sprintf("messages-%d/blocks-%t/image-%t/%s", count, fixture.blocks, fixture.image, mode), func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					if mode == "scan-only" {
+						NormalizeInput(Chat, body)
+						continue
+					}
+					input := body
+					if mode == "duplicate" {
+						input = NormalizeInput(Chat, input)
+					}
+					if _, err := PrepareRequest(Chat, Responses, input, ""); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestMixedReasoningAndParallelToolHistoryRoundTrip(t *testing.T) {
+	var body map[string]any
+	if err := json.Unmarshal([]byte(`{"model":"fixture","messages":[{"role":"user","content":"start"},{"role":"assistant","content":"plan","reasoning_content":"consider both tools","tool_calls":[{"id":"call_a","type":"function","function":{"name":"first","arguments":"{\"value\":\"cc_version=1\"}"}},{"id":"call_b","type":"function","function":{"name":"second","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_b","content":"second result"},{"role":"tool","tool_call_id":"call_a","content":"first result"},{"role":"user","content":"continue"}]}`), &body); err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []Protocol{Chat, Anthropic, Responses} {
+		t.Run(string(target), func(t *testing.T) {
+			converted, err := ConvertRequest(Chat, target, body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			back, err := ConvertRequest(target, Chat, converted)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := decodeBridgeRequest(Chat, back)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var calls, results []string
+			var thoughts, text strings.Builder
+			for _, message := range decoded.Messages {
+				for _, block := range message.Blocks {
+					switch block.Kind {
+					case "reasoning":
+						thoughts.WriteString(block.Text)
+					case "text":
+						text.WriteString(block.Text)
+					case "tool_call":
+						calls = append(calls, block.ID+":"+block.Name+":"+block.ArgumentsJSON)
+					case "tool_result":
+						results = append(results, block.CallID+":"+fmt.Sprint(block.Result))
+					}
+				}
+			}
+			wantResults := []string{"call_a:first result", "call_b:second result"}
+			if target == Chat {
+				wantResults = []string{"call_b:second result", "call_a:first result"}
+			}
+			if !reflect.DeepEqual(calls, []string{`call_a:first:{"value":"cc_version=1"}`, `call_b:second:{}`}) || !reflect.DeepEqual(results, wantResults) || text.String() != "startplancontinue" {
+				t.Fatal("parallel history changed", back)
+			}
+			if target != Responses && thoughts.String() != "consider both tools" {
+				t.Fatal("readable reasoning lost", back)
+			}
+			if target == Responses && thoughts.Len() != 0 {
+				t.Fatal("unissued reasoning reference synthesized", back)
+			}
+		})
+	}
+}
+
+func TestNormalizeInputsPreservesMediaAndToolContracts(t *testing.T) {
+	data := []byte{255, 254, 253, 252, 251}
+	encoded := base64.RawURLEncoding.EncodeToString(data)
+	standard := base64.StdEncoding.EncodeToString(data)
+	for _, from := range []Protocol{Chat, Anthropic, Responses} {
+		image := map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64," + encoded}}
+		key := "messages"
+		item := map[string]any{"role": "user", "content": []any{image}}
+		if from == Anthropic {
+			image = map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": encoded}}
+			item["content"] = []any{image}
+		}
+		if from == Responses {
+			key = "input"
+			image = map[string]any{"type": "input_image", "image_url": "data:image/png;base64," + encoded}
+			item["content"] = []any{image}
+		}
+		body := map[string]any{key: []any{item}, "tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": "echo", "parameters": map[string]any{"const": encoded}}}}}
+		before, _ := json.Marshal(body)
+		out := NormalizeInput(from, body)
+		after, _ := json.Marshal(body)
+		if !bytes.Equal(before, after) {
+			t.Fatal("source mutated")
+		}
+		wire, _ := json.Marshal(out)
+		if !bytes.Contains(wire, []byte(standard)) || !bytes.Contains(wire, []byte(`"const":"`+encoded+`"`)) {
+			t.Fatal("media or opaque schema corrupted", string(wire))
+		}
+		if !sameMap(out, NormalizeInput(from, out)) {
+			t.Fatal("normalization is not idempotent")
+		}
+	}
+	for _, bad := range []string{"-_+/", "YQ=", "=YQ", "a", "not base64!"} {
+		if _, changed := standardBase64(bad); changed {
+			t.Fatal("rewrote invalid encoding", bad)
+		}
+	}
+	body := map[string]any{"messages": []any{map[string]any{"role": "system", "tools": []any{map[string]any{"name": "read", "inputSchema": map[string]any{"type": "object", "required": []any{"path"}}}, map[string]any{"name": "fixed", "parameters": map[string]any{"const": "wrong"}}}}, map[string]any{"role": "user", "content": "Keep this."}}, "tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": "fixed", "parameters": map[string]any{"const": "keep"}}}}}
+	before, _ := json.Marshal(body)
+	out := NormalizeInput(Chat, body)
+	after, _ := json.Marshal(body)
+	if !bytes.Equal(before, after) {
+		t.Fatal("tool source mutated")
+	}
+	tools := out["tools"].([]any)
+	if len(tools) != 2 || len(out["messages"].([]any)) != 1 {
+		t.Fatal("tool lifting failed", out)
+	}
+	fn := tools[1].(map[string]any)["function"].(map[string]any)
+	if fn["name"] != "read" || !reflect.DeepEqual(fn["parameters"], map[string]any{"type": "object", "required": []any{"path"}}) {
+		t.Fatal("tool schema weakened", fn)
+	}
+	for _, target := range []Protocol{Chat, Anthropic, Responses} {
+		converted, err := PrepareRequest(Chat, target, body, "")
+		if err != nil {
+			t.Fatal(target, err)
+		}
+		wire, _ := json.Marshal(converted)
+		for _, fragment := range []string{`"read"`, `"required":["path"]`, `"const":"keep"`} {
+			if !bytes.Contains(wire, []byte(fragment)) {
+				t.Fatal("lost tool contract", target, fragment, string(wire))
+			}
+		}
+	}
+}
 
 type terminalOnlyReader struct {
 	wire  string

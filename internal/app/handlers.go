@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 
+	coreprotocol "work2api/internal/core/protocol"
 	"work2api/internal/core/provider"
 	"work2api/internal/streamwatch"
 	wbruntime "work2api/internal/workbuddy/runtime"
@@ -26,6 +27,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, errBody(400, "messages is required", "invalid_request_error").Body)
 		return
 	}
+	payload = coreprotocol.NormalizeInput(coreprotocol.Chat, payload)
 	if aerr := s.prepareModel(principal, payload); aerr != nil {
 		writeAPIErr(w, aerr)
 		return
@@ -86,6 +88,7 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").Body)
 		return
 	}
+	payload = coreprotocol.NormalizeInput(coreprotocol.Protocol(protocol), payload)
 	if aerr := s.prepareModel(principal, payload); aerr != nil {
 		writeAPIErr(w, aerr)
 		return

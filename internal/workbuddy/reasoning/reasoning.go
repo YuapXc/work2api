@@ -5,7 +5,10 @@
 package reasoning
 
 import (
+	"encoding/json"
+	"io"
 	"log"
+	"maps"
 	"strconv"
 	"strings"
 )
@@ -205,7 +208,137 @@ func Sanitize(body Body, efforts map[string][]string) Body {
 	body = RepairToolSequence(body)
 	body = InjectThinking(body)
 	body = BackfillReasoningContent(body)
+	body = MirrorUpstreamReasoning(body)
+	body, _ = GuardEmptyTextParts(body, false)
 	return body
+}
+
+func MirrorUpstreamReasoning(body Body) Body {
+	model, _ := body["model"].(string)
+	model = strings.ToLower(model)
+	matched := false
+	for _, family := range []string{"kimi", "glm", "minimax", "mimo", "step", "space-bunny"} {
+		if model == family || strings.HasPrefix(model, family+"-") {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return body
+	}
+	msgs, _ := body["messages"].([]any)
+	var out []any
+	for i, raw := range msgs {
+		m, ok := raw.(map[string]any)
+		if !ok || m["role"] != "assistant" {
+			continue
+		}
+		canonical, _ := m["reasoning"].(string)
+		alias, _ := m["reasoning_content"].(string)
+		if canonical != "" || strings.TrimSpace(alias) == "" {
+			continue
+		}
+		if out == nil {
+			out = append([]any(nil), msgs...)
+		}
+		next := maps.Clone(m)
+		next["reasoning"] = alias
+		out[i] = next
+	}
+	if out == nil {
+		return body
+	}
+	next := maps.Clone(body)
+	next["messages"] = out
+	return next
+}
+
+// Strings are interpreted as protocol parts only after an explicit 11151.
+func GuardEmptyTextParts(body Body, stringParts bool) (Body, bool) {
+	msgs, _ := body["messages"].([]any)
+	var out []any
+	for i, raw := range msgs {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		parts, isList := m["content"].([]any)
+		if !isList {
+			if !stringParts {
+				continue
+			}
+			text, ok := m["content"].(string)
+			if !ok {
+				continue
+			}
+			parts = sniffTextParts(text)
+			if len(parts) == 0 {
+				continue
+			}
+		}
+
+		var fixed []any
+		for j, rawPart := range parts {
+			part, ok := rawPart.(map[string]any)
+			if !ok || part["type"] != "text" {
+				continue
+			}
+			if v := part["text"]; v != nil && v != "" {
+				continue
+			}
+			if fixed == nil {
+				fixed = append([]any(nil), parts...)
+			}
+			next := maps.Clone(part)
+			next["text"] = " "
+			fixed[j] = next
+		}
+		if fixed == nil {
+			continue
+		}
+		var content any = fixed
+		if !isList {
+			encoded, err := json.Marshal(fixed)
+			if err != nil {
+				continue
+			}
+			content = string(encoded)
+		}
+		if out == nil {
+			out = append([]any(nil), msgs...)
+		}
+		next := maps.Clone(m)
+		next["content"] = content
+		out[i] = next
+	}
+	if out == nil {
+		return body, false
+	}
+	next := maps.Clone(body)
+	next["messages"] = out
+	return next, true
+}
+
+func sniffTextParts(text string) []any {
+	if !strings.HasPrefix(strings.TrimLeft(text, " \t\r\n"), "[") {
+		return nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(text))
+	decoder.UseNumber()
+	var parts []any
+	if decoder.Decode(&parts) != nil {
+		return nil
+	}
+	var extra any
+	if decoder.Decode(&extra) != io.EOF {
+		return nil
+	}
+	for _, part := range parts {
+		if _, ok := part.(map[string]any); !ok {
+			return nil
+		}
+	}
+	return parts
 }
 
 // NormalizeRoles rewrites developer→system (upstream role whitelist rejects

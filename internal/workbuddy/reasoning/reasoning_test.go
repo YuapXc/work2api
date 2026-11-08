@@ -2,10 +2,32 @@ package reasoning
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+func BenchmarkUpstreamHistoryGuards(b *testing.B) {
+	for _, count := range []int{256, 2048} {
+		messages := make([]any, count)
+		for i := range messages {
+			role := "user"
+			if i%2 == 1 {
+				role = "assistant"
+			}
+			messages[i] = map[string]any{"role": role, "content": strings.Repeat("synthetic context ", 128)}
+		}
+		body := Body{"model": "glm-5.3-flash", "messages": messages}
+		b.Run(fmt.Sprint(count), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				out := MirrorUpstreamReasoning(body)
+				GuardEmptyTextParts(out, false)
+			}
+		})
+	}
+}
 
 func TestWorkBuddyDeepseekReasoningReplay(t *testing.T) {
 	for _, tc := range []struct {
@@ -252,6 +274,61 @@ func TestExplicitOffWithUnknownSupportDisablesDeepseekThinking(t *testing.T) {
 		}
 		if _, present := out["reasoning_effort"]; present {
 			t.Fatal("disabled effort not removed")
+		}
+	}
+}
+
+func TestFamilyReasoningMirrorAndEmptyTextBoundaries(t *testing.T) {
+	for _, model := range []string{"kimi", "kimi-k3.1-pro", "glm-5.3-flash", "minimax-m3.1", "mimo-v2", "step-5", "space-bunny-sg", "kimono", "glmish", "stepfather", "hy4-preview", "gpt-5"} {
+		original := Body{"model": model, "messages": []any{map[string]any{"role": "assistant", "content": "answer", "reasoning_content": " thought "}, map[string]any{"role": "assistant", "content": "native", "reasoning": "canonical", "reasoning_content": "alias"}, map[string]any{"role": "assistant", "reasoning_content": " \t "}, map[string]any{"role": "user", "reasoning_content": "user data"}}}
+		before, _ := json.Marshal(original)
+		out := MirrorUpstreamReasoning(original)
+		msgs := out["messages"].([]any)
+		want := model == "kimi" || strings.HasPrefix(model, "kimi-") || strings.HasPrefix(model, "glm-") || strings.HasPrefix(model, "minimax-") || strings.HasPrefix(model, "mimo-") || strings.HasPrefix(model, "step-") || strings.HasPrefix(model, "space-bunny-")
+		if (msgs[0].(map[string]any)["reasoning"] == " thought ") != want || msgs[1].(map[string]any)["reasoning"] != "canonical" || msgs[2].(map[string]any)["reasoning"] != nil || msgs[3].(map[string]any)["reasoning"] != nil {
+			t.Fatal(model, out)
+		}
+		after, _ := json.Marshal(original)
+		if string(before) != string(after) || !reflect.DeepEqual(out, MirrorUpstreamReasoning(out)) {
+			t.Fatal("source mutation or repeated mirror", model)
+		}
+	}
+	for _, content := range []any{
+		[]any{map[string]any{"type": "text", "text": "", "tag": "keep"}, map[string]any{"type": "image_url", "image_url": "https://example.test/image"}, map[string]any{"type": "text", "text": "Next Step"}},
+		` [{"type":"text","text":null,"integer":9007199254740993},{"type":"text","text":"Next Step"}]`,
+		`[{"type":"text"}]`,
+	} {
+		original := Body{"messages": []any{map[string]any{"role": "tool", "content": content, "tool_call_id": "call"}}, "tools": []any{map[string]any{"const": content}}}
+		before, _ := json.Marshal(original)
+		out, changed := GuardEmptyTextParts(original, true)
+		if !changed {
+			t.Fatal("empty part not repaired", content)
+		}
+		raw, _ := json.Marshal(out)
+		if !strings.Contains(string(raw), "Next Step") && strings.Contains(string(before), "Next Step") {
+			t.Fatal("sibling lost")
+		}
+		if strings.Contains(string(before), "9007199254740993") && !strings.Contains(string(raw), "9007199254740993") {
+			t.Fatal("business number rounded")
+		}
+		again, changed := GuardEmptyTextParts(out, true)
+		if changed || !reflect.DeepEqual(again, out) {
+			t.Fatal("not idempotent")
+		}
+		after, _ := json.Marshal(original)
+		if string(before) != string(after) || !reflect.DeepEqual(original["tools"], out["tools"]) {
+			t.Fatal("business input mutated")
+		}
+		if _, isString := content.(string); isString {
+			if out, changed := GuardEmptyTextParts(original, false); changed || !reflect.DeepEqual(out, original) {
+				t.Fatal("JSON string sniffed without rejection")
+			}
+		}
+	}
+	for _, content := range []string{`[{"type":"text","text":"   "}]`, `[{"text":""}]`, `{"type":"text","text":""}`, `["",{"type":"text","text":""}]`, `[{"type":"text","text":0}]`, `[{"type":"text","text":""}] trailing`, `[invalid`, "plain text"} {
+		body := Body{"messages": []any{map[string]any{"role": "tool", "content": content}}}
+		if _, changed := GuardEmptyTextParts(body, true); changed {
+			t.Fatal("ordinary business content changed", content)
 		}
 	}
 }

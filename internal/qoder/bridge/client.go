@@ -276,64 +276,35 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 			return &streamOpenError{upstream}
 		}
 
-		// 建流成功：进入流式读取，不再在本层重试。
-		// 看门狗：空闲 180s 无任何字节 / 总时长 30min 上限——上游建流后挂住
-		// 不再让 goroutine 和连接无限挂到客户端断开（buddy-proxy 同款双超时）。
-		watch := streamwatch.NewWatch(resp.Body, ctx, 0, 0)
-		defer watch.Close()
-		defer resp.Body.Close()
-		lineCh := make(chan string)
-		errCh := make(chan error, 1)
-		// done：主循环提前退出（onLine 返回 false）时关闭，解锁 scanner goroutine，
-		// 避免其阻塞在 lineCh 发送处、仅剩 ctx.Done 一条出路造成 goroutine 泄漏
-		done := make(chan struct{})
-		defer close(done)
-		go func() {
-			buffer, release := streamwatch.BorrowLineBuffer()
-			defer release()
-			scanner := bufio.NewScanner(watch.Reader(resp.Body))
-			scanner.Buffer(buffer, streamwatch.DefaultMaxLineBytes)
-			for scanner.Scan() {
-				select {
-				case lineCh <- scanner.Text():
-				case <-ctx.Done():
-					errCh <- ctx.Err()
-					return
-				case <-done:
-					return
-				}
-			}
-			if err := scanner.Err(); err != nil {
-				errCh <- err
-				return
-			}
-			errCh <- nil
-		}()
-		for {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case err := <-errCh:
-				if watch.Err() != nil {
-					logger.Error("[streamwatch] %v", watch.Err())
-					return watch.Err()
-				}
-				logger.Debug("stream read complete")
-				return err
-			case line := <-lineCh:
-				if line != "" {
-					// onLine 返回 false：消费方已置位 upstreamErr（信封错误帧），
-					// 立即停止读取，避免上游不关流时请求挂起；
-					// 错误由 CallQoderWithOpts 的 emitted 闸门 + isRetryableStreamError 完成重开
-					if !onLine(line) {
-						return nil
-					}
-				}
-			}
-		}
+		return readStreamLines(ctx, resp.Body, onLine)
 	}
 	// 防御性兜底：所有失败分支均在循环内直接 return，正常不可达
 	return WrapTransportError(lastErr)
+}
+
+func readStreamLines(ctx context.Context, body io.ReadCloser, onLine func(string) bool) error {
+	watch := streamwatch.NewWatch(body, ctx, 0, 0)
+	defer watch.Close()
+	defer body.Close()
+	buffer, release := streamwatch.BorrowLineBuffer()
+	defer release()
+	scanner := bufio.NewScanner(watch.Reader(body))
+	scanner.Buffer(buffer, streamwatch.DefaultMaxLineBytes)
+	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if line := scanner.Text(); line != "" && !onLine(line) {
+			return nil
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := watch.Err(); err != nil {
+		return err
+	}
+	return scanner.Err()
 }
 
 func retryAfterDelay(value string) time.Duration {

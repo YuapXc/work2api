@@ -2,9 +2,11 @@ package app
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -216,9 +218,17 @@ func TestOpenUpstreamFailureAccounting(t *testing.T) {
 		{"wrapped dns", fmt.Errorf("dial: %w", dnsErr), false, false},
 		{"dns timeout", &net.DNSError{Err: "timeout", Name: "upstream.invalid", IsTimeout: true}, false, false},
 		{"connection reset", errors.New("connection reset"), false, true},
+		{"typed connection reset", &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}, false, false},
+		{"typed stream reset", &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}, true, false},
+		{"broken pipe", fmt.Errorf("write: %w", syscall.EPIPE), false, false},
+		{"tls verification", &tls.CertificateVerificationError{Err: errors.New("fixture certificate")}, false, false},
+		{"truncated stream", io.ErrUnexpectedEOF, true, false},
+		{"transport eof", io.EOF, false, false},
 		{"local route unavailable", fmt.Errorf("dial: %w", syscall.ENETUNREACH), false, false},
 		{"local route lost during stream", fmt.Errorf("read: %w", syscall.ENETDOWN), true, false},
 		{"upstream 429", &upstream.UpstreamError{StatusCode: 429, Raw: []byte(`{"error":{"message":"rate limited"}}`)}, false, true},
+		{"empty text rejection", &upstream.UpstreamError{StatusCode: 400, Raw: []byte(`{"code":11151}`)}, false, false},
+		{"empty text after output", &upstream.UpstreamError{StatusCode: 400, Raw: []byte(`{"code":11151}`)}, true, false},
 		{"canceled", context.Canceled, false, false},
 		{"stream interrupted", errors.New("connection reset"), true, true},
 	} {
@@ -1226,6 +1236,7 @@ func TestWorkBuddyResponseIntegrity(t *testing.T) {
 type preambleFailureUpstream struct {
 	calls   int
 	content bool
+	fault   *upstream.UpstreamError
 }
 
 func (f *preambleFailureUpstream) StreamUpstream(_ context.Context, _ map[string]string, _ map[string]any, _ string, yield upstream.LineFunc) error {
@@ -1238,6 +1249,9 @@ func (f *preambleFailureUpstream) StreamUpstream(_ context.Context, _ map[string
 			if err := yield(`data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}`); err != nil {
 				return err
 			}
+		}
+		if f.fault != nil {
+			return f.fault
 		}
 		return &upstream.UpstreamError{StatusCode: 503, Raw: []byte(`{"error":{"message":"temporary"}}`)}
 	}
@@ -1272,6 +1286,27 @@ func TestWorkBuddyPreambleFailover(t *testing.T) {
 		})
 	}
 }
+func TestWorkBuddyStartedModelFaultDoesNotReplayOrCoolAccount(t *testing.T) {
+	for _, fault := range []*upstream.UpstreamError{
+		{StatusCode: 500, Raw: []byte(`{"code":11134}`)},
+		{StatusCode: 429, Raw: []byte(`{"code":6004,"msg":"switch models"}`)},
+	} {
+		t.Run(fmt.Sprint(fault.StatusCode), func(t *testing.T) {
+			o, account := newDNSFailoverOrch(t, &failingUpstream{})
+			client := &preambleFailureUpstream{content: true, fault: fault}
+			o.wb.UpstreamClient = client
+			var lines []string
+			_, err := o.openUpstream(context.Background(), account, map[string]any{"model": "test-model"}, "test-model", "", func(line string) error { lines = append(lines, line); return nil }, nil)
+			if err == nil || client.calls != 1 || len(lines) == 0 {
+				t.Fatal("started request replayed or output lost", client.calls, err, lines)
+			}
+			if o.wb.Pool.Get(account.UID).CooldownUntil > nowSec() || o.modelCooldownUntil(account.UID, "test-model") <= nowSec() || o.modelCooldownUntil(account.UID, "other-model") > nowSec() {
+				t.Fatal("model fault contaminated account or unrelated model")
+			}
+		})
+	}
+}
+
 func TestWorkBuddySSEMetadataRetention(t *testing.T) {
 	role := false
 	first := sanitizeChatSSEWithRole(`data: {"choices":[{"delta":{"role":"assistant"}}]}`, &role)
