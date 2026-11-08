@@ -12,7 +12,7 @@ import (
 func (r *Runtime) AccountsForDisplay() []map[string]any {
 	accounts := r.Pool.AllAccounts()
 	dates, _ := r.db.CheckinDates()
-	today := time.Now().Format("2006-01-02")
+	today := today()
 	for _, a := range accounts {
 		uid, _ := a["uid"].(string)
 		if mgr := r.Manager(uid); mgr != nil {
@@ -69,12 +69,14 @@ func (r *Runtime) AttachModelAccounts(entries []map[string]any) {
 	}
 	// (uid, model) → cooldown_until for per-model daily-limit cooldowns
 	mcd := map[string]float64{}
+	mcdReasons := map[string]string{}
 	if rows, err := r.db.ActiveModelCooldowns(now); err == nil {
 		for _, row := range rows {
 			uid, _ := row["account_uid"].(string)
 			model, _ := row["model"].(string)
 			until, _ := row["cooldown_until"].(float64)
 			mcd[uid+"\x00"+model] = until
+			mcdReasons[uid+"\x00"+model], _ = row["reason"].(string)
 		}
 	}
 	for _, e := range entries {
@@ -128,15 +130,17 @@ func (r *Runtime) AttachModelAccounts(entries []map[string]any) {
 				}
 				site, _ := a["site"].(string)
 				supporters = append(supporters, map[string]any{
-					"uid":            uid,
-					"label":          AccountLabel(a),
-					"profile":        a["profile"],
-					"site":           site,
-					"site_label":     SiteLabel(site),
-					"enabled":        a["enabled"],
-					"healthy":        healthy && modelCd <= now,
-					"cooldown_until": coolUntil,
-					"model_cooldown": modelCd > now,
+					"uid":                   uid,
+					"label":                 AccountLabel(a),
+					"profile":               a["profile"],
+					"site":                  site,
+					"site_label":            SiteLabel(site),
+					"enabled":               a["enabled"],
+					"healthy":               healthy && modelCd <= now,
+					"cooldown_until":        coolUntil,
+					"model_cooldown":        modelCd > now,
+					"model_cooldown_until":  modelCd,
+					"model_cooldown_reason": mcdReasons[uid+"\x00"+id],
 				})
 			}
 		}
@@ -186,7 +190,7 @@ func AccountFloat(a map[string]any, key string) float64 {
 func (r *Runtime) checkin(ctx context.Context) map[string]any {
 	results := []map[string]any{}
 	skipped := []string{}
-	today := time.Now().Format("2006-01-02")
+	today := today()
 	dates, _ := r.db.CheckinDates()
 	for _, a := range r.Pool.Accounts() {
 		mgr := r.Manager(a.UID)
@@ -209,7 +213,14 @@ func (r *Runtime) checkin(ctx context.Context) map[string]any {
 		if err != nil && msg == "" {
 			msg = err.Error()
 		}
-		results = append(results, map[string]any{"uid": a.UID, "ok": res.OK, "message": msg, "already": res.Already})
+		status := "done"
+		if err != nil || !res.OK && !res.Already {
+			status = "failed"
+		}
+		if err == nil && (res.Outcome == "inactive" || res.Outcome == "ineligible") {
+			status = "unsupported"
+		}
+		results = append(results, map[string]any{"uid": a.UID, "ok": res.OK, "message": msg, "already": res.Already, "status": status, "outcome": res.Outcome, "credit": res.Credit, "streak_days": res.StreakDays})
 	}
 	return map[string]any{"ok": true, "results": results, "skipped": skipped, "accounts": r.AccountsForDisplay()}
 }

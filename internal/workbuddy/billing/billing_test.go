@@ -2,11 +2,103 @@ package billing
 
 import (
 	"context"
+	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 )
+
+func TestModernCreditSummaryDoesNotDuplicateDetails(t *testing.T) {
+	for _, groupsOnly := range []bool{false, true} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var payload any = map[string]any{"Accounts": []any{}}
+			switch r.URL.Path {
+			case "/billing/meter/get-user-resource-summary":
+				if groupsOnly {
+					payload = map[string]any{"CreditGroups": []any{map[string]any{"Kind": "plan_base", "Name": "Plan", "CycleRemainCapacity": "0.5", "CycleTotalCapacity": "1"}, map[string]any{"Kind": "benefit", "Name": "Bonus", "CycleRemainCapacity": "0.25", "CycleTotalCapacity": "2"}}}
+				} else {
+					payload = map[string]any{"Packages": []any{map[string]any{"PackageCode": "base", "CycleRemainCapacity": "0.25", "CycleTotalCapacity": "1"}, map[string]any{"PackageCode": "prepaid", "CycleRemainCapacity": "2.25"}}, "CreditGroups": []any{map[string]any{"Kind": "plan_base", "CycleRemainCapacity": "999", "CycleTotalCapacity": "999"}}}
+				}
+			case "/billing/meter/get-user-resource-paid-packages":
+				payload = map[string]any{"Accounts": []any{map[string]any{"PackageCode": "base", "CapacityRemain": 100, "CapacityRemainPrecise": "0.25", "CapacitySizePrecise": "1"}, map[string]any{"PackageCode": "bonus", "CapacityRemainPrecise": "0.125", "CapacitySizePrecise": "2.5"}}}
+			}
+			json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": payload})
+		}))
+		defer srv.Close()
+		result, err := FetchCredits(context.Background(), checkinCredential{srv.URL})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if groupsOnly {
+			if result.Remain != 0.75 || result.Total != 3 || result.UnknownTotal {
+				t.Fatal("aggregate groups counted twice", result)
+			}
+			continue
+		}
+		if result.Remain != 2.625 || result.Total != 3.5 || !result.UnknownTotal || len(result.Packages) != 3 {
+			t.Fatal("precision, summary supplement or dedup failed", result)
+		}
+		unknown := 0
+		for _, p := range result.Packages {
+			if p["total"] == nil {
+				unknown++
+			}
+		}
+		if unknown != 1 {
+			t.Fatal("unknown total fabricated", result.Packages)
+		}
+	}
+	for _, v := range []any{"NaN", "Inf", math.Inf(1), "invalid", nil} {
+		if knownCredit(v) != nil {
+			t.Fatal("invalid receipt accepted")
+		}
+	}
+	instant := time.Date(2026, 11, 7, 16, 0, 0, 0, time.UTC)
+	if BusinessTime(instant).Format("2006-01-02") != "2026-11-08" || BusinessTime(instant.In(time.FixedZone("other", -8*3600))) != BusinessTime(instant) {
+		t.Fatal("business date depends on host")
+	}
+}
+
+func TestCheckinReceiptsAndUnsupportedActivities(t *testing.T) {
+	for _, tc := range []struct {
+		body, outcome string
+		already       bool
+		credit        *float64
+	}{
+		{`{"code":0,"data":{"credit":"0.125","streak_days":3}}`, "claimed", false, ptr(0.125)},
+		{`{"code":0,"data":{"credit":"invalid"}}`, "claimed", false, nil},
+		{`{"code":1001}`, "done", true, nil}, {`{"code":1002}`, "ineligible", false, nil}, {`{"code":1003}`, "inactive", false, nil},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(tc.body)) }))
+		res, err := DailyCheckin(context.Background(), checkinCredential{srv.URL})
+		srv.Close()
+		if err != nil || res.Outcome != tc.outcome || res.Already != tc.already || (res.Credit == nil) != (tc.credit == nil) || res.Credit != nil && *res.Credit != *tc.credit {
+			t.Fatal(res, err)
+		}
+	}
+	for _, valid := range []bool{false, true} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v2/billing/meter/daily-checkin" {
+				w.WriteHeader(401)
+				w.Write([]byte(`{}`))
+				return
+			}
+			if valid {
+				w.Write([]byte(`{"code":0,"data":{"Packages":[]}}`))
+			} else {
+				w.WriteHeader(401)
+				w.Write([]byte(`{}`))
+			}
+		}))
+		res, err := DailyCheckin(context.Background(), checkinCredential{srv.URL})
+		srv.Close()
+		if valid && (err != nil || res.Outcome != "ineligible") || !valid && err == nil {
+			t.Fatal("sign-in and activity rejection confused", res, err)
+		}
+	}
+}
 
 type checkinCredential struct{ endpoint string }
 

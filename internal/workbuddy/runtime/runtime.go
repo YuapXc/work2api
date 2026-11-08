@@ -416,8 +416,15 @@ func (r *Runtime) refreshCreditsFor(ctx context.Context, db *store.DB, acc *pool
 		log.Printf("额度查询失败 %s: %v", acc.UID, err)
 		return err
 	}
-	r.Pool.SetCredits(acc.UID, &cr.Remain, &cr.Total, cr.ExpireAt, cr.Packages)
+	total := &cr.Total
+	if cr.UnknownTotal {
+		total = nil
+	}
+	r.Pool.SetCredits(acc.UID, &cr.Remain, total, cr.ExpireAt, cr.Packages)
 	fields := map[string]any{"credits_remaining": cr.Remain, "credits_total": cr.Total}
+	if cr.UnknownTotal {
+		fields["credits_total"] = nil
+	}
 	if cr.ExpireAt != nil {
 		fields["credits_expire_at"] = strconv.FormatFloat(*cr.ExpireAt, 'f', -1, 64)
 	} else {

@@ -27,23 +27,28 @@ type Credential interface {
 
 // Credit is the query result.
 type Credit struct {
-	Remain   float64          `json:"remain"`
-	Total    float64          `json:"total"`
-	ExpireAt *float64         `json:"expire_at"`
-	Packages []map[string]any `json:"packages"`
+	Remain       float64          `json:"remain"`
+	Total        float64          `json:"total"`
+	ExpireAt     *float64         `json:"expire_at"`
+	Packages     []map[string]any `json:"packages"`
+	UnknownTotal bool             `json:"total_unknown,omitempty"`
 }
 
 // CheckinResult is the daily check-in outcome.
 type CheckinResult struct {
-	OK      bool   `json:"ok"`
-	Message string `json:"message"`
-	Already bool   `json:"already"`
+	OK         bool     `json:"ok"`
+	Message    string   `json:"message"`
+	Already    bool     `json:"already"`
+	Outcome    string   `json:"outcome,omitempty"`
+	Credit     *float64 `json:"credit,omitempty"`
+	StreakDays int      `json:"streak_days,omitempty"`
 }
 
 var paidPackageCodes = []string{
 	"TCACA_code_002_AkiJS3ZHF5", "TCACA_code_005_maRGyrHhw1", "TCACA_code_003_FAnt7lcmRT",
 	"TCACA_code_023_4xbGhMrE6q", "TCACA_code_026_BaESVICNoi", "TCACA_code_027_0FCGVA6vSa",
 	"TCACA_code_009_0XmEQc2xOf", "TCACA_code_038_OhvqZtiPKr", "TCACA_code_036_lupO5WgNdG",
+	"TCACA_code_043_6oIkxT7Z0S",
 }
 
 var freePackageCodes = []string{
@@ -61,6 +66,8 @@ const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
 var httpClient = httpclient.New(20 * time.Second)
 var errIncompleteBilling = errors.New("额度明细分页未完成")
 var billingTimezone = time.FixedZone("UTC+8", 8*60*60)
+
+func BusinessTime(t time.Time) time.Time { return t.In(billingTimezone) }
 
 func billingHeaders(ctx context.Context, mgr Credential) (map[string]string, error) {
 	var h map[string]string
@@ -155,18 +162,126 @@ func extractAccounts(data map[string]any) []any {
 			}
 		}
 	}
+	node := billingData(data)
+	if packages, ok := node["Packages"].([]any); ok && len(packages) > 0 {
+		return normalizeSummaryAccounts(packages, false)
+	}
+	if groups, ok := node["CreditGroups"].([]any); ok {
+		return normalizeSummaryAccounts(groups, true)
+	}
 	return nil
+}
+
+func billingData(data map[string]any) map[string]any {
+	for i := 0; i < 4; i++ {
+		found := false
+		for _, key := range []string{"data", "Response", "Data"} {
+			if next, ok := data[key].(map[string]any); ok {
+				data = next
+				found = true
+				break
+			}
+		}
+		if !found {
+			break
+		}
+	}
+	return data
+}
+
+func normalizeSummaryAccounts(rows []any, group bool) []any {
+	var out []any
+	for _, raw := range rows {
+		row, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, hasRemain := row["CycleRemainCapacity"]; !hasRemain {
+			continue
+		}
+		next := make(map[string]any, len(row)+4)
+		for key, value := range row {
+			next[key] = value
+		}
+		for _, pair := range [][2]string{{"CycleRemainCapacity", "CycleCapacityRemainPrecise"}, {"CycleTotalCapacity", "CycleCapacitySizePrecise"}, {"CycleUsedCapacity", "CycleCapacityUsedPrecise"}} {
+			if value, exists := row[pair[0]]; exists {
+				next[pair[1]] = value
+			}
+		}
+		if group {
+			next["_summary_group"] = true
+			next["PackageName"] = row["Name"]
+			next["PackageCode"] = "group:" + str(row["Kind"])
+		}
+		out = append(out, next)
+	}
+	return out
+}
+
+func mergeResourceAccounts(summary, details []any) []any {
+	if len(summary) > 0 {
+		row, _ := summary[0].(map[string]any)
+		if row["_summary_group"] == true {
+			return summary
+		}
+	}
+	out := append([]any(nil), details...)
+	codes := map[string]bool{}
+	for _, raw := range details {
+		row, _ := raw.(map[string]any)
+		code := str(row["PackageCode"])
+		if code == "" {
+			code = str(row["SubProductCode"])
+		}
+		codes[code] = true
+	}
+	for _, raw := range summary {
+		row, _ := raw.(map[string]any)
+		code := str(row["PackageCode"])
+		if code == "" {
+			code = str(row["SubProductCode"])
+		}
+		if len(details) > 0 && (row["_summary_group"] == true || code == "" || codes[code]) {
+			continue
+		}
+		out = append(out, raw)
+	}
+	return out
 }
 
 func num(v any) float64 {
 	switch x := v.(type) {
 	case float64:
-		return x
+		if !math.IsNaN(x) && !math.IsInf(x, 0) {
+			return x
+		}
 	case string:
 		f, _ := strconv.ParseFloat(strings.TrimSpace(x), 64)
-		return f
+		if !math.IsNaN(f) && !math.IsInf(f, 0) {
+			return f
+		}
 	}
 	return 0
+}
+
+func knownCredit(value any) *float64 {
+	var n float64
+	var err error
+	switch v := value.(type) {
+	case float64:
+		n = v
+	case string:
+		if strings.TrimSpace(v) == "" {
+			return nil
+		}
+		n, err = strconv.ParseFloat(v, 64)
+	default:
+		return nil
+	}
+	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) || n < 0 {
+		return nil
+	}
+	return &n
 }
 
 func parseTS(raw any, isMs bool) *float64 {
@@ -205,11 +320,11 @@ func summarize(accounts []any) (remain, total float64) {
 		if !ok {
 			continue
 		}
-		cycleRemain := num(acct["CycleCapacityRemain"])
-		cycleSize := num(acct["CycleCapacitySize"])
-		capRemain := num(acct["CapacityRemain"])
-		capSize := num(acct["CapacitySize"])
-		cycleUsed := num(acct["CycleCapacityUsed"])
+		cycleRemain := precise(acct, "CycleCapacityRemain")
+		cycleSize := precise(acct, "CycleCapacitySize")
+		capRemain := precise(acct, "CapacityRemain")
+		capSize := precise(acct, "CapacitySize")
+		cycleUsed := precise(acct, "CycleCapacityUsed")
 		if cycleSize > 0 {
 			remain += math.Max(cycleRemain, 0)
 			total += cycleSize
@@ -222,6 +337,26 @@ func summarize(accounts []any) (remain, total float64) {
 		}
 	}
 	return remain, total
+}
+
+func precise(row map[string]any, key string) float64 {
+	if value, ok := row[key+"Precise"]; ok && value != nil && value != "" {
+		return num(value)
+	}
+	return num(row[key])
+}
+
+func creditFromAccounts(accounts []any) *Credit {
+	remain, total := summarize(accounts)
+	pkgs := summarizePackages(accounts)
+	unknown := false
+	for _, raw := range accounts {
+		row, _ := raw.(map[string]any)
+		if precise(row, "CycleCapacitySize") <= 0 && precise(row, "CapacitySize") <= 0 && (precise(row, "CycleCapacityRemain") > 0 || precise(row, "CapacityRemain") > 0) {
+			unknown = true
+		}
+	}
+	return &Credit{Remain: remain, Total: total, ExpireAt: earliestPackageExpiry(pkgs), Packages: pkgs, UnknownTotal: unknown}
 }
 
 func summarizePackages(accounts []any) []map[string]any {
@@ -294,7 +429,10 @@ func summarizePackages(accounts []any) []map[string]any {
 	var out []map[string]any
 	for _, k := range order {
 		g := groups[k]
-		if g["total"].(float64) > 0 {
+		if g["total"].(float64) > 0 || g["remain"].(float64) > 0 {
+			if g["total"].(float64) <= 0 {
+				g["total"] = nil
+			}
 			out = append(out, g)
 		}
 	}
@@ -335,7 +473,7 @@ func fetchNewCredits(ctx context.Context, mgr Credential) *Credit {
 	dayStart := now.Format("2006-01-02") + " 00:00:00"
 	dayEnd := now.Format("2006-01-02") + " 23:59:59"
 	base := mgr.Endpoint() + "/billing/meter"
-	var accounts []any
+	var accounts, summary []any
 	endpoints := []struct {
 		url  string
 		body map[string]any
@@ -361,13 +499,16 @@ func fetchNewCredits(ctx context.Context, mgr Credential) *Credit {
 			continue
 		}
 		accounts = append(accounts, pageAccounts...)
+		if e.url == base+"/get-user-resource-summary" {
+			summary = pageAccounts
+			accounts = nil
+		}
 	}
+	accounts = mergeResourceAccounts(summary, accounts)
 	if len(accounts) == 0 {
 		return nil
 	}
-	remain, total := summarize(accounts)
-	pkgs := summarizePackages(accounts)
-	return &Credit{Remain: math.Round(remain), Total: math.Round(total), ExpireAt: earliestPackageExpiry(pkgs), Packages: pkgs}
+	return creditFromAccounts(accounts)
 }
 
 func fetchOldCredits(ctx context.Context, mgr Credential) *Credit {
@@ -388,9 +529,7 @@ func fetchOldCredits(ctx context.Context, mgr Credential) *Credit {
 	if len(accounts) == 0 {
 		return nil
 	}
-	remain, total := summarize(accounts)
-	pkgs := summarizePackages(accounts)
-	return &Credit{Remain: math.Round(remain), Total: math.Round(total), ExpireAt: earliestPackageExpiry(pkgs), Packages: pkgs}
+	return creditFromAccounts(accounts)
 }
 
 // Only read-only billing lists are paged. Incomplete lists must not replace a
@@ -527,6 +666,15 @@ func DailyCheckin(ctx context.Context, mgr Credential) (CheckinResult, error) {
 	// 必须存在明确的 code 字段才判成功——否则非 JSON / 网关 404 / WAF 拦截等
 	// 会被 num(nil)==0 误判为「签到成功」（国际站无签到活动即属此类）。
 	if status == http.StatusUnauthorized {
+		probe, probeStatus, err := postJSONStatus(ctx, mgr, mgr.Endpoint()+"/billing/meter/get-user-resource-summary", map[string]any{})
+		code := knownCredit(probe["code"])
+		summary := billingData(probe)
+		_, packages := summary["Packages"].([]any)
+		_, groups := summary["CreditGroups"].([]any)
+		_, accounts := summary["Accounts"].([]any)
+		if err == nil && probeStatus >= 200 && probeStatus < 300 && code != nil && *code == 0 && (packages || groups || accounts) {
+			return CheckinResult{Outcome: "ineligible", Message: "账号额度授权有效，但签到接口不接受当前客户端，请在官方客户端签到"}, nil
+		}
 		return CheckinResult{}, &QueryError{Kind: "unauthorized"}
 	}
 	if status >= 500 || status == http.StatusTooManyRequests {
@@ -558,11 +706,31 @@ func DailyCheckin(ctx context.Context, mgr Credential) (CheckinResult, error) {
 		return CheckinResult{}, &QueryError{Kind: "login_expired"}
 	}
 	if validCode && code == 0 && status >= 200 && status < 300 {
-		return CheckinResult{OK: true, Message: "签到成功"}, nil
+		result := CheckinResult{OK: true, Message: "签到成功", Outcome: "claimed"}
+		payload := billingData(data)
+		result.Credit = knownCredit(payload["credit"])
+		result.StreakDays = int(num(payload["streak_days"]))
+		if result.Credit != nil {
+			result.Message += "，获得 " + strconv.FormatFloat(*result.Credit, 'f', -1, 64) + " 积分"
+		}
+		if result.StreakDays > 0 {
+			result.Message += fmt.Sprintf("，连续 %d 天", result.StreakDays)
+		}
+		return result, nil
+	}
+	if status >= 200 && status < 300 && validCode {
+		switch int(code) {
+		case 1001:
+			return CheckinResult{Already: true, Outcome: "done", Message: "今日已签到"}, nil
+		case 1002:
+			return CheckinResult{Outcome: "ineligible", Message: "该账号暂不符合签到条件"}, nil
+		case 1003:
+			return CheckinResult{Outcome: "inactive", Message: "签到活动未开启"}, nil
+		}
 	}
 	for _, k := range []string{"已签到", "already checked in", "already checked-in", "already signed in"} {
 		if strings.Contains(strings.ToLower(msg), k) {
-			return CheckinResult{OK: false, Message: msg, Already: true}, nil
+			return CheckinResult{OK: false, Message: msg, Already: true, Outcome: "done"}, nil
 		}
 	}
 	if msg == "" {

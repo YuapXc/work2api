@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 	"work2api/internal/statebackup"
+	"work2api/internal/workbuddy/billing"
 	"work2api/internal/workbuddy/credentials"
 	"work2api/internal/workbuddy/pool"
 	"work2api/internal/workbuddy/siterouting"
@@ -177,7 +178,7 @@ func minInt(xs []int) int {
 }
 
 // today returns the local YYYY-MM-DD date string.
-func today() string { return time.Now().Format("2006-01-02") }
+func today() string { return billing.BusinessTime(time.Now()).Format("2006-01-02") }
 
 // checkedInToday returns the set of account UIDs already checked in today (by
 // local DB record).

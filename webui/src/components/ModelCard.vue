@@ -5,10 +5,22 @@ import WButton from './ui/WButton.vue'
 import WIcon from './ui/WIcon.vue'
 import { api } from '@/api/client'
 import { toast } from '@/lib/toast'
+import { dt } from '@/lib/format'
 const props = defineProps<{ model: Record<string, any>; provider: string; benchmarkBinding?: boolean }>()
 const emit = defineEmits<{ 'bind-benchmark': [] }>()
 const m = computed(() => props.model)
 const accounts = computed(() => (m.value.accounts || []) as any[])
+function accountHint(a: Record<string, any>): string {
+  const lines = [a.label || a.uid, a.site_label, a.enabled === false ? '已停用' : '']
+  if (a.model_cooldown) {
+    lines.push(`当前模型：${m.value.id}`, a.model_cooldown_reason || '当前模型暂不可用')
+    if (a.model_cooldown_until) lines.push(`预计恢复：${dt(a.model_cooldown_until, 'YYYY-MM-DD HH:mm:ss')}`)
+    lines.push('此冷却仅针对当前模型，其他模型状态单独判断')
+  } else if (a.cooldown_until) {
+    lines.push(`账号冷却，预计恢复：${dt(a.cooldown_until, 'YYYY-MM-DD HH:mm:ss')}`)
+  } else if (!a.healthy) lines.push('当前不可用，请到账号页查看健康详情')
+  return lines.filter(Boolean).join('\n')
+}
 const media = computed(() => ['image', 'video', 'audio'].includes(m.value.model_type))
 const systemOne = computed(() => String(m.value.native_protocol || '').toLowerCase() === 'systemone')
 const workspaceMode = computed(() => {
@@ -90,10 +102,12 @@ async function runTest() {
           v-for="a in accounts.slice(0, 6)"
           :key="a.uid"
           class="inline-flex max-w-full items-center gap-1 rounded-md bg-elevated px-1.5 py-0.5 text-micro"
-          :class="a.healthy ? 'text-live' : 'text-faint'"
-          :title="`${a.label || a.uid}${a.site_label ? ' · ' + a.site_label : ''}${a.model_cooldown ? ' · 本模型冷却中' : ''}`"
+          tabindex="0"
+          :class="a.enabled === false ? 'text-faint' : a.model_cooldown ? 'text-warn' : a.healthy ? 'text-live' : 'text-faint'"
+          :title="accountHint(a)"
+          :aria-label="accountHint(a)"
         >
-          <span class="h-1.5 w-1.5 rounded-full" :class="a.healthy ? 'bg-live' : 'bg-faint'" />
+          <span class="h-1.5 w-1.5 rounded-full" :class="a.enabled === false ? 'bg-faint' : a.model_cooldown ? 'bg-warn' : a.healthy ? 'bg-live' : 'bg-faint'" />
           <span class="truncate">{{ a.label || a.uid.slice(0, 6) }}</span>
         </span>
         <span v-if="accounts.length > 6" class="text-micro text-faint">+{{ accounts.length - 6 }}</span>

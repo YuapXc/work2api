@@ -174,6 +174,8 @@ export interface ModelAccount {
   cooldown_until?: number
   /** 仅当前模型达到每日上限；账号的其它模型仍可使用 */
   model_cooldown?: boolean
+  model_cooldown_until?: number
+  model_cooldown_reason?: string
 }
 
 export interface ProtocolStat {

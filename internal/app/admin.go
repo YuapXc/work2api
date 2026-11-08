@@ -14,6 +14,7 @@ import (
 
 	"work2api/internal/core/provider"
 	"work2api/internal/store"
+	"work2api/internal/workbuddy/billing"
 	wbruntime "work2api/internal/workbuddy/runtime"
 )
 
@@ -580,7 +581,8 @@ func (s *Server) adminCheckinHistory(w http.ResponseWriter, r *http.Request) {
 	if days <= 0 || days > 366 {
 		days = 35
 	}
-	since := time.Now().AddDate(0, 0, -(days - 1)).Format("2006-01-02")
+	checkinNow := billing.BusinessTime(time.Now())
+	since := checkinNow.AddDate(0, 0, -(days - 1)).Format("2006-01-02")
 	history, err := s.o.db.CheckinHistory(since)
 	if err != nil {
 		writeJSON(w, 500, errBody(500, "读取签到历史失败: "+err.Error(), "internal_error").Body)
@@ -589,8 +591,8 @@ func (s *Server) adminCheckinHistory(w http.ResponseWriter, r *http.Request) {
 	if history == nil {
 		history = map[string][]string{}
 	}
-	today := time.Now().Format("2006-01-02")
-	calendars := map[string]provider.CheckinCalendar{"workbuddy": {History: history, Today: today, WindowDate: today, Timezone: time.Now().Location().String()}}
+	today := checkinNow.Format("2006-01-02")
+	calendars := map[string]provider.CheckinCalendar{"workbuddy": {History: history, Today: today, WindowDate: today, Timezone: "Asia/Shanghai"}}
 	var warnings []string
 	for _, rt := range s.o.runtimes.Runtimes() {
 		if historian, ok := rt.(provider.CheckinHistorian); ok {

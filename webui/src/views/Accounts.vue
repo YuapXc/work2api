@@ -641,9 +641,13 @@ async function runMaintenance(kind: 'checkin' | 'credits') {
         const items = Array.isArray(result.results) ? result.results as Record<string, unknown>[] : []
         const failed = items.filter(item => item.ok === false && !item.already && item.status !== 'unsupported' || item.status === 'error' || item.status === 'failed').length
         const pending = items.filter(item => item.status === 'pending').length
+        const notApplicable = items.filter(item => item.status === 'unsupported').length
+        const receipts = items.filter(item => item.ok === true && typeof item.credit === 'number' && Number.isFinite(item.credit))
+        const reward = receipts.reduce((sum, item) => sum + Number(item.credit), 0)
         const unsupported = result.unsupported === true
         const ok = (result.ok !== false || unsupported) && failed === 0
-        taskResults.value.push({ provider: p.name, ok, message: unsupported ? '此账号暂不支持该操作' : pending ? `领取已发起，${pending} 个账号待上游确认` : ok ? '任务已完成' : `任务存在失败${failed ? '（' + failed + ' 项）' : ''}，请查看账号状态` })
+        const summary = unsupported ? '此账号暂不支持该操作' : pending ? `领取已发起，${pending} 个账号待上游确认` : ok ? '任务已完成' : `任务存在失败${failed ? '（' + failed + ' 项）' : ''}，请查看账号状态`
+        taskResults.value.push({ provider: p.name, ok, message: summary + (receipts.length ? ` · 获得 ${fmtCredits(reward)} 积分` : '') + (notApplicable ? ` · ${notApplicable} 个账号不适用` : '') })
       } catch { taskResults.value.push({ provider: p.name, ok: false, message: '执行失败，其余渠道继续处理' }) }
     }
     if (!targets.length) toast.info('所选渠道不支持此操作')
