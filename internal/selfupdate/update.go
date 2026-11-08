@@ -314,7 +314,10 @@ func (m *Manager) Download(ctx context.Context) (err error) {
 	if !assetURL(asset.URL, current.Repository, latest.Tag) || !assetURL(checksum.URL, current.Repository, latest.Tag) {
 		return errors.New("Release 下载地址不属于当前发布仓库")
 	}
-	sum, e := fetch(ctx, checksum.URL, 4096)
+	if e := os.MkdirAll(m.root, 0700); e != nil {
+		return e
+	}
+	sum, e := downloadChecksum(ctx, *checksum, current.Repository, latest.Tag, m.root)
 	if e != nil {
 		return e
 	}
@@ -325,14 +328,6 @@ func (m *Manager) Download(ctx context.Context) (err error) {
 	digest := strings.ToLower(parts[0])
 	if asset.Digest != "" && asset.Digest != "sha256:"+digest {
 		return errors.New("GitHub资产摘要与校验文件不一致")
-	}
-	data, e := fetch(ctx, asset.URL, 128<<20)
-	if e != nil {
-		return e
-	}
-	hash := sha256.Sum256(data)
-	if hex.EncodeToString(hash[:]) != digest {
-		return errors.New("下载产物SHA-256不匹配")
 	}
 	dir, e := os.MkdirTemp(m.root, "candidate-")
 	if os.IsNotExist(e) {
@@ -349,8 +344,22 @@ func (m *Manager) Download(ctx context.Context) (err error) {
 			os.RemoveAll(dir)
 		}
 	}()
+	archive := filepath.Join(dir, "release.archive")
+	if e = downloadReleaseAsset(ctx, *asset, current.Repository, latest.Tag, archive, 128<<20); e != nil {
+		return e
+	}
+	actual, e := hashFileContext(ctx, archive)
+	if e != nil {
+		return e
+	}
+	if actual != digest {
+		return errors.New("下载产物SHA-256不匹配")
+	}
 	path := filepath.Join(dir, ExecutableName())
-	if e = ExtractBinary(data, ext, path); e != nil {
+	if e = extractBinaryFileContext(ctx, archive, ext, path); e != nil {
+		return e
+	}
+	if e = os.Remove(archive); e != nil {
 		return e
 	}
 	probe, e := Probe(ctx, path)
@@ -360,15 +369,18 @@ func (m *Manager) Download(ctx context.Context) (err error) {
 	if !probe.Release || probe.Application != "work2api" || probe.Repository != current.Repository || probe.OS != runtime.GOOS || probe.Arch != runtime.GOARCH || probe.Version != latest.Tag || probe.Schema < current.Schema {
 		return errors.New("候选程序来源、平台、版本或数据库兼容性不匹配")
 	}
-	binaryHash, e := HashFile(path)
+	binaryHash, e := hashFileContext(ctx, path)
 	if e != nil {
 		return e
 	}
-	oldHash, e := HashFile(m.target)
+	oldHash, e := hashFileContext(ctx, m.target)
 	if e != nil {
 		return e
 	}
 	candidate := &Candidate{Build: probe, Digest: digest, BinaryHash: binaryHash, AssetID: asset.ID, Migration: probe.Schema > current.Schema, Path: path}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if oldHash != binaryHash {
 		if e = WriteJSON(filepath.Join(m.root, "staged.json"), Plan{Candidate: *candidate, CandidatePath: candidate.Path}); e != nil {
 			return e
@@ -520,17 +532,7 @@ func fetch(ctx context.Context, raw string, limit int64) ([]byte, error) {
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "work2api-updater")
-	client := &http.Client{Timeout: 10 * time.Minute, CheckRedirect: func(r *http.Request, via []*http.Request) error {
-		if len(via) > 5 || r.URL.Scheme != "https" || r.URL.User != nil {
-			return errors.New("更新下载重定向无效")
-		}
-		host := r.URL.Hostname()
-		if host != "github.com" && host != "api.github.com" && !strings.HasSuffix(host, ".githubusercontent.com") {
-			return errors.New("更新下载跳转到未知来源")
-		}
-		return nil
-	}}
-	resp, e := client.Do(req)
+	resp, e := githubClient().Do(req)
 	if e != nil {
 		return nil, errors.New("连接GitHub更新源失败，请稍后重试")
 	}
@@ -543,6 +545,19 @@ func fetch(ctx context.Context, raw string, limit int64) ([]byte, error) {
 		return nil, errors.New("更新响应超出大小保护")
 	}
 	return rawData, e
+}
+
+func githubClient() *http.Client {
+	return &http.Client{Timeout: 10 * time.Minute, CheckRedirect: func(r *http.Request, via []*http.Request) error {
+		if len(via) > 5 || r.URL.Scheme != "https" || r.URL.User != nil {
+			return errors.New("更新下载重定向无效")
+		}
+		host := r.URL.Hostname()
+		if host != "github.com" && host != "api.github.com" && !strings.HasSuffix(host, ".githubusercontent.com") {
+			return errors.New("更新下载跳转到未知来源")
+		}
+		return nil
+	}}
 }
 func ExecutableName() string {
 	if runtime.GOOS == "windows" {
@@ -558,13 +573,23 @@ func ValidHash(s string) bool {
 	return e == nil
 }
 func HashFile(path string) (string, error) {
+	return hashFileContext(context.Background(), path)
+}
+
+func hashFileContext(ctx context.Context, path string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	file, e := os.Open(path)
 	if e != nil {
 		return "", e
 	}
 	defer file.Close()
 	h := sha256.New()
-	_, e = io.Copy(h, file)
+	_, e = io.Copy(h, contextReader{ctx, file})
+	if e == nil {
+		e = ctx.Err()
+	}
 	return hex.EncodeToString(h.Sum(nil)), e
 }
 func CopyFile(from, to string, mode os.FileMode) error {
@@ -642,9 +667,80 @@ func Probe(ctx context.Context, path string) (Build, error) {
 	return info, nil
 }
 func ExtractBinary(data []byte, format, target string) error {
-	var content []byte
+	return extractBinary(context.Background(), bytes.NewReader(data), int64(len(data)), format, target)
+}
+
+func ExtractBinaryFile(path, format, target string) error {
+	return extractBinaryFileContext(context.Background(), path, format, target)
+}
+
+func extractBinaryFileContext(ctx context.Context, path, format, target string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	return extractBinary(ctx, f, info.Size(), format, target)
+}
+
+type archiveSource interface {
+	io.Reader
+	io.ReaderAt
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
+}
+
+type contextArchive struct {
+	contextReader
+	source io.ReaderAt
+}
+
+func (r contextArchive) ReadAt(p []byte, off int64) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.source.ReadAt(p, off)
+}
+
+func extractBinary(ctx context.Context, data archiveSource, length int64, format, target string) (err error) {
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+	data = contextArchive{contextReader{ctx, data}, data}
+	f, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0700)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if e := f.Close(); err == nil {
+			err = e
+		}
+		if err != nil {
+			_ = os.Remove(target)
+		}
+	}()
 	count := 0
 	accept := func(name string, size int64, reader io.Reader) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		clean := strings.ReplaceAll(name, "\\", "/")
 		if strings.HasPrefix(clean, "/") || strings.Contains(clean, ":") || strings.Contains(clean, "../") {
 			return errors.New("更新包包含无效路径")
@@ -657,18 +753,24 @@ func ExtractBinary(data []byte, format, target string) error {
 			return errors.New("更新包程序数量或大小无效")
 		}
 		var e error
-		content, e = io.ReadAll(io.LimitReader(reader, size+1))
-		if int64(len(content)) != size {
+		n, e := io.Copy(f, io.LimitReader(contextReader{ctx, reader}, size+1))
+		if e != nil {
+			return e
+		}
+		if n != size {
 			return errors.New("更新包程序长度不符")
 		}
 		return e
 	}
 	if format == "zip" {
-		r, e := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+		r, e := zip.NewReader(data, length)
 		if e != nil {
 			return e
 		}
 		for _, f := range r.File {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if f.Mode()&os.ModeSymlink != 0 {
 				return errors.New("更新包包含符号链接")
 			}
@@ -686,13 +788,16 @@ func ExtractBinary(data []byte, format, target string) error {
 			}
 		}
 	} else {
-		gz, e := gzip.NewReader(bytes.NewReader(data))
+		gz, e := gzip.NewReader(data)
 		if e != nil {
 			return e
 		}
 		defer gz.Close()
 		r := tar.NewReader(gz)
 		for {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			h, e := r.Next()
 			if e == io.EOF {
 				break
@@ -714,7 +819,13 @@ func ExtractBinary(data []byte, format, target string) error {
 	if count != 1 {
 		return errors.New("更新包缺少程序")
 	}
-	return os.WriteFile(target, content, 0700)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
 // Prepare runs only after the old HTTP gate is drained. Pin the backup outside

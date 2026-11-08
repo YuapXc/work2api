@@ -33,6 +33,47 @@ func TestSessionAffinityIsolatedByUserAndModel(t *testing.T) {
 	}
 }
 
+func TestModelsETagRevalidatesKeyAndScope(t *testing.T) {
+	o, _ := newDNSFailoverOrch(t, &failingUpstream{})
+	o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: sessionCostCatalog{}})
+	o.wb.Catalog.Refresh()
+	id, err := o.db.CreateApp("etag", o.hashKey("etag-key"), "", "", "", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(o)
+	ask := func(tag string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("GET", "/v1/models", nil)
+		r.Header.Set("Authorization", "Bearer etag-key")
+		r.Header.Set("If-None-Match", tag)
+		w := httptest.NewRecorder()
+		s.handleModels(w, r)
+		return w
+	}
+	first := ask("")
+	tag := first.Header().Get("ETag")
+	if first.Code != 200 || tag == "" || first.Header().Get("Cache-Control") != "private, no-cache" {
+		t.Fatal(first.Code, first.Header())
+	}
+	unchanged := ask(`"other", W/` + tag)
+	if unchanged.Code != 304 || unchanged.Body.Len() != 0 || unchanged.Header().Get("Content-Length") != "" {
+		t.Fatal("not a proper 304", unchanged.Code, unchanged.Body.String())
+	}
+	if err = o.db.SetAppModels(id, `["nonexistent"]`); err != nil {
+		t.Fatal(err)
+	}
+	changed := ask(tag)
+	if changed.Code != 200 || changed.Header().Get("ETag") == tag || strings.Contains(changed.Body.String(), "test-model") {
+		t.Fatal("stale scope reused", changed.Code, changed.Body.String())
+	}
+	if _, err = o.db.DeleteApp(id); err != nil {
+		t.Fatal(err)
+	}
+	if deleted := ask("*"); deleted.Code == 304 || deleted.Code == 200 {
+		t.Fatal("deleted key bypassed auth", deleted.Code)
+	}
+}
+
 func TestResponsesSessionFallbackPreservesOriginalIdentity(t *testing.T) {
 	first := map[string]any{"role": "user", "content": "first request"}
 	want := extractSessionKey(map[string]any{"messages": []any{first}})

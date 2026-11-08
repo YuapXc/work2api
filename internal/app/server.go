@@ -3,6 +3,8 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -500,7 +503,32 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, clean)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": out})
+	sort.SliceStable(out, func(i, j int) bool { return str2(out[i]["id"]) < str2(out[j]["id"]) })
+	body, err := json.Marshal(map[string]any{"object": "list", "data": out})
+	if err != nil {
+		writeJSON(w, 500, errBody(500, "模型目录编码失败", "server_error").Body)
+		return
+	}
+	body = append(body, '\n')
+	sum := sha256.Sum256(body)
+	tag := `"` + hex.EncodeToString(sum[:]) + `"`
+	w.Header().Set("ETag", tag)
+	w.Header().Set("Cache-Control", "private, no-cache")
+	w.Header().Add("Vary", "Authorization")
+	w.Header().Add("Vary", "X-Api-Key")
+	for _, value := range strings.Split(r.Header.Get("If-None-Match"), ",") {
+		value = strings.TrimSpace(value)
+		if value == "*" || strings.TrimPrefix(value, "W/") == tag {
+			w.Header().Del("Content-Type")
+			w.Header().Del("Content-Length")
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 func (s *Server) modelCatalog(ctx context.Context) []map[string]any {
