@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useLiveRead } from '@/lib/liveRead'
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, type UsageExport } from '@/api/client'
@@ -31,22 +32,12 @@ const summary = ref<UsageSummary | null>(null)
 const points = ref<UsagePoint[]>([])
 const granularity = ref('hour')
 const metric = ref<string>('count')
-const anaLoading = ref(true)
-
-async function loadAnalytics() {
-  anaLoading.value = true
-  try {
-    const [s, ts] = await Promise.all([
-      api.usageSummary(),
-      api.usageTimeseries(granularity.value, granularity.value === 'hour' ? 24 : 30),
-    ])
-    summary.value = s
-    points.value = ts.data || []
-  } finally {
-    anaLoading.value = false
-  }
-}
-watch(granularity, loadAnalytics)
+const summaryRead = useLiveRead(signal => api.usageSummary(signal), value => { summary.value = value }, { interval: 20000, enabled: () => tab.value === 'analytics', immediate: false })
+const trendRead = useLiveRead(signal => api.usageTimeseries(granularity.value, granularity.value === 'hour' ? 24 : 30, undefined, signal), value => { points.value = value.data || [] }, { interval: 20000, enabled: () => tab.value === 'analytics', immediate: false })
+const anaLoading = summaryRead.loading
+const analyticsError = computed(() => summaryRead.error.value || trendRead.error.value)
+function loadAnalytics() { void summaryRead.refresh(); void trendRead.refresh() }
+watch(granularity, () => { void trendRead.refresh() })
 
 const protocolBars = computed(() =>
   (summary.value?.by_protocol || []).map((p) => ({ label: p.protocol, value: p.count, sub: abbr(p.tokens) + ' tok' })),
@@ -78,8 +69,7 @@ const records = ref<UsageRecord[]>([])
 const total = ref(0)
 const page = ref(1)
 const pageSize = 20
-const logLoading = ref(false)
-const logError = ref('')
+
 const detailError = ref('')
 let logVersion=0, detailVersion=0, disposed=false
 onUnmounted(()=>{disposed=true;logVersion++;detailVersion++})
@@ -93,47 +83,40 @@ const searchInput = ref('')
 const labelMap = ref<Record<string, string>>({})
 const labelProviders = ref<string[]>([])
 const defaultLabelProvider = ref('workbuddy')
-async function loadAccountLabels() {
-  try {
-    const providers = (await api.getProviders()).providers
-    labelProviders.value = providers.map(p => p.name)
-    defaultLabelProvider.value = providers.find(p => p.default)?.name || ''
-    const results = await Promise.allSettled(providers.map(p => api.getProvider(p.name)))
-    const next: Record<string, string> = {}
-    results.forEach((result, i) => {
-      const prefix = providers[i].name + '/'
-      if (result.status === 'rejected') {
-        for (const [key, value] of Object.entries(labelMap.value)) if (key.startsWith(prefix)) next[key] = value
-        return
-      }
-      const resources = result.value.resources || []
-      const counts = new Map<string, number>()
-      for (const resource of resources) counts.set(resource.label, (counts.get(resource.label) || 0) + 1)
-      for (const resource of resources) next[prefix + resource.id] = resource.label + ((counts.get(resource.label) || 0) > 1 ? ' · ' + resource.id.slice(0,8) : '')
-    })
-    labelMap.value = next
-  } catch { /* Keep the last successful label snapshot. */ }
-}
+const labelsRead=useLiveRead(async signal=>{
+  const providers=(await api.getProviders(signal)).providers
+  const results=await Promise.allSettled(providers.map(p=>api.getProvider(p.name,signal)))
+  return {providers,results}
+}, ({providers,results})=>{
+  labelProviders.value=providers.map(p=>p.name);defaultLabelProvider.value=providers.find(p=>p.default)?.name||''
+  const next: Record<string,string>={}
+  results.forEach((result,i)=>{
+    const prefix=providers[i].name+'/'
+    if(result.status==='rejected'){for(const [key,value] of Object.entries(labelMap.value))if(key.startsWith(prefix))next[key]=value;return}
+    const resources=result.value.resources||[], counts=new Map<string,number>()
+    for(const resource of resources)counts.set(resource.label,(counts.get(resource.label)||0)+1)
+    for(const resource of resources)next[prefix+resource.id]=resource.label+((counts.get(resource.label)||0)>1?' · '+resource.id.slice(0,8):'')
+  })
+  labelMap.value=next
+}, { interval:60000, immediate:false, enabled:()=>tab.value==='logs' })
+const loadAccountLabels=()=>labelsRead.refresh()
 function acctLabel(uid?: string | null, model = ''): string {
   if (!uid) return '—'
   const channel = labelProviders.value.find(name => model.startsWith(name + '/')) || defaultLabelProvider.value
   return labelMap.value[channel + '/' + uid] || uid.slice(0, 8)
 }
 
-async function loadFilters() {
-  const f = await api.usageFilters()
-  filterOpts.value = { protocols: f.protocols || [], models: f.models || [], apps: f.apps || [], apps_history: f.apps_history || [], statuses: f.statuses || [] }
-}
-async function loadLogs() {
-  const version=++logVersion
-  logLoading.value=true;logError.value=''
-  try {
-    const res=await api.usageRecent(page.value,pageSize,{...filters.value})
-    if(disposed || version!==logVersion)return
-    records.value=res.records || [];total.value=res.total || 0
-  } catch(e:any) { if(!disposed && version===logVersion)logError.value=e?.message || '查询调用记录失败' }
-  finally { if(!disposed && version===logVersion)logLoading.value=false }
-}
+const filtersRead=useLiveRead(signal=>api.usageFilters(signal), f=>{
+  filterOpts.value={protocols:f.protocols||[],models:f.models||[],apps:f.apps||[],apps_history:f.apps_history||[],statuses:f.statuses||[]}
+}, { interval:60000, immediate:false, enabled:()=>tab.value==='logs' })
+const loadFilters=()=>filtersRead.refresh()
+const logsRead = useLiveRead(signal => api.usageRecent(page.value, pageSize, { ...filters.value }, signal), res => {
+  records.value = res.records || []; total.value = res.total || 0
+}, { interval: 20000, immediate: false, enabled: () => tab.value === 'logs' && page.value === 1 && !detailOpen.value })
+const logLoading = logsRead.loading
+const logError = logsRead.error
+const loadLogs = () => logsRead.refresh()
+
 function applyFilter() {
   filters.value.search = searchInput.value.trim() || undefined
   // page 变化会触发 watch 加载；已在第 1 页时手动加载一次，避免重复请求
@@ -240,7 +223,7 @@ onUnmounted(() => {
 })
 
 function loadTab(value: string) {
-  if (value === 'analytics') void loadAnalytics().catch(() => {})
+  if (value === 'analytics') loadAnalytics()
   if (value === 'logs') {
     void loadFilters().catch(() => {})
     void loadAccountLabels()
@@ -258,9 +241,9 @@ onMounted(() => loadTab(tab.value))
 
     <!-- ============ 分析 ============ -->
     <template v-if="tab === 'analytics'">
+      <p v-if="analyticsError" role="status" class="mb-3 text-small text-warn">部分统计读取失败，稍后自动重试；已有数据继续保留。</p>
       <WSpinner v-if="anaLoading && !summary" center label="加载中" />
-      <template v-else>
-        <div class="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <div v-if="summary" class="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
           <WStat label="累计请求" :value="int(summary?.total_requests)" tone="brand" />
           <WStat label="累计 Tokens" :value="abbr(summary?.total_tokens)" tone="route" />
           <WStat label="今日请求" :value="int(summary?.today_requests)" tone="live" />
@@ -296,16 +279,16 @@ onMounted(() => loadTab(tab.value))
             <WTabs v-model="metric" :tabs="[{ key: 'count', label: '请求数' }, { key: 'tokens', label: 'Tokens' }]" />
             <WTabs v-model="granularity" :tabs="[{ key: 'hour', label: '24 小时' }, { key: 'day', label: '30 天' }]" />
           </template>
-          <TrendChart :data="points" :metric="metric" />
+          <WSpinner v-if="trendRead.loading.value && !points.length" center label="趋势加载中" />
+          <TrendChart v-else :data="points" :metric="metric" />
         </WCard>
 
-        <div class="grid gap-4 lg:grid-cols-2">
+        <div v-if="summary" class="grid gap-4 lg:grid-cols-2">
           <WCard title="按协议"><BarList :items="protocolBars" tone="brand" /></WCard>
           <WCard title="按账号"><BarList :items="accountBars" tone="live" /></WCard>
           <WCard title="按模型（Top 10）"><BarList :items="modelBars" tone="route" /></WCard>
           <WCard title="按应用"><BarList :items="appBars" tone="warn" /></WCard>
         </div>
-      </template>
     </template>
 
     <!-- ============ 日志 ============ -->

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useLiveRead } from '@/lib/liveRead'
 import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import { api } from '@/api/client'
 import type { ProviderSummary, OAuthOption, ResourceSummary } from '@/types'
@@ -32,8 +33,9 @@ interface Row {
 
 const providers = ref<ProviderSummary[]>([])
 const rows = ref<Row[]>([])
-const loading = ref(true)
+const loading = computed(() => accountRead.loading.value)
 const busy = ref(false)
+const editingPriority = ref('')
 const rowBusy = ref(new Set<string>())
 async function renewAccount(r: Record<string, any>) { try { await mutateRow(r, () => api.providerRenewAccount(r.provider, r.id)); toast.success("授权已续期") } catch(e: any) { toast.error(e?.response?.data?.error?.message || "续期失败") } }
 async function mutateRow(r: Record<string, any>, operation: () => Promise<unknown>) {
@@ -98,23 +100,6 @@ async function runAccountTest() {
     modelTestResult.value = await api.testAccount(row.provider, row.id, model); await load()
   } finally { confirmingAccountTest = false; testing.value = false }
 }
-let checkPoll: ReturnType<typeof setInterval> | null = null
-let checkPollRunning = false
-async function pollAccountChecks() {
-  if (document.hidden || checkPollRunning || loading.value || checking.value || testing.value || batchBusy.value) return
-  checkPollRunning = true
-  try {
-    const data = await api.accountCheckSnapshots()
-    const snapshots = new Map(data.results.map(r => [`${r.provider}/${r.id}`, r]))
-    const changed = rows.value.some(row => {
-      const current = snapshots.get(row.key)
-      return !!current && (JSON.stringify(current.check) !== JSON.stringify(row.raw.account_check || null) || JSON.stringify(current.test) !== JSON.stringify(row.raw.account_test || null))
-    })
-    if (changed) await load()
-  } catch { /* Keep the last successful snapshot; GET client reports failures. */ }
-  finally { checkPollRunning = false }
-}
-
 async function checkAccountsBatch() {
   if (batchBusy.value) return
   const targets = (selectedRows.value.length ? selectedRows.value : filtered.value).filter(r => r.raw.account_check_supported)
@@ -144,30 +129,21 @@ function caps(name: string): string[] {
 }
 
 const readErrors = ref<Record<string, string>>({})
-let loadVersion = 0
-async function load() {
-  const version = ++loadVersion
-  loading.value = true
-  const nextRows = new Map<string, Row[]>()
-  for (const p of providers.value) {
-    nextRows.set(p.name, rows.value.filter(r => r.provider === p.name))
-  }
-  const errors: Record<string, string> = {}
-  try {
-    let provs: ProviderSummary[]
-    try { provs = (await api.getProviders()).providers || [] }
-    catch { if (version === loadVersion) readErrors.value = { providers: '渠道列表读取失败，保留上次成功快照' }; return }
-    if (version !== loadVersion) return
-    providers.value = provs
-    const names = new Set(provs.filter(p => p.capabilities?.includes('accounts') || p.capabilities?.includes('config')).map(p => p.name))
-    for (const name of nextRows.keys()) if (!names.has(name)) nextRows.delete(name)
-    const targets = provs.filter(p => p.capabilities?.includes('accounts') || p.capabilities?.includes('config'))
-    const results = await Promise.allSettled(targets.map(p => api.getProvider(p.name)))
-    if (version !== loadVersion) return
-    results.forEach((result, i) => {
-      const name = targets[i].name
-      if (result.status === 'rejected') { errors[name] = '读取失败，保留上次成功快照'; return }
-      const detail = result.value
+const accountRead = useLiveRead(async signal => {
+  let provs: ProviderSummary[]
+  try { provs = (await api.getProviders(signal)).providers || [] }
+  catch (e) { if (!signal.aborted) readErrors.value = { ...readErrors.value, providers: '渠道列表读取失败，保留上次成功快照' }; throw e }
+  if (signal.aborted || editingPriority.value) return
+  providers.value = provs
+  const targets = provs.filter(p => p.capabilities?.includes('accounts') || p.capabilities?.includes('config'))
+  const names = new Set(targets.map(p => p.name))
+  rows.value = rows.value.filter(r => names.has(r.provider))
+  readErrors.value = Object.fromEntries(Object.entries(readErrors.value).filter(([name]) => names.has(name)))
+  const results = await Promise.allSettled(targets.map(async p => {
+    const name = p.name
+    try {
+      const detail = await api.getProvider(name, signal)
+      if (signal.aborted || editingPriority.value) return
       const metadata = new Map((detail.resources || []).map(r => [r.id, r]))
       const accounts: Row[] = []
       for (const raw of detail.accounts || []) {
@@ -177,13 +153,22 @@ async function load() {
         const normalized = quota ? { ...raw, credits_remaining: quota.remaining, credits_total: quota.total, credits_expire_at: quota.expires_at, quota_stale: quota.stale, quota_refresh_failed: quota.refresh_failed } : raw
         accounts.push({ key: name + '/' + id, provider: name, id, raw: normalized, resource })
       }
-      nextRows.set(name, accounts)
-    })
-    rows.value = [...nextRows.values()].flat()
-    selectedKeys.value = new Set([...selectedKeys.value].filter(key => rows.value.some(r => r.key === key)))
-    readErrors.value = errors
-  } finally { if (version === loadVersion) loading.value = false }
-}
+      const grouped = new Map<string, Row[]>()
+      for (const row of rows.value) { const list=grouped.get(row.provider)||[];list.push(row);grouped.set(row.provider,list) }
+      grouped.set(name, accounts)
+      rows.value = [...grouped.values()].flat()
+      selectedKeys.value = new Set([...selectedKeys.value].filter(key => rows.value.some(r => r.key === key)))
+      const errors = { ...readErrors.value }; delete errors[name]; readErrors.value = errors
+    } catch (e) {
+      if (!signal.aborted) readErrors.value = { ...readErrors.value, [name]: '读取失败，保留上次成功快照' }
+      throw e
+    }
+  }))
+  const failure = results.find(r => r.status === 'rejected')
+  if (failure?.status === 'rejected') throw failure.reason
+}, () => {}, { interval: 30000, enabled: () => !checking.value && !testing.value && !batchBusy.value && rowBusy.value.size === 0 && !editingPriority.value })
+const load = () => accountRead.refresh()
+
 function action(r: Record<string, any>, name: string) { return (r.resource as ResourceSummary | undefined)?.actions[name] }
 function can(r: Record<string, any>, name: string) { return action(r, name)?.enabled === true }
 const selectedKeys = ref(new Set<string>())
@@ -503,8 +488,6 @@ const calOpenFor = ref<string | null>(null)
 const calStyle = ref<Record<string, string>>({})
 const calData = ref<Record<string, string[]>>({})
 const calendars = ref<Record<string, { history: Record<string, string[]>; today: string; window_date: string; timezone: string }>>({})
-let calendarTimer: ReturnType<typeof setInterval> | null = null
-let calendarInflight: Promise<void> | null = null
 const calDays = ref(35)
 const calAnchor = ref<HTMLElement | null>(null)
 
@@ -524,22 +507,10 @@ function calDatesOf(r: any): string[] {
   return calendars.value[r.provider]?.history[shortUid(r)] || (r.provider === 'workbuddy' ? calData.value[shortUid(r)] : []) || []
 }
 
-async function loadCalendar() {
-  if (calendarInflight) return calendarInflight
-  calendarInflight = fetchCalendar()
-  try { await calendarInflight } finally { calendarInflight = null }
-}
-
-async function fetchCalendar() {
-  try {
-    const res = await api.checkinHistory(calDays.value)
-    calData.value = res.history || {}
-    calendars.value = res.calendars || {}
-    calDays.value = res.days || 35
-  } catch {
-    /* 静默：日历是增强信息，失败不打断账号列表 */
-  }
-}
+const calendarRead=useLiveRead(signal=>api.checkinHistory(calDays.value,signal),res=>{
+  calData.value=res.history||{};calendars.value=res.calendars||{};calDays.value=res.days||35
+}, { interval:60000 })
+const loadCalendar=()=>calendarRead.refresh()
 
 function openCalendar(r: any, e: MouseEvent | FocusEvent) {
   dismissPopovers()
@@ -869,14 +840,9 @@ async function onAddByToken() {
 }
 
 function refreshVisibleCalendar() {
-  if (document.visibilityState === 'visible') void loadCalendar()
-  else dismissPopovers()
+  if (document.hidden) dismissPopovers()
 }
 onMounted(() => {
-  checkPoll = setInterval(pollAccountChecks, 30000)
-  void load()
-  void loadCalendar()
-  calendarTimer = setInterval(refreshVisibleCalendar, 60000)
   document.addEventListener('visibilitychange', refreshVisibleCalendar)
   document.addEventListener('pointerdown', dismissOutside, true)
   document.addEventListener('focusin', dismissOutside, true)
@@ -888,11 +854,8 @@ onMounted(() => {
 // 组件卸载时停掉可能残留的扫码轮询/悬浮层关闭定时器，避免离开页面后仍在轮询
 onUnmounted(() => {
   checkOpen.value = false
-  if (checkPoll) clearInterval(checkPoll)
-  loadVersion++
   stopPoll()
   cancelClose()
-  if (calendarTimer) clearInterval(calendarTimer)
   document.removeEventListener('visibilitychange', refreshVisibleCalendar)
   document.removeEventListener('pointerdown', dismissOutside, true)
   document.removeEventListener('focusin', dismissOutside, true)
@@ -1078,6 +1041,7 @@ async function saveConfig() {
               v-if="can(row, 'priority')"
               type="number"
               :value="row.raw.priority ?? 0"
+              @focus="editingPriority = row.key" @blur="editingPriority = ''"
               :disabled="rowBusy.has(row.provider + '/' + row.id)"
               class="mono h-8 w-16 rounded-lg border border-line bg-bg/40 px-2 text-center text-small text-ink focus:border-brand focus:outline-none"
               @change="savePriority(row, +($event.target as HTMLInputElement).value)"

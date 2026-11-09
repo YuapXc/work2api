@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { useLiveRead } from '@/lib/liveRead'
+import { ref, computed } from 'vue'
 import { api } from '@/api/client'
 import type { AppInfo, ModelInfo } from '@/types'
 import { toast } from '@/lib/toast'
@@ -20,7 +21,7 @@ import WSpinner from '@/components/ui/WSpinner.vue'
 import WIcon from '@/components/ui/WIcon.vue'
 
 const apps = ref<AppInfo[]>([])
-const loading = ref(true)
+
 
 const cols: Column[] = [
   { key: 'name', label: '名称' },
@@ -34,14 +35,10 @@ const cols: Column[] = [
   { key: 'actions', label: '操作', align: 'right', minWidth: '14rem', nowrap: true },
 ]
 
-async function load() {
-  loading.value = true
-  try {
-    apps.value = (await api.apps()).apps ?? []
-  } finally {
-    loading.value = false
-  }
-}
+const keyRead = useLiveRead(signal => api.apps(signal), result => { apps.value = result.apps ?? [] })
+const loading = keyRead.loading
+const loadError = keyRead.error
+const load = () => keyRead.refresh()
 
 // 新建
 const createOpen = ref(false)
@@ -176,7 +173,7 @@ function modelCell(app: any) {
   return `${list[0]}、${list[1]} 等 ${list.length} 个`
 }
 
-onMounted(load)
+
 </script>
 
 <template>
@@ -187,6 +184,7 @@ onMounted(load)
     </template>
 
     <WCard flush>
+      <p v-if="loadError" role="status" class="mb-3 text-small text-warn">密钥读取失败，稍后自动重试；已有数据继续保留。</p>
       <WSpinner v-if="loading" center label="加载中" />
       <WTable v-else :columns="cols" :rows="apps" row-key="id" min-width="880px">
         <template #cell-name="{ row }">

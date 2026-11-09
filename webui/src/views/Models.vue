@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { useLiveRead } from '@/lib/liveRead'
+import { ref, computed } from 'vue'
 import { api } from '@/api/client'
 import type { ModelRefreshResult, ProviderSummary } from '@/types'
 import { toast } from '@/lib/toast'
@@ -21,7 +22,7 @@ interface Entry {
 }
 const entries = ref<Entry[]>([])
 const source = ref<string>('')
-const loading = ref(true)
+
 const refreshing = ref(false)
 
 const search = ref('')
@@ -34,66 +35,62 @@ const bindingModel = ref('')
 const readErrors = ref<Record<string, string>>({})
 const knownProviders = ref<ProviderSummary[]>([])
 const refreshResults = ref<ModelRefreshResult[]>([])
-let loadVersion = 0
-let benchLoadVersion = 0
-
-async function load() {
-  const version = ++loadVersion
-  loading.value = true
-  const next = new Map<string, Entry[]>()
+let benchmarkSnapshot: Awaited<ReturnType<typeof api.benchmarks>> | undefined
+function applyBenchmarks() {
+  if (!benchmarkSnapshot) return
+  const map = benchmarkSnapshot.models || {}
   for (const e of entries.value) {
-    const list = next.get(e.provider) || []
-    list.push(e)
-    next.set(e.provider, list)
-  }
-  const errors: Record<string, string> = {}
-  try {
-    const [wb, providers] = await Promise.allSettled([api.models(), api.getProviders()])
-    if (version !== loadVersion) return
-    if (wb.status === 'fulfilled') {
-      source.value = wb.value.source || ''
-      next.set('workbuddy', (wb.value.models || []).map((model) => ({ provider: 'workbuddy', model: { ...model, id: String(model.id).startsWith('workbuddy/') ? model.id : `workbuddy/${model.id}` } })))
-    } else errors.workbuddy = '读取失败，保留上次成功目录'
-    if (providers.status === 'fulfilled') {
-      knownProviders.value = providers.value.providers || []
-      const others = knownProviders.value.filter((p) => !p.default && p.capabilities?.includes('models'))
-      const names = new Set(['workbuddy', ...others.map((p) => p.name)])
-      for (const name of next.keys()) if (!names.has(name)) next.delete(name)
-      const details = await Promise.allSettled(others.map((p) => api.getProvider(p.name)))
-      if (version !== loadVersion) return
-      details.forEach((d, i) => {
-        const name = others[i].name
-        if (d.status === 'fulfilled') {
-          // A successful empty directory is authoritative: old cards must disappear.
-          next.set(name, ((d.value.models as Record<string, any>[]) || []).map((model) => ({ provider: name, model })))
-        } else errors[name] = '读取失败，保留上次成功目录'
-      })
-    } else errors.providers = '渠道列表读取失败，保留上次成功目录'
-    entries.value = [...next.values()].flat()
-    readErrors.value = errors
-    await loadBenchmarks()
-  } finally {
-    if (version === loadVersion) loading.value = false
+    e.model.benchmark = map[e.model.id] || (e.provider === 'workbuddy' ? map[String(e.model.id).replace(/^workbuddy\//, '')] : undefined)
+    e.model.benchmark_state = benchmarkSnapshot.binding_states?.[e.model.id]
   }
 }
-
-// AA 评测按带命名空间的模型 id 合并进各卡片（后端 key 即 e.model.id）。
-async function loadBenchmarks() {
-  const version = ++benchLoadVersion
-  try {
-    const res = await api.benchmarks()
-    if (version !== benchLoadVersion) return false
-    aaConfigured.value = !!res.configured
-    const map = res.models || {}
-    for (const e of entries.value) {
-      e.model.benchmark = map[e.model.id] || (e.provider === 'workbuddy' ? map[String(e.model.id).replace(/^workbuddy\//, '')] : undefined)
-      e.model.benchmark_state = res.binding_states?.[e.model.id]
-    }
-    return res.configured
-  } catch {
-    return false
+const benchmarksRead = useLiveRead(signal => api.benchmarks(signal), result => {
+  benchmarkSnapshot = result
+  aaConfigured.value = !!result.configured
+  applyBenchmarks()
+}, { interval: 60000 })
+async function loadBenchmarks() { return await benchmarksRead.refresh() && aaConfigured.value }
+const directoryRead = useLiveRead(async signal => {
+  const publish = (name: string, models: Entry[]) => {
+    if (signal.aborted) return
+    const grouped = new Map<string, Entry[]>()
+    for (const entry of entries.value) { const list=grouped.get(entry.provider)||[];list.push(entry);grouped.set(entry.provider,list) }
+    grouped.set(name, models)
+    entries.value = [...grouped.values()].flat()
+    const errors = { ...readErrors.value }; delete errors[name]; readErrors.value = errors
+    applyBenchmarks()
   }
-}
+  const failed = (name: string, error: unknown): never => {
+    if (!signal.aborted) readErrors.value = { ...readErrors.value, [name]: '读取失败，保留上次成功目录' }
+    throw error
+  }
+  const results = await Promise.allSettled([
+    api.models(signal).then(result => {
+      if (signal.aborted) return
+      source.value = result.source || ''
+      publish('workbuddy', (result.models || []).map(model => ({ provider: 'workbuddy', model: { ...model, id: String(model.id).startsWith('workbuddy/') ? model.id : `workbuddy/${model.id}` } })))
+    }).catch(e => failed('workbuddy', e)),
+    api.getProviders(signal).then(async result => {
+      if (signal.aborted) return
+      knownProviders.value = result.providers || []
+      const errors = { ...readErrors.value }; delete errors.providers; readErrors.value = errors
+      const others = knownProviders.value.filter(p => !p.default && p.capabilities?.includes('models'))
+      const names = new Set(['workbuddy', ...others.map(p => p.name)])
+      readErrors.value = Object.fromEntries(Object.entries(readErrors.value).filter(([name]) => names.has(name)))
+      entries.value = entries.value.filter(e => names.has(e.provider))
+      const details = await Promise.allSettled(others.map(async p => {
+        try { const detail = await api.getProvider(p.name, signal); publish(p.name, ((detail.models as Record<string, any>[]) || []).map(model => ({ provider: p.name, model }))) }
+        catch (e) { failed(p.name, e) }
+      }))
+      const failure = details.find(r => r.status === 'rejected')
+      if (failure?.status === 'rejected') throw failure.reason
+    }, e => failed('providers', e)),
+  ])
+  const failure = results.find(r => r.status === 'rejected')
+  if (failure?.status === 'rejected') throw failure.reason
+}, () => {}, { interval: 60000 })
+const loading = directoryRead.loading
+const load = () => directoryRead.refresh()
 
 async function refreshAA() {
   refreshingAA.value = true
@@ -163,8 +160,7 @@ const stats = computed(() => {
   return { total, multi, tool, aa }
 })
 
-onMounted(load)
-onBeforeUnmount(() => { loadVersion++; benchLoadVersion++ })
+
 </script>
 
 <template>
@@ -195,7 +191,8 @@ onBeforeUnmount(() => { loadVersion++; benchLoadVersion++ })
         <WStat v-if="aaConfigured" label="已评测" :value="stats.aa" tone="warn" />
       </div>
 
-      <div v-if="!aaConfigured" class="mb-4 flex items-center gap-2 rounded-lg border border-line bg-elevated/40 px-3 py-2 text-small text-muted">
+      <p v-if="benchmarksRead.error.value" role="status" class="mb-4 text-small text-warn">评测读取失败，稍后自动重试。</p>
+      <div v-if="!aaConfigured && !benchmarksRead.loading.value && !benchmarksRead.error.value" class="mb-4 flex items-center gap-2 rounded-lg border border-line bg-elevated/40 px-3 py-2 text-small text-muted">
         <WIcon name="chart" :size="15" class="text-faint" />
           在「设置」填入 Artificial Analysis API Key 后，这里会展示已匹配模型的第三方评测。
       </div>

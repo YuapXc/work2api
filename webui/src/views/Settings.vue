@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ref, reactive, onMounted, computed } from 'vue'
+import { useLiveRead } from '@/lib/liveRead'
+import { ref, reactive, computed, watch } from 'vue'
 import { api } from '@/api/client'
 import type { Settings, ProviderSummary } from '@/types'
 import { toast } from '@/lib/toast'
@@ -12,7 +13,7 @@ import WTextarea from '@/components/ui/WTextarea.vue'
 import WToggle from '@/components/ui/WToggle.vue'
 import WSpinner from '@/components/ui/WSpinner.vue'
 
-const loading = ref(true)
+
 const loadFailed = ref(false)
 const saving = ref(false)
 const s = reactive<Record<string, string>>({
@@ -41,7 +42,7 @@ const backup = ref<{ status: string; last_success: number | null }>({ status: ''
 const backupFailed = ref(false)
 async function createBackup() {
   backingUp.value = true
-  try { backup.value = await api.createBackup(); backupFailed.value = false; toast.success('完整备份已保存到服务器数据目录') }
+  try { backup.value = await api.createBackup(); backupFailed.value = false; void backupRead.refresh(); toast.success('完整备份已保存到服务器数据目录') }
   finally { backingUp.value = false }
 }
 const costAware = ref(true)
@@ -51,33 +52,36 @@ const aaMasked = ref('')
 const aaEnabled = ref(false)
 const clearAA = ref(false)
 
-async function load() {
-  loading.value = true
-  loadFailed.value = false
-  try {
-    const data = (await api.getSettings()) as Settings & Record<string, string>
-    for (const k of Object.keys(s)) if (data[k] != null) s[k] = String(data[k])
-    accountChecks.value = String(data.account_check_enabled ?? '1') === '1'
-    keepalive.value = String(data.keepalive_enabled ?? '1') === '1'
-    const [providers, backupStatus] = await Promise.allSettled([api.getProviders(), api.backupStatus()])
-    maintenanceFailed.value = providers.status === 'rejected'
-    maintenanceProviders.value = providers.status === 'fulfilled' ? providers.value.providers.filter(p => p.maintenance?.length) : []
-    for (const p of maintenanceProviders.value) for (const option of p.maintenance || []) {
-      maintenanceValues[option.key] = String(data[option.key] ?? (option.default ? '1' : '0')) === '1'
-    }
-    backupEnabled.value = String(data.backup_enabled ?? '0') === '1'
-    backupFailed.value = backupStatus.status === 'rejected'
-    if (backupStatus.status === 'fulfilled') backup.value = backupStatus.value
-    costAware.value = String(data.cost_aware_routing ?? '1') === '1'
-    alertOn.value = String(data.alert_enabled ?? '0') === '1'
-    aaEnabled.value = !!data.aa_enabled
-    aaMasked.value = data.aa_api_key_masked || ''
-  } catch {
-    loadFailed.value = true
-  } finally {
-    loading.value = false
+let settingsSnapshot: (Settings & Record<string,string>) | undefined
+function initializeMaintenance() {
+  if (!settingsSnapshot) return
+  for (const p of maintenanceProviders.value) for (const option of p.maintenance || []) {
+    if (!(option.key in maintenanceValues)) maintenanceValues[option.key] = String(settingsSnapshot[option.key] ?? (option.default ? '1' : '0')) === '1'
   }
 }
+const settingsRead = useLiveRead(signal => api.getSettings(signal), raw => {
+  const data = raw as Settings & Record<string,string>
+  const previous=settingsSnapshot
+  for (const k of Object.keys(s)) if(data[k]!=null && (!previous || s[k]===String(previous[k]??''))) s[k]=String(data[k])
+  for(const [target,key,fallback] of [[accountChecks,'account_check_enabled','1'],[keepalive,'keepalive_enabled','1'],[backupEnabled,'backup_enabled','0'],[costAware,'cost_aware_routing','1'],[alertOn,'alert_enabled','0']] as const) {
+    if(!previous || target.value===(String(previous[key]??fallback)==='1')) target.value=String(data[key]??fallback)==='1'
+  }
+  settingsSnapshot=data
+  aaEnabled.value=!!data.aa_enabled;aaMasked.value=data.aa_api_key_masked||''
+  loadFailed.value=false
+  initializeMaintenance()
+}, { interval: 30000, enabled: () => loadFailed.value && !saving.value })
+const providerRead = useLiveRead(signal => api.getProviders(signal), result => {
+  maintenanceProviders.value=result.providers.filter(p=>p.maintenance?.length)
+  initializeMaintenance()
+  maintenanceFailed.value=false
+}, { interval: 30000, enabled: () => maintenanceFailed.value && !saving.value })
+const backupRead = useLiveRead(signal => api.backupStatus(signal), value => { backup.value=value;backupFailed.value=false }, { interval: 30000, enabled: () => !backingUp.value })
+const loading=settingsRead.loading
+watch(settingsRead.error, value => { loadFailed.value=!!value })
+watch(providerRead.error, value => { maintenanceFailed.value=!!value })
+watch(backupRead.error, value => { backupFailed.value=!!value })
+async function load() { await Promise.all([settingsRead.refresh(),providerRead.refresh(),backupRead.refresh()]) }
 
 async function save() {
   if (loading.value || loadFailed.value || saving.value) return
@@ -130,7 +134,7 @@ async function exportCreds() {
   }
 }
 
-onMounted(load)
+
 </script>
 
 <template>

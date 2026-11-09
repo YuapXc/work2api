@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useLiveRead } from '../src/lib/liveRead'
 // 门户外壳：登录/注册门 + 已登录的简单顶栏导航。风格与管理 WebUI 一致
 // （同一套设计令牌），但结构极简：用户只需要看到资格、密钥和用量。
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
@@ -35,41 +36,25 @@ if (entryURL.searchParams.has('aff')) {
 const busy = ref(false)
 const error = ref('')
 const connectionError = ref('')
-let probing: Promise<void> | null = null
 let lastProbe = 0
-let disposed = false
 let sessionVersion = 0
-
-async function probe() {
-  if (probing) return probing
-  probing = probeOnce().finally(() => { probing = null })
-  return probing
-}
-async function probeOnce() {
-  const version = sessionVersion
-  try {
-    const result = await api.me()
-    if (disposed || version !== sessionVersion) return
-    me.value = result
-    invite.value = '' // An existing session never redeems or retains the invitation.
-    connectionError.value = ''
-    lastProbe = Date.now()
-  } catch (e) {
-    if (disposed) return
-    if (e instanceof PortalAPIError && e.status === 401) {
-      if (version !== sessionVersion && me.value) return
-      me.value = null
-      const stateVersion = sessionVersion
-      try {
-        const state = await api.authState()
-        if (disposed || stateVersion !== sessionVersion) return
-        mode.value = state.mode; connectionError.value = ''
-      } catch (err: any) { if (!disposed && stateVersion === sessionVersion) connectionError.value = err.message }
-    } else if (version === sessionVersion) { connectionError.value = e instanceof Error ? e.message : '暂时无法获取账号信息' }
-  } finally {
-    if (!disposed) checking.value = false
+const identityRead = useLiveRead(async signal => {
+  let version=sessionVersion
+  try { return { value:await api.me(signal), version } }
+  catch(e) {
+    if(signal.aborted)throw e
+    if(!(e instanceof PortalAPIError) || e.status!==401)throw e
+    version=sessionVersion
+    return { state:await api.authState(signal), version }
   }
-}
+}, result => {
+  if(result.version!==sessionVersion)return
+  if(result.value) { me.value=result.value;invite.value='' }
+  else if(result.state) { me.value=null;mode.value=result.state.mode }
+  connectionError.value='';checking.value=false;lastProbe=Date.now()
+}, { interval:30000, enabled:()=>!!me.value || !!connectionError.value })
+watch(identityRead.error, value => { if(value){connectionError.value=value;checking.value=false} })
+const probe=()=>identityRead.refresh()
 function expireSession() { sessionVersion++; me.value = null }
 function refreshIfStale() { if (Date.now() - lastProbe > 15000) void probe() }
 
@@ -85,7 +70,6 @@ async function submit() {
       await api.register(username.value.trim(), password.value, invite.value.trim())
     }
     sessionVersion++
-    if (probing) await probing
     await probe()
     username.value = password.value = invite.value = ''
   } catch (e: any) {
@@ -119,8 +103,8 @@ function toggleTheme() {
 }
 
 watch(() => route.path, refreshIfStale)
-onMounted(() => { void probe(); window.addEventListener('focus', refreshIfStale); window.addEventListener('portal-session-expired', expireSession) })
-onUnmounted(() => { disposed = true; window.removeEventListener('focus', refreshIfStale); window.removeEventListener('portal-session-expired', expireSession) })
+onMounted(() => { window.addEventListener('portal-session-expired', expireSession) })
+onUnmounted(() => { window.removeEventListener('portal-session-expired', expireSession) })
 </script>
 
 <template>

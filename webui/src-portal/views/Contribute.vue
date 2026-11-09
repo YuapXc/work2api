@@ -1,6 +1,7 @@
 <script setup lang="ts">
+import { useLiveRead } from '../../src/lib/liveRead'
 // 门户账号授权、导入和共享状态。
-import { ref, watch, onMounted, onUnmounted } from 'vue'
+import { ref, watch, onUnmounted } from 'vue'
 import { api, PortalAPIError, fmtTime, type ContributionInfo, type Me } from '../api'
 import { toast } from '../../src/lib/toast'
 import { confirm } from '../../src/lib/confirm'
@@ -11,10 +12,9 @@ defineProps<{ me: Me }>()
 const emit = defineEmits<{ refresh: [] }>()
 
 const list = ref<ContributionInfo[]>([])
-const loading = ref(true)
-const loadError = ref('')
+
+
 const rowBusy = ref(new Set<number>())
-let loadVersion = 0
 const accepted = ref(false)
 const begining = ref(false)
 const authUrl = ref('')
@@ -39,15 +39,13 @@ async function importCredential(){if(importing.value||!accepted.value||!credenti
 	function cancelTask(id:string){return taskChannel.value==='trae'?api.traeCancel(id):taskChannel.value==='qoder'?api.qoderCancel(id):api.contributionCancel(id)}
 	async function completeCallback(){if(callbackBusy.value)return;callbackBusy.value=true;try{await api.traeComplete(taskId.value,callbackURL.value.trim());callbackURL.value='';toast.success('回调已提交')}catch(e:any){toast.error(e.message)}finally{callbackBusy.value=false}}
 
-async function load() {
-  const version = ++loadVersion
-  loading.value = true
-  loadError.value = ''
-  try { const result = await api.contributions(); if (!disposed && version === loadVersion) list.value = result.contributions }
-  catch (e: any) { if (!disposed && version === loadVersion) loadError.value = e?.message || '加载贡献失败' }
-  finally { if (!disposed && version === loadVersion) loading.value = false }
-}
-onMounted(() => { load() })
+const resource = useLiveRead(signal => api.contributions(signal), result => {
+  list.value = result.contributions
+}, { interval: 30000 })
+const loading = resource.loading
+const loadError = resource.error
+const load = () => resource.refresh()
+
 onUnmounted(() => { disposed = true; stopPoll(); if (taskId.value) void cancelTask(taskId.value).catch(() => {}) })
 
 async function begin() {
@@ -191,9 +189,9 @@ async function share(c: ContributionInfo) {
     <div class="glass rounded-2xl p-6">
       <h2 class="text-base font-semibold">我的账号与贡献状态</h2>
       <div v-if="loading" class="mt-4 text-small text-faint">加载中…</div>
-      <div v-else-if="loadError" role="alert" class="mt-4 text-small text-fault">{{ loadError }} <button class="text-brand" @click="load">重试</button></div>
-      <div v-else-if="!list.length" class="mt-4 text-small text-faint">还没有贡献记录。</div>
-      <div v-else class="mt-4 space-y-3">
+      <div v-if="loadError" role="alert" class="mt-4 text-small text-fault">{{ loadError }} <button class="text-brand" @click="load">重试</button></div>
+      <div v-if="!loading && !loadError && !list.length" class="mt-4 text-small text-faint">还没有贡献记录。</div>
+      <div v-if="list.length" class="mt-4 space-y-3">
         <div v-for="c in list" :key="c.id" class="flex flex-wrap items-center gap-3 rounded-xl border border-line bg-elevated/40 p-4">
           <span class="h-2 w-2 rounded-full" :class="c.status === 'active' ? 'bg-live' : 'bg-faint'" />
           <span class="text-micro text-muted">{{ c.provider }}</span><code class="mono text-small">{{ c.account }}</code>

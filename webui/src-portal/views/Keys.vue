@@ -1,7 +1,8 @@
 <script setup lang="ts">
+import { useLiveRead } from '../../src/lib/liveRead'
 // Key 管理：创建（默认收窄到全部可用模型）、启停、模型收窄、删除。
 // 明文仅按需读取本人 Key，不持久化到浏览器。
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onUnmounted } from 'vue'
 import { api, fmtTokens, fmtTime, type KeyInfo, type Me } from '../api'
 import { toast } from '../../src/lib/toast'
 import { confirm } from '../../src/lib/confirm'
@@ -14,7 +15,7 @@ const props = defineProps<{ me: Me }>()
 const baseURL = window.location.origin + '/v1'
 
 const keys = ref<KeyInfo[]>([])
-const loading = ref(true)
+
 const newName = ref('')
 const creating = ref(false)
 const newPolicy = ref<'follow' | 'fixed'>('follow')
@@ -28,19 +29,16 @@ const modelSearch = ref('')
 const visibleModels = computed(() => [...new Set([...props.me.available_models, ...draftModels.value])].filter(m => m.toLowerCase().includes(modelSearch.value.trim().toLowerCase())))
 const rowBusy = ref(new Set<number>())
 let disposed = false
-let loadVersion = 0
 onUnmounted(() => { disposed = true; freshKey.value = null; revealedKeys.value = {} })
-const loadError = ref('')
 
-async function load() {
-  const version = ++loadVersion
-  loading.value = true
-  loadError.value = ''
-  try { const result = await api.keys(); if (!disposed && version === loadVersion) keys.value = result.keys }
-  catch (e: any) { if (!disposed && version === loadVersion) loadError.value = e?.message || '加载密钥失败' }
-  finally { if (!disposed && version === loadVersion) loading.value = false }
-}
-onMounted(load)
+
+const resource = useLiveRead(signal => api.keys(signal), result => {
+  keys.value = result.keys
+}, { interval: 30000 })
+const loading = resource.loading
+const loadError = resource.error
+const load = () => resource.refresh()
+
 
 async function create() {
   if (creating.value) return
@@ -152,9 +150,9 @@ async function saveModels(k: KeyInfo, selected: string[], policy: "follow" | "fi
     <div class="glass rounded-2xl p-6">
       <h2 class="text-base font-semibold">我的密钥</h2>
       <div v-if="loading" class="mt-4 text-small text-faint">加载中…</div>
-      <div v-else-if="loadError" class="mt-4 text-small text-fault">{{ loadError }} <button class="text-brand" @click="load">重试</button></div>
-      <div v-else-if="!keys.length" class="mt-4 text-small text-faint">还没有 Key，先在上面创建一个。</div>
-      <div v-else class="mt-4 space-y-3">
+      <div v-if="loadError" class="mt-4 text-small text-fault">{{ loadError }} <button class="text-brand" @click="load">重试</button></div>
+      <div v-if="!loading && !loadError && !keys.length" class="mt-4 text-small text-faint">还没有 Key，先在上面创建一个。</div>
+      <div v-if="keys.length" class="mt-4 space-y-3">
         <div v-for="k in keys" :key="k.id" class="rounded-xl border border-line bg-elevated/40 p-4">
           <div class="flex flex-wrap items-center gap-3">
             <span class="h-2 w-2 rounded-full" :class="k.enabled ? 'bg-live' : 'bg-faint'" />

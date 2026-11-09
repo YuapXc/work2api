@@ -1,6 +1,7 @@
 <script setup lang="ts">
+import { useLiveRead } from '../../src/lib/liveRead'
 // 用量：今日合计（多 Key 合并）+ 各 Key 明细。日限额为 0 表示未启用该维度。
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onUnmounted } from 'vue'
 import { api, fmtTokens, type KeyInfo, type Me } from '../api'
 
 import type { UsageRecord } from '../../src/types'
@@ -12,21 +13,19 @@ import ChannelCosts from '../../src/components/ChannelCosts.vue'
 import WInput from '../../src/components/ui/WInput.vue'
 defineProps<{ me: Me }>()
 const records=ref<UsageRecord[]>([])
-const page=ref(1), total=ref(0), logsLoading=ref(false), logsError=ref('')
+const page=ref(1), total=ref(0)
 const model=ref(''), protocol=ref(''), status=ref('')
 let appliedFilters = { model: '', protocol: '', status: '' }
 const detail=ref<UsageRecord|null>(null), detailOpen=ref(false), detailLoading=ref(false), detailError=ref('')
 let version=0, detailVersion=0, disposed=false
 onUnmounted(()=>{disposed=true;version++;detailVersion++})
-async function loadLogs(reset=false) {
- if(reset) {
-  page.value=1
-  appliedFilters = {model:model.value.trim(),protocol:protocol.value,status:status.value}
- }
- const current=++version;logsLoading.value=true;logsError.value=''
- try { const result=await api.usageRecords(page.value,appliedFilters);if(disposed || current!==version)return;records.value=result.records;total.value=result.total }
- catch(e:any){if(!disposed && current===version)logsError.value=e?.message || '加载调用记录失败'}
- finally{if(!disposed && current===version)logsLoading.value=false}
+const logsRead = useLiveRead(signal => api.usageRecords(page.value, appliedFilters, signal), result => {
+ records.value=result.records;total.value=result.total
+}, { interval: 20000, enabled: () => page.value === 1 && !detailOpen.value })
+const logsLoading = logsRead.loading, logsError = logsRead.error
+function loadLogs(reset=false) {
+ if(reset) { page.value=1;appliedFilters={model:model.value.trim(),protocol:protocol.value,status:status.value} }
+ return logsRead.refresh()
 }
 async function openDetail(id:number) {
  const current=++detailVersion;detailOpen.value=true;detailLoading.value=true;detailError.value='';detail.value=null
@@ -37,21 +36,13 @@ async function openDetail(id:number) {
 function move(next:number){page.value=next;loadLogs()}
 
 
-const loading = ref(true)
-const error = ref('')
+
 const today = ref<Awaited<ReturnType<typeof api.usage>>['today']>({ requests: 0, input_tokens: null, output_tokens: null, daily_limit_requests: 0, daily_limit_input: 0, daily_limit_output: 0 })
 const keys = ref<KeyInfo[]>([])
 
-async function load() {
-  loading.value = true
-  error.value = ''
-  try {
-    const res = await api.usage()
-    today.value = res.today
-    keys.value = res.keys
-  } catch (e: any) { error.value = e?.message || '加载用量失败' } finally { loading.value = false }
-}
-onMounted(()=>{load();loadLogs()})
+const usageRead = useLiveRead(signal => api.usage(signal), res => { today.value=res.today;keys.value=res.keys }, { interval: 20000 })
+const loading=usageRead.loading, error=usageRead.error
+const load=() => usageRead.refresh()
 
 </script>
 
@@ -61,7 +52,7 @@ onMounted(()=>{load();loadLogs()})
     <div class="glass rounded-2xl p-6">
       <h1 class="text-base font-semibold">今日用量</h1>
       <p class="mt-1 text-micro text-faint">汇总本人所有 Key 的今日调用。</p>
-      <div v-if="!loading && !error" class="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
+      <div v-if="!loading" class="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
         <div class="rounded-xl border border-line bg-elevated/50 p-4">
           <div class="text-micro text-faint">请求数</div>
           <div class="mono mt-1 text-xl font-semibold">{{ fmtTokens(today.requests) }}</div>

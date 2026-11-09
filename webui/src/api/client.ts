@@ -1,4 +1,5 @@
 import axios, { type AxiosInstance, type InternalAxiosRequestConfig } from 'axios'
+import { isLiveRead } from '@/lib/liveRead'
 import { toast } from '@/lib/toast'
 import type {
   AABenchmark, AABenchmarkBinding, AABenchmarkBindingOptions,
@@ -56,7 +57,7 @@ http.interceptors.response.use(
     const localOverload = status === 429 && err?.response?.data?.error?.type === "local_overload"
     // 可重试条件：GET 请求 + （网络错误 / 5xx 服务端错误）+ 未超过重试次数
     const retriable =
-      method === 'get' &&
+      method === 'get' && !isLiveRead(config?.signal) &&
       config !== undefined &&
       (status === undefined || status >= 500 || localOverload) &&
       (config._retry ?? 0) < MAX_RETRIES
@@ -76,7 +77,7 @@ http.interceptors.response.use(
       typeof detail === 'string'
         ? detail
         : data?.error?.message || (typeof data?.error === 'string' ? data.error : '') || data?.message || detail?.error?.message || detail?.message || err.message
-    toastOnce(msg)
+    if (!isLiveRead(config?.signal)) toastOnce(msg)
     return Promise.reject(err)
   },
 )
@@ -109,7 +110,7 @@ export const api = {
  saveModelRoute: (route: ModelRoute) => http.post<unknown, { ok: boolean }>('/admin/model-routes', route),
  deleteModelRoute: (route: ModelRoute) => http.delete(`/admin/model-routes/${route.id}?revision=${route.revision}`),
   portalInviteHistory: (code: string, offset = 0) => http.get<unknown, {records: import('./portal').InviteRedemption[]; next_offset: number}>(`/admin/portal/invites/${encodeURIComponent(code)}/history`, {params:{offset}}),
-  portalOverview: () => http.get<unknown, import('./portal').PortalOverview>('/admin/portal/overview'),
+  portalOverview: (signal?: AbortSignal) => http.get<unknown, import('./portal').PortalOverview>('/admin/portal/overview', { signal }),
   adminIdentity: () => http.get<unknown, { identity: import('./portal').AdminIdentity; owner_exists: boolean }>('/admin/identity'),
   adminReauth: (body: { password?: string; token?: string }) => http.post('/admin/identity/reauth', body),
   adminPassword: (old_password: string, new_password: string) => http.post('/admin/identity/password', { old_password, new_password }),
@@ -117,8 +118,8 @@ export const api = {
   identityAudit: () => http.get<unknown, { records: { id: number; ts: number; actor_name: string; target_name: string; auth_method: string; action: string; before_value: string; after_value: string }[] }>('/admin/identity/audit'),
   portalWrite: (path: string, body: unknown) => http.post<unknown, Record<string, unknown>>('/admin/portal/' + path, body),
   portalDelete: (path: string) => http.delete<unknown, { ok: boolean }>('/admin/portal/' + path),
-  health: () => http.get<unknown, { available_providers: number; total_providers: number }>('/admin/health'),
-  overview: () => http.get<unknown, Overview>('/admin/overview?compact=1'),
+  health: (signal?: AbortSignal) => http.get<unknown, { available_providers: number; total_providers: number }>('/admin/health', { signal }),
+  overview: (signal?: AbortSignal) => http.get<unknown, Overview>('/admin/overview?compact=1', { signal }),
   accounts: () => http.get<unknown, { accounts: AccountInfo[] }>('/admin/accounts'),
   setEnabled: (uid: string, enabled: boolean) =>
     http.post<unknown, { ok: boolean }>(`/admin/accounts/${uid}/${enabled ? 'enable' : 'disable'}`),
@@ -130,9 +131,9 @@ export const api = {
   deleteAccount: (uid: string) => http.delete<unknown, { ok: boolean }>(`/admin/accounts/${uid}`),
   refreshCredits: () => http.post<unknown, { ok: boolean; accounts: AccountInfo[] }>('/admin/credits/refresh'),
   checkin: () => http.post<unknown, CheckinResponse>('/admin/checkin'),
-  checkinHistory: (days = 35) =>
+  checkinHistory: (days = 35, signal?: AbortSignal) =>
     http.get<unknown, { days: number; since: string; history: Record<string, string[]>; calendars: Record<string, { history: Record<string, string[]>; today: string; window_date: string; timezone: string }> }>(
-      `/admin/checkin/history?days=${days}`,
+      `/admin/checkin/history?days=${days}`, { signal },
     ),
   modelTest: (model: string, prompt: string) =>
     http.post<unknown, { ok: boolean; model: string; latency_ms: number; content?: string; error?: string; finish_reason?: string }>(
@@ -143,10 +144,11 @@ export const api = {
   sessions: () => http.get<unknown, { sessions: SessionRow[] }>('/admin/sessions'),
   sessionAccounts: (id: string) => http.get<unknown, { session: ActiveSession; accounts: SessionAccountOption[] }>(`/admin/sessions/${encodeURIComponent(id)}/accounts`),
   sessionControl: (id: string, version: number, action: 'switch' | 'reselect' | 'cancel', uid = '') => http.post(`/admin/sessions/${encodeURIComponent(id)}`, { version, action, uid }),
-  usageSummary: () => http.get<unknown, UsageSummary>('/admin/usage/summary'),
-  usageTimeseries: (granularity = 'hour', points = 24, model?: string) =>
+  usageSummary: (signal?: AbortSignal) => http.get<unknown, UsageSummary>('/admin/usage/summary', { signal }),
+  usageTimeseries: (granularity = 'hour', points = 24, model?: string, signal?: AbortSignal) =>
     http.get<unknown, { granularity: string; points: number; data: UsagePoint[] }>(
       `/admin/usage/timeseries?granularity=${granularity}&points=${points}${model ? `&model=${encodeURIComponent(model)}` : ''}`,
+      { signal },
     ),
   // 服务端分页：page/page_size + 筛选条件，返回 records + total（总数驱动分页器）
   startUsageExport: (input: { protocol?: string; model?: string; app_name?: string; status?: string; search?: string; timezone: string }) =>
@@ -155,7 +157,7 @@ export const api = {
     http.get<unknown, UsageExport>(`/admin/usage/exports/${encodeURIComponent(id)}`, { signal }),
   cancelUsageExport: (id: string) =>
     http.delete<unknown, UsageExport>(`/admin/usage/exports/${encodeURIComponent(id)}`),
-  usageRecent: (page = 1, pageSize = 20, filters: { protocol?: string; model?: string; app_name?: string; status?: string; search?: string } = {}) => {
+  usageRecent: (page = 1, pageSize = 20, filters: { protocol?: string; model?: string; app_name?: string; status?: string; search?: string } = {}, signal?: AbortSignal) => {
     const p = new URLSearchParams({ page: String(page), page_size: String(pageSize), light: '1', group: 'request' })
     if (filters.protocol) p.set('protocol', filters.protocol)
     if (filters.model) p.set('model', filters.model)
@@ -164,11 +166,11 @@ export const api = {
     if (filters.status) p.set('status', filters.status)
     // 内容关键字（在输入/输出/思考链三列里做字面匹配，服务端已转义通配符）
     if (filters.search) p.set('search', filters.search)
-    return http.get<unknown, RecordsResponse>(`/admin/usage/recent?${p.toString()}`)
+    return http.get<unknown, RecordsResponse>(`/admin/usage/recent?${p.toString()}`, { signal })
   },
   // 单条记录详情（含完整输入/输出/COT）：列表走 light 投影，点开详情才按需取大文本
   usageDetail: (id: number) => http.get<unknown, { record: UsageRecord }>(`/admin/usage/${id}`),
-  usageFilters: () =>
+  usageFilters: (signal?: AbortSignal) =>
     http.get<unknown, {
       protocols: string[]
       models: string[]
@@ -176,14 +178,14 @@ export const api = {
       apps_history: string[]  // 已删除应用的历史记录名
       has_unnamed?: boolean   // 是否存在未记录应用的旧记录
       statuses: string[]
-    }>('/admin/usage/filters'),
-  models: () => http.get<unknown, { models: ModelInfo[]; source?: 'dynamic' | 'static' }>('/admin/models'),
-  modelCatalog: () => http.get<unknown, { models: ModelInfo[] }>('/admin/models/catalog'),
+    }>('/admin/usage/filters', { signal }),
+  models: (signal?: AbortSignal) => http.get<unknown, { models: ModelInfo[]; source?: 'dynamic' | 'static' }>('/admin/models', { signal }),
+  modelCatalog: (signal?: AbortSignal) => http.get<unknown, { models: ModelInfo[] }>('/admin/models/catalog', { signal }),
   modelsRefresh: (provider?: string) =>
     http.post<unknown, { ok: boolean; models: ModelInfo[]; source?: 'dynamic' | 'static'; warnings?: string[]; providers?: ModelRefreshResult[] }>('/admin/models/refresh', {}, { params: provider ? { provider } : undefined }),
   // AA（Artificial Analysis）评测：按带命名空间的模型 id 返回智能/编码/数学指数
-  benchmarks: () =>
-    http.get<unknown, { configured: boolean; models: Record<string, AABenchmark>; binding_states?: Record<string, 'review' | 'conflict'> }>('/admin/models/benchmarks'),
+  benchmarks: (signal?: AbortSignal) =>
+    http.get<unknown, { configured: boolean; models: Record<string, AABenchmark>; binding_states?: Record<string, 'review' | 'conflict'> }>('/admin/models/benchmarks', { signal }),
   benchmarksRefresh: () =>
     http.post<unknown, { ok: boolean; configured: boolean }>('/admin/models/benchmarks/refresh'),
   benchmarkBinding: (model: string, q?: string) =>
@@ -193,10 +195,10 @@ export const api = {
 
   // ---------- 多供应商（workbuddy / qoder / opencode）统一管理 ----------
   // 摘要列表：驱动左侧导航的供应商子项与概览页的供应商卡片
-  getProviders: () => http.get<unknown, { providers: ProviderSummary[] }>('/admin/providers'),
+  getProviders: (signal?: AbortSignal) => http.get<unknown, { providers: ProviderSummary[] }>('/admin/providers', { signal }),
   // 单供应商详情：摘要字段 + accounts[] + models[]
-  getProvider: (name: string) =>
-    http.get<unknown, ProviderDetail>(`/admin/providers/${encodeURIComponent(name)}`),
+  getProvider: (name: string, signal?: AbortSignal) =>
+    http.get<unknown, ProviderDetail>(`/admin/providers/${encodeURIComponent(name)}`, { signal }),
   // 供应商签到（qoder 返回逐账号结果；workbuddy 另含 skipped/accounts）
   providerCheckin: (name: string) =>
     http.post<unknown, Record<string, unknown>>(`/admin/providers/${encodeURIComponent(name)}/checkin`),
@@ -252,8 +254,8 @@ export const api = {
   testAccount: (name: string, id: string, model: string) => http.post<unknown, Record<string, any>>(`/admin/providers/${encodeURIComponent(name)}/accounts/${encodeURIComponent(id)}/test`, { model }, { timeout: 95000 }),
 
   // 自动签到 / 额度刷新 设置
-  getSettings: () => http.get<unknown, Settings>('/admin/settings'),
-  backupStatus: () => http.get<unknown, { status: string; last_success: number | null }>('/admin/backups'),
+  getSettings: (signal?: AbortSignal) => http.get<unknown, Settings>('/admin/settings', { signal }),
+  backupStatus: (signal?: AbortSignal) => http.get<unknown, { status: string; last_success: number | null }>('/admin/backups', { signal }),
   createBackup: () => http.post<unknown, { status: string; last_success: number | null }>('/admin/backups', {}, { timeout: 150000 }),
   saveSettings: (data: Partial<Settings>) => http.post<unknown, Settings & { ok: boolean }>('/admin/settings', data),
 
@@ -275,7 +277,7 @@ export const api = {
       '/admin/oauth/poll', { state, site }, { signal }),
 
   // 应用 API Key
-  apps: () => http.get<unknown, { apps: AppInfo[] }>('/admin/apps'),
+  apps: (signal?: AbortSignal) => http.get<unknown, { apps: AppInfo[] }>('/admin/apps', { signal }),
   createApp: (name: string, note = '', allowed_models?: string[]) =>
     http.post<unknown, { ok: boolean; id: number; app_id: number; name: string; key: string }>(
       '/admin/apps', { name, note, allowed_models }),

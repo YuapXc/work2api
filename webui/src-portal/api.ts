@@ -6,8 +6,11 @@ export class PortalAPIError extends Error {
   get retryable() { return this.status === 0 || this.status === 429 || this.status >= 500 }
 }
 
-async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function call<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   const controller = new AbortController()
+  const cancel = () => controller.abort()
+  if (signal?.aborted) controller.abort()
+  else signal?.addEventListener('abort', cancel, { once: true })
   const timer = setTimeout(() => controller.abort(), 40000)
   try {
     const res = await fetch(path, {
@@ -18,6 +21,7 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
       signal: controller.signal,
     })
     const data = await res.json().catch(() => null)
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
     if (!res.ok) {
       const fallback = data === null && res.status >= 500
         ? `服务返回非 JSON 错误（${res.status}），请管理员检查反代、隧道与服务日志`
@@ -33,7 +37,7 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
   } catch (e) {
     if (e instanceof PortalAPIError) throw e
     throw new PortalAPIError(controller.signal.aborted ? '请求超时，请稍后重试' : '网络连接失败，请检查连接后重试', 0)
-  } finally { clearTimeout(timer) }
+  } finally { clearTimeout(timer); signal?.removeEventListener('abort', cancel) }
 }
 
 export interface Me {
@@ -100,13 +104,13 @@ export interface ContributionInfo {
 }
 
 export const api = {
-  usageRecords: (page: number, filters: { model?: string; protocol?: string; status?: string } = {}) => {
+  usageRecords: (page: number, filters: { model?: string; protocol?: string; status?: string } = {}, signal?: AbortSignal) => {
     const params = new URLSearchParams({ page: String(page), page_size: '20' })
     for (const [key, value] of Object.entries(filters)) if (value) params.set(key, value)
-    return call<RecordsResponse>('GET', '/portal/api/usage/records?' + params.toString())
+    return call<RecordsResponse>('GET', '/portal/api/usage/records?' + params.toString(), undefined, signal)
   },
   usageRecord: (id: number) => call<{ record: UsageRecord }>('GET', `/portal/api/usage/records/${id}`),
-  authState: () => call<{ mode: 'invite' | 'open' | 'closed'; portal_enabled: boolean }>('GET', '/portal/api/auth/state'),
+  authState: (signal?: AbortSignal) => call<{ mode: 'invite' | 'open' | 'closed'; portal_enabled: boolean }>('GET', '/portal/api/auth/state', undefined, signal),
   register: (username: string, password: string, invite_code: string) =>
     call<{ ok: boolean; user: Me['user'] }>('POST', '/portal/api/auth/register', { username, password, invite_code }),
   login: (username: string, password: string) =>
@@ -114,17 +118,17 @@ export const api = {
   logout: () => call<{ ok: boolean }>('POST', '/portal/api/auth/logout'),
   changePassword: (old_password: string, new_password: string) =>
     call<{ ok: boolean }>('POST', '/portal/api/auth/password', { old_password, new_password }),
-  me: () => call<Me>('GET', '/portal/api/me'),
-  models: () => call<{ models: PortalModel[]; source: string }>('GET', '/portal/api/models'),
+  me: (signal?: AbortSignal) => call<Me>('GET', '/portal/api/me', undefined, signal),
+  models: (signal?: AbortSignal) => call<{ models: PortalModel[]; source: string }>('GET', '/portal/api/models', undefined, signal),
   key: (id: number) => call<{ ok: boolean; key?: string; message?: string }>('GET', `/portal/api/keys/${id}/key`),
-  keys: () => call<{ keys: KeyInfo[] }>('GET', '/portal/api/keys'),
+  keys: (signal?: AbortSignal) => call<{ keys: KeyInfo[] }>('GET', '/portal/api/keys', undefined, signal),
   createKey: (name: string, allowed_models?: string[], model_policy: "follow" | "fixed" = "follow") =>
     call<{ id: number; key: string }>('POST', '/portal/api/keys', { name, allowed_models, model_policy }),
   toggleKey: (id: number) => call<{ ok: boolean; enabled: boolean }>('POST', `/portal/api/keys/${id}/toggle`),
   setKeyModels: (id: number, allowed_models: string[], model_policy: "follow" | "fixed" = "fixed") =>
     call<{ ok: boolean; allowed_models: string[]; model_policy: 'follow' | 'fixed' }>('POST', `/portal/api/keys/${id}/models`, { allowed_models, model_policy }),
   deleteKey: (id: number) => call<{ ok: boolean }>('DELETE', `/portal/api/keys/${id}`),
-  contributions: () => call<{ contributions: ContributionInfo[] }>('GET', '/portal/api/contributions'),
+  contributions: (signal?: AbortSignal) => call<{ contributions: ContributionInfo[] }>('GET', '/portal/api/contributions', undefined, signal),
   contributionBegin: (site: string, accepted: boolean) =>
     call<{ task_id: string; auth_url: string; site: string; expires_at: number }>('POST', '/portal/api/contributions/begin', { site, accepted }),
 	traeBegin: (product:string,accepted:boolean) => call<{task_id:string;auth_url:string;expires_at:number}>('POST','/portal/api/providers/trae/oauth/begin',{product,accepted}),
@@ -145,11 +149,11 @@ export const api = {
   refreshContributionModels: (id: number) => call<{ ok: boolean }>('POST', `/portal/api/contributions/${id}/models/refresh`, {}),
   revokeContribution: (id: number) => call<{ ok: boolean }>('POST', `/portal/api/contributions/${id}/revoke`, {}),
   shareContribution: (id: number) => call<{ ok: boolean }>('POST', `/portal/api/contributions/${id}/share`, { accepted: true }),
-  usage: () =>
+  usage: (signal?: AbortSignal) =>
     call<{
        today: { requests: number; input_tokens: number | null; output_tokens: number | null; recorded_input_tokens?:number; recorded_output_tokens?:number; tokens_known?:boolean; daily_limit_requests: number; daily_limit_input: number; daily_limit_output: number }
       keys: KeyInfo[]
-    }>('GET', '/portal/api/usage'),
+    }>('GET', '/portal/api/usage', undefined, signal),
 }
 
 export function fmtTokens(n: number | null | undefined): string {

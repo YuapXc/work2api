@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { useLiveRead } from '../../src/lib/liveRead'
+import { computed, ref } from 'vue'
 import { api, type PortalModel } from '../api'
 import ModelInfoCard from '../../src/components/ModelInfoCard.vue'
 import WButton from '../../src/components/ui/WButton.vue'
@@ -7,20 +8,19 @@ import WInput from '../../src/components/ui/WInput.vue'
 
 const models = ref<PortalModel[]>([])
 const query = ref('')
-const loading = ref(false)
-const error = ref('')
+
+
 const source = ref('')
 const filtered = computed(() => models.value.filter(m => `${m.id} ${m.name || ''}`.toLowerCase().includes(query.value.trim().toLowerCase())))
 function channel(model: PortalModel) { return model.provider || (model.id.includes('/') ? model.id.split('/')[0]! : 'workbuddy') }
-async function load() {
-  if (loading.value) return
-  loading.value = true
-  error.value = ''
-  try { const result = await api.models(); models.value = result.models; source.value = result.source }
-  catch (e: any) { error.value = e?.message || '加载模型失败' }
-  finally { loading.value = false }
-}
-onMounted(load)
+const resource = useLiveRead(signal => api.models(signal), result => {
+  models.value = result.models
+  source.value = result.source
+}, { interval: 60000 })
+const loading = resource.loading
+const error = resource.error
+const load = () => resource.refresh()
+
 </script>
 
 <template>

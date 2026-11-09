@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { useLiveRead } from '@/lib/liveRead'
+import { ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '@/api/client'
 import type { Overview, ProviderSummary } from '@/types'
@@ -19,27 +20,17 @@ const router = useRouter()
 const ov = ref<Overview | null>(null)
 const providers = ref<ProviderSummary[]>([])
 const points = ref<{ bucket: string; bucket_ts: number; count: number; tokens: number }[]>([])
-const loading = ref(true)
-let timer: ReturnType<typeof setInterval> | null = null
-
-const refreshFailed = ref(false)
-let refreshing = false
-async function load() {
-  if (refreshing || document.hidden) return
-  refreshing = true
-  try {
-    const [o, ts] = await Promise.all([api.overview(), api.usageTimeseries('hour', 24)])
-    ov.value = o
-    providers.value = o.providers || []
-    points.value = ts.data || []
-    refreshFailed.value = false
-  } catch {
-    refreshFailed.value = true
-  } finally {
-    refreshing = false
-    loading.value = false
-  }
-}
+const overviewRead = useLiveRead(signal => api.overview(signal), o => {
+  ov.value = o
+  providers.value = o.providers || []
+}, { interval: 20000 })
+const trendRead = useLiveRead(signal => api.usageTimeseries('hour', 24, undefined, signal), ts => {
+  points.value = ts.data || []
+}, { interval: 20000 })
+const loading = overviewRead.loading
+const trendLoading = trendRead.loading
+const refreshFailed = overviewRead.error
+const trendFailed = trendRead.error
 
 function memorySize(value: number | null | undefined): string {
   if (value == null) return '—'
@@ -76,24 +67,11 @@ const recent = computed(() => (ov.value?.recent || []).slice(0, 8))
 const labelMap = computed(() => buildLabelMap(ov.value?.display_accounts || ov.value?.accounts || []))
 const acctLabel = (uid?: string | null) => (uid ? labelMap.value[uid] || uid.slice(0, 8) : '—')
 
-function onVisibilityChange() {
-  if (!document.hidden) void load()
-}
-
-onMounted(() => {
-  document.addEventListener('visibilitychange', onVisibilityChange)
-  load()
-  timer = setInterval(load, 20000)
-})
-onUnmounted(() => {
-  if (timer) clearInterval(timer)
-  document.removeEventListener('visibilitychange', onVisibilityChange)
-})
 </script>
 
 <template>
   <WPage title="概览" sub="网关运行状态与额度续航一览。">
-    <div v-if="refreshFailed" class="mb-4 text-small text-warn">刷新失败，当前显示上次获取的数据。</div>
+    <div v-if="refreshFailed" class="mb-4 text-small text-warn">{{ ov ? '概览刷新失败，当前显示上次数据。' : '概览加载失败，稍后自动重试。' }}</div>
     <WCard v-if="ov?.admission" class="mb-4">
       <span class="text-small text-muted">正在执行 <span class="mono font-medium text-ink">{{ ov.admission.running }}</span> 个请求</span>
       <p v-if="!ov.admission.limits_disabled && ov.admission.memory_pressure" class="mt-2 text-small text-warn">内存压力保护中，请求等待恢复。</p>
@@ -192,7 +170,14 @@ onUnmounted(() => {
 
       <!-- 趋势 + 近期调用 -->
       <div class="grid gap-4 lg:grid-cols-[1fr_1fr]">
-        <WCard title="近 24 小时请求"><TrendChart :data="points" metric="count" /></WCard>
+        <WCard title="近 24 小时请求">
+          <div v-if="trendLoading" class="flex h-64 items-center justify-center"><WSpinner label="加载趋势" /></div>
+          <div v-else-if="trendFailed && !points.length" class="flex h-64 items-center justify-center text-small text-muted">趋势暂不可用，稍后自动重试。</div>
+          <template v-else>
+            <p v-if="trendFailed" class="text-small text-warn">趋势刷新失败，当前显示上次数据。</p>
+            <TrendChart :data="points" metric="count" />
+          </template>
+        </WCard>
         <WCard title="最近调用" flush>
           <WTable :columns="recentCols" :rows="recent" row-key="id" min-width="420px">
             <template #cell-ts="{ value }">{{ dt(value, 'HH:mm:ss') }}</template>

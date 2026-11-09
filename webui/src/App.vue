@@ -1,6 +1,7 @@
 <script setup lang="ts">
+import { useLiveRead } from '@/lib/liveRead'
 import { api } from '@/api/client'
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { toast } from '@/lib/toast'
 import WIcon from '@/components/ui/WIcon.vue'
@@ -147,27 +148,20 @@ async function logout() {
 // ---------- 网关健康（30s 轮询） ----------
 const healthy = ref<number | null>(null)
 const total = ref<number | null>(null)
-let timer: ReturnType<typeof setInterval> | null = null
-const healthRefreshFailed = ref(false)
-let healthRefreshing = false
+const healthRead=useLiveRead(async signal=>{
+  const epoch=authEpoch
+  try { return {data:await api.health(signal),epoch} }
+  catch(err:any) {
+    if(!signal.aborted && epoch===authEpoch && authOk.value && [401,403].includes(err?.response?.status))clearAuth()
+    throw err
+  }
+}, ({data,epoch})=>{
+  if(epoch!==authEpoch || !authOk.value)return
+  healthy.value=data.available_providers??0;total.value=data.total_providers??0
+}, {interval:30000,immediate:false,enabled:()=>authOk.value && !identity.value?.must_change_password})
+const healthRefreshFailed=healthRead.error
 async function refreshHealth() {
-  if (!authOk.value || identity.value?.must_change_password) return
-  if (healthRefreshing) return
-  healthRefreshing = true
-  const epoch = authEpoch
-  try {
-    const data = await api.health()
-    if (epoch !== authEpoch || !authOk.value) return
-    healthRefreshFailed.value = false
-    healthy.value = data.available_providers ?? 0
-    total.value = data.total_providers ?? 0
-  } catch (err: any) {
-    if (epoch !== authEpoch || !authOk.value) return
-    healthRefreshFailed.value = true
-    if (err?.response?.status === 401 || err?.response?.status === 403) {
-      clearAuth()
-    }
-  } finally { healthRefreshing = false }
+  if(!document.hidden && authOk.value && !identity.value?.must_change_password)await healthRead.refresh()
 }
 const serving = computed(() => (healthy.value ?? 0) > 0)
 const gwText = computed(() => (healthRefreshFailed.value ? '刷新失败（保留上次状态）' : healthy.value == null ? '状态未知' : serving.value ? '有可用渠道' : '无可用渠道'))
@@ -175,9 +169,8 @@ const gwText = computed(() => (healthRefreshFailed.value ? '刷新失败（保�
 onMounted(() => {
   checkAuth()
   refreshHealth()
-  timer = setInterval(refreshHealth, 30000)
 })
-onUnmounted(() => timer && clearInterval(timer))
+
 </script>
 
 <template>
