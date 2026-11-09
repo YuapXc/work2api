@@ -176,19 +176,33 @@ func (acc *collapseAccumulator) apply(event bridgeStreamEvent) {
 		}
 	case "text":
 		acc.text.WriteString(event.Text)
+	case "reasoning_start":
+		acc.splitReasoning()
+		acc.reasoningBlock().SealSource = event.SealSource
+		acc.reasoningBlock().NativeThinking = event.NativeThinking
+	case "reasoning_end":
+		acc.splitReasoning()
+	case "reasoning_state":
+		block := acc.reasoningBlock()
+		block.SealSource = event.SealSource
+		block.NativeThinking = event.NativeThinking
+		block.Encrypted = event.Encrypted
+		appendReasoningDelta(&acc.reasonText, len(acc.response.Reasoning)-1, event.Text)
+		appendReasoningDelta(&acc.reasonSignatures, len(acc.response.Reasoning)-1, event.Signature)
 	case "reasoning":
 		if event.Text == "" && event.Encrypted == "" && event.Signature == "" {
 			break
 		}
-		acc.reasoningBlock()
+		acc.reasoningBlock().SealSource = event.SealSource
 		appendReasoningDelta(&acc.reasonText, len(acc.response.Reasoning)-1, event.Text)
 		if event.Encrypted != "" {
-			acc.splitReasoning()
 			acc.reasoningBlock().Encrypted += event.Encrypted
-			acc.reason = nil
+			if event.SealSource != Anthropic {
+				acc.reason = nil
+			}
 		}
 	case "reasoning_signature":
-		acc.reasoningBlock()
+		acc.reasoningBlock().SealSource = event.SealSource
 		appendReasoningDelta(&acc.reasonSignatures, len(acc.response.Reasoning)-1, event.Signature)
 	case "tool_start":
 		acc.toolBlock(event.ToolKey, event.ToolID, event.ToolName)

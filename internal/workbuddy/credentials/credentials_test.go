@@ -39,6 +39,22 @@ func writeTestCredential(t *testing.T, path, token string) {
 func TestChatIdentityPreviewIsOfflineAndRedacted(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "preview.info")
 	writeTestCredential(t, path, "private-access-token")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture map[string]any
+	if err = json.Unmarshal(data, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	fixture["auth"].(map[string]any)["deviceToken"] = "private-device-token"
+	data, err = json.Marshal(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
 	m := NewManager(path)
 	m.client = &http.Client{Transport: refreshTransport(func(*http.Request) (*http.Response, error) {
 		t.Error("offline preview attempted a network request")
@@ -52,12 +68,12 @@ func TestChatIdentityPreviewIsOfflineAndRedacted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, secret := range []string{"private-access-token", "refresh-1", path, `"alias"`, `"test"`} {
+	for _, secret := range []string{"private-access-token", "private-device-token", "refresh-1", path, `"alias"`, `"test"`} {
 		if strings.Contains(string(raw), secret) {
 			t.Fatal("identity preview leaked private data")
 		}
 	}
-	if present, ok := preview["present"].(map[string]bool); !ok || !present["Authorization"] {
+	if present, ok := preview["present"].(map[string]bool); !ok || !present["Authorization"] || !present["X-Device-Token"] {
 		t.Fatal("credential presence missing", preview)
 	}
 	if err := m.Retire(false); err != nil {

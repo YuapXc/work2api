@@ -361,3 +361,19 @@ func TestResponsesNativeOptionsAdaptToChat(t *testing.T) {
 		t.Fatal("structured output schema lost", schema)
 	}
 }
+
+func TestResponsesAdapterRequiresPortableHistory(t *testing.T) {
+	input := map[string]any{"model": "deepseek-v4.1-flash", "previous_response_id": "resp_prior", "input": []any{map[string]any{"role": "user", "content": "next"}}}
+	before, _ := json.Marshal(input)
+	if _, err := ResponsesRequestToChat(input); err == nil || !strings.Contains(err.Error(), "previous_response_id") {
+		t.Fatal("server continuation silently became a new conversation", err)
+	}
+	after, _ := json.Marshal(input)
+	if string(before) != string(after) {
+		t.Fatal("mutated rejected request")
+	}
+	delete(input, "previous_response_id")
+	if _, err := ResponsesRequestToChat(input); err != nil {
+		t.Fatal("portable input rejected", err)
+	}
+}

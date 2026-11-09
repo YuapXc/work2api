@@ -44,6 +44,8 @@ type Runtime struct {
 	modelRefresh     provider.RefreshGate
 	toolTailMu       sync.RWMutex
 	toolTailModels   map[string]bool
+	thinkingMu       sync.RWMutex
+	refusedThinking  map[thinkingRefusalKey]bool
 	MaintenanceMu    sync.Mutex
 	maintenance      *maintenanceState
 	Pool             *pool.Pool

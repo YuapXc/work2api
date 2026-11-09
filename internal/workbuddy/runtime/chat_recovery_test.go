@@ -21,7 +21,7 @@ import (
 )
 
 func TestNativeMessagesTransportAndSignatureRecovery(t *testing.T) {
-	for _, mode := range []string{"stream", "json", "signature", "after_output", "truncated", "budget", "auth", "image", "tool"} {
+	for _, mode := range []string{"stream", "json", "signature", "signature_memory", "signature_wording", "after_output", "truncated", "budget", "auth", "image", "tool"} {
 		t.Run(mode, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "native.info")
 			raw, _ := json.Marshal(map[string]any{"auth": map[string]any{"accessToken": "fixture", "refreshToken": "r", "domain": "www.codebuddy.cn", "expiresAt": time.Now().Add(time.Hour).UnixMilli()}, "account": map[string]any{"uid": "fixture"}})
@@ -50,7 +50,7 @@ func TestNativeMessagesTransportAndSignatureRecovery(t *testing.T) {
 				}
 				blocks := sent["messages"].([]any)[0].(map[string]any)["content"].([]any)
 				want := 2
-				if mode == "signature" && calls == 2 {
+				if (mode == "signature" || mode == "signature_memory" || mode == "signature_wording") && calls > 1 {
 					want = 1
 				}
 				if len(blocks) != want {
@@ -81,8 +81,11 @@ func TestNativeMessagesTransportAndSignatureRecovery(t *testing.T) {
 						t.Error("rejected image not removed")
 					}
 				}
-				if (mode == "signature" || mode == "budget") && calls == 1 {
+				if (mode == "signature" || mode == "signature_memory" || mode == "signature_wording" || mode == "budget") && calls == 1 {
 					ct, status, payload = "application/json", 400, `{"error":{"code":400001,"internal_code":11159}}`
+					if mode == "signature_wording" {
+						payload = `{"error":{"type":"invalid_request_error","message":"messages.0.content.0: Invalid signature in thinking block. The block is bound to a different conversation."}}`
+					}
 				}
 				if mode == "auth" {
 					ct, status, payload = "application/json", 401, `{"code":12153}`
@@ -110,8 +113,11 @@ func TestNativeMessagesTransportAndSignatureRecovery(t *testing.T) {
 			if (err != nil) != failed {
 				t.Fatal(started, err)
 			}
+			if mode == "after_output" && len(rt.refusedThinking) != 0 {
+				t.Fatal("output-started refusal must not learn a replay rule")
+			}
 			want := 1
-			if mode == "signature" || mode == "image" {
+			if mode == "signature" || mode == "signature_memory" || mode == "signature_wording" || mode == "image" {
 				want = 2
 			}
 			if calls != want {
@@ -127,6 +133,15 @@ func TestNativeMessagesTransportAndSignatureRecovery(t *testing.T) {
 				blocks := result.message["content"].([]any)
 				if len(blocks) != 2 || blocks[0].(map[string]any)["signature"] != "signed-response" || blocks[1].(map[string]any)["text"] != "OK" {
 					t.Fatal("lost native content", result.message)
+				}
+			}
+			if mode == "signature_memory" {
+				budget.remaining = 5
+				if _, err := rt.Stream(ctx, p.Get("fixture"), map[string]any{"model": "claude-test"}, func(string) error { return nil }, AttemptOptions{}); err != nil {
+					t.Fatal(err)
+				}
+				if calls != 3 || budget.remaining != 4 {
+					t.Fatal("rejected signature was sent again", calls, budget.remaining)
 				}
 			}
 			after, _ := json.Marshal(original)
@@ -542,5 +557,123 @@ func TestEmptyTextRecoveryIsRequestLocalAndBudgeted(t *testing.T) {
 				t.Fatal("11151 causes futile account rotation", kind)
 			}
 		})
+	}
+}
+
+func TestKimiReferenceCompatibilityReachesPreparedRequest(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.info")
+	raw, _ := json.Marshal(map[string]any{"auth": map[string]any{"accessToken": "fixture", "domain": "www.workbuddy.cn", "expiresAt": time.Now().Add(time.Hour).UnixMilli()}, "account": map[string]any{"uid": "fixture"}})
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	mgr := credentials.NewManager(path)
+	p := pool.New(map[string]pool.Credential{"fixture": mgr}, "")
+	var seen []string
+	tr := maintenanceTransport(func(req *http.Request) (*http.Response, error) {
+		var sent map[string]any
+		if err := json.NewDecoder(req.Body).Decode(&sent); err != nil {
+			t.Fatal(err)
+		}
+		fn := sent["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)
+		params := fn["parameters"].(map[string]any)
+		model := sent["model"].(string)
+		encoded, _ := json.Marshal(params)
+		if (params["$defs"] == nil) != (model == "kimi-k3.1-pro") || !strings.Contains(string(encoded), `"minLength":1`) || !strings.Contains(string(encoded), `"required":["value"]`) {
+			t.Fatal("schema scope or constraint changed", model, params)
+		}
+		seen = append(seen, model)
+		return &http.Response{Request: req, StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}]}`))}, nil
+	})
+	rt := &Runtime{Managers: map[string]*credentials.Manager{"fixture": mgr}, Pool: p, UpstreamClient: upstream.NewClient(&http.Client{Transport: tr})}
+	for _, model := range []string{"kimi-k3.1-pro", "glm-5.3-flash"} {
+		var body map[string]any
+		json.Unmarshal([]byte(`{"messages":[{"role":"user","content":"synthetic"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","$defs":{"value":{"type":"string","minLength":1}},"required":["value"],"properties":{"value":{"$ref":"#/$defs/value"}}}}}]}`), &body)
+		body["model"] = model
+		before, _ := json.Marshal(body)
+		if _, err := rt.Stream(context.Background(), p.Get("fixture"), body, func(string) error { return nil }, AttemptOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		after, _ := json.Marshal(body)
+		if string(before) != string(after) {
+			t.Fatal("source request mutated")
+		}
+	}
+	if len(seen) != 2 {
+		t.Fatal("unexpected sends", seen)
+	}
+}
+
+func TestNativeThinkingFilteringAndScopedRecovery(t *testing.T) {
+	thinking := func(signature any) map[string]any {
+		return map[string]any{"type": "thinking", "thinking": "analysis", "signature": signature}
+	}
+	foreign := thinking("12345678-1234-1234-1234-123456789abc")
+	text := map[string]any{"type": "text", "text": "keep"}
+	call := map[string]any{"type": "tool_use", "id": "c1", "name": "read", "input": map[string]any{"signature": "business"}}
+	before := thinking("before")
+	target := thinking("target")
+	redacted := map[string]any{"type": "redacted_thinking", "data": "opaque"}
+	body := map[string]any{"model": "claude-test", "messages": []any{
+		map[string]any{"role": "assistant", "content": []any{thinking(nil), thinking("  "), foreign}},
+		map[string]any{"role": "assistant", "content": []any{before, target, redacted, call, text}},
+		map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": "c1", "content": "result"}}},
+	}}
+	original, _ := json.Marshal(body)
+	clean := withoutMessagesThinking(body, false)
+	messages := clean["messages"].([]any)
+	if len(messages) != 2 || len(messages[0].(map[string]any)["content"].([]any)) != 5 {
+		t.Fatal("foreign-only message was not removed or native blocks lost", clean)
+	}
+	if reflect.ValueOf(withoutMessagesThinking(clean, false)).Pointer() != reflect.ValueOf(clean).Pointer() {
+		t.Fatal("filter not idempotent")
+	}
+	rt := &Runtime{}
+	err := &upstream.UpstreamError{StatusCode: 400, Raw: []byte(`{"error":{"message":"messages.0.content.1: Invalid signature in thinking block"}}`)}
+	fixed, ok := rt.recoverBoundThinking("account-a/model-a", clean, err)
+	if !ok {
+		t.Fatal("explicit signature refusal not recovered")
+	}
+	kept := fixed["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	if len(kept) != 3 || kept[0].(map[string]any)["signature"] != "before" || kept[1].(map[string]any)["id"] != "c1" {
+		t.Fatal("lost earlier signature or tool contract", fixed)
+	}
+	learned := rt.withoutRefusedThinking("account-a/model-a", clean)
+	if !reflect.DeepEqual(learned, fixed) {
+		t.Fatal("refusal not remembered")
+	}
+	for _, owner := range []string{"account-b/model-a", "account-a/model-b", "new-credentials"} {
+		if reflect.ValueOf(rt.withoutRefusedThinking(owner, clean)).Pointer() != reflect.ValueOf(clean).Pointer() {
+			t.Fatal("refusal escaped owner", owner)
+		}
+	}
+	for _, e := range []*upstream.UpstreamError{
+		{StatusCode: 401, Raw: err.Raw},
+		{StatusCode: 400, Raw: []byte(`{"error":{"message":"please include thinking in tool turns"}}`)},
+		{StatusCode: 400, Raw: []byte(`{"code":11135}`)},
+	} {
+		if _, ok := rt.recoverBoundThinking("unrelated", clean, e); ok {
+			t.Fatal("unrelated error rewrote thinking")
+		}
+	}
+	missing := &upstream.UpstreamError{StatusCode: 400, Raw: []byte(`{"code":11159,"msg":"messages.99999999999999999999999.content.9"}`)}
+	all, ok := rt.recoverBoundThinking("missing-position", clean, missing)
+	if !ok || len(all["messages"].([]any)[0].(map[string]any)["content"].([]any)) != 2 {
+		t.Fatal("unlocatable refusal did not preserve text/tools", all)
+	}
+	after, _ := json.Marshal(body)
+	if string(original) != string(after) {
+		t.Fatal("original history mutated")
+	}
+}
+
+func TestNativeThinkingRecoveryCacheBound(t *testing.T) {
+	rt := &Runtime{refusedThinking: map[thinkingRefusalKey]bool{}}
+	for i := 0; i < 1<<14; i++ {
+		rt.refusedThinking[thinkingRefusalKey{owner: "old", block: [32]byte{byte(i), byte(i >> 8)}}] = true
+	}
+	body := map[string]any{"messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "thinking", "thinking": "reason", "signature": "new"}}}, map[string]any{"role": "user", "content": "continue"}}}
+	out, ok := rt.recoverBoundThinking("new", body, &upstream.UpstreamError{StatusCode: 400, Raw: []byte(`{"code":11159}`)})
+	if !ok || len(rt.refusedThinking) != 1 || len(out["messages"].([]any)) != 1 || out["messages"].([]any)[0].(map[string]any)["role"] != "user" {
+		t.Fatal("cache did not remain bounded or preserved an empty assistant", len(rt.refusedThinking), out)
 	}
 }

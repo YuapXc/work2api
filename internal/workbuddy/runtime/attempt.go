@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"reflect"
 	"strings"
@@ -96,7 +97,7 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 	if err := provider.CheckDispatch(ctx, ref, model); err != nil {
 		return false, err
 	}
-	if tools := toolschema.WorkBuddyTools(body["tools"]); reflectToolsChanged(body["tools"], tools) {
+	if tools := toolschema.WorkBuddyToolsForModel(body["tools"], model); reflectToolsChanged(body["tools"], tools) {
 		copyBody := make(map[string]any, len(body))
 		for k, v := range body {
 			copyBody[k] = v
@@ -107,6 +108,7 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 	url, _ := siterouting.ChatURLForProfile(acc.Profile)
 	nativeURL := nativeMessagesEndpoint(acc.Profile, model)
 	var nativeBody map[string]any
+	var thinkingOwner string
 	if nativeURL != "" {
 		if err := upstream.ValidateChoiceCount(body); err != nil {
 			return false, err
@@ -115,6 +117,8 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 		if err != nil {
 			return false, err
 		}
+		thinkingOwner = fmt.Sprintf("%s\x00%s\x00%s\x00%p", acc.Profile, acc.UID, model, r.Manager(acc.UID))
+		nativeBody = r.withoutRefusedThinking(thinkingOwner, nativeBody)
 		if body["max_tokens"] == nil && body["max_completion_tokens"] == nil && r.Catalog != nil {
 			if limit := r.Catalog.MaxOutputTokens(model); limit > 0 {
 				nativeBody["max_tokens"] = limit
@@ -126,7 +130,7 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 	var preamble []string
 	preambleBytes := 0
 	wrapped := func(line string) error {
-		if nativeBody != nil && ctx.Value(messagesRequestKey{}) == nil {
+		if nativeBody != nil && ctx.Value(messagesRequestKey{}) == nil && ctx.Value(responsesRequestKey{}) == nil {
 			chunk := upstream.DecodeFrame(ctx, line)
 			if _, exists := chunk[upstream.NativeEvent]; exists {
 				return nil // Native-only metadata never crosses the Chat/Responses contract.
@@ -268,8 +272,8 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 				continue
 			}
 		}
-		if nativeBody != nil && !started && ctx.Err() == nil && rejected != nil && !signatureRetried && recoveryAvailable(ctx) && upstream.ParseBusinessFault(rejected.Raw).Code == "11159" {
-			if next := withoutMessagesThinking(nativeBody, true); reflect.ValueOf(next).Pointer() != reflect.ValueOf(nativeBody).Pointer() {
+		if nativeBody != nil && !started && ctx.Err() == nil && rejected != nil && !signatureRetried && recoveryAvailable(ctx) {
+			if next, ok := r.recoverBoundThinking(thinkingOwner, nativeBody, rejected); ok {
 				nativeBody, signatureRetried = next, true
 				preamble, preambleBytes, responseBytes = nil, 0, 0
 				continue

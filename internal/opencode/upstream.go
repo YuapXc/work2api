@@ -78,8 +78,7 @@ func stripStaleReasoningBody(body []byte) ([]byte, bool) {
 	if json.Unmarshal(body, &payload) != nil {
 		return body, false
 	}
-	_, changed := payload["previous_response_id"]
-	delete(payload, "previous_response_id")
+	changed := false
 	if raw, ok := payload["input"].([]any); ok {
 		kept := make([]any, 0, len(raw))
 		for _, item := range raw {

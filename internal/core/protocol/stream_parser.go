@@ -1,9 +1,12 @@
 package protocol
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"strings"
 
 	"work2api/internal/jsonutil"
@@ -11,6 +14,9 @@ import (
 )
 
 type bridgeStreamParser struct {
+	responseReasonHashes     map[string]hash.Hash
+	responseReasoningDone    map[string]bool
+	anthropicThinking        map[string]bool
 	generationCtx            context.Context
 	rewrite                  func(map[string]any) error
 	protocol                 Protocol
@@ -46,16 +52,24 @@ func (parser *bridgeStreamParser) Parse(eventName, data string) ([]bridgeStreamE
 			return nil, err
 		}
 	}
+	var events []bridgeStreamEvent
+	var err error
 	switch parser.protocol {
 	case Chat:
-		return parser.parseChatEvent(eventName, value), nil
+		events = parser.parseChatEvent(eventName, value)
 	case Anthropic:
-		return parser.parseAnthropicEvent(eventName, value)
+		events, err = parser.parseAnthropicEvent(eventName, value)
 	case Responses:
-		return parser.parseResponses(eventName, value), nil
+		events = parser.parseResponses(eventName, value)
 	default:
 		return nil, fmt.Errorf("unsupported stream protocol %q", parser.protocol)
 	}
+	for i := range events {
+		if events[i].SealSource == "" {
+			events[i].SealSource = parser.protocol
+		}
+	}
+	return events, err
 }
 
 func (parser *bridgeStreamParser) observeGeneration(eventName string, value map[string]any) {
@@ -186,7 +200,11 @@ func (parser *bridgeStreamParser) parseAnthropicEvent(eventName string, value ma
 		key := fmt.Sprint(value["index"])
 		switch jsonutil.StringAt(block, "type") {
 		case "thinking":
-			events := make([]bridgeStreamEvent, 0, 2)
+			if parser.anthropicThinking == nil {
+				parser.anthropicThinking = map[string]bool{}
+			}
+			parser.anthropicThinking[key] = true
+			events := []bridgeStreamEvent{{Kind: "reasoning_start", NativeThinking: block}}
 			if thinking := jsonutil.StringAt(block, "thinking"); thinking != "" {
 				events = append(events, bridgeStreamEvent{Kind: "reasoning", Text: thinking})
 			}
@@ -195,7 +213,11 @@ func (parser *bridgeStreamParser) parseAnthropicEvent(eventName string, value ma
 			}
 			return events, nil
 		case "redacted_thinking":
-			return []bridgeStreamEvent{{Kind: "reasoning", Encrypted: jsonutil.StringAt(block, "data")}}, nil
+			if parser.anthropicThinking == nil {
+				parser.anthropicThinking = map[string]bool{}
+			}
+			parser.anthropicThinking[key] = true
+			return []bridgeStreamEvent{{Kind: "reasoning_start", NativeThinking: block}, {Kind: "reasoning", Encrypted: jsonutil.StringAt(block, "data")}}, nil
 		case "tool_use":
 			parser.tools[key] = true
 			return []bridgeStreamEvent{{Kind: "tool_start", ToolKey: key, ToolID: jsonutil.StringAt(block, "id"), ToolName: jsonutil.StringAt(block, "name")}}, nil
@@ -216,6 +238,12 @@ func (parser *bridgeStreamParser) parseAnthropicEvent(eventName string, value ma
 			return []bridgeStreamEvent{{Kind: "text", Text: jsonutil.StringAt(delta, "text")}}, nil
 		case "input_json_delta":
 			return []bridgeStreamEvent{{Kind: "tool_delta", ToolKey: key, Text: jsonutil.StringAt(delta, "partial_json")}}, nil
+		}
+	case "content_block_stop":
+		key := fmt.Sprint(value["index"])
+		if parser.anthropicThinking[key] {
+			delete(parser.anthropicThinking, key)
+			return []bridgeStreamEvent{{Kind: "reasoning_end"}}, nil
 		}
 	case "message_delta":
 		events := make([]bridgeStreamEvent, 0, 2)
@@ -258,7 +286,15 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 	case "response.reasoning_summary_text.delta":
 		key := responseToolKey(value, nil)
 		parser.responseReasoning[key] = true
-		return []bridgeStreamEvent{{Kind: "reasoning", Text: jsonutil.StringAt(value, "delta")}}
+		text := jsonutil.StringAt(value, "delta")
+		if parser.responseReasonHashes == nil {
+			parser.responseReasonHashes = map[string]hash.Hash{}
+		}
+		if parser.responseReasonHashes[key] == nil {
+			parser.responseReasonHashes[key] = sha256.New()
+		}
+		_, _ = parser.responseReasonHashes[key].Write([]byte(text))
+		return []bridgeStreamEvent{{Kind: "reasoning", Text: text}}
 	case "response.output_item.added":
 		item := jsonutil.MapAt(value, "item")
 		if jsonutil.StringAt(item, "type") == "function_call" {
@@ -283,13 +319,32 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 		item := jsonutil.MapAt(value, "item")
 		if jsonutil.StringAt(item, "type") == "reasoning" {
 			key := responseToolKey(value, item)
+			if parser.responseReasoningDone[key] {
+				return nil
+			}
+			if parser.responseReasoningDone == nil {
+				parser.responseReasoningDone = map[string]bool{}
+			}
+			parser.responseReasoningDone[key] = true
 			blocks := decodeResponsesReasoning(item)
 			if len(blocks) > 0 {
 				text := blocks[0].Text
+				var events []bridgeStreamEvent
 				if parser.responseReasoning[key] {
-					text = ""
+					different := false
+					if blocks[0].SealSource == Anthropic && blocks[0].Signature != "" {
+						expected := sha256.Sum256([]byte(text))
+						seen := parser.responseReasonHashes[key]
+						different = seen == nil || !bytes.Equal(seen.Sum(nil), expected[:])
+					}
+					if different {
+						events = append(events, bridgeStreamEvent{Kind: "reasoning_start"})
+					} else {
+						text = ""
+					}
 				}
-				return []bridgeStreamEvent{{Kind: "reasoning", Text: text, Encrypted: blocks[0].Encrypted}}
+				delete(parser.responseReasonHashes, key)
+				return append(events, bridgeStreamEvent{Kind: "reasoning_state", Text: text, Encrypted: blocks[0].Encrypted, Signature: blocks[0].Signature, SealSource: blocks[0].SealSource, NativeThinking: blocks[0].NativeThinking}, bridgeStreamEvent{Kind: "reasoning_end"})
 			}
 			return nil
 		}
@@ -330,6 +385,12 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 			stop = parser.responsesCompletedStop(response)
 		}
 		events := make([]bridgeStreamEvent, 0, 3)
+		for i, raw := range jsonutil.SliceAt(response, "output") {
+			item, _ := raw.(map[string]any)
+			if item["type"] == "reasoning" {
+				events = append(events, parser.parseResponses("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})...)
+			}
+		}
 		if len(usageMap) > 0 {
 			usage := decodeOpenAIUsage(usageMap)
 			events = append(events, bridgeStreamEvent{Kind: "usage", Usage: &usage})

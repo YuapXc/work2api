@@ -18,6 +18,35 @@ import (
 	"work2api/internal/streamwatch"
 )
 
+func TestResponsesContinuationCannotLoseHistoryDuringConversion(t *testing.T) {
+	for _, previous := range []any{"resp_previous", " ", 7, map[string]any{"id": "resp_previous"}} {
+		body := map[string]any{"model": "test", "previous_response_id": previous, "input": "next", "store": false}
+		before, _ := json.Marshal(body)
+		for _, target := range []Protocol{Chat, Anthropic} {
+			if _, err := ConvertRequest(Responses, target, body); err == nil || !strings.Contains(err.Error(), "previous_response_id") {
+				t.Fatal("continuation silently lost", target, previous, err)
+			}
+		}
+		native, err := ConvertRequest(Responses, Responses, body)
+		nativeID, _ := json.Marshal(native["previous_response_id"])
+		originalID, _ := json.Marshal(previous)
+		if err != nil || !bytes.Equal(nativeID, originalID) {
+			t.Fatal("native continuation changed", native, err)
+		}
+		after, _ := json.Marshal(body)
+		if !bytes.Equal(before, after) {
+			t.Fatal("mutated request")
+		}
+	}
+	for _, previous := range []any{nil, ""} {
+		for _, target := range []Protocol{Chat, Anthropic} {
+			if _, err := ConvertRequest(Responses, target, map[string]any{"model": "test", "previous_response_id": previous, "input": "full history"}); err != nil {
+				t.Fatal("ordinary complete request rejected", err)
+			}
+		}
+	}
+}
+
 func BenchmarkBase64AlphabetCheck(b *testing.B) {
 	value := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{255, 254, 253}, 350000))
 	for _, legacy := range []bool{true, false} {
@@ -1323,6 +1352,193 @@ func TestStreamStopsOnFlushFailureWithObservedUsage(t *testing.T) {
 		}
 		if strings.Contains(base.Body.String(), "upstream_error") {
 			t.Fatal("delivery failure mislabeled as upstream", base.Body.String())
+		}
+	}
+}
+
+func TestAnthropicReasoningEnvelopeRoundTrip(t *testing.T) {
+	blocks := []any{
+		map[string]any{"type": "thinking", "thinking": "first", "signature": "sig-first", "cache_control": map[string]any{"type": "ephemeral"}},
+		map[string]any{"type": "thinking", "thinking": "", "signature": "sig-empty"},
+		map[string]any{"type": "redacted_thinking", "data": "opaque-native"},
+		map[string]any{"type": "tool_use", "id": "call1", "name": "lookup", "input": map[string]any{"q": "business"}},
+	}
+	native := map[string]any{"id": "msg_native", "type": "message", "role": "assistant", "model": "claude-test", "content": blocks, "stop_reason": "tool_use"}
+	raw, _ := json.Marshal(native)
+	converted, err := ConvertResponse(Anthropic, Responses, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response map[string]any
+	if json.Unmarshal(converted, &response) != nil {
+		t.Fatal("invalid output")
+	}
+	output := response["output"].([]any)
+	if len(output) != 4 {
+		t.Fatal("native reasoning boundaries lost", string(converted))
+	}
+	for i := 0; i < 3; i++ {
+		item := output[i].(map[string]any)
+		sealed, _ := item["encrypted_content"].(string)
+		block, ours := OpenAnthropicReasoning(sealed)
+		if !ours || !reflect.DeepEqual(block, blocks[i]) {
+			t.Fatal("native block did not survive", i, block, blocks[i])
+		}
+	}
+	history := append([]any{map[string]any{"type": "message", "role": "user", "content": "lookup"}}, output...)
+	history = append(history, map[string]any{"type": "function_call_output", "call_id": "call1", "output": "result"})
+	input := map[string]any{"model": "claude-test", "input": history}
+	before, _ := json.Marshal(input)
+	restored, err := PrepareRequest(Responses, Anthropic, input, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := restored["messages"].([]any)
+	got := msgs[1].(map[string]any)["content"].([]any)
+	if !reflect.DeepEqual(got, blocks) {
+		t.Fatal("tool loop or signed blocks changed", got)
+	}
+	if msgs[2].(map[string]any)["content"].([]any)[0].(map[string]any)["tool_use_id"] != "call1" {
+		t.Fatal("tool result detached")
+	}
+	outbound, err := PrepareRequest(Responses, Responses, input, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(outbound)
+	if bytes.Contains(encoded, []byte(anthropicReasoningMark)) || bytes.Contains(encoded, []byte("sig-first")) || bytes.Contains(encoded, []byte("opaque-native")) {
+		t.Fatal("gateway envelope escaped to a Responses upstream", string(encoded))
+	}
+	after, _ := json.Marshal(input)
+	if !bytes.Equal(before, after) {
+		t.Fatal("input mutated")
+	}
+	for _, bad := range []string{anthropicReasoningMark + "invalid", anthropicReasoningMark + base64.StdEncoding.EncodeToString([]byte(`{"type":"tool_use","name":"unexpected"}`))} {
+		body := map[string]any{"model": "claude-test", "input": []any{map[string]any{"type": "reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": "readable"}}, "encrypted_content": bad}}}
+		out, err := ConvertRequest(Responses, Anthropic, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := json.Marshal(out)
+		if bytes.Contains(raw, []byte("redacted_thinking")) || bytes.Contains(raw, []byte("unexpected")) || !bytes.Contains(raw, []byte("readable")) {
+			t.Fatal("invalid envelope was treated as native state", string(raw))
+		}
+	}
+}
+
+func TestForeignResponsesCiphertextIsNotAnthropicThinking(t *testing.T) {
+	raw := []byte(`{"id":"resp1","object":"response","status":"completed","output":[{"type":"reasoning","id":"rs1","summary":[{"type":"summary_text","text":"readable"}],"encrypted_content":"foreign-ciphertext"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}]}`)
+	converted, err := ConvertResponse(Responses, Anthropic, raw)
+	if err != nil || bytes.Contains(converted, []byte("foreign-ciphertext")) || bytes.Contains(converted, []byte("redacted_thinking")) || !bytes.Contains(converted, []byte("readable")) {
+		t.Fatal(string(converted), err)
+	}
+	wire := "data: " + `{"type":"response.completed","response":` + string(raw) + "}\n\n"
+	rec := httptest.NewRecorder()
+	if err := transcodeStream(rec, strings.NewReader(wire), Responses, Anthropic, "claude-test"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rec.Body.String(), "foreign-ciphertext") || strings.Contains(rec.Body.String(), "redacted_thinking") || !strings.Contains(rec.Body.String(), "readable") {
+		t.Fatal("foreign seal reached Messages stream", rec.Body.String())
+	}
+	native, err := ConvertResponse(Responses, Responses, raw)
+	if err != nil || !bytes.Equal(native, raw) {
+		t.Fatal("native ciphertext changed")
+	}
+}
+
+func TestAnthropicReasoningStreamBoundariesAndSeals(t *testing.T) {
+	events := []string{
+		`{"type":"message_start","message":{"id":"msg1","model":"claude-test"}}`,
+		`{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"first"}}`,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-"}}`,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"one"}}`,
+		`{"type":"content_block_stop","index":0}`,
+		`{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"","signature":"sig-empty"}}`,
+		`{"type":"content_block_stop","index":1}`,
+		`{"type":"content_block_start","index":2,"content_block":{"type":"redacted_thinking","data":"native-opaque"}}`,
+		`{"type":"content_block_stop","index":2}`,
+		`{"type":"content_block_start","index":3,"content_block":{"type":"text","text":"answer"}}`,
+		`{"type":"content_block_stop","index":3}`,
+		`{"type":"message_delta","delta":{"stop_reason":"end_turn"}}`,
+		`{"type":"message_stop"}`,
+	}
+	wire := ""
+	for _, event := range events {
+		wire += "data: " + event + "\n\n"
+	}
+	collapsed, err := CollapseStream(strings.NewReader(wire), Anthropic, "claude-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var original map[string]any
+	json.Unmarshal(collapsed, &original)
+	if len(original["content"].([]any)) != 4 {
+		t.Fatal("native collapse merged blocks", string(collapsed))
+	}
+	recorder := httptest.NewRecorder()
+	if err := transcodeStream(recorder, strings.NewReader(wire), Anthropic, Responses, "claude-test"); err != nil {
+		t.Fatal(err)
+	}
+	response, err := CollapseStream(strings.NewReader(recorder.Body.String()), Responses, "claude-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := ConvertResponse(Responses, Anthropic, response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	json.Unmarshal(restored, &got)
+	if !reflect.DeepEqual(got["content"], original["content"]) {
+		t.Fatal("stream seal round trip changed blocks", string(restored), string(collapsed))
+	}
+	terminalOnly := "data: " + `{"type":"response.completed","response":` + string(response) + "}\n\n"
+	rec := httptest.NewRecorder()
+	if err := transcodeStream(rec, strings.NewReader(terminalOnly), Responses, Anthropic, "claude-test"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rec.Body.String(), "sig-one") || !strings.Contains(rec.Body.String(), "native-opaque") {
+		t.Fatal("terminal-only sealed state lost", rec.Body.String())
+	}
+}
+
+func TestSealedThinkingSummaryCannotReplaceSignedText(t *testing.T) {
+	sealed := SealAnthropicReasoning(map[string]any{"type": "thinking", "thinking": "original signed text", "signature": "signature-for-original"})
+	item := map[string]any{"id": "rs_sealed", "type": "reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": "short display"}}, "encrypted_content": sealed}
+	raw, _ := json.Marshal(item)
+	wire := "data: " + `{"type":"response.reasoning_summary_text.delta","item_id":"rs_sealed","delta":"short display"}` + "\n\n" +
+		"data: " + `{"type":"response.output_item.done","item":` + string(raw) + "}\n\n" +
+		"data: " + `{"type":"response.completed","response":{"status":"completed"}}` + "\n\n"
+	for _, target := range []Protocol{Anthropic, Responses} {
+		rec := httptest.NewRecorder()
+		if err := transcodeStream(rec, strings.NewReader(wire), Responses, target, "claude-test"); err != nil {
+			t.Fatal(err)
+		}
+		doc, err := CollapseStream(strings.NewReader(rec.Body.String()), target, "claude-test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if target == Responses {
+			doc, err = ConvertResponse(Responses, Anthropic, doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		var response map[string]any
+		json.Unmarshal(doc, &response)
+		found := false
+		for _, raw := range response["content"].([]any) {
+			block := raw.(map[string]any)
+			if block["signature"] == "signature-for-original" {
+				found = true
+				if block["thinking"] != "original signed text" {
+					t.Fatal("display summary replaced signed text", string(doc))
+				}
+			}
+		}
+		if !found {
+			t.Fatal("original signed block missing", string(doc))
 		}
 	}
 }

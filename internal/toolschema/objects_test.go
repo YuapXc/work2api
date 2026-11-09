@@ -3,6 +3,7 @@ package toolschema
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -93,5 +94,89 @@ func TestWorkBuddySchemaPreservesConstraints(t *testing.T) {
 		if fields[key].(map[string]any)["pattern"] != want {
 			t.Fatal(key, fields[key])
 		}
+	}
+}
+
+func TestKimiLocalReferenceExpansionPreservesContracts(t *testing.T) {
+	var source map[string]any
+	json.Unmarshal([]byte(`{"$schema":"https://json-schema.org/draft/2020-12/schema","$defs":{"a/b":{"type":"integer","minimum":1,"enum":[1,2]}},"type":"object","required":["x"],"additionalProperties":false,"properties":{"x":{"$ref":"#/$defs/a~1b","maximum":1,"allOf":[{"not":{"const":2}}]}},"const":{"$ref":"business data"},"description":"keep"}`), &source)
+	before, _ := json.Marshal(source)
+	out := inlineLocalSchema(source).(map[string]any)
+	property := out["properties"].(map[string]any)["x"].(map[string]any)
+	all := property["allOf"].([]any)
+	if out["$defs"] != nil || property["$ref"] != nil || property["maximum"] != float64(1) || len(all) != 2 || !reflect.DeepEqual(all[0], source["$defs"].(map[string]any)["a/b"]) || !reflect.DeepEqual(all[1], source["properties"].(map[string]any)["x"].(map[string]any)["allOf"].([]any)[0]) || !reflect.DeepEqual(out["required"], source["required"]) || out["additionalProperties"] != false || !reflect.DeepEqual(out["const"], source["const"]) {
+		t.Fatal("constraints weakened", out)
+	}
+	after, _ := json.Marshal(source)
+	if string(before) != string(after) || !reflect.DeepEqual(out, inlineLocalSchema(out)) {
+		t.Fatal("source changed or non-idempotent")
+	}
+	for _, raw := range []string{
+		`{"$defs":{"x":{"$ref":"#/$defs/x"}},"$ref":"#/$defs/x"}`,
+		`{"$defs":{"x":{"type":"string"}},"properties":{"a":{"$ref":"#/$defs/x"},"b":{"$ref":"#/$defs/missing"}}}`,
+		`{"$defs":{"x":{"type":"string"}},"$ref":"https://example.test/schema"}`,
+		`{"$defs":{"x":{"$id":"nested","type":"string"}},"$ref":"#/$defs/x"}`,
+		`{"$schema":"http://json-schema.org/draft-07/schema#","definitions":{"x":{"type":"string"}},"$ref":"#/definitions/x"}`,
+		`{"$schema":"https://example.test/custom-2020-12","$defs":{"x":{"type":"string"}},"$ref":"#/$defs/x"}`,
+		`{"id":"legacy-resource","$defs":{"x":{"type":"string"}},"$ref":"#/$defs/x"}`,
+		`{"$defs":{"x":{"type":"string"}},"$dynamicRef":"#x","$ref":"#/$defs/x"}`,
+		`{"$defs":{"x":{"type":"string"}},"$ref":"#/$defs/x~2"}`,
+		`{"$defs":{"x":{"type":"string"}},"$ref":"#/$defs/x","maxLength":2}`,
+	} {
+		var input map[string]any
+		json.Unmarshal([]byte(raw), &input)
+		if changedMap(input, inlineLocalSchema(input).(map[string]any)) {
+			t.Fatal("uncertain schema partially expanded", raw)
+		}
+	}
+	var booleans map[string]any
+	json.Unmarshal([]byte(`{"definitions":{"no":false},"$ref":"#/definitions/no"}`), &booleans)
+	if got := inlineLocalSchema(booleans).(map[string]any)["allOf"].([]any)[0]; got != false {
+		t.Fatal("false schema loosened", got)
+	}
+	var tools any
+	json.Unmarshal([]byte(`[{"type":"function","function":{"name":"lookup","parameters":{"$defs":{"x":{"type":"string"}},"type":"object","properties":{"x":{"$ref":"#/$defs/x"}}}}}]`), &tools)
+	for _, model := range []string{"kimi-k3.1-pro", "KIMI-K2", "kimono", "glm-5.3-flash"} {
+		out := WorkBuddyToolsForModel(tools, model).([]any)[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)
+		want := model == "kimi-k3.1-pro" || model == "KIMI-K2"
+		if (out["$defs"] == nil) != want {
+			t.Fatal("model scope changed", model, out)
+		}
+	}
+	defs := map[string]any{"x": map[string]any{"type": "string"}}
+	previous := "x"
+	for i := 0; i < 14; i++ {
+		name := previous + "x"
+		defs[name] = map[string]any{"anyOf": []any{map[string]any{"$ref": "#/$defs/" + previous}, map[string]any{"$ref": "#/$defs/" + previous}}}
+		previous = name
+	}
+	large := map[string]any{"$defs": defs, "$ref": "#/$defs/" + previous}
+	if changedMap(large, inlineLocalSchema(large).(map[string]any)) {
+		t.Fatal("over-budget expansion partially published")
+	}
+	wide := map[string]any{}
+	for i := 0; i < 20; i++ {
+		wide[strings.Repeat("x", i+1)] = map[string]any{"$ref": "#/$defs/large"}
+	}
+	amplified := map[string]any{"$defs": map[string]any{"large": map[string]any{"type": "string", "description": strings.Repeat("d", 50000)}}, "properties": wide}
+	if changedMap(amplified, inlineLocalSchema(amplified).(map[string]any)) {
+		t.Fatal("reference annotations amplified without a byte bound")
+	}
+}
+func BenchmarkKimiReferencePreparation(b *testing.B) {
+	for _, references := range []bool{false, true} {
+		schema := map[string]any{"type": "object", "properties": map[string]any{"value": map[string]any{"type": "string"}}}
+		name := "ordinary"
+		if references {
+			name = "local-ref"
+			schema["$defs"] = map[string]any{"value": map[string]any{"type": "string", "minLength": 1}}
+			schema["properties"] = map[string]any{"value": map[string]any{"$ref": "#/$defs/value"}}
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				inlineLocalSchema(schema)
+			}
+		})
 	}
 }

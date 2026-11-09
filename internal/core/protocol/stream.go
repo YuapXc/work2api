@@ -31,19 +31,21 @@ const (
 )
 
 type bridgeStreamEvent struct {
-	Kind       string
-	ResponseID string
-	Model      string
-	Text       string
-	Signature  string
-	ToolKey    string
-	ToolID     string
-	ToolName   string
-	Stop       string
-	Error      string
-	ErrorType  string
-	Encrypted  string
-	Usage      *Usage
+	NativeThinking map[string]any
+	SealSource     Protocol
+	Kind           string
+	ResponseID     string
+	Model          string
+	Text           string
+	Signature      string
+	ToolKey        string
+	ToolID         string
+	ToolName       string
+	Stop           string
+	Error          string
+	ErrorType      string
+	Encrypted      string
+	Usage          *Usage
 }
 
 func transcodeStream(w http.ResponseWriter, reader io.Reader, from, to Protocol, model string) error {

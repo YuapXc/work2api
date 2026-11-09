@@ -157,6 +157,249 @@ func WorkBuddyTools(value any) any {
 	return mapTools(value, workBuddySchema)
 }
 
+func WorkBuddyToolsForModel(value any, model string) any {
+	model = strings.ToLower(model)
+	if model != "kimi" && !strings.HasPrefix(model, "kimi-") {
+		return WorkBuddyTools(value)
+	}
+	return mapTools(value, func(schema any) any { return workBuddySchema(inlineLocalSchema(schema)) })
+}
+
+// Expand only closed local references; an uncertain reference leaves the whole schema intact.
+func inlineLocalSchema(schema any) any {
+	root, ok := schema.(map[string]any)
+	if !ok || root["$defs"] == nil && root["definitions"] == nil {
+		return schema
+	}
+	if root["id"] != nil {
+		return schema
+	}
+	modernDialect := false
+	if raw, exists := root["$schema"]; exists {
+		dialect, ok := raw.(string)
+		if !ok {
+			return schema
+		}
+		switch strings.TrimSuffix(dialect, "#") {
+		case "https://json-schema.org/draft/2020-12/schema", "http://json-schema.org/draft/2020-12/schema", "https://json-schema.org/draft/2019-09/schema", "http://json-schema.org/draft/2019-09/schema":
+			modernDialect = true
+		default:
+			return schema
+		}
+	}
+	originalSize, valid := schemaSizeBound(root, 8<<20)
+	if !valid {
+		return schema
+	}
+	budget, expanded := 10000, 0
+	active := map[string]bool{}
+	var walk func(any, int) (any, bool)
+	walk = func(value any, depth int) (any, bool) {
+		if depth > 64 || budget <= 0 {
+			return nil, false
+		}
+		budget--
+		node, ok := value.(map[string]any)
+		if !ok {
+			_, ok := value.(bool)
+			return value, ok
+		}
+		if depth > 0 && (node["$id"] != nil || node["id"] != nil || node["$schema"] != nil) || node["$dynamicRef"] != nil || node["$recursiveRef"] != nil || node["$anchor"] != nil || node["$dynamicAnchor"] != nil || node["$recursiveAnchor"] != nil || node["$vocabulary"] != nil {
+			return nil, false
+		}
+		out := node
+		set := func(key string, v any) {
+			if !changedMap(node, out) {
+				out = copyMap(node)
+			}
+			out[key] = v
+		}
+		remove := func(key string) {
+			if _, exists := out[key]; exists {
+				if !changedMap(node, out) {
+					out = copyMap(node)
+				}
+				delete(out, key)
+			}
+		}
+		for _, key := range []string{"items", "additionalItems", "unevaluatedItems", "contains", "not", "if", "then", "else", "propertyNames", "additionalProperties", "unevaluatedProperties", "contentSchema"} {
+			if child, exists := node[key]; exists {
+				if _, tuple := child.([]any); tuple {
+					continue
+				}
+				next, valid := walk(child, depth+1)
+				if !valid {
+					return nil, false
+				}
+				if !sameSchema(child, next) {
+					set(key, next)
+				}
+			}
+		}
+		for _, key := range []string{"anyOf", "oneOf", "allOf", "prefixItems", "items"} {
+			if children, ok := node[key].([]any); ok {
+				var next []any
+				for i, child := range children {
+					v, valid := walk(child, depth+1)
+					if !valid {
+						return nil, false
+					}
+					if !sameSchema(child, v) {
+						if next == nil {
+							next = append([]any(nil), children...)
+						}
+						next[i] = v
+					}
+				}
+				if next != nil {
+					set(key, next)
+				}
+			}
+		}
+		for _, key := range []string{"properties", "patternProperties", "dependentSchemas", "dependencies"} {
+			if children, ok := node[key].(map[string]any); ok {
+				var next map[string]any
+				for name, child := range children {
+					if key == "dependencies" {
+						if _, list := child.([]any); list {
+							continue
+						}
+					}
+					v, valid := walk(child, depth+1)
+					if !valid {
+						return nil, false
+					}
+					if !sameSchema(child, v) {
+						if next == nil {
+							next = copyMap(children)
+						}
+						next[name] = v
+					}
+				}
+				if next != nil {
+					set(key, next)
+				}
+			}
+		}
+		if raw, exists := node["$ref"]; exists {
+			if !modernDialect {
+				for key := range node {
+					switch key {
+					case "$ref", "$defs", "definitions", "title", "description", "$comment", "default", "examples", "example", "readOnly", "writeOnly", "deprecated":
+					default:
+						return nil, false
+					}
+				}
+			}
+			ref, ok := raw.(string)
+			if !ok || !(strings.HasPrefix(ref, "#/$defs/") || strings.HasPrefix(ref, "#/definitions/")) || active[ref] || strings.Contains(ref, "%") {
+				return nil, false
+			}
+			for i := 0; i < len(ref); i++ {
+				if ref[i] == '~' {
+					if i+1 == len(ref) || ref[i+1] != '0' && ref[i+1] != '1' {
+						return nil, false
+					}
+					i++
+				}
+			}
+			target := localRef(root, ref)
+			if target == nil {
+				return nil, false
+			}
+			active[ref] = true
+			resolved, valid := walk(target, depth+1)
+			delete(active, ref)
+			if !valid {
+				return nil, false
+			}
+			var constraints []any
+			if current, exists := out["allOf"]; exists {
+				var ok bool
+				constraints, ok = current.([]any)
+				if !ok {
+					return nil, false
+				}
+			}
+			set("allOf", append([]any{resolved}, constraints...))
+			remove("$ref")
+			expanded++
+		}
+		remove("$defs")
+		remove("definitions")
+		return out, true
+	}
+	out, ok := walk(root, 0)
+	if !ok || expanded == 0 {
+		return schema
+	}
+	if _, valid := schemaSizeBound(out, min(8<<20, max(64<<10, originalSize*4))); !valid {
+		return schema
+	}
+	return out
+}
+
+// Account for repeated annotation/data bytes before an expanded tree is JSON encoded.
+func schemaSizeBound(value any, limit int) (int, bool) {
+	left, nodes := limit, 100000
+	charge := func(n int) bool {
+		if n > left {
+			return false
+		}
+		left -= n
+		return true
+	}
+	stringCost := func(s string) bool {
+		if len(s) > (left-2)/6 {
+			return false
+		}
+		return charge(6*len(s) + 2)
+	}
+	var visit func(any, int) bool
+	visit = func(v any, depth int) bool {
+		if depth > 64 || nodes <= 0 || !charge(1) {
+			return false
+		}
+		nodes--
+		switch x := v.(type) {
+		case map[string]any:
+			if !charge(2) {
+				return false
+			}
+			for k, child := range x {
+				if !stringCost(k) || !charge(1) || !visit(child, depth+1) {
+					return false
+				}
+			}
+			return true
+		case []any:
+			if !charge(2) {
+				return false
+			}
+			for _, child := range x {
+				if !visit(child, depth+1) {
+					return false
+				}
+			}
+			return true
+		case string:
+			return stringCost(x)
+		case nil, bool:
+			return charge(5)
+		case json.Number:
+			return charge(len(x))
+		case float64, float32, int, int64, int32, uint, uint64, uint32:
+			return charge(32)
+		default:
+			return false
+		}
+	}
+	if !visit(value, 0) {
+		return 0, false
+	}
+	return limit - left, true
+}
+
 func mapTools(value any, normalize func(any) any) any {
 	list, ok := value.([]any)
 	if !ok {

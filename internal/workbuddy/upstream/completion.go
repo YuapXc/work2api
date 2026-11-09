@@ -321,6 +321,24 @@ func (s *completionState) complete(allowToolFinish bool) error {
 // HasOutput distinguishes response-bearing deltas from role/usage preambles.
 // Unknown extensions are conservatively output, so they are never replayed.
 func HasOutput(chunk map[string]any) bool {
+	if event, ok := chunk[NativeEvent].(map[string]any); ok {
+		switch event["type"] {
+		case "content_block_start":
+			block, _ := event["content_block"].(map[string]any)
+			for _, key := range []string{"text", "thinking", "signature", "data", "name"} {
+				if value, _ := block[key].(string); value != "" {
+					return true
+				}
+			}
+		case "content_block_delta":
+			delta, _ := event["delta"].(map[string]any)
+			for _, key := range []string{"text", "thinking", "signature", "partial_json"} {
+				if value, _ := delta[key].(string); value != "" {
+					return true
+				}
+			}
+		}
+	}
 	choices, _ := chunk["choices"].([]any)
 	for _, v := range choices {
 		choice, _ := v.(map[string]any)

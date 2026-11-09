@@ -19,35 +19,37 @@ import (
 type Config struct {
 	RequestBodyReadTimeoutSeconds int
 
-	Host                   string // listen host
-	Port                   int    // listen port
-	AllowPortFallback      bool   // only an unconfigured default port may auto-avoid
-	DBPath                 string // SQLite file path
-	AdminToken             string // admin/WebUI auth; empty => loopback-only
-	AdminCookieSecure      bool   // force Secure cookies behind a TLS-terminating proxy
-	AdminCookieSecureAuto  bool   // automatic policy permits genuine loopback HTTP access
-	TrustedProxyCIDRs      string // explicit peers permitted to supply overwritten X-Real-IP
-	MaxRequestBytes        int64
-	ModelMemoryGuard       bool
-	ModelBufferBudgetBytes int64
-	ModelMemoryHighBytes   int64
-	ModelLimitsDisabled    bool // Model execution has no local concurrency, queue or daily quota caps.
-	MaxConcurrentRequests  int
-	ModelQueueSize         int
-	ModelQueueWaitSeconds  int
-	ModelKeyQueueSize      int
-	ModelKeyLimits         string
-	AdminConcurrency       int
-	HeavyAdminConcurrency  int
-	QueryConcurrency       int
-	BodyReadConcurrency    int
-	RequestBodyBudget      int64
-	MaxResponseBytes       int64
-	MaxJSONItems           int
-	MaxJSONDepth           int
-	DataDir                string // base dir for data (db, attachments, secrets)
-	LogLevel               string
-	LogToFile              bool
+	Host                      string // listen host
+	Port                      int    // listen port
+	AllowPortFallback         bool   // only an unconfigured default port may auto-avoid
+	DBPath                    string // SQLite file path
+	AdminToken                string // admin/WebUI auth; empty => loopback-only
+	AdminCookieSecure         bool   // force Secure cookies behind a TLS-terminating proxy
+	AdminCookieSecureAuto     bool   // automatic policy permits genuine loopback HTTP access
+	TrustedProxyCIDRs         string // explicit peers permitted to supply overwritten X-Real-IP
+	MaxRequestBytes           int64
+	ModelMemoryGuard          bool
+	ModelBufferBudgetBytes    int64
+	ModelMemoryHighBytes      int64
+	ModelLimitsDisabled       bool // Model execution has no local concurrency, queue or daily quota caps.
+	MaxConcurrentRequests     int
+	ModelQueueSize            int
+	ModelQueueWaitSeconds     int
+	ModelKeyQueueSize         int
+	ModelKeyLimits            string
+	AdminConcurrency          int
+	HeavyAdminConcurrency     int
+	QueryConcurrency          int
+	BodyReadConcurrency       int
+	RequestBodyBudget         int64
+	ResponseHistoryBytes      int64
+	ResponseHistoryTTLSeconds int
+	MaxResponseBytes          int64
+	MaxJSONItems              int
+	MaxJSONDepth              int
+	DataDir                   string // base dir for data (db, attachments, secrets)
+	LogLevel                  string
+	LogToFile                 bool
 
 	// 用户门户（HANDOFF §8 方案）：注册模式 invite|open|closed；贡献扫码任务
 	// 上限（防批量任务耗尽内存）；用户级并发与每日用量（0 = 不启用该限制，
@@ -159,35 +161,37 @@ func Load(args []string) *Config {
 	return &Config{
 		RequestBodyReadTimeoutSeconds: positiveEnvInt("REQUEST_BODY_READ_TIMEOUT_SECONDS", DefaultRequestBodyReadTimeoutSeconds),
 
-		AllowPortFallback:      !explicitPort,
-		Host:                   *host,
-		Port:                   *port,
-		DataDir:                dd,
-		DBPath:                 dbp,
-		AdminToken:             *adminToken,
-		AdminCookieSecure:      cookieSecure,
-		AdminCookieSecureAuto:  !cookieExplicit,
-		TrustedProxyCIDRs:      envOr("TRUSTED_PROXY_CIDRS", ""),
-		MaxRequestBytes:        requestLimit,
-		ModelMemoryGuard:       memoryGuard,
-		ModelBufferBudgetBytes: int64(positiveEnvInt("MODEL_BUFFER_BUDGET_BYTES", int(responseBudget))),
-		ModelMemoryHighBytes:   int64(positiveEnvInt("MODEL_MEMORY_HIGH_BYTES", 256<<20)),
-		ModelLimitsDisabled:    true,
-		MaxConcurrentRequests:  modelConcurrency,
-		ModelQueueSize:         positiveEnvInt("MODEL_QUEUE_SIZE", 32),
-		ModelQueueWaitSeconds:  positiveEnvInt("MODEL_QUEUE_WAIT_SECONDS", 60),
-		ModelKeyQueueSize:      positiveEnvInt("MODEL_KEY_QUEUE_SIZE", 16),
-		ModelKeyLimits:         env("MODEL_KEY_CONCURRENCY_LIMITS", ""),
-		AdminConcurrency:       positiveEnvInt("ADMIN_CONCURRENCY", 8),
-		HeavyAdminConcurrency:  positiveEnvInt("HEAVY_ADMIN_CONCURRENCY", 2),
-		QueryConcurrency:       positiveEnvInt("QUERY_CONCURRENCY", 4),
-		BodyReadConcurrency:    positiveEnvInt("BODY_READ_CONCURRENCY", 4),
-		RequestBodyBudget:      int64(max(0, envInt("REQUEST_BODY_BUDGET", int(bodyBudget)))),
-		MaxResponseBytes:       responseLimit,
-		MaxJSONItems:           max(0, envInt("MAX_JSON_ITEMS", DefaultMaxJSONItems)),
-		MaxJSONDepth:           max(0, envInt("MAX_JSON_DEPTH", DefaultMaxJSONDepth)),
-		LogLevel:               strings.ToUpper(*logLevel),
-		LogToFile:              env("LOG_TO_FILE", "1") != "0",
+		AllowPortFallback:         !explicitPort,
+		Host:                      *host,
+		Port:                      *port,
+		DataDir:                   dd,
+		DBPath:                    dbp,
+		AdminToken:                *adminToken,
+		AdminCookieSecure:         cookieSecure,
+		AdminCookieSecureAuto:     !cookieExplicit,
+		TrustedProxyCIDRs:         envOr("TRUSTED_PROXY_CIDRS", ""),
+		MaxRequestBytes:           requestLimit,
+		ModelMemoryGuard:          memoryGuard,
+		ModelBufferBudgetBytes:    int64(positiveEnvInt("MODEL_BUFFER_BUDGET_BYTES", int(responseBudget))),
+		ModelMemoryHighBytes:      int64(positiveEnvInt("MODEL_MEMORY_HIGH_BYTES", 256<<20)),
+		ModelLimitsDisabled:       true,
+		MaxConcurrentRequests:     modelConcurrency,
+		ModelQueueSize:            positiveEnvInt("MODEL_QUEUE_SIZE", 32),
+		ModelQueueWaitSeconds:     positiveEnvInt("MODEL_QUEUE_WAIT_SECONDS", 60),
+		ModelKeyQueueSize:         positiveEnvInt("MODEL_KEY_QUEUE_SIZE", 16),
+		ModelKeyLimits:            env("MODEL_KEY_CONCURRENCY_LIMITS", ""),
+		AdminConcurrency:          positiveEnvInt("ADMIN_CONCURRENCY", 8),
+		HeavyAdminConcurrency:     positiveEnvInt("HEAVY_ADMIN_CONCURRENCY", 2),
+		QueryConcurrency:          positiveEnvInt("QUERY_CONCURRENCY", 4),
+		BodyReadConcurrency:       positiveEnvInt("BODY_READ_CONCURRENCY", 4),
+		RequestBodyBudget:         int64(max(0, envInt("REQUEST_BODY_BUDGET", int(bodyBudget)))),
+		ResponseHistoryBytes:      int64(max(0, envInt("RESPONSE_HISTORY_BYTES", 256<<20))),
+		ResponseHistoryTTLSeconds: max(0, envInt("RESPONSE_HISTORY_TTL_SECONDS", 21600)),
+		MaxResponseBytes:          responseLimit,
+		MaxJSONItems:              max(0, envInt("MAX_JSON_ITEMS", DefaultMaxJSONItems)),
+		MaxJSONDepth:              max(0, envInt("MAX_JSON_DEPTH", DefaultMaxJSONDepth)),
+		LogLevel:                  strings.ToUpper(*logLevel),
+		LogToFile:                 env("LOG_TO_FILE", "1") != "0",
 
 		PortalRegistrationMode:  strings.ToLower(strings.TrimSpace(envOr("PORTAL_REGISTRATION_MODE", envOr("PORTAL_INVITE_MODE", "invite")))),
 		PortalMaxTasksPerUser:   positiveEnvInt("PORTAL_MAX_TASKS_PER_USER", 3),

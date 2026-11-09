@@ -3,11 +3,16 @@ package adapters
 import (
 	"encoding/json"
 	"strings"
+
+	"work2api/internal/core/protocol"
 )
 
 // ResponsesRequestToChat converts an OpenAI Responses request body into a Chat
 // Completions request body.
 func ResponsesRequestToChat(body map[string]any) (map[string]any, error) {
+	if err := protocol.RequireFullResponsesInput(body); err != nil {
+		return nil, err
+	}
 	var messages []any
 
 	if instructions, ok := body["instructions"]; ok && instructions != nil && instructions != "" {

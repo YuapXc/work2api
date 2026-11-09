@@ -1,15 +1,20 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+	"work2api/internal/config"
+	"work2api/internal/core/protocol"
 	"work2api/internal/workbuddy/models"
 	"work2api/internal/workbuddy/pool"
 	"work2api/internal/workbuddy/upstream"
@@ -251,61 +256,165 @@ func TestStableSessionAcrossProtocolHandlers(t *testing.T) {
 func TestWorkBuddyNativeMessagesAcrossPublicProtocols(t *testing.T) {
 	for _, kind := range []string{"chat", "anthropic", "responses"} {
 		for _, stream := range []bool{false, true} {
-			t.Run(kind+fmt.Sprint(stream), func(t *testing.T) {
-				o, _ := newDNSFailoverOrch(t, &failingUpstream{})
-				o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: mediaAppTransport(func(r *http.Request) (*http.Response, error) {
-					return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"code":0,"data":{"models":[{"id":"claude-test","credits":1}],"agents":[{"name":"cli","models":["claude-test"]}]}}`))}, nil
-				})})
-				o.wb.Catalog.Refresh()
-				calls := 0
-				o.wb.UpstreamClient = upstream.NewClient(&http.Client{Transport: mediaAppTransport(func(r *http.Request) (*http.Response, error) {
-					calls++
-					if r.URL.Path != "/v1/messages" {
-						t.Error("native endpoint not selected")
+			for _, sourceStream := range []bool{false, true} {
+				t.Run(kind+fmt.Sprint(stream)+"/upstream-stream="+fmt.Sprint(sourceStream), func(t *testing.T) {
+					respond := func(req *http.Request, raw string) *http.Response {
+						contentType := "application/json"
+						if sourceStream {
+							var message map[string]any
+							json.Unmarshal([]byte(raw), &message)
+							start := map[string]any{}
+							for k, v := range message {
+								start[k] = v
+							}
+							start["content"] = []any{}
+							start["stop_reason"] = nil
+							var wire strings.Builder
+							emit := func(event map[string]any) {
+								encoded, _ := json.Marshal(event)
+								wire.WriteString("data: " + string(encoded) + "\n\n")
+							}
+							emit(map[string]any{"type": "message_start", "message": start})
+							for i, raw := range message["content"].([]any) {
+								block := raw.(map[string]any)
+								if block["type"] == "thinking" {
+									emit(map[string]any{"type": "content_block_start", "index": i, "content_block": map[string]any{"type": "thinking", "thinking": ""}})
+									if text := block["thinking"].(string); text != "" {
+										emit(map[string]any{"type": "content_block_delta", "index": i, "delta": map[string]any{"type": "thinking_delta", "thinking": text}})
+									}
+									signature := block["signature"].(string)
+									for _, part := range []string{signature[:len(signature)/2], signature[len(signature)/2:]} {
+										emit(map[string]any{"type": "content_block_delta", "index": i, "delta": map[string]any{"type": "signature_delta", "signature": part}})
+									}
+								} else {
+									emit(map[string]any{"type": "content_block_start", "index": i, "content_block": block})
+								}
+								emit(map[string]any{"type": "content_block_stop", "index": i})
+							}
+							emit(map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": message["stop_reason"]}, "usage": message["usage"]})
+							emit(map[string]any{"type": "message_stop"})
+							raw = wire.String()
+							contentType = "text/event-stream"
+						}
+						return &http.Response{Request: req, StatusCode: 200, Header: http.Header{"Content-Type": []string{contentType}}, Body: io.NopCloser(strings.NewReader(raw))}
 					}
-					var sent map[string]any
-					if err := json.NewDecoder(r.Body).Decode(&sent); err != nil {
+					o, _ := newDNSFailoverOrch(t, &failingUpstream{})
+					o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: mediaAppTransport(func(r *http.Request) (*http.Response, error) {
+						return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"code":0,"data":{"models":[{"id":"claude-test","credits":1}],"agents":[{"name":"cli","models":["claude-test"]}]}}`))}, nil
+					})})
+					o.wb.Catalog.Refresh()
+					calls := 0
+					o.wb.UpstreamClient = upstream.NewClient(&http.Client{Transport: mediaAppTransport(func(r *http.Request) (*http.Response, error) {
+						calls++
+						if r.URL.Path != "/v1/messages" {
+							t.Error("native endpoint not selected")
+						}
+						var sent map[string]any
+						if err := json.NewDecoder(r.Body).Decode(&sent); err != nil {
+							t.Fatal(err)
+						}
+						if kind == "anthropic" {
+							if sent["output_config"].(map[string]any)["effort"] != "high" {
+								t.Error("effort lost")
+							}
+						}
+						if kind == "responses" && calls == 2 {
+							raw, _ := json.Marshal(sent)
+							for _, token := range []string{"opaque-signature", "empty-signature", "redacted-native", "tool-result", "lookup"} {
+								if !strings.Contains(string(raw), token) {
+									t.Errorf("native Responses tool loop lost %s: %s", token, raw)
+								}
+							}
+							if strings.Contains(string(raw), "work2api-anthropic1:") {
+								t.Fatal("transport envelope leaked to Claude")
+							}
+						}
+						if kind == "responses" && calls == 1 {
+							return respond(r, `{"id":"msg_native","type":"message","role":"assistant","model":"claude-test","content":[{"type":"thinking","thinking":"reason","signature":"opaque-signature"},{"type":"thinking","thinking":"","signature":"empty-signature"},{"type":"redacted_thinking","data":"redacted-native"},{"type":"text","text":"OK"},{"type":"tool_use","id":"call1","name":"lookup","input":{"q":"business"}}],"stop_reason":"tool_use","usage":{"input_tokens":7,"output_tokens":5}}`), nil
+						}
+						return respond(r, `{"id":"msg_native","type":"message","role":"assistant","model":"claude-test","content":[{"type":"thinking","thinking":"reason","signature":"opaque-signature"},{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":7,"output_tokens":5}}`), nil
+					})})
+					if _, err := o.db.CreateApp("native", o.hashKey("native-key"), "", "", "", "", 0); err != nil {
 						t.Fatal(err)
 					}
+					s := NewServer(o)
+					body := map[string]any{"model": "claude-test", "stream": stream, "max_tokens": 256, "messages": []any{map[string]any{"role": "user", "content": "hello"}}}
+					path := "/v1/chat/completions"
 					if kind == "anthropic" {
-						if sent["output_config"].(map[string]any)["effort"] != "high" {
-							t.Error("effort lost")
+						path = "/v1/messages"
+						body["thinking"] = map[string]any{"type": "adaptive"}
+						body["output_config"] = map[string]any{"effort": "high"}
+					}
+					if kind == "responses" {
+						path = "/v1/responses"
+						delete(body, "messages")
+						body["input"] = "hello"
+					}
+					raw, _ := json.Marshal(body)
+					r := httptest.NewRequest("POST", path, strings.NewReader(string(raw)))
+					r.Header.Set("Authorization", "Bearer native-key")
+					w := httptest.NewRecorder()
+					handler := http.HandlerFunc(s.handleChat)
+					if kind != "chat" {
+						handler = func(w http.ResponseWriter, r *http.Request) { s.handleConverted(w, r, kind) }
+					}
+					s.requestGuard(handler).ServeHTTP(w, r)
+					if w.Code != 200 || calls != 1 || !strings.Contains(w.Body.String(), "OK") || strings.Contains(w.Body.String(), upstream.NativeEvent) {
+						t.Fatal(w.Code, calls, w.Body.String())
+					}
+					if kind == "anthropic" {
+						raw := w.Body.Bytes()
+						if stream {
+							var err error
+							raw, err = protocol.CollapseStream(strings.NewReader(w.Body.String()), protocol.Anthropic, "claude-test")
+							if err != nil {
+								t.Fatal(err)
+							}
+						}
+						if !strings.Contains(string(raw), "opaque-signature") {
+							t.Fatal("native signature lost", string(raw))
 						}
 					}
-					return &http.Response{Request: r, StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"id":"msg_native","type":"message","role":"assistant","model":"claude-test","content":[{"type":"thinking","thinking":"reason","signature":"opaque-signature"},{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":7,"output_tokens":5}}`))}, nil
-				})})
-				if _, err := o.db.CreateApp("native", o.hashKey("native-key"), "", "", "", "", 0); err != nil {
-					t.Fatal(err)
-				}
-				s := NewServer(o)
-				body := map[string]any{"model": "claude-test", "stream": stream, "max_tokens": 256, "messages": []any{map[string]any{"role": "user", "content": "hello"}}}
-				path := "/v1/chat/completions"
-				if kind == "anthropic" {
-					path = "/v1/messages"
-					body["thinking"] = map[string]any{"type": "adaptive"}
-					body["output_config"] = map[string]any{"effort": "high"}
-				}
-				if kind == "responses" {
-					path = "/v1/responses"
-					delete(body, "messages")
-					body["input"] = "hello"
-				}
-				raw, _ := json.Marshal(body)
-				r := httptest.NewRequest("POST", path, strings.NewReader(string(raw)))
-				r.Header.Set("Authorization", "Bearer native-key")
-				w := httptest.NewRecorder()
-				handler := http.HandlerFunc(s.handleChat)
-				if kind != "chat" {
-					handler = func(w http.ResponseWriter, r *http.Request) { s.handleConverted(w, r, kind) }
-				}
-				s.requestGuard(handler).ServeHTTP(w, r)
-				if w.Code != 200 || calls != 1 || !strings.Contains(w.Body.String(), "OK") || strings.Contains(w.Body.String(), upstream.NativeEvent) {
-					t.Fatal(w.Code, calls, w.Body.String())
-				}
-				if kind == "anthropic" && !strings.Contains(w.Body.String(), "opaque-signature") {
-					t.Fatal("native signature lost", w.Body.String())
-				}
-			})
+					if kind == "responses" {
+						var response map[string]any
+						if stream {
+							for _, line := range strings.Split(w.Body.String(), "\n") {
+								if !strings.HasPrefix(line, "data:") {
+									continue
+								}
+								var event map[string]any
+								if json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), &event) == nil && event["type"] == "response.completed" {
+									response, _ = event["response"].(map[string]any)
+								}
+							}
+						} else if json.Unmarshal(w.Body.Bytes(), &response) != nil {
+							t.Fatal("invalid Responses body")
+						}
+						output, _ := response["output"].([]any)
+						if len(output) != 5 {
+							t.Fatal("native block boundaries lost", response)
+						}
+						for i := 0; i < 3; i++ {
+							item, _ := output[i].(map[string]any)
+							block, ours := protocol.OpenAnthropicReasoning(item["encrypted_content"].(string))
+							if !ours || block == nil {
+								t.Fatal("missing signed envelope", item)
+							}
+						}
+						next := append([]any{map[string]any{"type": "message", "role": "user", "content": "hello"}}, output...)
+						next = append(next, map[string]any{"type": "function_call_output", "call_id": "call1", "output": "tool-result"})
+						body["input"] = next
+						raw, _ := json.Marshal(body)
+						req := httptest.NewRequest("POST", path, strings.NewReader(string(raw)))
+						req.Header.Set("Authorization", "Bearer native-key")
+						follow := httptest.NewRecorder()
+						s.requestGuard(handler).ServeHTTP(follow, req)
+						if follow.Code != 200 || calls != 2 {
+							t.Fatal("native Responses round trip failed", follow.Code, calls, follow.Body.String())
+						}
+					}
+				})
+			}
 		}
 	}
 }
@@ -865,5 +974,397 @@ func TestSessionOldFailurePreservesNewBinding(t *testing.T) {
 	after, _ = r.View("session")
 	if after.UID != "" || after.Version == v.Version {
 		t.Fatal("actual failed affinity was not cleared")
+	}
+}
+
+func historyTestServer(t *testing.T) *Server {
+	t.Helper()
+	c := newResponseHistoryCache(256<<20, 6*time.Hour)
+	t.Cleanup(func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.timer != nil {
+			c.timer.Stop()
+		}
+	})
+	return &Server{o: &Orchestrator{cfg: &config.Config{MaxRequestBytes: config.DefaultMaxRequestBytes, MaxJSONDepth: 512, MaxJSONItems: 1000000}}, responseHistory: c}
+}
+func historyTestRequest(key string) *http.Request {
+	r := httptest.NewRequest("POST", "/v1/responses", nil)
+	r.Header.Set("Authorization", "Bearer "+key)
+	return r
+}
+func historyTestPrepare(t *testing.T, s *Server, key string, body map[string]any) (http.ResponseWriter, func()) {
+	t.Helper()
+	w, finish, err := s.prepareResponseHistory(httptest.NewRecorder(), historyTestRequest(key), body, &Principal{AppID: 1, UserID: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w, finish
+}
+func historyTestComplete(w http.ResponseWriter, id string) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = fmt.Fprintf(w, `{"id":%q,"object":"response","status":"completed","output":[{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}]}`, id)
+}
+func TestResponseHistoryContinuationAndIsolation(t *testing.T) {
+	s := historyTestServer(t)
+	first := map[string]any{"input": "first", "instructions": "old instructions", "tools": []any{map[string]any{"type": "function", "name": "old-tool"}}}
+	w, finish := historyTestPrepare(t, s, "key-a", first)
+	historyTestComplete(w, "resp_first")
+	// A second request must resolve the ID even before the first handler's defer runs.
+	second := map[string]any{"previous_response_id": "resp_first", "input": []any{map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "result"}}, "instructions": "new instructions"}
+	w2, finish2 := historyTestPrepare(t, s, "key-a", second)
+	got := second["input"].([]any)
+	if len(got) != 3 || got[0].(map[string]any)["content"] != "first" || got[1].(map[string]any)["call_id"] != "call_1" || second["previous_response_id"] != nil || second["tools"] != nil || second["instructions"] != "new instructions" {
+		t.Fatalf("wrong restore: %#v", second)
+	}
+	historyTestComplete(w2, "resp_second")
+	finish2()
+	finish()
+	third := map[string]any{"previous_response_id": "resp_second", "input": "third", "store": false}
+	w3, finish3 := historyTestPrepare(t, s, "key-a", third)
+	historyTestComplete(w3, "resp_unstored")
+	finish3()
+	if len(third["input"].([]any)) != 5 {
+		t.Fatal("lost ancestors")
+	}
+	for _, tc := range []struct {
+		key, id   string
+		principal *Principal
+	}{
+		{"key-b", "resp_first", &Principal{AppID: 1, UserID: 2}},
+		{"key-a", "resp_first", &Principal{AppID: 1, UserID: 3}},
+		{"key-a", "resp_unstored", &Principal{AppID: 1, UserID: 2}},
+	} {
+		_, f, err := s.prepareResponseHistory(httptest.NewRecorder(), historyTestRequest(tc.key), map[string]any{"previous_response_id": tc.id, "input": "next"}, tc.principal)
+		f()
+		if err == nil {
+			t.Fatal("scope/store isolation failed")
+		}
+	}
+	branch := map[string]any{"previous_response_id": "resp_first", "input": "branch", "store": false}
+	_, f := historyTestPrepare(t, s, "key-a", branch)
+	f()
+	if len(branch["input"].([]any)) != 3 {
+		t.Fatal("branch mutated ancestor")
+	}
+	if first["input"] != "first" {
+		t.Fatal("initial body mutated")
+	}
+	now := time.Now().Add(7 * time.Hour)
+	s.responseHistory.now = func() time.Time { return now }
+	_, f, err := s.prepareResponseHistory(httptest.NewRecorder(), historyTestRequest("key-a"), map[string]any{"previous_response_id": "resp_first", "input": "next"}, &Principal{AppID: 1, UserID: 2})
+	f()
+	if err == nil {
+		t.Fatal("expired history accepted")
+	}
+	s.responseHistory.timer.Stop()
+	s.responseHistory.expire()
+	if s.responseHistory.used != 0 || len(s.responseHistory.items) != 0 {
+		t.Fatal("expired cache not reclaimed")
+	}
+}
+func TestResponseHistorySharedAccountingAndConcurrency(t *testing.T) {
+	s := historyTestServer(t)
+	c := s.responseHistory
+	root := []json.RawMessage{json.RawMessage(`{"role":"user","content":"` + strings.Repeat("x", 8192) + `"}`)}
+	if !c.put(responseHistoryKey{"scope", "root"}, nil, root) {
+		t.Fatal("put")
+	}
+	parent := c.acquire(responseHistoryKey{"scope", "root"})
+	if !c.put(responseHistoryKey{"scope", "child"}, parent, []json.RawMessage{json.RawMessage(`{"role":"assistant","content":"ok"}`)}) {
+		t.Fatal("child")
+	}
+	c.mu.Lock()
+	c.drop(c.items[responseHistoryKey{"scope", "root"}])
+	before := c.used
+	c.mu.Unlock()
+	c.release(parent)
+	if c.used >= before || c.used < 8192 {
+		t.Fatal("shared ancestor undercounted", before, c.used)
+	}
+	lease := c.acquire(responseHistoryKey{"scope", "child"})
+	c.limit = c.used + 10
+	if c.put(responseHistoryKey{"scope", "oversized"}, nil, root) {
+		t.Fatal("over budget accepted")
+	}
+	c.release(lease)
+	c.limit = 256 << 20
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			p := c.acquire(responseHistoryKey{"scope", "child"})
+			if p == nil {
+				return
+			}
+			defer c.release(p)
+			c.put(responseHistoryKey{"scope", fmt.Sprint(i)}, p, []json.RawMessage{json.RawMessage(`{"role":"user","content":"next"}`)})
+		}(i)
+	}
+	wg.Wait()
+	c.mu.Lock()
+	for c.order.Len() > 0 {
+		c.drop(c.order.Back())
+	}
+	used := c.used
+	c.mu.Unlock()
+	if used != 0 {
+		t.Fatal("leaked accounting", used)
+	}
+}
+func TestResponseHistoryCaptureBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		status     int
+		good       bool
+	}{
+		{"json", `{"id":"resp_ok","status":"completed","output":[]}`, 200, true},
+		{"incomplete", `{"id":"resp_ok","status":"incomplete","output":[]}`, 200, true},
+		{"failed", `{"id":"resp_ok","status":"failed","output":[]}`, 200, false},
+		{"http error", `{"id":"resp_ok","status":"completed","output":[]}`, 500, false},
+		{"truncated", `{"id":"resp_ok","status":"completed","output":[`, 200, false},
+		{"primitive output", `{"id":"resp_ok","status":"completed","output":[3]}`, 200, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := historyTestServer(t)
+			w, f := historyTestPrepare(t, s, "key", map[string]any{"input": "hello"})
+			w.WriteHeader(tc.status)
+			_, _ = io.WriteString(w, tc.body)
+			capture := w.(*responseHistoryFlushWriter).responseHistoryWriter
+			path := ""
+			if capture.file != nil {
+				path = capture.file.Name()
+			}
+			f()
+			if (len(s.responseHistory.items) > 0) != tc.good {
+				t.Fatal("unexpected cache state")
+			}
+			if path != "" {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatal("spool not removed", err)
+				}
+			}
+		})
+	}
+	t.Run("oversize and disk failure preserve output", func(t *testing.T) {
+		for _, diskFailure := range []bool{false, true} {
+			s := historyTestServer(t)
+			w, f := historyTestPrepare(t, s, "key", map[string]any{"input": "hello"})
+			capture := w.(*responseHistoryFlushWriter).responseHistoryWriter
+			if diskFailure {
+				file, err := os.CreateTemp(t.TempDir(), "closed-")
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = file.Close()
+				capture.file = file
+			} else {
+				capture.limit = 1
+			}
+			historyTestComplete(w, "resp_failed")
+			f()
+			if len(s.responseHistory.items) != 0 {
+				t.Fatal("cached failed capture")
+			}
+			if !strings.Contains(capture.ResponseWriter.(*httptest.ResponseRecorder).Body.String(), "resp_failed") {
+				t.Fatal("capture failure damaged response")
+			}
+		}
+	})
+	t.Run("delivered terminal survives client close", func(t *testing.T) {
+		s := historyTestServer(t)
+		r := historyTestRequest("key")
+		ctx, cancel := context.WithCancel(r.Context())
+		r = r.WithContext(ctx)
+		w, f, err := s.prepareResponseHistory(httptest.NewRecorder(), r, map[string]any{"input": "hello"}, &Principal{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		historyTestComplete(w, "resp_delivered")
+		cancel()
+		f()
+		if len(s.responseHistory.items) != 1 {
+			t.Fatal("client close lost delivered response")
+		}
+	})
+	t.Run("cancel and downstream error", func(t *testing.T) {
+		s := historyTestServer(t)
+		r := historyTestRequest("key")
+		ctx, cancel := context.WithCancel(r.Context())
+		r = r.WithContext(ctx)
+		w, f, err := s.prepareResponseHistory(httptest.NewRecorder(), r, map[string]any{"input": "hello"}, &Principal{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		historyTestComplete(w, "resp_cancel")
+		f()
+		if len(s.responseHistory.items) != 0 {
+			t.Fatal("cancelled response retained")
+		}
+		w, f, err = s.prepareResponseHistory(&historyFailWriter{header: make(http.Header)}, historyTestRequest("key"), map[string]any{"input": "hello"}, &Principal{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		historyTestComplete(w, "resp_fail")
+		f()
+		if len(s.responseHistory.items) != 0 {
+			t.Fatal("failed downstream retained")
+		}
+	})
+}
+
+type historyFailWriter struct{ header http.Header }
+
+func (w *historyFailWriter) Header() http.Header       { return w.header }
+func (w *historyFailWriter) WriteHeader(int)           {}
+func (w *historyFailWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+func TestResponseHistorySSEAndRestoredLimits(t *testing.T) {
+	stream := "event: response.output_item.done\ndata: {\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"call_x\",\"name\":\"apply_patch\",\"input\":\"patch\"}}\n\nevent: response.completed\ndata: {\"response\":{\"id\":\"resp_sse\",\"status\":\"completed\"}}\n\n"
+	s := historyTestServer(t)
+	w, f := historyTestPrepare(t, s, "key", map[string]any{"input": "first"})
+	w.Header().Set("Content-Type", "text/event-stream")
+	for _, b := range []byte(stream) {
+		_, _ = w.Write([]byte{b})
+	}
+	if len(s.responseHistory.items) != 1 {
+		t.Fatal("split SSE terminal not published")
+	}
+	f()
+	body := map[string]any{"previous_response_id": "resp_sse", "input": []any{map[string]any{"type": "custom_tool_call_output", "call_id": "call_x", "output": "done"}}}
+	_, release := historyTestPrepare(t, s, "key", body)
+	release()
+	input := body["input"].([]any)
+	if len(input) != 3 || input[1].(map[string]any)["type"] != "custom_tool_call" {
+		t.Fatal("custom tool lost")
+	}
+	for _, bad := range []string{strings.TrimSuffix(stream, "\n\n"), strings.ReplaceAll(stream, "response.completed", "response.failed"), stream + "data: {\"type\":\"error\"}\n\n"} {
+		if _, _, ok := readResponseHistoryResult(strings.NewReader(bad), "text/event-stream"); ok {
+			t.Fatal("cached invalid stream")
+		}
+	}
+	s.o.cfg.MaxRequestBytes = 5
+	_, release, err := s.prepareResponseHistory(httptest.NewRecorder(), historyTestRequest("key"), map[string]any{"previous_response_id": "resp_sse", "input": "next"}, &Principal{AppID: 1, UserID: 2})
+	release()
+	if _, ok := err.(responseHistoryLimitError); !ok {
+		t.Fatal("restored byte limit bypassed", err)
+	}
+	if responseHistoryWithinLimits(map[string]any{"input": []any{map[string]any{"role": "user"}}}, 1<<20, 2, 512) {
+		t.Fatal("restored node limit bypassed")
+	}
+	if responseHistoryWithinLimits(map[string]any{"input": []any{map[string]any{"role": "user"}}}, 1<<20, 0, 2) {
+		t.Fatal("restored depth limit bypassed")
+	}
+}
+func BenchmarkResponseHistoryRestore(b *testing.B) {
+	s := &Server{o: &Orchestrator{cfg: &config.Config{MaxRequestBytes: 256 << 20, MaxJSONDepth: 512, MaxJSONItems: 1000000}}, responseHistory: newResponseHistoryCache(256<<20, 6*time.Hour)}
+	b.Cleanup(func() {
+		c := s.responseHistory
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.timer != nil {
+			c.timer.Stop()
+		}
+	})
+	req := historyTestRequest("key")
+	body := map[string]any{"input": strings.Repeat("long tool result ", 65536)}
+	w, f, err := s.prepareResponseHistory(httptest.NewRecorder(), req, body, &Principal{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	historyTestComplete(w, "resp_large")
+	f()
+	full, _ := json.Marshal(body)
+	delta, _ := json.Marshal(map[string]any{"previous_response_id": "resp_large", "input": "continue", "store": false})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		payload := map[string]any{"previous_response_id": "resp_large", "input": "continue", "store": false}
+		_, release, err := s.prepareResponseHistory(httptest.NewRecorder(), req, payload, &Principal{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		raw, _ := json.Marshal(payload["input"])
+		if !bytes.Contains(raw, []byte("long tool result")) {
+			b.Fatal("history missing")
+		}
+		release()
+	}
+	b.ReportMetric(float64(len(full)), "full-wire-B")
+	b.ReportMetric(float64(len(delta)), "delta-wire-B")
+}
+
+func TestResponseHistoryHTTPPermissionsAndWireSavings(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream_%v", stream), func(t *testing.T) {
+			o, _ := newDNSFailoverOrch(t, &failingUpstream{})
+			o.wb.UpstreamClient = sessionSuccessfulUpstream{}
+			o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: sessionCostCatalog{}})
+			o.wb.Catalog.Refresh()
+			o.cfg.ResponseHistoryBytes = 256 << 20
+			o.cfg.ResponseHistoryTTLSeconds = 21600
+			app, err := o.db.CreateApp("history", o.hashKey("history-key"), "", "", "", "", 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := NewServer(o)
+			t.Cleanup(func() {
+				c := s.responseHistory
+				c.mu.Lock()
+				defer c.mu.Unlock()
+				if c.timer != nil {
+					c.timer.Stop()
+				}
+			})
+			request := func(body map[string]any) *httptest.ResponseRecorder {
+				raw, _ := json.Marshal(body)
+				req := httptest.NewRequest("POST", "/v1/responses", bytes.NewReader(raw))
+				req.Header.Set("Authorization", "Bearer history-key")
+				w := httptest.NewRecorder()
+				s.requestGuard(http.HandlerFunc(s.handleResponses)).ServeHTTP(w, req)
+				return w
+			}
+			first := map[string]any{"model": "test-model", "input": strings.Repeat("history ", 32768), "stream": stream}
+			w := request(first)
+			if w.Code != 200 {
+				t.Fatal(w.Code, w.Body.String())
+			}
+			var result map[string]any
+			rawResponse := w.Body.Bytes()
+			if stream {
+				rawResponse, err = protocol.CollapseStream(bytes.NewReader(rawResponse), protocol.Responses, "test-model")
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if json.Unmarshal(rawResponse, &result) != nil {
+				t.Fatal(w.Body.String())
+			}
+			delta := map[string]any{"model": "test-model", "input": "continue", "previous_response_id": result["id"], "stream": stream}
+			second := request(delta)
+			if second.Code != 200 || !strings.Contains(second.Body.String(), "hello") {
+				t.Fatal(second.Code, second.Body.String())
+			}
+			fullWire, _ := json.Marshal(first)
+			deltaWire, _ := json.Marshal(delta)
+			t.Logf("full input request=%d B, continuation request=%d B", len(fullWire), len(deltaWire))
+			if len(fullWire) < 1000*len(deltaWire) {
+				t.Fatal("unexpected wire savings")
+			}
+			if err := o.db.SetAppModels(app, `["forbidden"]`); err != nil {
+				t.Fatal(err)
+			}
+			if denied := request(delta); denied.Code == 200 {
+				t.Fatal("cached history bypassed current model permission")
+			}
+			if _, err := o.db.DeleteApp(app); err != nil {
+				t.Fatal(err)
+			}
+			if denied := request(delta); denied.Code != 401 {
+				t.Fatal("deleted key bypassed identity", denied.Code)
+			}
+		})
 	}
 }

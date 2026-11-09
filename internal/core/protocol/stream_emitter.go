@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"strings"
 	"time"
@@ -25,6 +26,9 @@ type bridgeStreamTool struct {
 }
 
 type bridgeStreamEmitter struct {
+	reasoningNative    map[string]any
+	reasoningSource    Protocol
+	reasoningSignature strings.Builder
 	w                  io.Writer
 	flush              func() error
 	target             Protocol
@@ -77,18 +81,61 @@ func (emitter *bridgeStreamEmitter) Emit(event bridgeStreamEvent) error {
 	if event.Model != "" {
 		emitter.model = event.Model
 	}
-	if !emitter.started && (event.Kind == "start" || event.Kind == "reasoning" || event.Kind == "reasoning_signature" || event.Kind == "text" || event.Kind == "tool_start" || event.Kind == "tool_delta") {
+	if !emitter.started && (event.Kind == "start" || event.Kind == "reasoning" || event.Kind == "reasoning_signature" || event.Kind == "reasoning_state" || event.Kind == "text" || event.Kind == "tool_start" || event.Kind == "tool_delta") {
 		if err := emitter.start(); err != nil {
 			return err
 		}
 	}
 	switch event.Kind {
+	case "reasoning_start":
+		if err := emitter.finishReasoning(); err != nil {
+			return err
+		}
+		emitter.reopenReasoning()
+		emitter.reasoningSource = event.SealSource
+		emitter.reasoningNative = event.NativeThinking
+		return nil
+	case "reasoning_end":
+		return emitter.finishReasoning()
+	case "reasoning_state":
+		emitter.reopenReasoning()
+		emitter.reasoningSource = event.SealSource
+		emitter.reasoningNative = event.NativeThinking
+		emitter.reasoningEncrypted = event.Encrypted
+		if event.Signature != "" && emitter.target == Responses {
+			emitter.reasoningSignature.WriteString(event.Signature)
+		}
+		if event.Text != "" {
+			if emitter.target == Responses {
+				emitter.reasoning.WriteString(event.Text)
+			}
+			if err := emitter.emitReasoning(event.Text); err != nil {
+				return err
+			}
+		}
+		if event.Encrypted != "" && event.SealSource == Anthropic && emitter.target == Anthropic {
+			return emitter.emitRedactedThinking(event.Encrypted)
+		}
+		if event.Signature != "" && emitter.target == Anthropic {
+			return emitter.emitReasoningSignature(event.Signature)
+		}
+		if emitter.target == Responses && (event.Encrypted != "" || event.Signature != "") {
+			return emitter.startReasoning()
+		}
+		return nil
 	case "reasoning":
 		if event.Text == "" && event.Encrypted == "" {
 			return nil
 		}
 		emitter.reopenReasoning()
+		emitter.reasoningSource = event.SealSource
 		if event.Encrypted != "" {
+			if event.SealSource == Anthropic && emitter.target == Anthropic {
+				return emitter.emitRedactedThinking(event.Encrypted)
+			}
+			if event.SealSource == Responses && emitter.target == Anthropic && event.Text == "" {
+				return nil
+			}
 			emitter.reasoningEncrypted = event.Encrypted
 			if emitter.target != Responses && event.Text == "" {
 				event.Text = anthropicRedactedThinkingPlaceholder
@@ -109,6 +156,10 @@ func (emitter *bridgeStreamEmitter) Emit(event bridgeStreamEvent) error {
 			return nil
 		}
 		emitter.reopenReasoning()
+		emitter.reasoningSource = event.SealSource
+		if emitter.target == Responses {
+			emitter.reasoningSignature.WriteString(event.Signature)
+		}
 		return emitter.emitReasoningSignature(event.Signature)
 	case "text":
 		if event.Text == "" {
@@ -355,6 +406,9 @@ func (emitter *bridgeStreamEmitter) reopenReasoning() {
 		emitter.reasoningClosed, emitter.reasoningOpen = false, false
 		emitter.reasoning.Reset()
 		emitter.reasoningEncrypted = ""
+		emitter.reasoningSource = ""
+		emitter.reasoningNative = nil
+		emitter.reasoningSignature.Reset()
 	}
 }
 
@@ -409,10 +463,7 @@ func (emitter *bridgeStreamEmitter) finishReasoning() error {
 		if err := emitter.sse("response.reasoning_summary_part.done", map[string]any{"type": "response.reasoning_summary_part.done", "item_id": emitter.reasoningItemID, "output_index": emitter.reasoningOutput, "summary_index": 0, "part": part, "sequence_number": emitter.nextSequence()}); err != nil {
 			return err
 		}
-		item := map[string]any{"id": emitter.reasoningItemID, "type": "reasoning", "status": "completed", "summary": []any{part}}
-		if emitter.reasoningEncrypted != "" {
-			item["encrypted_content"] = emitter.reasoningEncrypted
-		}
+		item := encodeResponsesReasoning(bridgeBlock{Kind: "reasoning", ID: emitter.reasoningItemID, Text: text, SealSource: emitter.reasoningSource, NativeThinking: emitter.reasoningNative, Signature: emitter.reasoningSignature.String(), Encrypted: emitter.reasoningEncrypted}, true)
 		emitter.recordResponseItem(emitter.reasoningOutput, item)
 		return emitter.sse("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": emitter.reasoningOutput, "item": item, "sequence_number": emitter.nextSequence()})
 	}
@@ -721,4 +772,26 @@ func mergeBridgeUsage(destination *Usage, source Usage) {
 	}
 	destination.ReasoningKnown = destination.ReasoningKnown || source.ReasoningKnown
 	destination.Total = max(destination.Total, destination.Input+destination.Output)
+}
+
+func (emitter *bridgeStreamEmitter) emitRedactedThinking(data string) error {
+	if err := emitter.finishReasoning(); err != nil {
+		return err
+	}
+	index := emitter.nextAnthropic
+	emitter.nextAnthropic++
+	if err := emitter.sse("content_block_start", map[string]any{"type": "content_block_start", "index": index, "content_block": emitter.redactedThinkingBlock(data)}); err != nil {
+		return err
+	}
+	return emitter.sse("content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
+}
+
+func (emitter *bridgeStreamEmitter) redactedThinkingBlock(data string) map[string]any {
+	block := maps.Clone(emitter.reasoningNative)
+	if block == nil {
+		block = map[string]any{}
+	}
+	block["type"] = "redacted_thinking"
+	block["data"] = data
+	return block
 }

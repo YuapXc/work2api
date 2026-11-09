@@ -1073,7 +1073,7 @@ func TestFreeTierRecoveryPreservesShapedToolBody(t *testing.T) {
 		}
 		tools, _ := payload["tools"].([]any)
 		items, _ := payload["input"].([]any)
-		if payload["stream"] != true || payload["previous_response_id"] != nil || len(tools) != 2 || len(items) != 1 {
+		if payload["stream"] != true || payload["previous_response_id"] != "expired" || len(tools) != 2 || len(items) != 1 {
 			t.Fatal(tier, payload)
 		}
 		if item, ok := items[0].(map[string]any); !ok || item["role"] != "user" {
@@ -1087,4 +1087,33 @@ func TestFreeTierRecoveryPreservesShapedToolBody(t *testing.T) {
 
 func fixtureRouteBodies(bodies map[Tier][]byte) routeBody {
 	return func(tier Tier) ([]byte, error) { return bodies[tier], nil }
+}
+
+func TestStaleReasoningRecoveryKeepsServerConversation(t *testing.T) {
+	for _, body := range []string{
+		`{"previous_response_id":"resp_prior","input":"continue"}`,
+		`{"previous_response_id":"resp_prior","input":[{"type":"message","role":"user","content":"continue"}]}`,
+	} {
+		out, changed := stripStaleReasoningBody([]byte(body))
+		if changed || string(out) != body {
+			t.Fatal("continuation-only request was reset", string(out))
+		}
+	}
+	body := []byte(`{"previous_response_id":"resp_prior","input":[{"type":"reasoning","id":"expired"},{"type":"function_call","call_id":"c1","name":"read","arguments":"{}"},{"type":"function_call_output","call_id":"c1","output":"result"}]}`)
+	out, changed := stripStaleReasoningBody(body)
+	if !changed {
+		t.Fatal("stale reasoning was not repaired")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatal(err)
+	}
+	items := payload["input"].([]any)
+	if payload["previous_response_id"] != "resp_prior" || len(items) != 2 || items[0].(map[string]any)["call_id"] != "c1" || items[1].(map[string]any)["output"] != "result" {
+		t.Fatal("conversation or tools lost", payload)
+	}
+	again, changed := stripStaleReasoningBody(out)
+	if changed || string(again) != string(out) {
+		t.Fatal("recovery is not idempotent")
+	}
 }

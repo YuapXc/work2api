@@ -46,3 +46,31 @@ func TestChatHeadersRequestIDs(t *testing.T) {
 		t.Fatal("Authorization 缺失")
 	}
 }
+
+func TestChatDeviceTokenIsAccountAndProductScoped(t *testing.T) {
+	for _, tc := range []struct {
+		domain, token string
+		want          bool
+	}{
+		{"www.workbuddy.cn", "real-account-device", true},
+		{"www.codebuddy.cn", "real-account-device", false},
+		{"www.codebuddy.ai", "real-account-device", false},
+		{"www.workbuddy.ai", "real-account-device", false},
+		{"www.workbuddy.cn", "bad\r\nheader", false},
+		{"www.workbuddy.cn", strings.Repeat("x", 1025), false},
+	} {
+		auth := siterouting.Auth{"accessToken": "fixture", "domain": tc.domain, "deviceToken": tc.token}
+		got := ChatHeaders(auth, Account{"uid": "fixture"})
+		if (got["X-Device-Token"] == tc.token) != tc.want {
+			t.Fatal(tc.domain, tc.want)
+		}
+		if CredentialHeaders(auth, nil)["X-Device-Token"] != "" || CatalogHeaders(auth, nil)["X-Device-Token"] != "" {
+			t.Fatal("device token leaked into another purpose")
+		}
+	}
+	first := siterouting.Auth{"domain": "www.workbuddy.cn", "accessToken": "one", "device_token": "first-device"}
+	second := siterouting.Auth{"domain": "www.workbuddy.cn", "accessToken": "two"}
+	if ChatHeaders(first, nil)["X-Device-Token"] != "first-device" || ChatHeaders(second, nil)["X-Device-Token"] != "" {
+		t.Fatal("account token crossed identities")
+	}
+}

@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"errors"
 	"strings"
 
 	"work2api/internal/jsonutil"
@@ -14,22 +15,24 @@ const (
 var reasoningVendorHints = [...]string{"moonshot", "kimi", "deepseek", "mimo", "xiaomimimo"}
 
 type bridgeBlock struct {
-	Kind          string
-	Text          string
-	Signature     string
-	Encrypted     string
-	URL           string
-	MediaType     string
-	Data          string
-	FileID        string
-	Filename      string
-	ID            string
-	Name          string
-	Arguments     any
-	ArgumentsJSON string
-	CallID        string
-	Result        any
-	IsError       bool
+	NativeThinking map[string]any
+	SealSource     Protocol
+	Kind           string
+	Text           string
+	Signature      string
+	Encrypted      string
+	URL            string
+	MediaType      string
+	Data           string
+	FileID         string
+	Filename       string
+	ID             string
+	Name           string
+	Arguments      any
+	ArgumentsJSON  string
+	CallID         string
+	Result         any
+	IsError        bool
 }
 
 type bridgeMessage struct {
@@ -113,7 +116,16 @@ type bridgeResponse struct {
 
 func ConvertRequest(from, to Protocol, input map[string]any) (map[string]any, error) {
 	if from == to {
-		return jsonutil.CloneMap(input), nil
+		out := jsonutil.CloneMap(input)
+		if to == Responses {
+			stripAnthropicReasoningEnvelopes(out)
+		}
+		return out, nil
+	}
+	if from == Responses {
+		if err := RequireFullResponsesInput(input); err != nil {
+			return nil, err
+		}
 	}
 	filtered, err := FunctionToolSubset(input, from)
 	if err != nil {
@@ -124,6 +136,15 @@ func ConvertRequest(from, to Protocol, input map[string]any) (map[string]any, er
 		return nil, err
 	}
 	return encodeBridgeRequest(to, request)
+}
+
+// A foreign protocol cannot resolve an upstream-owned response identifier.
+func RequireFullResponsesInput(input map[string]any) error {
+	value := input["previous_response_id"]
+	if value == nil || value == "" {
+		return nil
+	}
+	return errors.New("previous_response_id requires a native Responses endpoint that retains the response; send the full conversation without previous_response_id when converting protocols")
 }
 
 func normalizeResponsesRole(role string) string {

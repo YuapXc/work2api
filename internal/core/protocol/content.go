@@ -1,9 +1,11 @@
 package protocol
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 
 	"work2api/internal/identity"
@@ -83,12 +85,14 @@ func decodeAnthropicBlocksChecked(value any) ([]bridgeBlock, error) {
 		switch jsonutil.StringAt(part, "type") {
 		case "thinking":
 			blocks = append(blocks, bridgeBlock{
-				Kind:      "reasoning",
-				Text:      jsonutil.StringAt(part, "thinking"),
-				Signature: jsonutil.StringAt(part, "signature"),
+				Kind:           "reasoning",
+				SealSource:     Anthropic,
+				NativeThinking: part,
+				Text:           jsonutil.StringAt(part, "thinking"),
+				Signature:      jsonutil.StringAt(part, "signature"),
 			})
 		case "redacted_thinking":
-			blocks = append(blocks, bridgeBlock{Kind: "reasoning", Encrypted: jsonutil.StringAt(part, "data")})
+			blocks = append(blocks, bridgeBlock{Kind: "reasoning", SealSource: Anthropic, NativeThinking: part, Encrypted: jsonutil.StringAt(part, "data")})
 		case "text":
 			blocks = append(blocks, bridgeBlock{Kind: "text", Text: jsonutil.StringAt(part, "text")})
 		case "image":
@@ -161,14 +165,22 @@ func decodeResponsesReasoning(item map[string]any) []bridgeBlock {
 		}
 	}
 	encrypted := jsonutil.StringAt(item, "encrypted_content")
+	if block, ours := OpenAnthropicReasoning(encrypted); ours {
+		if block != nil {
+			blocks, _ := decodeAnthropicBlocksChecked([]any{block})
+			return blocks
+		}
+		encrypted = ""
+	}
 	if text.Len() == 0 && encrypted == "" {
 		return nil
 	}
 	return []bridgeBlock{{
-		Kind:      "reasoning",
-		ID:        jsonutil.StringAt(item, "id"),
-		Text:      text.String(),
-		Encrypted: encrypted,
+		Kind:       "reasoning",
+		SealSource: Responses,
+		ID:         jsonutil.StringAt(item, "id"),
+		Text:       text.String(),
+		Encrypted:  encrypted,
 	}}
 }
 
@@ -178,7 +190,7 @@ func decodeResponsesReasoning(item map[string]any) []bridgeBlock {
 // reasoning reference (Chat text or Anthropic thinking), so replaying them
 // under a synthesized id can only be rejected as a stale reference.
 func encodeResponsesReasoningInput(block bridgeBlock) (map[string]any, bool) {
-	if block.ID == "" && block.Encrypted == "" {
+	if block.SealSource == Anthropic || block.ID == "" && block.Encrypted == "" {
 		return nil, false
 	}
 	return encodeResponsesReasoning(block, false), true
@@ -194,7 +206,11 @@ func encodeResponsesReasoning(block bridgeBlock, completed bool) map[string]any 
 		summary = append(summary, map[string]any{"type": "summary_text", "text": block.Text})
 	}
 	item := map[string]any{"id": id, "type": "reasoning", "summary": summary}
-	if block.Encrypted != "" {
+	if block.SealSource == Anthropic {
+		if sealed := SealAnthropicReasoning(anthropicReasoningBlock(block)); sealed != "" {
+			item["encrypted_content"] = sealed
+		}
+	} else if block.Encrypted != "" {
 		item["encrypted_content"] = block.Encrypted
 	}
 	if completed {
@@ -290,11 +306,17 @@ func encodeAnthropicBlocks(blocks []bridgeBlock) []any {
 			}
 			parts = append(parts, map[string]any{"type": "tool_result", "tool_use_id": block.CallID, "content": content, "is_error": block.IsError})
 		case "reasoning":
-			if block.Encrypted != "" {
-				parts = append(parts, map[string]any{"type": "redacted_thinking", "data": block.Encrypted})
+			if block.Encrypted != "" && block.SealSource == Anthropic {
+				parts = append(parts, anthropicReasoningBlock(block))
+				continue
+			}
+			if block.Text == "" && block.Signature == "" {
 				continue
 			}
 			part := map[string]any{"type": "thinking", "thinking": block.Text, "signature": block.Signature}
+			if block.SealSource == Anthropic {
+				part = anthropicReasoningBlock(block)
+			}
 			parts = append(parts, part)
 		}
 	}
@@ -417,5 +439,98 @@ func encodeAnthropicToolChoice(choice bridgeToolChoice) any {
 		return map[string]any{"type": choice.Mode}
 	default:
 		return nil
+	}
+}
+
+const anthropicReasoningMark = "work2api-anthropic1:"
+
+// This is a transport envelope, not encryption or an upstream-issued signature.
+func validAnthropicReasoning(block map[string]any) bool {
+	switch block["type"] {
+	case "thinking":
+		signature, _ := block["signature"].(string)
+		_, ok := block["thinking"].(string)
+		return ok && strings.TrimSpace(signature) != ""
+	case "redacted_thinking":
+		data, _ := block["data"].(string)
+		return data != ""
+	default:
+		return false
+	}
+}
+func SealAnthropicReasoning(block map[string]any) string {
+	if !validAnthropicReasoning(block) {
+		return ""
+	}
+	raw, err := json.Marshal(block)
+	if err != nil {
+		return ""
+	}
+	return anthropicReasoningMark + base64.StdEncoding.EncodeToString(raw)
+}
+
+func OpenAnthropicReasoning(value string) (map[string]any, bool) {
+	encoded, ours := strings.CutPrefix(value, anthropicReasoningMark)
+	if !ours {
+		return nil, false
+	}
+	raw, err := base64.StdEncoding.Strict().DecodeString(encoded)
+	if err != nil {
+		return nil, true
+	}
+	var block map[string]any
+	if json.Unmarshal(raw, &block) != nil {
+		return nil, true
+	}
+	if !validAnthropicReasoning(block) {
+		return nil, true
+	}
+	return block, true
+}
+
+func anthropicReasoningBlock(block bridgeBlock) map[string]any {
+	if block.NativeThinking != nil {
+		raw := maps.Clone(block.NativeThinking)
+		if raw["type"] == "thinking" {
+			raw["thinking"] = block.Text
+			raw["signature"] = block.Signature
+		} else {
+			raw["data"] = block.Encrypted
+		}
+		return raw
+	}
+	if block.Encrypted != "" {
+		return map[string]any{"type": "redacted_thinking", "data": block.Encrypted}
+	}
+	return map[string]any{"type": "thinking", "thinking": block.Text, "signature": block.Signature}
+}
+
+func stripAnthropicReasoningEnvelopes(body map[string]any) {
+	items, ok := body["input"].([]any)
+	if !ok {
+		return
+	}
+	var next []any
+	for i, raw := range items {
+		item, ok := raw.(map[string]any)
+		encrypted, _ := item["encrypted_content"].(string)
+		if !ok || item["type"] != "reasoning" || !strings.HasPrefix(encrypted, anthropicReasoningMark) {
+			if next != nil {
+				next = append(next, raw)
+			}
+			continue
+		}
+		if next == nil {
+			next = append(make([]any, 0, len(items)), items[:i]...)
+		}
+		if summary, ok := item["summary"].([]any); ok && len(summary) > 0 {
+			copy := maps.Clone(item)
+			delete(copy, "encrypted_content")
+			delete(copy, "id")
+			next = append(next, copy)
+		}
+	}
+	if next != nil {
+		body["input"] = next
 	}
 }

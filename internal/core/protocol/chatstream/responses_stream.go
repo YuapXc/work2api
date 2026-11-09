@@ -2,10 +2,12 @@ package chatstream
 
 import (
 	"encoding/json"
+	"maps"
 	"sort"
 	"strings"
 	"time"
 
+	"work2api/internal/core/protocol"
 	"work2api/internal/identity"
 	"work2api/internal/tokenusage"
 )
@@ -13,10 +15,13 @@ import (
 // ResponsesStreamConverter converts a Chat SSE stream into a Responses API
 // semantic event stream.
 type ResponsesStreamConverter struct {
-	respID    string
-	msgID     string
-	model     string
-	createdAt int64
+	nativeBlockKinds map[int]string
+	nativeMessages   bool
+	nativeThinking   map[int]*nativeThinkingItem
+	respID           string
+	msgID            string
+	model            string
+	createdAt        int64
 
 	nonstream                                               bool
 	emittedCreated                                          bool
@@ -92,6 +97,20 @@ func (c *ResponsesStreamConverter) FeedLine(line string) string {
 func (c *ResponsesStreamConverter) FeedChunk(chunk map[string]any) string {
 	if chunk == nil {
 		return ""
+	}
+	if c.nativeMessages {
+		filtered := maps.Clone(chunk)
+		if choices, ok := chunk["choices"].([]any); ok {
+			next := make([]any, 0, len(choices))
+			for _, raw := range choices {
+				choice, _ := raw.(map[string]any)
+				copy := maps.Clone(choice)
+				copy["delta"] = map[string]any{}
+				next = append(next, copy)
+			}
+			filtered["choices"] = next
+		}
+		return c.processChunk(filtered)
 	}
 	return c.processChunk(chunk)
 }
@@ -208,7 +227,7 @@ func (c *ResponsesStreamConverter) processChunk(chunk map[string]any) string {
 		finish, _ := choice["finish_reason"].(string)
 
 		if delta != nil {
-			if reasoning, ok := delta["reasoning_content"].(string); ok && reasoning != "" {
+			if reasoning, ok := delta["reasoning_content"].(string); ok && reasoning != "" && !c.nativeMessages {
 				if c.reasoningIdx < 0 {
 					c.reasoningIdx = len(c.items)
 					c.items = append(c.items, responseOutputItem{kind: "reasoning"})
@@ -370,6 +389,8 @@ func (c *ResponsesStreamConverter) responseObj(status string) map[string]any {
 		switch item.kind {
 		case "reasoning":
 			output = append(output, c.reasoningItem(status, false))
+		case "native_reasoning":
+			output = append(output, c.nativeThinking[item.tool].item(status, false))
 		case "message":
 			output = append(output, c.msgItem(status, false))
 		case "function_call":
@@ -506,4 +527,151 @@ func itoa(n int) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+type nativeThinkingItem struct {
+	raw             map[string]any
+	id              string
+	output          int
+	kind            string
+	text, signature strings.Builder
+	data            string
+	closed          bool
+}
+
+func (n *nativeThinkingItem) item(status string, empty bool) map[string]any {
+	summary := []any{}
+	if !empty && n.text.Len() > 0 {
+		summary = append(summary, map[string]any{"type": "summary_text", "text": n.text.String()})
+	}
+	item := map[string]any{"type": "reasoning", "id": n.id, "status": status, "summary": summary}
+	if !empty {
+		block := maps.Clone(n.raw)
+		block["thinking"] = n.text.String()
+		block["signature"] = n.signature.String()
+		if n.kind == "redacted_thinking" {
+			block = maps.Clone(n.raw)
+			block["data"] = n.data
+		}
+		if sealed := protocol.SealAnthropicReasoning(block); sealed != "" {
+			item["encrypted_content"] = sealed
+		}
+	}
+	return item
+}
+
+// Native blocks preserve their boundaries; the accompanying Chat projection only supplies text/tools/usage.
+func (c *ResponsesStreamConverter) FeedNativeMessagesEvent(event map[string]any) string {
+	c.nativeMessages = true
+	if message, ok := event["message"].(map[string]any); ok {
+		if model, ok := message["model"].(string); ok {
+			c.model = model
+		}
+	}
+	var out strings.Builder
+	out.WriteString(c.processChunk(map[string]any{}))
+	index := 0
+	switch n := event["index"].(type) {
+	case float64:
+		index = int(n)
+	case int:
+		index = n
+	}
+	switch event["type"] {
+	case "content_block_start":
+		block, _ := event["content_block"].(map[string]any)
+		kind, _ := block["type"].(string)
+		if c.nativeBlockKinds == nil {
+			c.nativeBlockKinds = map[int]string{}
+		}
+		c.nativeBlockKinds[index] = kind
+		if kind == "text" {
+			if text, ok := block["text"].(string); ok && text != "" {
+				out.WriteString(c.nativeChatDelta(map[string]any{"content": text}))
+			}
+			return out.String()
+		}
+		if kind == "tool_use" {
+			arguments := ""
+			if input, ok := block["input"].(map[string]any); ok && len(input) > 0 {
+				raw, _ := json.Marshal(input)
+				arguments = string(raw)
+			}
+			out.WriteString(c.nativeChatDelta(map[string]any{"tool_calls": []any{map[string]any{"index": index, "id": block["id"], "function": map[string]any{"name": block["name"], "arguments": arguments}}}}))
+			return out.String()
+		}
+		if kind != "thinking" && kind != "redacted_thinking" {
+			return out.String()
+		}
+		if c.nativeThinking == nil {
+			c.nativeThinking = map[int]*nativeThinkingItem{}
+		}
+		n := &nativeThinkingItem{id: identity.RandomID("rs", 12), output: len(c.items), kind: kind, raw: block}
+		c.nativeThinking[index] = n
+		c.items = append(c.items, responseOutputItem{kind: "native_reasoning", tool: index})
+		n.data, _ = block["data"].(string)
+		if signature, ok := block["signature"].(string); ok {
+			n.signature.WriteString(signature)
+		}
+		out.WriteString(c.evt("response.output_item.added", map[string]any{"output_index": n.output, "item": n.item("in_progress", true)}))
+		if text, ok := block["thinking"].(string); ok && text != "" {
+			n.text.WriteString(text)
+			c.reasoning.WriteString(text)
+			out.WriteString(c.nativeThinkingDelta(n, text))
+		}
+	case "content_block_delta":
+		delta, _ := event["delta"].(map[string]any)
+		if c.nativeBlockKinds[index] == "text" && delta["type"] == "text_delta" {
+			out.WriteString(c.nativeChatDelta(map[string]any{"content": delta["text"]}))
+			return out.String()
+		}
+		if c.nativeBlockKinds[index] == "tool_use" && delta["type"] == "input_json_delta" {
+			out.WriteString(c.nativeChatDelta(map[string]any{"tool_calls": []any{map[string]any{"index": index, "function": map[string]any{"arguments": delta["partial_json"]}}}}))
+			return out.String()
+		}
+		n := c.nativeThinking[index]
+		if n == nil {
+			return out.String()
+		}
+		if delta["type"] == "thinking_delta" {
+			text, _ := delta["thinking"].(string)
+			n.text.WriteString(text)
+			c.reasoning.WriteString(text)
+			out.WriteString(c.nativeThinkingDelta(n, text))
+		}
+		if delta["type"] == "signature_delta" {
+			text, _ := delta["signature"].(string)
+			n.signature.WriteString(text)
+		}
+	case "content_block_stop":
+		if c.nativeBlockKinds[index] == "tool_use" {
+			if tool := c.toolCalls[index]; tool != nil && tool.args.Len() == 0 {
+				out.WriteString(c.nativeChatDelta(map[string]any{"tool_calls": []any{map[string]any{"index": index, "function": map[string]any{"arguments": "{}"}}}}))
+			}
+			return out.String()
+		}
+		n := c.nativeThinking[index]
+		if n == nil || n.closed {
+			return out.String()
+		}
+		n.closed = true
+		if n.text.Len() > 0 {
+			out.WriteString(c.evt("response.reasoning_summary_text.done", map[string]any{"item_id": n.id, "output_index": n.output, "summary_index": 0, "text": n.text.String()}))
+			out.WriteString(c.evt("response.reasoning_summary_part.done", map[string]any{"item_id": n.id, "output_index": n.output, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": n.text.String()}}))
+		}
+		out.WriteString(c.evt("response.output_item.done", map[string]any{"output_index": n.output, "item": n.item("completed", false)}))
+	}
+	return out.String()
+}
+func (c *ResponsesStreamConverter) nativeThinkingDelta(n *nativeThinkingItem, text string) string {
+	var out strings.Builder
+	if n.text.Len() == len(text) {
+		out.WriteString(c.evt("response.reasoning_summary_part.added", map[string]any{"item_id": n.id, "output_index": n.output, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": ""}}))
+	}
+	out.WriteString(c.evt("response.reasoning_summary_text.delta", map[string]any{"item_id": n.id, "output_index": n.output, "summary_index": 0, "delta": text}))
+	return out.String()
+}
+
+func (c *ResponsesStreamConverter) nativeChatDelta(delta map[string]any) string {
+	return c.processChunk(map[string]any{"choices": []any{map[string]any{"delta": delta}}})
 }

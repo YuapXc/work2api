@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"net/http"
 
 	coreprotocol "work2api/internal/core/protocol"
@@ -87,6 +88,20 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 	if err != nil {
 		writeJSON(w, 400, errBody(400, "bad json", "invalid_request_error").Body)
 		return
+	}
+	if protocol == "responses" {
+		var finish func()
+		w, finish, err = s.prepareResponseHistory(w, r, payload, principal)
+		if err != nil {
+			status, code, param := 400, "previous_response_not_found", "previous_response_id"
+			var limitErr responseHistoryLimitError
+			if errors.As(err, &limitErr) {
+				status, code, param = 413, "request_too_large", "input"
+			}
+			writeJSON(w, status, map[string]any{"error": map[string]any{"type": "invalid_request_error", "code": code, "param": param, "message": err.Error()}})
+			return
+		}
+		defer finish()
 	}
 	payload = coreprotocol.NormalizeInput(coreprotocol.Protocol(protocol), payload)
 	if aerr := s.prepareModel(principal, payload); aerr != nil {

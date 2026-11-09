@@ -88,6 +88,29 @@ func ChatHeaders(auth siterouting.Auth, account Account) map[string]string {
 	headers["X-Conversation-Message-ID"] = rid
 	headers["X-Conversation-Request-ID"] = rid
 	headers["X-Conversation-ID"] = newConversationID()
+	profile, _ := siterouting.ProfileForAuth(auth)
+	region, _ := siterouting.ProfileRegion(profile)
+	product, _ := siterouting.ProfileProduct(profile)
+	if region == "cn" && product != "cli" {
+		for _, key := range []string{"deviceToken", "device_token"} {
+			token, _ := auth[key].(string)
+			if token == "" || len(token) > 1024 {
+				continue
+			}
+			valid := true
+			for _, c := range []byte(token) {
+				if c < 33 || c == 127 {
+					valid = false
+					break
+				}
+			}
+			if valid {
+				headers["X-Device-Token"] = token
+				break
+			}
+		}
+	}
+
 	return headers
 }
 
@@ -163,6 +186,7 @@ func AuthHeaders(auth siterouting.Auth, account Account) map[string]string {
 		"Referer":          "https://" + domain + "/",
 	}
 	profile, _ := siterouting.ProfileForAuth(auth)
+
 	for k, v := range IdentityHeaders(profile) {
 		headers[k] = v
 	}

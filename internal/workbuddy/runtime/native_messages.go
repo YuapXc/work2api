@@ -2,16 +2,20 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"maps"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"work2api/internal/core/protocol"
 	"work2api/internal/workbuddy/siterouting"
+	"work2api/internal/workbuddy/upstream"
 )
 
 type messagesRequestKey struct{}
+type responsesRequestKey struct{}
 type messagesBetaKey struct{}
 
 func nativeMessagesEndpoint(profile, model string) string {
@@ -25,6 +29,12 @@ func nativeMessagesBody(ctx context.Context, chat map[string]any) (map[string]an
 	var body map[string]any
 	if original, ok := ctx.Value(messagesRequestKey{}).(map[string]any); ok {
 		body = maps.Clone(original)
+	} else if original, ok := ctx.Value(responsesRequestKey{}).(map[string]any); ok {
+		var err error
+		body, err = protocol.PrepareRequest(protocol.Responses, protocol.Anthropic, original, "")
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		var err error
 		body, err = protocol.PrepareRequest(protocol.Chat, protocol.Anthropic, chat, "")
@@ -66,39 +76,150 @@ func recoverNativeImages(body map[string]any, raw []byte, full bool) (map[string
 }
 
 func withoutMessagesThinking(body map[string]any, all bool) map[string]any {
+	return filterMessagesThinking(body, func(_, _ int, block map[string]any) bool {
+		if block["type"] != "thinking" {
+			return false
+		}
+		sig, _ := block["signature"].(string)
+		return all || strings.TrimSpace(sig) == "" || foreignThinkingSignature.MatchString(sig)
+	})
+}
+
+var foreignThinkingSignature = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+var boundThinkingRefusal = regexp.MustCompile("(?i)invalid `?signature`? in `?thinking`? block|bound to a different conversation|not created in this conversation|invalid data in `?redacted_thinking`? block")
+var boundThinkingPosition = regexp.MustCompile(`messages\.(\d+)\.content\.(\d+)`)
+
+type thinkingRefusalKey struct {
+	owner string
+	block [32]byte
+}
+
+func thinkingBlockKey(block map[string]any) [32]byte {
+	value, _ := block["signature"].(string)
+	if value == "" {
+		value, _ = block["data"].(string)
+	}
+	if value == "" {
+		value, _ = block["thinking"].(string)
+	}
+	kind, _ := block["type"].(string)
+	return sha256.Sum256([]byte(kind + "\x00" + value))
+}
+
+func isThinkingBlock(block map[string]any) bool {
+	return block["type"] == "thinking" || block["type"] == "redacted_thinking"
+}
+
+func (r *Runtime) withoutRefusedThinking(owner string, body map[string]any) map[string]any {
+	r.thinkingMu.RLock()
+	defer r.thinkingMu.RUnlock()
+	if len(r.refusedThinking) == 0 {
+		return body
+	}
+	return filterMessagesThinking(body, func(_, _ int, block map[string]any) bool {
+		return r.refusedThinking[thinkingRefusalKey{owner, thinkingBlockKey(block)}]
+	})
+}
+
+func (r *Runtime) recoverBoundThinking(owner string, body map[string]any, err *upstream.UpstreamError) (map[string]any, bool) {
+	if err.StatusCode != 400 {
+		return body, false
+	}
+	fault := upstream.ParseBusinessFault(err.Raw)
+	if fault.Code != "11159" && !boundThinkingRefusal.Match(err.Raw) {
+		return body, false
+	}
+	fromMessage, fromBlock := 0, 0
+	if at := boundThinkingPosition.FindSubmatch(err.Raw); at != nil {
+		mi, e1 := strconv.Atoi(string(at[1]))
+		bi, e2 := strconv.Atoi(string(at[2]))
+		messages, _ := body["messages"].([]any)
+		if e1 == nil && e2 == nil && mi < len(messages) {
+			message, _ := messages[mi].(map[string]any)
+			blocks, _ := message["content"].([]any)
+			if bi < len(blocks) {
+				block, _ := blocks[bi].(map[string]any)
+				if isThinkingBlock(block) {
+					fromMessage, fromBlock = mi, bi
+				}
+			}
+		}
+	}
+	var keys []thinkingRefusalKey
+	next := filterMessagesThinking(body, func(mi, bi int, block map[string]any) bool {
+		if mi < fromMessage || mi == fromMessage && bi < fromBlock {
+			return false
+		}
+		if len(keys) < 1<<14 {
+			keys = append(keys, thinkingRefusalKey{owner, thinkingBlockKey(block)})
+		}
+		return true
+	})
+	if len(keys) == 0 {
+		return body, false
+	}
+	r.thinkingMu.Lock()
+	if r.refusedThinking == nil || len(r.refusedThinking)+len(keys) > 1<<14 {
+		r.refusedThinking = make(map[thinkingRefusalKey]bool)
+	}
+	for _, key := range keys {
+		if len(r.refusedThinking) >= 1<<14 {
+			break
+		}
+		r.refusedThinking[key] = true
+	}
+	r.thinkingMu.Unlock()
+	return next, true
+}
+
+func filterMessagesThinking(body map[string]any, drop func(int, int, map[string]any) bool) map[string]any {
 	messages, _ := body["messages"].([]any)
 	var next []any
 	for i, v := range messages {
 		m, ok := v.(map[string]any)
 		if !ok || m["role"] != "assistant" {
+			if next != nil {
+				next = append(next, v)
+			}
 			continue
 		}
 		blocks, ok := m["content"].([]any)
 		if !ok {
+			if next != nil {
+				next = append(next, v)
+			}
 			continue
 		}
 		var kept []any
 		changed := false
-		for _, v := range blocks {
+		for bi, v := range blocks {
 			b, _ := v.(map[string]any)
-			if b["type"] == "thinking" && (all || b["signature"] == nil || b["signature"] == "") {
+			if isThinkingBlock(b) && drop(i, bi, b) {
+				if !changed {
+					kept = append(make([]any, 0, len(blocks)), blocks[:bi]...)
+				}
 				changed = true
 				continue
 			}
-			kept = append(kept, v)
+			if changed {
+				kept = append(kept, v)
+			}
 		}
 		if !changed {
+			if next != nil {
+				next = append(next, v)
+			}
 			continue
 		}
 		if next == nil {
-			next = append([]any(nil), messages...)
+			next = append(make([]any, 0, len(messages)), messages[:i]...)
 		}
 		if len(kept) == 0 {
-			kept = []any{map[string]any{"type": "text", "text": ""}}
+			continue
 		}
 		copy := maps.Clone(m)
 		copy["content"] = kept
-		next[i] = copy
+		next = append(next, copy)
 	}
 	if next == nil {
 		return body

@@ -173,6 +173,9 @@ func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload
 			r = r.WithContext(context.WithValue(r.Context(), messagesBetaKey{}, beta))
 		}
 	}
+	if protocol == "responses" {
+		r = r.WithContext(context.WithValue(r.Context(), responsesRequestKey{}, payload))
+	}
 	var chatBody map[string]any
 	var cvErr error
 	if protocol == "anthropic" {
@@ -246,6 +249,14 @@ func (o *Runtime) serveConverted(w http.ResponseWriter, r *http.Request, payload
 	nativeResponse := false
 	sink := func(line string) error {
 		chunk := upstream.DecodeFrame(r.Context(), line)
+		if event, ok := chunk[upstream.NativeEvent].(map[string]any); ok && protocol == "responses" {
+			responses := conv.(*chatstream.ResponsesStreamConverter)
+			evt := responses.FeedNativeMessagesEvent(event)
+			if streamMode && evt != "" {
+				return writeChunk(evt)
+			}
+			return nil
+		}
 		if event, ok := chunk[upstream.NativeEvent].(map[string]any); ok && protocol == "anthropic" {
 			if !nativeResponse {
 				if messages, ok := conv.(*chatstream.AnthropicStreamConverter); ok {

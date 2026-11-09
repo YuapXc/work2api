@@ -24,11 +24,12 @@ import (
 
 // Server is the HTTP surface over an Orchestrator.
 type Server struct {
-	updater      *selfupdate.Manager
-	calls        callMonitor
-	resources    resourceMonitor
-	usageExports usageExportQueue
-	o            *Orchestrator
+	responseHistory *responseHistoryCache
+	updater         *selfupdate.Manager
+	calls           callMonitor
+	resources       resourceMonitor
+	usageExports    usageExportQueue
+	o               *Orchestrator
 	// adminSessions + loginLimiter back the WebUI login (HttpOnly cookie
 	// sessions). In-memory only: restart signs everyone out.
 	sessions                                                    *adminSessionManager
@@ -89,7 +90,7 @@ func NewServer(o *Orchestrator) *Server {
 	if o.cfg.ModelLimitsDisabled {
 		bodyLimit = max(int64(0), o.cfg.RequestBodyBudget)
 	}
-	return &Server{o: o, sessions: newAdminSessionManager(), loginLimiter: newLoginRateLimiter(), portalLoginLimiter: newLoginRateLimiter(), portalSlots: make(chan struct{}, 8),
+	return &Server{o: o, responseHistory: newResponseHistoryCache(o.cfg.ResponseHistoryBytes, time.Duration(o.cfg.ResponseHistoryTTLSeconds)*time.Second), sessions: newAdminSessionManager(), loginLimiter: newLoginRateLimiter(), portalLoginLimiter: newLoginRateLimiter(), portalSlots: make(chan struct{}, 8),
 		portalTasks: map[string]*portalContributionTask{}, portalPollLimiter: map[int64]*pollLimiter{},
 		publicBodySlots: make(chan struct{}, 2), publicBodyWaiting: make(chan struct{}, 2), publicBodies: &bodyBudget{limit: 64 << 10},
 		bodyWaiting: make(chan struct{}, positiveOr(o.cfg.ModelQueueSize, 32)), modelsAdmission: newModelAdmission(o.cfg), adminSlots: make(chan struct{}, positiveOr(o.cfg.AdminConcurrency, 8)), heavySlots: make(chan struct{}, positiveOr(o.cfg.HeavyAdminConcurrency, 2)), querySlots: make(chan struct{}, positiveOr(o.cfg.QueryConcurrency, 4)), bodySlots: make(chan struct{}, positiveOr(o.cfg.BodyReadConcurrency, 4)), bodies: &bodyBudget{limit: bodyLimit}, refreshSlots: make(chan struct{}, 8), refreshes: map[string]*refreshFlight{}}
