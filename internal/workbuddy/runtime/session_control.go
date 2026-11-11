@@ -5,39 +5,42 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"work2api/internal/store"
 )
 
 // Observations and controls share the affinity map's bounded, in-memory lifetime.
 // No conversation text, raw session identifier or credential is retained.
 type SessionState struct {
-	ID                           string          `json:"id"`
-	Model                        string          `json:"model"`
-	App                          string          `json:"app"`
-	UserID                       int64           `json:"user_id"`
-	Source                       string          `json:"source"`
-	Version                      uint64          `json:"Version"`
-	Started                      float64         `json:"started_at"`
-	Last                         float64         `json:"last_at"`
-	Requests                     int             `json:"requests"`
-	Running                      int             `json:"Running"`
-	Waiting                      int             `json:"waiting"`
-	Credits                      float64         `json:"credits"`
-	Known                        int             `json:"credits_known"`
-	Unknown                      int             `json:"credits_unknown"`
-	Pending                      string          `json:"pending_action"`
-	Target                       string          `json:"target_uid"`
-	RouteStatus                  string          `json:"route_status"`
-	RouteMessage                 string          `json:"route_message"`
-	LastSuccess                  string          `json:"last_success_uid"`
-	LastAttempt                  string          `json:"last_attempt_uid"`
-	ManualUID                    string          `json:"-"`
-	ControlEpoch                 uint64          `json:"-"`
-	AgentRequests                int             `json:"agent_requests"`
-	LastUID                      string          `json:"-"`
-	Compatibility                string          `json:"Compatibility"`
-	CompatUID, CompatFingerprint string          `json:"-"`
-	CompatLevel                  int             `json:"-"`
-	Scope                        map[string]bool `json:"-"`
+	cacheInput                             int
+	cacheAccount, cacheModel, cacheProfile string
+	ID                                     string          `json:"id"`
+	Model                                  string          `json:"model"`
+	App                                    string          `json:"app"`
+	UserID                                 int64           `json:"user_id"`
+	Source                                 string          `json:"source"`
+	Version                                uint64          `json:"Version"`
+	Started                                float64         `json:"started_at"`
+	Last                                   float64         `json:"last_at"`
+	Requests                               int             `json:"requests"`
+	Running                                int             `json:"Running"`
+	Waiting                                int             `json:"waiting"`
+	Credits                                float64         `json:"credits"`
+	Known                                  int             `json:"credits_known"`
+	Unknown                                int             `json:"credits_unknown"`
+	Pending                                string          `json:"pending_action"`
+	Target                                 string          `json:"target_uid"`
+	RouteStatus                            string          `json:"route_status"`
+	RouteMessage                           string          `json:"route_message"`
+	LastSuccess                            string          `json:"last_success_uid"`
+	LastAttempt                            string          `json:"last_attempt_uid"`
+	ManualUID                              string          `json:"-"`
+	ControlEpoch                           uint64          `json:"-"`
+	AgentRequests                          int             `json:"agent_requests"`
+	LastUID                                string          `json:"-"`
+	Compatibility                          string          `json:"Compatibility"`
+	CompatUID, CompatFingerprint           string          `json:"-"`
+	CompatLevel                            int             `json:"-"`
+	Scope                                  map[string]bool `json:"-"`
 }
 type SessionView struct {
 	SessionState
@@ -46,12 +49,15 @@ type SessionView struct {
 }
 type SessionCallKey struct{}
 type SessionCall struct {
-	Router         *SessionRouter
-	Key            string
-	State          *SessionState
-	Running        bool
-	ControlVersion uint64
-	TargetUID      string
+	sequence                                        int
+	previousInput                                   int
+	previousAccount, previousModel, previousProfile string
+	Router                                          *SessionRouter
+	Key                                             string
+	State                                           *SessionState
+	Running                                         bool
+	ControlVersion                                  uint64
+	TargetUID                                       string
 }
 type SessionSelection struct {
 	Key                      string
@@ -101,6 +107,11 @@ func (r *SessionRouter) Begin(ctx context.Context, key, model string, p SessionP
 		info.UserID = p.SessionCaller().UserID
 		info.Scope = CopySessionScope(p.SessionCaller().AccountScope)
 	}
+	previousInput := info.cacheInput
+	if info.Running+info.Waiting > 0 {
+		previousInput = 0
+		info.cacheInput = 0
+	}
 	info.Requests++
 	if identity, ok := ctx.Value(RequestSessionIdentityKey{}).(RequestSessionIdentity); ok && identity.Agent != "" {
 		info.AgentRequests++
@@ -110,7 +121,7 @@ func (r *SessionRouter) Begin(ctx context.Context, key, model string, p SessionP
 	entry.Expires = now + r.Ttl
 	r.M[key] = entry
 	r.Order.MoveToBack(entry.Order)
-	call := &SessionCall{Router: r, Key: key, State: info}
+	call := &SessionCall{Router: r, Key: key, State: info, sequence: info.Requests, previousInput: previousInput, previousAccount: info.cacheAccount, previousModel: info.cacheModel, previousProfile: info.cacheProfile}
 	r.Mu.Unlock()
 	return context.WithValue(ctx, SessionCallKey{}, call), func() { call.Finish() }
 }
@@ -365,4 +376,33 @@ func (r *SessionRouter) Control(key string, version uint64, action, target strin
 		e.Info.RouteMessage = "等待下一次尚未开始执行的请求"
 	}
 	return true
+}
+
+func SessionCacheObservation(ctx context.Context, account, model, profile string, input int, cached *int, success bool) *store.UsageCacheReuse {
+	if ctx == nil {
+		return nil
+	}
+	c, _ := ctx.Value(SessionCallKey{}).(*SessionCall)
+	if c == nil {
+		return nil
+	}
+	c.Router.Mu.Lock()
+	defer c.Router.Mu.Unlock()
+	e, ok := c.Router.M[c.Key]
+	if !ok || e.Info != c.State {
+		return nil
+	}
+	if c.sequence != c.State.Requests || c.State.Running+c.State.Waiting != 1 {
+		c.State.cacheInput = 0
+		return nil
+	}
+	c.State.cacheInput = 0
+	if !success || input <= 0 || account == "" {
+		return nil
+	}
+	c.State.cacheInput, c.State.cacheAccount, c.State.cacheModel, c.State.cacheProfile = input, account, model, profile
+	if c.previousInput <= 0 || c.previousModel != model || c.previousProfile != profile || cached == nil || *cached < 0 || *cached > input {
+		return nil
+	}
+	return &store.UsageCacheReuse{PreviousInput: c.previousInput, AccountChanged: c.previousAccount != account, ReadRatio: float64(*cached) / float64(c.previousInput)}
 }

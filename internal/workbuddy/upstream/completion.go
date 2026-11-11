@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+	"work2api/internal/core/protocol"
 )
 
 type BusinessFault struct{ Code, Message string }
@@ -149,6 +150,7 @@ type streamedTool struct {
 // completionState validates before terminal events reach protocol adapters.
 // Normal argument fragments remain untouched; only the complete JSON is checked.
 type completionState struct {
+	toolIndexes   protocol.ToolCallIndexes
 	seen, content bool
 	finish        string
 	tools         map[int]*streamedTool

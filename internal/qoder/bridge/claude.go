@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"work2api/internal/core/protocol"
 	"work2api/internal/core/provider"
 
 	"work2api/internal/qoder/cosy"
@@ -125,6 +126,7 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 
 		// toolCallMerged: key=index, value=merged tool call
 		toolCallMerged := map[int]map[string]interface{}{}
+		var toolIndexes protocol.ToolCallIndexes
 		contentBlockIndex := 0
 		streamContentLen := 0
 		var totalInputTokens, totalOutputTokens int
@@ -175,7 +177,7 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 				})
 			}
 			if d.ToolCalls != nil {
-				MergeToolCallChunks(toolCallMerged, d.ToolCalls)
+				MergeToolCallChunks(toolCallMerged, d.ToolCalls, &toolIndexes)
 			}
 		})
 		result.InputTokens = totalInputTokens
@@ -253,6 +255,7 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 		var full strings.Builder
 		var reasoningBuf strings.Builder
 		toolCallMerged := map[int]map[string]interface{}{}
+		var toolIndexes protocol.ToolCallIndexes
 		var totalInputTokens, totalOutputTokens int
 		err := b.CallQoderWithOpts(ctx, "claude", messages, model, tools, opts, func(d Delta) {
 			if d.Err != nil {
@@ -266,7 +269,7 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 				full.WriteString(d.Content)
 			}
 			if d.ToolCalls != nil {
-				MergeToolCallChunks(toolCallMerged, d.ToolCalls)
+				MergeToolCallChunks(toolCallMerged, d.ToolCalls, &toolIndexes)
 			}
 		})
 		result.InputTokens = totalInputTokens
@@ -406,7 +409,41 @@ func WriteClaudeErr(w http.ResponseWriter, err error) {
 }
 
 // MergeToolCallChunks 将流式 tool_call 增量 chunk 按 index 合并。
-func MergeToolCallChunks(merged map[int]map[string]interface{}, chunks []interface{}) {
+func MergeToolCallChunks(merged map[int]map[string]interface{}, chunks []interface{}, trackers ...*protocol.ToolCallIndexes) {
+	var local protocol.ToolCallIndexes
+	tracker := &local
+	if len(trackers) > 0 && trackers[0] != nil {
+		tracker = trackers[0]
+	} else {
+		for index, existing := range merged {
+			id, _ := existing["id"].(string)
+			local.Resolve(0, index, id)
+		}
+		for _, raw := range chunks {
+			call, _ := raw.(map[string]any)
+			if call == nil || call["index"] != nil {
+				continue
+			}
+			id, _ := call["id"].(string)
+			if id == "" {
+				continue
+			}
+			index := 0
+			for key := range merged {
+				if key >= index {
+					index = key + 1
+				}
+			}
+			for key, existing := range merged {
+				if existing["id"] == id {
+					index = key
+					break
+				}
+			}
+			call["index"] = index
+		}
+	}
+	tracker.NormalizeTools(0, chunks)
 	for _, chunk := range chunks {
 		tc, ok := chunk.(map[string]interface{})
 		if !ok {

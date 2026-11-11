@@ -10,6 +10,7 @@ import (
 	"log"
 	"math/big"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -313,6 +314,8 @@ func (c *Client) ChatPreparedStreamWithHeaders(a *auth.Auth, prepared []byte) (r
 }
 
 type ModelInfo struct {
+	ReasoningOptions       []string `json:"reasoning_options,omitempty"`
+	DefaultReasoning       string   `json:"default_reasoning,omitempty"`
 	ID                     string
 	Name                   string
 	ContextWindow          int64 // = context_window_tokens.dev（目录未给则 0）
@@ -367,7 +370,9 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			DisplayConfig         modelDisplay    `json:"display_config"`
 			Contact               json.RawMessage `json:"display_contact_config"`
 			ReasoningEffortConfig struct {
-				SupportThinking *bool `json:"support_thinking"`
+				SupportThinking *bool             `json:"support_thinking"`
+				Options         []json.RawMessage `json:"options"`
+				DefaultLevel    string            `json:"default_level"`
 			} `json:"reasoning_effort_config"`
 			Details []struct {
 				MaxTokens       int64           `json:"max_tokens"`
@@ -412,7 +417,16 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 				maxTokens = detail.MaxTokens
 			}
 		}
+		options := []string{}
+		for _, raw := range cfg.ReasoningEffortConfig.Options {
+			var option string
+			if json.Unmarshal(raw, &option) == nil && NativeEffortName(option) != "" && !slices.Contains(options, option) {
+				options = append(options, option)
+			}
+		}
 		out = append(out, ModelInfo{
+			ReasoningOptions:       options,
+			DefaultReasoning:       cfg.ReasoningEffortConfig.DefaultLevel,
 			ID:                     cfg.ConfigName,
 			Name:                   cfg.DisplayConfig.DisplayName,
 			ContextWindow:          cfg.ContextWindowTokens.Dev,
@@ -1220,4 +1234,43 @@ func truncate(s string, n int) string {
 		return s[:n]
 	}
 	return s
+}
+
+func NativeEffortName(native string) string {
+	switch native {
+	case "light":
+		return "low"
+	case "medium", "high", "max":
+		return native
+	case "extra_high":
+		return "xhigh"
+	}
+	return ""
+}
+func (m ModelInfo) ReasoningEfforts() []string {
+	out := []string{}
+	for _, option := range m.ReasoningOptions {
+		if name := NativeEffortName(option); name != "" && !slices.Contains(out, name) {
+			out = append(out, name)
+		}
+	}
+	if slices.Contains(out, "xhigh") && !slices.Contains(out, "max") {
+		out = append(out, "max")
+	}
+	return out
+}
+func (m ModelInfo) NativeEffort(effort string) (string, bool) {
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	if native := NativeEffortName(effort); native != "" {
+		effort = native
+	}
+	for _, option := range m.ReasoningOptions {
+		if NativeEffortName(option) == effort {
+			return option, true
+		}
+	}
+	if effort == "max" && slices.Contains(m.ReasoningOptions, "extra_high") && !slices.Contains(m.ReasoningOptions, "max") {
+		return "extra_high", true
+	}
+	return "", false
 }

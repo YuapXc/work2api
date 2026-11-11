@@ -1,6 +1,9 @@
 package upstream
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestClassifyLongContext5xxAsInputTooLarge(t *testing.T) {
 	for _, tc := range []struct {
@@ -51,5 +54,29 @@ func TestClassifyPreservesExplicitStatusAndParameterErrors(t *testing.T) {
 		if e.Kind() != want {
 			t.Fatal("stream status lost", e.Kind())
 		}
+	}
+}
+
+func TestDynamicReasoningNativeMapping(t *testing.T) {
+	model := ModelInfo{ReasoningOptions: []string{"light", "high", "extra_high"}, DefaultReasoning: "high"}
+	for _, tc := range []struct{ effort, want string }{{"low", "light"}, {"high", "high"}, {"xhigh", "extra_high"}, {"max", "extra_high"}, {"medium", ""}, {"unknown", ""}, {"", ""}} {
+		raw := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+		var obj map[string]any
+		_ = json.Unmarshal(raw, &obj)
+		if tc.effort != "" {
+			obj["reasoning_effort"] = tc.effort
+		}
+		raw, _ = json.Marshal(obj)
+		result, _ := PrepareBodyResolvedWithLimits(raw, "cn", "m", model)
+		var body map[string]any
+		_ = json.Unmarshal(result, &body)
+		got, _ := body["reasoning_effort"].(string)
+		if got != tc.want {
+			t.Fatalf("%s -> %s want %s, body=%s", tc.effort, got, tc.want, result)
+		}
+	}
+	model.ReasoningOptions = append(model.ReasoningOptions, "max")
+	if got, ok := model.NativeEffort("max"); !ok || got != "max" {
+		t.Fatal("native max overwritten", got, ok)
 	}
 }

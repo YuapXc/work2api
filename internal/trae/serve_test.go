@@ -320,7 +320,7 @@ func TestImageCapabilityDoesNotPromoteUnknownModels(t *testing.T) {
 }
 
 func TestCatalogUsesUpstreamMetadata(t *testing.T) {
-	response := `{"config_info_list":[{"config_name":"vision","display_config":{"display_name":"Vision","multimodal":true,"model_capability":"reasoning_model","tool_response_multimodal":true},"reasoning_effort_config":{"support_thinking":false},"context_window_tokens":{"dev":200000},"model_detail_list":[{"max_tokens":8192},{"max_tokens":4096}]},{"config_name":"text","display_config":{"display_name":"Text","multimodal":false}},{"config_name":"unknown","display_config":{"display_name":"Unknown"}}]}`
+	response := `{"config_info_list":[{"config_name":"vision","display_config":{"display_name":"Vision","multimodal":true,"model_capability":"reasoning_model","tool_response_multimodal":true},"reasoning_effort_config":{"support_thinking":false,"options":["light","extra_high","high","extra_high",{"unknown":true}],"default_level":"high"},"context_window_tokens":{"dev":200000},"model_detail_list":[{"max_tokens":8192},{"max_tokens":4096}]},{"config_name":"text","display_config":{"display_name":"Text","multimodal":false}},{"config_name":"unknown","display_config":{"display_name":"Unknown"}}]}`
 	response = strings.Replace(response, `[{"max_tokens":8192},{"max_tokens":4096}]`, `[{"max_tokens":8192,"model_entitlement_usage_cost":1},{"max_tokens":4096,"model_entitlement_usage_cost":0},{"model_entitlement_usage_cost":{"unknown":1}}]`, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) { io.WriteString(w, response) }))
 	defer server.Close()
@@ -329,6 +329,9 @@ func TestCatalogUsesUpstreamMetadata(t *testing.T) {
 	models, err := client.FetchModels(&auth.Auth{Variant: "cn", AccessToken: "fixture"})
 	if err != nil || len(models) != 3 {
 		t.Fatalf("models=%v err=%v", models, err)
+	}
+	if strings.Join(models[0].ReasoningOptions, ",") != "light,extra_high,high" || models[0].DefaultReasoning != "high" {
+		t.Fatal("dynamic options lost", models[0])
 	}
 	r := &Runtime{accounts: map[string]*accountState{"a": {Auth: &auth.Auth{Variant: "cn"}, Enabled: true, Models: models}}}
 	data := r.AdminData(context.Background())
@@ -1294,4 +1297,18 @@ func TestQuotaPublicationDoesNotWaitForCredentialRotation(t *testing.T) {
 		t.Fatal("singleflight followers would see stale success")
 	}
 	r.Models(context.Background())
+}
+
+func TestReasoningCatalogMergePreservesNativeOptions(t *testing.T) {
+	entry := provider.CatalogModel{Extra: map[string]any{}}
+	applyModelCapabilities(&entry, upstream.ModelInfo{ReasoningOptions: []string{"light", "extra_high"}, DefaultReasoning: "light"})
+	mergeCatalogCapabilities(&entry, upstream.ModelInfo{ReasoningOptions: []string{"high", "max"}, DefaultReasoning: "high"})
+	reasoning := entry.Extra["reasoning"].(map[string]any)
+	efforts := reasoning["supportedEfforts"].([]string)
+	if strings.Join(efforts, ",") != "low,xhigh,high,max" || reasoning["defaultEffort"] != nil {
+		t.Fatalf("merged efforts/default: %v", reasoning)
+	}
+	if got := entry.Extra["reasoning_options"].([]string); strings.Join(got, ",") != "light,extra_high,high,max" {
+		t.Fatal("lost native options", got)
+	}
 }

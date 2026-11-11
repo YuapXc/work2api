@@ -14,6 +14,7 @@ import (
 )
 
 type bridgeStreamParser struct {
+	chatIndexes              ToolCallIndexes
 	responseReasonHashes     map[string]hash.Hash
 	responseReasoningDone    map[string]bool
 	anthropicThinking        map[string]bool
@@ -104,6 +105,7 @@ func (parser *bridgeStreamParser) parseChat(value map[string]any) []bridgeStream
 }
 
 func (parser *bridgeStreamParser) parseChatEvent(eventName string, value map[string]any) []bridgeStreamEvent {
+	parser.chatIndexes.NormalizeChunk(value)
 	events := make([]bridgeStreamEvent, 0, 4)
 	if eventName == "error" {
 		return []bridgeStreamEvent{{Kind: "error", Error: streamErrorMessage(value, "upstream Chat stream error"), ErrorType: streamErrorType(value)}}

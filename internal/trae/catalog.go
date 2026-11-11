@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"work2api/internal/core/provider"
@@ -140,6 +141,15 @@ func mergeModelInfo(a, b upstream.ModelInfo) upstream.ModelInfo {
 	a.Multimodal = unionBool(a.Multimodal, b.Multimodal)
 	a.ToolResponseMultimodal = unionBool(a.ToolResponseMultimodal, b.ToolResponseMultimodal)
 	a.ThinkingControl = unionBool(a.ThinkingControl, b.ThinkingControl)
+	a.ReasoningOptions = slices.Clone(a.ReasoningOptions)
+	for _, option := range b.ReasoningOptions {
+		if !slices.Contains(a.ReasoningOptions, option) {
+			a.ReasoningOptions = append(a.ReasoningOptions, option)
+		}
+	}
+	if a.DefaultReasoning != b.DefaultReasoning {
+		a.DefaultReasoning = ""
+	}
 	if b.Capability == "reasoning_model" || a.Capability == "" {
 		a.Capability = b.Capability
 	}
@@ -171,9 +181,18 @@ func applyModelCapabilities(entry *provider.CatalogModel, m upstream.ModelInfo) 
 	entry.Extra["model_capability"] = m.Capability
 	entry.Extra["thinking_control"] = boolValue(m.ThinkingControl)
 	entry.Extra["tool_response_multimodal"] = boolValue(m.ToolResponseMultimodal)
+	entry.Extra["reasoning_options"] = slices.Clone(m.ReasoningOptions)
+	entry.Extra["reasoning_default"] = m.DefaultReasoning
 	entry.Extra["reasoning"] = nil
-	if m.Capability == "reasoning_model" || m.Capability == "chat_model" {
-		entry.Extra["reasoning"] = map[string]any{"supportsReasoning": m.Capability == "reasoning_model"}
+	if m.Capability == "reasoning_model" || m.Capability == "chat_model" || len(m.ReasoningOptions) > 0 {
+		reasoning := map[string]any{"supportsReasoning": m.Capability == "reasoning_model" || len(m.ReasoningOptions) > 0}
+		if efforts := m.ReasoningEfforts(); len(efforts) > 0 {
+			reasoning["supportedEfforts"] = efforts
+		}
+		if native, ok := m.NativeEffort(m.DefaultReasoning); ok {
+			reasoning["defaultEffort"] = upstream.NativeEffortName(native)
+		}
+		entry.Extra["reasoning"] = reasoning
 	}
 	entry.Modalities = nil
 	if m.Multimodal != nil {
@@ -197,6 +216,8 @@ func mergeCatalogCapabilities(entry *provider.CatalogModel, m upstream.ModelInfo
 		tool = &value
 	}
 	previous := upstream.ModelInfo{Multimodal: vision, ThinkingControl: thinking, ToolResponseMultimodal: tool, Capability: text(entry.Extra["model_capability"]), ContextWindow: int64(entry.Context), MaxTokens: int64(entry.MaxOutput)}
+	previous.ReasoningOptions, _ = entry.Extra["reasoning_options"].([]string)
+	previous.DefaultReasoning, _ = entry.Extra["reasoning_default"].(string)
 	previous.EntitlementCosts, _ = entry.Extra["entitlement_usage_cost"].([]float64)
 	previous.Pricing, _ = entry.Extra["price_factors"].([]upstream.ModelPrice)
 	merged := mergeModelInfo(previous, m)

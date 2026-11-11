@@ -238,6 +238,7 @@ export interface UsagePoint {
 }
 
 export interface UsageDiagnostics {
+ cache_reuse?: {previous_input_tokens:number; account_changed:boolean; read_ratio:number}
  media_task_id?: string
  media?: {operation?: string; size?: string; n?: number; seconds?: number; resolution?: string; aspect_ratio?: string; enable_audio?: boolean; output_video_duration?: number; output_video_coefficient?: number}
 

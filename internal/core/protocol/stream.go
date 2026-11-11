@@ -462,3 +462,104 @@ func readSSE(reader io.Reader, handler func(eventName, data string) error) error
 	}
 	return nil
 }
+
+// ToolCallIndexes separates calls whose upstream index is reused. An absent ID
+// continues the open call; repeated IDs retain their original output index.
+type ToolCallIndexes struct {
+	open map[[2]int]toolIndexSlot
+	ids  map[toolIndexID]toolIndexSlot
+	used map[int]bool
+	next int
+}
+type toolIndexSlot struct {
+	index int
+	id    string
+}
+type toolIndexID struct {
+	choice int
+	id     string
+}
+
+func (t *ToolCallIndexes) Resolve(choice, index int, id string) int {
+	if t.open == nil {
+		t.open = map[[2]int]toolIndexSlot{}
+		t.ids = map[toolIndexID]toolIndexSlot{}
+		t.used = map[int]bool{}
+	}
+	key := [2]int{choice, index}
+	slot, ok := t.open[key]
+	if id != "" {
+		if known, exists := t.ids[toolIndexID{choice, id}]; exists {
+			slot, ok = known, true
+		}
+	}
+	if !ok || id != "" && slot.id != "" && slot.id != id {
+		n := index
+		if n < 0 || t.used[n] {
+			for t.used[t.next] {
+				t.next++
+			}
+			n = t.next
+		}
+		slot = toolIndexSlot{index: n}
+		t.used[n] = true
+	}
+	if id != "" {
+		slot.id = id
+		t.ids[toolIndexID{choice, id}] = slot
+	}
+	t.open[key] = slot
+	return slot.index
+}
+func (t *ToolCallIndexes) NormalizeTools(choice int, calls []any) bool {
+	changed := false
+	for _, raw := range calls {
+		call, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		index := 0
+		switch n := call["index"].(type) {
+		case nil:
+		case int:
+			index = n
+		case float64:
+			if n != float64(int(n)) {
+				continue
+			}
+			index = int(n)
+		default:
+			continue
+		}
+		if index < 0 {
+			continue
+		}
+		id, _ := call["id"].(string)
+		output := t.Resolve(choice, index, id)
+		if output != index || call["index"] == nil {
+			call["index"] = output
+			changed = true
+		}
+	}
+	return changed
+}
+func (t *ToolCallIndexes) NormalizeChunk(chunk map[string]any) bool {
+	changed := false
+	choices, _ := chunk["choices"].([]any)
+	for _, raw := range choices {
+		choice, _ := raw.(map[string]any)
+		index := 0
+		switch n := choice["index"].(type) {
+		case int:
+			index = n
+		case float64:
+			index = int(n)
+		}
+		delta, _ := choice["delta"].(map[string]any)
+		calls, _ := delta["tool_calls"].([]any)
+		if t.NormalizeTools(index, calls) {
+			changed = true
+		}
+	}
+	return changed
+}

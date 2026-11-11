@@ -677,3 +677,43 @@ func TestNativeThinkingRecoveryCacheBound(t *testing.T) {
 		t.Fatal("cache did not remain bounded or preserved an empty assistant", len(rt.refusedThinking), out)
 	}
 }
+
+func TestSessionCacheObservationIgnoresOverlapAndUnknownUsage(t *testing.T) {
+	router := NewSessionRouter()
+	observe := func(ctx context.Context, account string, input, cached int, success bool) {
+		t.Helper()
+		got := SessionCacheObservation(ctx, account, "model", "cn", input, &cached, success)
+		if got != nil {
+			t.Fatalf("unexpected observation: %+v", got)
+		}
+	}
+	ctx, done := router.Begin(context.Background(), "s", "model", nil, nil)
+	observe(ctx, "a", 100, 0, true)
+	done()
+	ctx, done = router.Begin(context.Background(), "s", "model", nil, nil)
+	cached := 120
+	got := SessionCacheObservation(ctx, "b", "model", "cn", 150, &cached, true)
+	if got == nil || !got.AccountChanged || got.PreviousInput != 100 || got.ReadRatio != 1.2 {
+		t.Fatalf("bad reuse observation %+v", got)
+	}
+	done()
+	first, finishFirst := router.Begin(context.Background(), "s", "model", nil, nil)
+	second, finishSecond := router.Begin(context.Background(), "s", "model", nil, nil)
+	observe(first, "a", 160, 130, true)
+	finishFirst()
+	observe(second, "b", 180, 140, true)
+	finishSecond()
+	ctx, done = router.Begin(context.Background(), "s", "model", nil, nil)
+	if got := SessionCacheObservation(ctx, "b", "model", "cn", 200, nil, true); got != nil {
+		t.Fatal("unknown cache fabricated")
+	}
+	done()
+	ctx, done = router.Begin(context.Background(), "other", "model", nil, nil)
+	observe(ctx, "a", 500, 200, true)
+	done()
+	ctx, done = router.Begin(context.Background(), "s", "model", nil, nil)
+	if got := SessionCacheObservation(ctx, "b", "model", "solo", 220, &cached, true); got != nil {
+		t.Fatal("cross product mixed")
+	}
+	done()
+}

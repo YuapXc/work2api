@@ -90,6 +90,7 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 		return
 	}
 	if protocol == "responses" {
+		r = r.WithContext(context.WithValue(r.Context(), responseHistoryContextKey{}, &responseHistoryReplay{}))
 		var finish func()
 		w, finish, err = s.prepareResponseHistory(w, r, payload, principal)
 		if err != nil {

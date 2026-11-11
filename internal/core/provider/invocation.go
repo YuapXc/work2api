@@ -30,7 +30,9 @@ type Caller struct {
 // immediately before dispatch, including after credentials or queue waits.
 // It does not grant permission merely because an earlier check succeeded.
 type Invocation struct {
-	Diagnostic bool
+	Dispatched  func(AccountRef, string)
+	PrepareBody func(AccountRef, string, []byte) ([]byte, error)
+	Diagnostic  bool
 
 	LogCapture    *LogCapturePolicy
 	Provider      string
@@ -64,7 +66,12 @@ func CheckDispatch(ctx context.Context, account AccountRef, model string) error 
 		return &DispatchError{Status: 403, Message: "诊断请求不得切换到其他账号", Type: "diagnostic_target_mismatch"}
 	}
 	if check := call.Check; check != nil {
-		return check(ctx, account, model)
+		if err := check(ctx, account, model); err != nil {
+			return err
+		}
+	}
+	if call.Dispatched != nil {
+		call.Dispatched(account, model)
 	}
 	return nil
 }
@@ -111,4 +118,11 @@ func DisplayAccountCounts(counts map[string]int, defaultName string) map[string]
 		}
 	}
 	return out
+}
+
+func PrepareDispatchBody(ctx context.Context, account AccountRef, model string, body []byte) ([]byte, error) {
+	if prepare := CurrentInvocation(ctx).PrepareBody; prepare != nil {
+		return prepare(account, model, body)
+	}
+	return body, nil
 }

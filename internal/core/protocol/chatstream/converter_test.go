@@ -347,3 +347,44 @@ func chatChunk(delta map[string]any) string {
 	})
 	return "data: " + string(b) + "\n\n"
 }
+
+func TestConvertersSeparateCallsWithReusedIndex(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		responses := NewResponsesStreamConverter("m")
+		messages := NewAnthropicStreamConverter("m")
+		if !stream {
+			responses.SetNonstream()
+			messages.SetNonstream()
+		}
+		var wire strings.Builder
+		for _, raw := range []string{
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"one","arguments":"{\"key\":"}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"A\"}"}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"b","function":{"name":"two","arguments":"{\"key\":\"B\"}"}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		} {
+			var chunk map[string]any
+			_ = json.Unmarshal([]byte(raw), &chunk)
+			wire.WriteString(responses.FeedChunk(chunk))
+			_ = json.Unmarshal([]byte(raw), &chunk)
+			wire.WriteString(messages.FeedChunk(chunk))
+		}
+		calls := responses.GetNonstreamResponse()["output"].([]any)
+		if len(calls) != 2 {
+			t.Fatal("Responses lost call", calls)
+		}
+		for _, item := range calls {
+			v := item.(map[string]any)
+			if !json.Valid([]byte(v["arguments"].(string))) {
+				t.Fatal("invalid Responses arguments", v)
+			}
+		}
+		content := messages.GetNonstreamResponse()["content"].([]any)
+		if len(content) != 2 || content[0].(map[string]any)["id"] != "a" || content[1].(map[string]any)["id"] != "b" {
+			t.Fatal("Messages lost call", content)
+		}
+		if stream && (!strings.Contains(wire.String(), "a") || !strings.Contains(wire.String(), "b")) {
+			t.Fatal("stream missing calls")
+		}
+	}
+}

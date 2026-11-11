@@ -143,7 +143,14 @@ type UsageParams struct {
 }
 
 // UsageDiagnostics contains protocol facts only, never prompts or credentials.
+type UsageCacheReuse struct {
+	PreviousInput  int     `json:"previous_input_tokens"`
+	AccountChanged bool    `json:"account_changed"`
+	ReadRatio      float64 `json:"read_ratio"`
+}
+
 type UsageDiagnostics struct {
+	CacheReuse         *UsageCacheReuse   `json:"cache_reuse,omitempty"`
 	MediaTaskID        string             `json:"media_task_id,omitempty"`
 	Media              map[string]any     `json:"media,omitempty"`
 	ImagesRemoved      int                `json:"images_removed,omitempty"`

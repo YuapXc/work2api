@@ -15,6 +15,7 @@ import (
 	"time"
 	"work2api/internal/config"
 	"work2api/internal/core/protocol"
+	"work2api/internal/core/provider"
 	"work2api/internal/workbuddy/models"
 	"work2api/internal/workbuddy/pool"
 	"work2api/internal/workbuddy/upstream"
@@ -1366,5 +1367,43 @@ func TestResponseHistoryHTTPPermissionsAndWireSavings(t *testing.T) {
 				t.Fatal("deleted key bypassed identity", denied.Code)
 			}
 		})
+	}
+}
+
+func TestResponseHistoryOriginOnlyCleansForeignRestoredItems(t *testing.T) {
+	origin := responseHistoryOrigin{"opencode", "old", "m"}
+	replay := &responseHistoryReplay{restored: []responseHistoryOrigin{origin, origin, origin, origin}, total: 5}
+	body := []byte(`{"input":[{"role":"assistant","id":"old_message","content":"hello"},{"type":"function_call","id":"old_call","call_id":"c1","name":"read","arguments":"{\"id\":\"business\"}"},{"type":"reasoning","id":"old_ref"},{"type":"reasoning","id":"old_sealed","encrypted_content":"opaque"},{"type":"message","id":"new_input","role":"user","content":"next"}],"tools":[{"type":"function","name":"read"}]}`)
+	unchanged, err := replay.prepareBody(provider.AccountRef{Provider: "opencode", LocalID: "old"}, "m", body)
+	if err != nil || !bytes.Equal(unchanged, body) {
+		t.Fatal("same origin changed", err)
+	}
+	for _, target := range []responseHistoryOrigin{{"opencode", "new", "m"}, {"opencode", "old", "other"}, {"other", "old", "m"}} {
+		result, err := replay.prepareBody(provider.AccountRef{Provider: target.Provider, LocalID: target.Account}, target.Model, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var payload map[string]any
+		if err = json.Unmarshal(result, &payload); err != nil {
+			t.Fatal(err)
+		}
+		items := payload["input"].([]any)
+		if len(items) != 4 {
+			t.Fatal("reference reasoning retained", string(result))
+		}
+		for _, raw := range items[:3] {
+			if raw.(map[string]any)["id"] != nil {
+				t.Fatal("foreign ID retained", string(result))
+			}
+		}
+		call := items[1].(map[string]any)
+		if call["call_id"] != "c1" || call["arguments"] != `{"id":"business"}` || items[2].(map[string]any)["encrypted_content"] != "opaque" || items[3].(map[string]any)["id"] != "new_input" || payload["tools"] == nil {
+			t.Fatal("tool/new input contract changed", string(result))
+		}
+	}
+	replay.total++
+	unchanged, err = replay.prepareBody(provider.AccountRef{Provider: "opencode", LocalID: "new"}, "m", body)
+	if err != nil || !bytes.Equal(unchanged, body) {
+		t.Fatal("guessed mismatched history")
 	}
 }

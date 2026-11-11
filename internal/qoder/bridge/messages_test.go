@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"work2api/internal/core/protocol"
 	"work2api/internal/qoder/cosy"
 	"work2api/internal/streamwatch"
 )
@@ -731,5 +732,39 @@ func BenchmarkQoderStreamReadDispatch(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func TestQoderAggregateSeparatesReusedIndex(t *testing.T) {
+	merged := map[int]map[string]any{}
+	var indexes protocol.ToolCallIndexes
+	for _, raw := range []string{
+		`[{"index":0,"id":"a","function":{"name":"read","arguments":"{\"path\":"}}]`,
+		`[{"index":0,"function":{"arguments":"\"A\"}"}}]`,
+		`[{"index":0,"id":"b","function":{"name":"read","arguments":"{\"path\":\"B\"}"}}]`,
+	} {
+		var calls []any
+		_ = json.Unmarshal([]byte(raw), &calls)
+		MergeToolCallChunks(merged, calls, &indexes)
+	}
+	calls := SortedToolCalls(merged)
+	if len(calls) != 2 {
+		t.Fatal("calls merged", calls)
+	}
+	for i, call := range calls {
+		var args map[string]string
+		if err := json.Unmarshal([]byte(call["function"].(map[string]any)["arguments"].(string)), &args); err != nil || args["path"] != []string{"A", "B"}[i] {
+			t.Fatal("arguments corrupted", call, err)
+		}
+	}
+}
+
+func TestQoderStatelessToolMergeKeepsMissingIndexCompatibility(t *testing.T) {
+	merged := map[int]map[string]any{}
+	for _, id := range []string{"a", "b", "a"} {
+		MergeToolCallChunks(merged, []any{map[string]any{"id": id, "function": map[string]any{"name": "read", "arguments": " "}}})
+	}
+	if len(merged) != 2 || merged[0]["id"] != "a" || merged[1]["id"] != "b" || merged[0]["function"].(map[string]any)["arguments"] != "  " {
+		t.Fatal("stateless merge regressed", merged)
 	}
 }

@@ -269,7 +269,15 @@ func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies 
 			drainAndClose(lastResponse.Body)
 			lastResponse = nil
 		}
-		req, err := newUpstreamRequest(ctx, rt.anonymousBase(), route.Protocol, body, ids, anonymousZenKey)
+		attemptBody := body
+		if route.Protocol == protocol.Responses {
+			var err error
+			attemptBody, err = provider.PrepareDispatchBody(ctx, provider.AccountRef{Provider: runtimeName, LocalID: "opencode:anonymous"}, runtimePrefix+route.ID, body)
+			if err != nil {
+				return nil, err, attempts
+			}
+		}
+		req, err := newUpstreamRequest(ctx, rt.anonymousBase(), route.Protocol, attemptBody, ids, anonymousZenKey)
 		if err != nil {
 			return nil, err, attempts
 		}
@@ -489,7 +497,15 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies routeB
 			lastResponse = nil
 		}
 		attempts++
-		req, err := newUpstreamRequest(ctx, baseURL, route.Protocol, body, ids, node.key)
+		attemptBody := body
+		if route.Protocol == protocol.Responses {
+			var err error
+			attemptBody, err = provider.PrepareDispatchBody(ctx, provider.AccountRef{Provider: runtimeName, LocalID: uid}, runtimePrefix+route.ID, body)
+			if err != nil {
+				return nil, err, attempts
+			}
+		}
+		req, err := newUpstreamRequest(ctx, baseURL, route.Protocol, attemptBody, ids, node.key)
 		if err != nil {
 			return nil, err, attempts
 		}

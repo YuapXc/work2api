@@ -79,8 +79,19 @@ func (o *Runtime) LogUsage(a LogArgs) {
 	if effort == "" {
 		effort = "default"
 	}
+	diagnostics := requestdiag.UsageDiagnostics(a.Ctx)
+	profile := ""
+	if a.Acc != nil {
+		profile = a.Acc.Profile
+	}
+	if reuse := SessionCacheObservation(a.Ctx, uid, a.Model, profile, inTok, UsageCachedTokens(a.Usage), completedTransport && known); reuse != nil {
+		if diagnostics == nil {
+			diagnostics = &store.UsageDiagnostics{}
+		}
+		diagnostics.CacheReuse = reuse
+	}
 	params := store.UsageParams{
-		Diagnostics:         requestdiag.UsageDiagnostics(a.Ctx),
+		Diagnostics:         diagnostics,
 		Model:               a.Model,
 		Protocol:            a.Protocol,
 		AccountUID:          uid,

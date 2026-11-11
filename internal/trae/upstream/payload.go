@@ -16,7 +16,7 @@ func PrepareBodyResolved(src []byte, variant, resolvedModel string) []byte {
 
 // Capture effective limits from the same object that produces the wire body;
 // callers must not prepare and decode the entire conversation again for logs.
-func PrepareBodyResolvedWithLimits(src []byte, variant, resolvedModel string) ([]byte, map[string]int) {
+func PrepareBodyResolvedWithLimits(src []byte, variant, resolvedModel string, models ...ModelInfo) ([]byte, map[string]int) {
 	if len(src) == 0 {
 		return src, nil
 	}
@@ -83,6 +83,15 @@ func PrepareBodyResolvedWithLimits(src []byte, variant, resolvedModel string) ([
 		"presence_penalty", "frequency_penalty", "seed", "n"} {
 		if v, ok := obj[k].(float64); ok {
 			out[k] = v
+		}
+	}
+	if len(models) > 0 {
+		if re, ok := obj["reasoning_effort"].(string); ok {
+			if native, known := models[0].NativeEffort(re); known {
+				obj["reasoning_effort"] = native
+			} else {
+				delete(obj, "reasoning_effort")
+			}
 		}
 	}
 	if re, ok := obj["reasoning_effort"].(string); ok {

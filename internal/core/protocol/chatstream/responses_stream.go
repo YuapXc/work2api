@@ -15,6 +15,7 @@ import (
 // ResponsesStreamConverter converts a Chat SSE stream into a Responses API
 // semantic event stream.
 type ResponsesStreamConverter struct {
+	toolIndexes      protocol.ToolCallIndexes
 	nativeBlockKinds map[int]string
 	nativeMessages   bool
 	nativeThinking   map[int]*nativeThinkingItem
@@ -202,6 +203,7 @@ func (c *ResponsesStreamConverter) Fail(message string, code int) string {
 }
 
 func (c *ResponsesStreamConverter) processChunk(chunk map[string]any) string {
+	c.toolIndexes.NormalizeChunk(chunk)
 	var events strings.Builder
 
 	if m, ok := chunk["model"].(string); ok && m != "" {

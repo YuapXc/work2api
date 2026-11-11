@@ -1542,3 +1542,20 @@ func TestSealedThinkingSummaryCannotReplaceSignedText(t *testing.T) {
 		}
 	}
 }
+
+func TestToolCallIndexesSeparateReusedSourceIndexes(t *testing.T) {
+	var indexes ToolCallIndexes
+	for _, step := range []struct {
+		source int
+		id     string
+		want   int
+	}{{0, "a", 0}, {0, "b", 1}, {0, "", 1}, {0, "a", 0}, {1, "c", 2}, {1, "", 2}, {2, "c", 2}} {
+		if got := indexes.Resolve(0, step.source, step.id); got != step.want {
+			t.Fatalf("%+v: %d", step, got)
+		}
+	}
+	malformed := []any{map[string]any{"index": -1, "id": "x"}, map[string]any{"index": 0.5, "id": "y"}}
+	if indexes.NormalizeTools(0, malformed) {
+		t.Fatal("invalid index silently accepted")
+	}
+}

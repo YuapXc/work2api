@@ -57,6 +57,10 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 	defer cancel()
 	call := provider.CurrentInvocation(ctx)
 	call.Provider = rt.Name()
+	if history, _ := r.Context().Value(responseHistoryContextKey{}).(*responseHistoryReplay); history != nil {
+		call.Dispatched = history.dispatched
+		call.PrepareBody = history.prepareBody
+	}
 	call.Caller = principal.SessionCaller()
 	call.UsageObserver = principal.quota
 	call.LogCapture = &provider.LogCapturePolicy{Enabled: principal.UserID == 0, Limit: s.o.cfg.UsageContentMaxBytes}

@@ -18,15 +18,120 @@ import (
 	"sync"
 	"time"
 	"work2api/internal/config"
+	"work2api/internal/core/provider"
 )
 
 const responseHistoryCaptureLimit = 64 << 20
 
 type responseHistoryKey struct{ scope, id string }
+type responseHistoryOrigin struct{ Provider, Account, Model string }
+type responseHistoryContextKey struct{}
+type responseHistoryReplay struct {
+	mu       sync.Mutex
+	current  responseHistoryOrigin
+	restored []responseHistoryOrigin
+	total    int
+}
+
+func (h *responseHistoryReplay) dispatched(ref provider.AccountRef, model string) {
+	h.mu.Lock()
+	h.current = responseHistoryOrigin{ref.Provider, ref.LocalID, model}
+	h.mu.Unlock()
+}
+func (h *responseHistoryReplay) origin() responseHistoryOrigin {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.current
+}
+func (h *responseHistoryReplay) prepareBody(ref provider.AccountRef, model string, body []byte) ([]byte, error) {
+	if len(h.restored) == 0 {
+		return body, nil
+	}
+	target := responseHistoryOrigin{ref.Provider, ref.LocalID, model}
+	foreign := false
+	for _, origin := range h.restored {
+		if origin != target || origin.Provider == "" {
+			foreign = true
+			break
+		}
+	}
+	if !foreign {
+		return body, nil
+	}
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(body, &payload) != nil {
+		return body, nil
+	}
+	var items []json.RawMessage
+	if json.Unmarshal(payload["input"], &items) != nil || len(items) != h.total {
+		return body, nil
+	}
+	next := make([]json.RawMessage, 0, len(items))
+	changed := false
+	for index, raw := range items {
+		if index >= len(h.restored) || h.restored[index] == target && target.Provider != "" {
+			next = append(next, raw)
+			continue
+		}
+		var item map[string]json.RawMessage
+		if json.Unmarshal(raw, &item) != nil {
+			next = append(next, raw)
+			continue
+		}
+		var kind string
+		_ = json.Unmarshal(item["type"], &kind)
+		if kind == "" {
+			var role string
+			_ = json.Unmarshal(item["role"], &role)
+			if role == "user" || role == "assistant" || role == "system" || role == "developer" {
+				kind = "message"
+			}
+		}
+		switch kind {
+		case "reasoning":
+			var encrypted string
+			_ = json.Unmarshal(item["encrypted_content"], &encrypted)
+			if encrypted == "" {
+				changed = true
+				continue
+			}
+			if _, ok := item["id"]; !ok {
+				next = append(next, raw)
+				continue
+			}
+		case "message", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output":
+			if _, ok := item["id"]; !ok {
+				next = append(next, raw)
+				continue
+			}
+		default:
+			next = append(next, raw)
+			continue
+		}
+		delete(item, "id")
+		encoded, err := json.Marshal(item)
+		if err != nil {
+			return nil, err
+		}
+		next = append(next, encoded)
+		changed = true
+	}
+	if !changed {
+		return body, nil
+	}
+	encoded, err := json.Marshal(next)
+	if err != nil {
+		return nil, err
+	}
+	payload["input"] = encoded
+	return json.Marshal(payload)
+}
+
 type responseHistorySegment struct {
-	items []json.RawMessage
-	bytes int64
-	refs  int
+	origin responseHistoryOrigin
+	items  []json.RawMessage
+	bytes  int64
+	refs   int
 }
 type responseHistoryEntry struct {
 	key      responseHistoryKey
@@ -98,11 +203,15 @@ func (c *responseHistoryCache) release(e *responseHistoryEntry) {
 	defer c.mu.Unlock()
 	c.releaseLocked(e)
 }
-func (c *responseHistoryCache) put(key responseHistoryKey, parent *responseHistoryEntry, items []json.RawMessage) bool {
+func (c *responseHistoryCache) put(key responseHistoryKey, parent *responseHistoryEntry, items []json.RawMessage, origins ...responseHistoryOrigin) bool {
 	if len(key.id) == 0 || len(key.id) > 512 {
 		return false
 	}
 	segment := &responseHistorySegment{items: items, bytes: 128 + int64(cap(items))*24}
+	if len(origins) > 0 {
+		segment.origin = origins[0]
+		segment.bytes += int64(len(segment.origin.Provider)+len(segment.origin.Account)+len(segment.origin.Model)) + 48
+	}
 	for _, raw := range items {
 		segment.bytes += int64(cap(raw))
 	}
@@ -316,6 +425,10 @@ func (s *Server) prepareResponseHistory(w http.ResponseWriter, r *http.Request, 
 	}
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%d/%d/", principal.AppID, principal.UserID) + r.Header.Get("Authorization") + "\x00" + r.Header.Get("X-Api-Key")))
 	scope := hex.EncodeToString(sum[:])
+	history, _ := r.Context().Value(responseHistoryContextKey{}).(*responseHistoryReplay)
+	if history == nil {
+		history = &responseHistoryReplay{}
+	}
 	fresh, valid := responseHistoryInput(payload["input"])
 	var parent *responseHistoryEntry
 	if previous := payload["previous_response_id"]; previous != nil && previous != "" {
@@ -341,7 +454,13 @@ func (s *Server) prepareResponseHistory(w http.ResponseWriter, r *http.Request, 
 				}
 			}
 		}
-		var history []any
+		for _, segment := range parent.segments {
+			for range segment.items {
+				history.restored = append(history.restored, segment.origin)
+			}
+		}
+		history.total = len(history.restored) + len(fresh)
+		var restoredItems []any
 		for _, segment := range parent.segments {
 			for _, raw := range segment.items {
 				var item map[string]any
@@ -349,10 +468,10 @@ func (s *Server) prepareResponseHistory(w http.ResponseWriter, r *http.Request, 
 					c.release(parent)
 					return w, noop, errors.New("续接历史不可用，请发送完整对话历史")
 				}
-				history = append(history, item)
+				restoredItems = append(restoredItems, item)
 			}
 		}
-		payload["input"] = append(history, fresh...)
+		payload["input"] = append(restoredItems, fresh...)
 		delete(payload, "previous_response_id")
 		if !responseHistoryWithinLimits(payload, limit, s.o.cfg.MaxJSONItems, s.o.cfg.MaxJSONDepth) {
 			c.release(parent)
@@ -394,7 +513,7 @@ func (s *Server) prepareResponseHistory(w http.ResponseWriter, r *http.Request, 
 		items := make([]json.RawMessage, len(inputs)+len(result))
 		copy(items, inputs)
 		copy(items[len(inputs):], result)
-		capture.saved = c.put(responseHistoryKey{scope, id}, parent, items)
+		capture.saved = c.put(responseHistoryKey{scope, id}, parent, items, history.origin())
 		capture.savedID = id
 		return true
 	}

@@ -447,3 +447,33 @@ func TestCanceledLargeRequestDoesNotDispatch(t *testing.T) {
 	default:
 	}
 }
+
+func TestCollectStreamSeparatesIDsReusingIndex(t *testing.T) {
+	reply, err := upstream.CollectStream("test", func(yield upstream.LineFunc) error {
+		for _, line := range []string{
+			`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"first","arguments":"{\"key\":"}}]}}]}`,
+			`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"A\"}"}}]}}]}`,
+			`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"b","function":{"name":"second","arguments":"{\"key\":\"B\"}"}}]}}]}`,
+			`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		} {
+			if err := yield(line); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := reply["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)["tool_calls"].([]any)
+	if len(calls) != 2 {
+		t.Fatalf("calls=%v", calls)
+	}
+	for i, call := range calls {
+		v := call.(map[string]any)
+		var args map[string]string
+		if err := json.Unmarshal([]byte(v["function"].(map[string]any)["arguments"].(string)), &args); err != nil || args["key"] != []string{"A", "B"}[i] {
+			t.Fatalf("corrupt tool call: %v %v", v, err)
+		}
+	}
+}

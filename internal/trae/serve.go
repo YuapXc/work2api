@@ -208,8 +208,36 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 		a := r.accounts[ref.LocalID]
 		var identityModel string
 		var identity *auth.Auth
+		var identityInfo upstream.ModelInfo
 		if a != nil {
 			identity, identityModel = a.modelIdentityFor(model, image, r.identityAvailableLocked)
+			effort := protocol.ExplicitReasoningEffort(body)
+			if effort != "" {
+				preferred, preferredModel := a.modelIdentityFor(model, image, func(candidate *auth.Auth) bool {
+					if !r.identityAvailableLocked(candidate) {
+						return false
+					}
+					for _, info := range a.Catalogs[candidate.Variant] {
+						if strings.EqualFold(info.ID, model) {
+							if _, ok := info.NativeEffort(effort); ok {
+								return true
+							}
+						}
+					}
+					return false
+				})
+				if preferred != nil {
+					identity, identityModel = preferred, preferredModel
+				}
+			}
+			if identity != nil {
+				for _, info := range a.Catalogs[identity.Variant] {
+					if info.ID == identityModel {
+						identityInfo = info
+						break
+					}
+				}
+			}
 		}
 		r.mu.Unlock()
 		if a == nil || identity == nil {
@@ -226,7 +254,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 			return report, err
 		}
 		streamwatch.StartAttempt(ctx)
-		prepared, limits := upstream.PrepareBodyResolvedWithLimits(encoded, identity.Variant, identityModel)
+		prepared, limits := upstream.PrepareBodyResolvedWithLimits(encoded, identity.Variant, identityModel, identityInfo)
 		report.EffectiveLimits = limits
 		stream, status, errorBody, headers, sendErr, beforeSend := r.sendPreparedChat(ctx, identity, prepared)
 		streamwatch.AttemptHeaders(ctx, status, headers)

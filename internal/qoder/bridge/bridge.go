@@ -479,6 +479,7 @@ func (b *Bridge) CallQoder(ctx context.Context, agent string, messages []interfa
 // 让 openStreamLines 及时退出——上游发出错误帧后若不关流，否则重开闸门
 // 永不触发、请求挂起；错误由 CallQoder 在流结束后统一返回。
 func deltaDispatcher(onDelta func(Delta), upstreamErr *error) func(string) bool {
+	var toolIndexes protocol.ToolCallIndexes
 	return func(line string) bool {
 		if *upstreamErr != nil {
 			return false
@@ -496,6 +497,7 @@ func deltaDispatcher(onDelta func(Delta), upstreamErr *error) func(string) bool 
 			return false
 		}
 		if !delta.isEmpty() {
+			toolIndexes.NormalizeTools(0, delta.ToolCalls)
 			onDelta(delta)
 		}
 		return true

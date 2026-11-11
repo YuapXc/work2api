@@ -302,7 +302,8 @@ func streamSSE(resp *http.Response, yield LineFunc, names ...map[string]string) 
 		if json.Unmarshal([]byte(data), &chunk) != nil {
 			return invalidStream("上游返回了无效 SSE 数据")
 		}
-		renamed := restore.restore(chunk)
+		remapped := state.toolIndexes.NormalizeChunk(chunk)
+		renamed := restore.restore(chunk) || remapped
 		if err := state.observe(chunk); err != nil {
 			return err
 		}
@@ -422,6 +423,7 @@ func CollectStream(fallbackModel string, produce func(yield LineFunc) error) (ma
 		if json.Unmarshal([]byte(data), &chunk) != nil {
 			return invalidStream("上游返回了无效 SSE 数据")
 		}
+		state.toolIndexes.NormalizeChunk(chunk)
 		if err := state.observe(chunk); err != nil {
 			return err
 		}

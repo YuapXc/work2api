@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+	"work2api/internal/core/protocol"
 
 	"work2api/internal/core/provider"
 	"work2api/internal/identity"
@@ -15,6 +16,7 @@ import (
 // AnthropicStreamConverter converts an OpenAI Chat SSE stream into an Anthropic
 // Messages SSE event stream in real time.
 type AnthropicStreamConverter struct {
+	toolIndexes protocol.ToolCallIndexes
 	observeOnly bool
 	msgID       string
 	model       string
@@ -170,6 +172,7 @@ func (c *AnthropicStreamConverter) GetNonstreamResponse() map[string]any {
 }
 
 func (c *AnthropicStreamConverter) processChunk(chunk map[string]any) string {
+	c.toolIndexes.NormalizeChunk(chunk)
 	var events strings.Builder
 
 	if m, ok := chunk["model"].(string); ok && m != "" {
