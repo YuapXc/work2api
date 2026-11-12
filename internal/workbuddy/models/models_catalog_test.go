@@ -585,3 +585,18 @@ func TestMediaModelsOutsideChatWhitelistRemainTypedAndUnpriced(t *testing.T) {
 		}
 	}
 }
+
+func TestEnterpriseCustomModelsAppendWithoutLocalProviders(t *testing.T) {
+	p := pool.New(map[string]pool.Credential{"a": catalogTestCredential{profile: "cn-cli"}}, "")
+	r := NewWithCatalogClient(p, nil, &http.Client{Transport: isolatedCatalogTransport(func(req *http.Request) (*http.Response, error) {
+		return catalogResponse(req, 200, `{"code":0,"data":{"agents":[{"name":"cli","models":["chat","custom:listed|listed"]}],"models":[{"id":"chat"},{"id":"custom:listed|listed"},{"id":"custom:enterprise|enterprise","modelType":"enterprise","credits":2,"supportsImages":true,"maxInputTokens":200000,"maxOutputTokens":16000},{"id":"local","modelType":"custom","url":"https://external.invalid","apiKey":"local"}]}}`), nil
+	})})
+	r.Refresh()
+	m, _ := r.CachedModel("custom:enterprise|enterprise")
+	if m == nil || m["context_length"] != 200000 || m["vision"] != true {
+		t.Fatal("enterprise model/capabilities lost", m)
+	}
+	if local, _ := r.CachedModel("local"); local != nil {
+		t.Fatal("local provider imported", local)
+	}
+}

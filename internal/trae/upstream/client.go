@@ -3,14 +3,17 @@ package upstream
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/big"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -153,8 +156,9 @@ func BusinessCode(body []byte) int64 {
 }
 
 type Client struct {
-	HTTP       *http.Client
-	StreamHTTP *http.Client
+	EnterpriseHost string
+	HTTP           *http.Client
+	StreamHTTP     *http.Client
 
 	AgentHost string // https://trae-api-cn.mchost.guru
 	UgHost    string // https://api.trae.cn
@@ -170,7 +174,7 @@ func New() *Client {
 		ResponseHeaderTimeout: 120 * time.Second, // 首字节兜底（长推理预留），不限制整流时长
 	}
 	return &Client{
-		HTTP:       &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		EnterpriseHost: "https://console.enterprise.trae.cn", HTTP: &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		StreamHTTP: &http.Client{Transport: tr}, // 无总超时
 		AgentHost:  AgentHost,
 		UgHost:     UgHost,
@@ -180,6 +184,12 @@ func New() *Client {
 }
 
 func (c *Client) agentBase() string { return c.AgentHost }
+func (c *Client) agentBaseFor(a *auth.Auth) string {
+	if a.EnterpriseConsole {
+		return c.EnterpriseHost
+	}
+	return c.AgentHost
+}
 func (c *Client) ugBase() string    { return c.UgHost }
 func (c *Client) oauthBase() string { return c.OAuthHost }
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
@@ -289,7 +299,7 @@ func (c *Client) ChatStreamWithHeaders(a *auth.Auth, body []byte, resolvedModel 
 
 // prepared is request-local and already normalized for this identity/model.
 func (c *Client) ChatPreparedStreamWithHeaders(a *auth.Auth, prepared []byte) (rc io.ReadCloser, status int, respBody []byte, headers http.Header, err error) {
-	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpChat, bytes.NewReader(prepared))
+	req, err := http.NewRequest(http.MethodPost, c.agentBaseFor(a)+EpChat, bytes.NewReader(prepared))
 	if err != nil {
 		return nil, 0, nil, nil, err
 	}
@@ -350,7 +360,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		"agent_type":          nil,
 	}
 	raw, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpModels, bytes.NewReader(raw))
+	req, err := http.NewRequest(http.MethodPost, c.agentBaseFor(a)+EpModels, bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -1273,4 +1283,147 @@ func (m ModelInfo) NativeEffort(effort string) (string, bool) {
 		return "extra_high", true
 	}
 	return "", false
+}
+
+type EnterpriseQuota struct {
+	Limit, Used *float64
+	Reset       *float64
+	Unlimited   bool
+	Partial     bool
+}
+
+func (c *Client) EnterpriseUsage(ctx context.Context, a *auth.Auth) (*EnterpriseQuota, error) {
+	ask := func(path string) (map[string]any, error) {
+		ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.EnterpriseHost+"/trae/gtm/tob/api/v1/config/"+path, strings.NewReader("{}"))
+		if err != nil {
+			return nil, err
+		}
+		SOLOHeaders(req, a, false)
+		data, err := c.doJSON(req)
+		if err != nil {
+			return nil, err
+		}
+		var v map[string]any
+		if err = json.Unmarshal(data, &v); err != nil {
+			return nil, err
+		}
+		for _, key := range []string{"code", "Code"} {
+			if n, ok := enterpriseNumber(v[key]); ok && n != 0 {
+				return nil, fmt.Errorf("enterprise quota business error: %.0f", n)
+			}
+		}
+		if nested, ok := v["data"].(map[string]any); ok {
+			return nested, nil
+		}
+		return v, nil
+	}
+	quota, err := ask("get_personal_quota")
+	if err != nil {
+		return nil, err
+	}
+	result, err := parseEnterpriseQuota(quota, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	spent, spendErr := ask("get_user_model_usage")
+	core, coreErr := ask("get_personal_core_data")
+	result, err = parseEnterpriseQuota(quota, spent, core)
+	if err == nil {
+		result.Partial = spendErr != nil || coreErr != nil || result.Used == nil
+	}
+	return result, err
+}
+func enterpriseNumber(v any) (float64, bool) {
+	var n float64
+	switch x := v.(type) {
+	case float64:
+		n = x
+	case string:
+		if strings.TrimSpace(x) == "" {
+			return 0, false
+		}
+		var err error
+		n, err = strconv.ParseFloat(x, 64)
+		if err != nil {
+			return 0, false
+		}
+	default:
+		return 0, false
+	}
+	return n, !math.IsNaN(n) && !math.IsInf(n, 0)
+}
+func parseEnterpriseQuota(quota, spent, core map[string]any) (*EnterpriseQuota, error) {
+	q, _ := quota["user_model_quota"].(map[string]any)
+	limit, ok := enterpriseNumber(q["seat_pool_currency_quota"])
+	if !ok {
+		return nil, fmt.Errorf("enterprise quota missing seat pool")
+	}
+	result := &EnterpriseQuota{Unlimited: limit < 0 || limit >= 1e9}
+	if !result.Unlimited {
+		result.Limit = &limit
+	}
+	rows, ok := spent["user_usage_list"].([]any)
+	if ok {
+		uid := fmt.Sprint(q["user_id"])
+		if q["user_id"] == nil {
+			uid = ""
+		}
+		ids := map[string]bool{}
+		for _, raw := range rows {
+			row, _ := raw.(map[string]any)
+			if id := row["user_id"]; id != nil && fmt.Sprint(id) != "" {
+				ids[fmt.Sprint(id)] = true
+			}
+		}
+		if uid == "" && len(ids) == 1 {
+			for id := range ids {
+				uid = id
+			}
+		}
+		if uid != "" || len(ids) == 0 && len(rows) <= 1 {
+			used := 0.0
+			found := len(rows) == 0
+			valid := true
+			for _, raw := range rows {
+				row, _ := raw.(map[string]any)
+				if len(ids) > 0 && fmt.Sprint(row["user_id"]) != uid {
+					continue
+				}
+				found = true
+				detail, _ := row["in_seat_detail"].(map[string]any)
+				models, detailsKnown := detail["chat_usage_details"].([]any)
+				if !detailsKnown {
+					valid = false
+					continue
+				}
+				for _, rawModel := range models {
+					model, _ := rawModel.(map[string]any)
+					n, known := enterpriseNumber(model["total_cost_currency"])
+					if !known || n < 0 {
+						valid = false
+						break
+					}
+					used += n
+				}
+			}
+			if found && valid && !math.IsInf(used, 0) {
+				result.Used = &used
+			}
+		}
+	}
+	data, _ := core["Data"].(map[string]any)
+	if data == nil {
+		data = core
+	}
+	if n, ok := enterpriseNumber(data["ResetTime"]); ok {
+		if n > 1e12 {
+			n /= 1000
+		}
+		if n > 0 && n < 4102444800 {
+			result.Reset = &n
+		}
+	}
+	return result, nil
 }

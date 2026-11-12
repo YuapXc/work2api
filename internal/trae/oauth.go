@@ -25,6 +25,7 @@ type loginState struct {
 	Listener                                     net.Listener
 	Code                                         string
 	RefreshToken                                 string
+	EnterpriseConsole                            bool
 	Account                                      map[string]any
 	Busy                                         bool
 	OwnerID                                      int64
@@ -87,7 +88,7 @@ func (r *Runtime) beginLogin(opts map[string]any, ownerID int64) (map[string]any
 	state.Context, state.Cancel = context.WithDeadline(context.Background(), state.Expires)
 	params := url.Values{"auth_from": {map[bool]string{true: "solo", false: "trae"}[product == "solo"]}, "client_id": {upstream.ClientIDFor(product)}, "login_trace_id": {id}, "auth_callback_url": {callback}, "code_challenge": {base64.RawURLEncoding.EncodeToString(sum[:])}, "code_challenge_method": {"S256"}, "machine_id": {state.Machine}, "device_id": {state.Device}, "app_version": {upstream.IdeVersion}, "plugin_version": {"1.0.0"}, "device_brand": {upstream.DeviceBrand}, "device_type": {"windows"}, "os_version": {upstream.OSVersion}, "env": {"prod"}, "app_type": {"desktop"}}
 	if product == "solo" {
-		params.Set("hide_saas_login", "true")
+		params.Set("hide_saas_login", "false")
 	}
 	for key, value := range map[string]string{"login_version": "1", "login_channel": "native_ide", "auth_type": "local", "redirect": "0", "x_device_id": state.Device, "x_machine_id": state.Machine, "x_device_brand": upstream.DeviceBrand, "x_device_type": "windows", "x_os_version": upstream.OSVersion, "x_env": "prod", "x_app_version": upstream.IdeVersion, "x_app_type": "desktop"} {
 		params.Set(key, value)
@@ -223,6 +224,24 @@ func (r *Runtime) captureCallback(id, callback string, ownerID int64) error {
 	if state.RefreshToken != "" && state.RefreshToken != refresh {
 		return errors.New("登录态已提交")
 	}
+	enterpriseHost := query.Get("host")
+	var userInfo map[string]any
+	_ = json.Unmarshal([]byte(query.Get("userInfo")), &userInfo)
+	if enterpriseHost == "" {
+		enterpriseHost, _ = userInfo["Host"].(string)
+	}
+	if enterpriseHost == "" {
+		enterpriseHost, _ = userInfo["host"].(string)
+	}
+	if enterpriseHost == "" {
+		enterpriseHost, _ = userInfo["APIHost"].(string)
+	}
+	if enterpriseHost == "" {
+		enterpriseHost, _ = userInfo["apiHost"].(string)
+	}
+	if parsed, e := url.Parse(enterpriseHost); e == nil && parsed.Scheme == "https" && parsed.Hostname() == "console.enterprise.trae.cn" && parsed.User == nil {
+		state.EnterpriseConsole = true
+	}
 	state.Code = code
 	state.RefreshToken = refresh
 	return nil
@@ -320,7 +339,7 @@ func (r *Runtime) pollLogin(id string, ownerID int64) (map[string]any, error) {
 		if err = r.client(ctx).RefreshToken(identity); err != nil {
 			return nil, errors.New("Trae 登录态交换失败，请重新授权")
 		}
-		raw, _ = json.Marshal(map[string]any{"accessToken": identity.AccessToken, "refreshToken": identity.RefreshToken, "expiresAt": identity.ExpiresAt, "domain": "trae.cn", "variant": state.Product, "machineId": state.Machine, "deviceId": state.Device})
+		raw, _ = json.Marshal(map[string]any{"accessToken": identity.AccessToken, "refreshToken": identity.RefreshToken, "expiresAt": identity.ExpiresAt, "domain": "trae.cn", "variant": state.Product, "enterpriseConsole": state.EnterpriseConsole, "machineId": state.Machine, "deviceId": state.Device})
 	} else {
 		public, private, err := auth.GenerateDeviceKeyPair()
 		if err != nil {
@@ -351,7 +370,7 @@ func (r *Runtime) pollLogin(id string, ownerID int64) (map[string]any, error) {
 		if expiry == 0 {
 			expiry = time.Now().Unix() + document.Result.TokenExpireDuration
 		}
-		raw, _ = json.Marshal(map[string]any{"accessToken": document.Result.Token, "refreshToken": document.Result.RefreshToken, "expiresAt": expiry, "domain": "trae.cn", "variant": state.Product, "machineId": state.Machine, "deviceId": state.Device, "devicePublicKey": public, "devicePrivateKey": private})
+		raw, _ = json.Marshal(map[string]any{"accessToken": document.Result.Token, "refreshToken": document.Result.RefreshToken, "expiresAt": expiry, "domain": "trae.cn", "variant": state.Product, "enterpriseConsole": state.EnterpriseConsole, "machineId": state.Machine, "deviceId": state.Device, "devicePublicKey": public, "devicePrivateKey": private})
 	}
 	var account map[string]any
 	if ownerID > 0 {

@@ -425,6 +425,7 @@ func (r *Runtime) refreshCreditsFor(ctx context.Context, db *store.DB, acc *pool
 		total = nil
 	}
 	r.Pool.SetCredits(acc.UID, &cr.Remain, total, cr.ExpireAt, cr.Packages)
+	r.Pool.SetCreditCumulative(acc.UID, cr.Granted, cr.Used)
 	fields := map[string]any{"credits_remaining": cr.Remain, "credits_total": cr.Total}
 	if cr.UnknownTotal {
 		fields["credits_total"] = nil

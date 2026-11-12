@@ -229,6 +229,9 @@ func (r *Runtime) accountRow(id, label, region, source, authMode string, active 
 		if q.expiresAt > 0 {
 			row["credits_expire_at"] = q.expiresAt
 		}
+		if q.resetAt > 0 {
+			row["credits_reset_at"] = q.resetAt
+		}
 		if len(q.packages) > 0 {
 			// 与 workbuddy 同键名：WebUI 账号表的积分构成弹层直接复用
 			row["credit_packages"] = q.packages
@@ -340,6 +343,20 @@ func buildQuotaEntry(q *account.QuotaInfo) quotaEntry {
 			pkg["expire_at"] = float64(expiry)
 		}
 		e.packages = append(e.packages, pkg)
+	}
+	for _, pkg := range e.packages {
+		remain, _ := pkg["remain"].(float64)
+		if remain <= 0 {
+			continue
+		}
+		if reset, ok := pkg["reset_time"].(string); ok {
+			for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05"} {
+				if t, err := time.ParseInLocation(layout, reset, time.FixedZone("UTC+8", 8*3600)); err == nil && t.Unix() > time.Now().Unix() && (e.resetAt == 0 || t.Unix() < e.resetAt) {
+					e.resetAt = t.Unix()
+					break
+				}
+			}
+		}
 	}
 	for _, pkg := range e.packages {
 		unit, _ := pkg["unit"].(string)

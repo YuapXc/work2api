@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"math"
 	"net/http"
 	"os"
@@ -39,6 +40,9 @@ type accountState struct {
 	Failures                 int
 	LastUsed                 float64
 	Remaining, Total, Expiry *float64
+	QuotaUnit                string
+	QuotaReset               *float64
+	QuotaUnlimited           bool
 	QuotaAt                  time.Time
 	QuotaFailed              bool
 	QuotaProbeAt             time.Time
@@ -260,7 +264,34 @@ type contextTransport struct {
 }
 
 func (t contextTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	return t.base.RoundTrip(req.WithContext(t.ctx))
+	if req.Context().Done() == nil {
+		return t.base.RoundTrip(req.WithContext(t.ctx))
+	}
+	ctx, cancel := context.WithCancel(req.Context())
+	stop := context.AfterFunc(t.ctx, cancel)
+	if err := t.ctx.Err(); err != nil {
+		cancel()
+	}
+	resp, err := t.base.RoundTrip(req.WithContext(ctx))
+	if err != nil {
+		stop()
+		cancel()
+		return resp, err
+	}
+	resp.Body = &contextResponseBody{ReadCloser: resp.Body, cancel: cancel, stop: stop}
+	return resp, nil
+}
+
+type contextResponseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+	stop   func() bool
+}
+
+func (b *contextResponseBody) Close() error {
+	defer b.cancel()
+	defer b.stop()
+	return b.ReadCloser.Close()
 }
 func (r *Runtime) client(ctx context.Context) *upstream.Client {
 	c := upstream.New()
@@ -510,7 +541,13 @@ func (r *Runtime) importAccount(ctx context.Context, token string, opts map[stri
 			state.CatalogErrors[product] = failed
 		}
 		state.Remaining, state.Total, state.Expiry = previous.Remaining, previous.Total, previous.Expiry
+		state.QuotaUnit, state.QuotaReset, state.QuotaUnlimited = previous.QuotaUnit, previous.QuotaReset, previous.QuotaUnlimited
 		state.QuotaAt, state.QuotaFailed, state.CreditPackages = previous.QuotaAt, previous.QuotaFailed, previous.CreditPackages
+	}
+	if previous != nil && previous.Auth != nil && previous.Auth.EnterpriseConsole != a.EnterpriseConsole {
+		state.Remaining, state.Total, state.Expiry = nil, nil, nil
+		state.QuotaUnit, state.QuotaReset, state.QuotaUnlimited = "", nil, false
+		state.QuotaAt, state.QuotaFailed, state.CreditPackages = time.Time{}, false, nil
 	}
 	state.Identities[a.Variant] = a
 	state.Catalogs[a.Variant] = models
@@ -679,8 +716,18 @@ func (r *Runtime) AdminData(context.Context) provider.AdminData {
 			}
 		}
 		row["products"] = products
+		if a.QuotaUnit != "" {
+			row["quota_unit"] = a.QuotaUnit
+		}
+		row["quota_reset_at"], row["quota_unlimited"] = a.QuotaReset, a.QuotaUnlimited
 		data.Accounts = append(data.Accounts, row)
-		budget := provider.CreditBudget(row, "credits", label, "积分", float64(time.Now().Unix()))
+		unitLabel := "积分"
+		domain := "credits"
+		if a.QuotaUnit == "CNY" {
+			unitLabel = "元"
+			domain = "CNY"
+		}
+		budget := provider.CreditBudget(row, domain, label, unitLabel, float64(time.Now().Unix()))
 		budget.EstimateUnavailable = "缺少逐次调用消费依据"
 		data.Budgets = append(data.Budgets, budget)
 		actions := map[string]provider.ResourceAction{"rename": {Label: "别名", Enabled: true}, "enabled": {Label: "启用", Enabled: true}, "priority": {Label: "优先级", Enabled: true}, "delete": {Label: "删除", Enabled: true, Confirmation: "删除网关导入的账号凭据？"}}

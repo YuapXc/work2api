@@ -16,7 +16,7 @@ func (r *Runtime) ExportCredentials() (map[string]any, error) {
 				continue
 			}
 			a.RLock()
-			doc := map[string]any{"accessToken": a.AccessToken, "refreshToken": a.RefreshToken, "expiresAt": a.ExpiresAt, "domain": a.Domain, "variant": a.Variant, "machineId": a.MachineID, "deviceId": a.DeviceID, "devicePublicKey": a.DevicePublicKey, "devicePrivateKey": a.DevicePrivateKey, "uid": a.UID, "enterpriseId": a.EnterpriseID, "nickname": a.Nickname}
+			doc := map[string]any{"accessToken": a.AccessToken, "refreshToken": a.RefreshToken, "expiresAt": a.ExpiresAt, "domain": a.Domain, "variant": a.Variant, "machineId": a.MachineID, "deviceId": a.DeviceID, "devicePublicKey": a.DevicePublicKey, "devicePrivateKey": a.DevicePrivateKey, "uid": a.UID, "enterpriseId": a.EnterpriseID, "enterpriseConsole": a.EnterpriseConsole, "nickname": a.Nickname}
 			a.RUnlock()
 			accounts = append(accounts, map[string]any{"id": id, "product": product, "credential": doc})
 		}

@@ -479,3 +479,11 @@ func TestCatalogRefreshWaitsOnlyForMatchingCredential(t *testing.T) {
 		t.Fatalf("matching catalog refresh was not shared: %v", err)
 	}
 }
+
+func TestQuotaResetSummaryDoesNotBecomeExpiry(t *testing.T) {
+	next := time.Now().Add(48 * time.Hour).UTC().Truncate(time.Second)
+	e := buildQuotaEntry(&account.QuotaInfo{UserQuota: &account.QuotaBucket{Total: 100, Remaining: 50, ResetTime: next.Format(time.RFC3339)}, AddonQuota: &account.QuotaBucket{Total: 10, Remaining: 0, ResetTime: time.Now().Add(time.Hour).Format(time.RFC3339)}})
+	if e.resetAt != next.Unix() || e.expiresAt != 0 || e.remaining != 50 {
+		t.Fatal("reset or balance corrupted", e)
+	}
+}

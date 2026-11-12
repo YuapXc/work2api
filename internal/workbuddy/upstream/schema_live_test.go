@@ -318,9 +318,9 @@ func TestCollectStreamKeepsInterleavedToolArguments(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatal("expected two tool calls")
 	}
-	for i, want := range []string{first.String(), second.String()} {
+	for i, want := range []string{second.String(), first.String()} {
 		call := calls[i].(map[string]any)
-		if call["id"] != fmt.Sprintf("call_%d", i) || call["function"].(map[string]any)["arguments"] != want {
+		if call["id"] != fmt.Sprintf("call_%d", 1-i) || call["function"].(map[string]any)["arguments"] != want {
 			t.Fatal("interleaved arguments or call order changed")
 		}
 	}

@@ -40,6 +40,9 @@ func TestModernCreditSummaryDoesNotDuplicateDetails(t *testing.T) {
 		if result.Remain != 2.625 || result.Total != 3.5 || !result.UnknownTotal || len(result.Packages) != 3 {
 			t.Fatal("precision, summary supplement or dedup failed", result)
 		}
+		if result.Used != nil {
+			t.Fatal("missing cumulative usage fabricated as zero", *result.Used)
+		}
 		unknown := 0
 		for _, p := range result.Packages {
 			if p["total"] == nil {
@@ -225,3 +228,34 @@ func TestPackagesKeepSeparateBalancesAndUseBillingTimezone(t *testing.T) {
 }
 
 func ptr(v float64) *float64 { return &v }
+
+func TestHistoricalCreditsKeepCurrentBalanceAndOfficialCumulative(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		json.NewDecoder(r.Body).Decode(&req)
+		var result map[string]any
+		switch r.URL.Path {
+		case "/billing/meter/get-user-resource-summary":
+			result = map[string]any{"Packages": []any{map[string]any{"PackageCode": "bonus", "CycleRemainCapacity": "25.5", "CycleTotalCapacity": "1000", "CycleUsedCapacity": "974.5"}}}
+		case "/billing/meter/get-user-resource-free-packages":
+			status, _ := req["Status"].([]any)
+			if len(status) != 4 || req["SlicePeriodStartTime"] != nil {
+				t.Error("history constrained to current slice", req)
+			}
+			result = map[string]any{"Accounts": []any{map[string]any{"PackageCode": "bonus", "Status": 0, "CapacityRemainPrecise": "25.5", "CapacitySizePrecise": "100", "CapacityUsedPrecise": "74.5", "ExpiredTime": "2030-01-01 00:00:00"}, map[string]any{"PackageCode": "bonus", "Status": 3, "CapacityRemainPrecise": "9", "CapacitySizePrecise": "100", "CapacityUsedPrecise": "100", "ExpiredTime": "2020-01-01 00:00:00"}}}
+		default:
+			result = map[string]any{"Accounts": []any{}}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": result})
+	}))
+	defer srv.Close()
+	result, err := FetchCredits(context.Background(), checkinCredential{srv.URL})
+	if err != nil || result.Remain != 25.5 || result.Total != 100 || result.Granted == nil || *result.Granted != 1000 || result.Used == nil || *result.Used != 974.5 || len(result.Packages) != 2 {
+		t.Fatal("history/cumulative changed current balance", result, err)
+	}
+	for _, pkg := range result.Packages {
+		if expiry, _ := pkg["expire_at"].(float64); expiry < float64(time.Now().Unix()) && pkg["remain"] != 0.0 {
+			t.Fatal("expired credit reused", pkg)
+		}
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -27,11 +28,12 @@ type Credential interface {
 
 // Credit is the query result.
 type Credit struct {
-	Remain       float64          `json:"remain"`
-	Total        float64          `json:"total"`
-	ExpireAt     *float64         `json:"expire_at"`
-	Packages     []map[string]any `json:"packages"`
-	UnknownTotal bool             `json:"total_unknown,omitempty"`
+	Remain        float64          `json:"remain"`
+	Total         float64          `json:"total"`
+	ExpireAt      *float64         `json:"expire_at"`
+	Packages      []map[string]any `json:"packages"`
+	Granted, Used *float64
+	UnknownTotal  bool `json:"total_unknown,omitempty"`
 }
 
 // CheckinResult is the daily check-in outcome.
@@ -314,10 +316,25 @@ func parseTS(raw any, isMs bool) *float64 {
 	return &f
 }
 
+func unavailablePackage(row map[string]any) bool {
+	if status, ok := row["Status"]; ok && status != nil && status != "" && num(status) != 0 {
+		return true
+	}
+	for _, field := range []string{"DeductionEndTime", "ExpiredTime", "CycleEndTime"} {
+		if ts := parseTS(row[field], field == "DeductionEndTime"); ts != nil {
+			return *ts <= float64(time.Now().Unix())
+		}
+	}
+	return false
+}
+
 func summarize(accounts []any) (remain, total float64) {
 	for _, a := range accounts {
 		acct, ok := a.(map[string]any)
 		if !ok {
+			continue
+		}
+		if unavailablePackage(acct) {
 			continue
 		}
 		cycleRemain := precise(acct, "CycleCapacityRemain")
@@ -436,12 +453,7 @@ func summarizePackages(accounts []any) []map[string]any {
 			out = append(out, g)
 		}
 	}
-	// sort by remain desc
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j-1]["remain"].(float64) < out[j]["remain"].(float64); j-- {
-			out[j-1], out[j] = out[j], out[j-1]
-		}
-	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i]["remain"].(float64) > out[j]["remain"].(float64) })
 	return out
 }
 
@@ -469,9 +481,6 @@ func earliestPackageExpiry(pkgs []map[string]any) *float64 {
 }
 
 func fetchNewCredits(ctx context.Context, mgr Credential) *Credit {
-	now := time.Now().In(billingTimezone)
-	dayStart := now.Format("2006-01-02") + " 00:00:00"
-	dayEnd := now.Format("2006-01-02") + " 23:59:59"
 	base := mgr.Endpoint() + "/billing/meter"
 	var accounts, summary []any
 	endpoints := []struct {
@@ -481,11 +490,11 @@ func fetchNewCredits(ctx context.Context, mgr Credential) *Credit {
 		{base + "/get-user-resource-summary", map[string]any{}},
 		{base + "/get-user-resource-paid-packages", map[string]any{
 			"PageNumber": 1, "PageSize": 100, "PackageCodes": paidPackageCodes,
-			"Status": []int{0, 3}, "NeedRenewInfo": true, "IsDisplayTotalInfo": true,
+			"Status": []int{0, 1, 2, 3}, "NeedRenewInfo": true, "IsDisplayTotalInfo": true,
 		}},
 		{base + "/get-user-resource-free-packages", map[string]any{
 			"PageNumber": 1, "PageSize": 100, "PackageCodes": freePackageCodes,
-			"Status": []int{0, 3}, "SlicePeriodStartTime": dayStart, "SlicePeriodEndTime": dayEnd,
+			"Status":             []int{0, 1, 2, 3},
 			"IsDisplayTotalInfo": true,
 		}},
 	}
@@ -504,18 +513,84 @@ func fetchNewCredits(ctx context.Context, mgr Credential) *Credit {
 			accounts = nil
 		}
 	}
+	details := accounts
 	accounts = mergeResourceAccounts(summary, accounts)
 	if len(accounts) == 0 {
 		return nil
 	}
-	return creditFromAccounts(accounts)
+	result := creditFromAccounts(accounts)
+	packageRows := mergeResourceAccounts(summary, details)
+	if len(summary) > 0 {
+		row, _ := summary[0].(map[string]any)
+		if row["_summary_group"] == true && len(details) > 0 {
+			packageRows = details
+		}
+	}
+	visibleRows := make([]any, 0, len(packageRows))
+	for _, raw := range packageRows {
+		row, _ := raw.(map[string]any)
+		if unavailablePackage(row) {
+			copy := make(map[string]any, len(row)+4)
+			for k, v := range row {
+				copy[k] = v
+			}
+			for _, k := range []string{"CycleCapacityRemain", "CycleCapacityRemainPrecise", "CapacityRemain", "CapacityRemainPrecise"} {
+				copy[k] = 0.0
+			}
+			visibleRows = append(visibleRows, copy)
+		} else {
+			visibleRows = append(visibleRows, row)
+		}
+	}
+	result.Packages = summarizePackages(visibleRows)
+	if len(result.Packages) == 0 {
+		result.Packages = summarizePackages(accounts)
+	}
+	result.ExpireAt = earliestPackageExpiry(result.Packages)
+	cumulative := summary
+	if len(cumulative) == 0 {
+		cumulative = details
+	}
+	granted, used := 0.0, 0.0
+	grantedKnown, usedKnown := len(cumulative) > 0, len(cumulative) > 0
+	for _, raw := range cumulative {
+		row, _ := raw.(map[string]any)
+		value := func(key string) *float64 {
+			if v := knownCredit(row[key+"Precise"]); v != nil {
+				return v
+			}
+			return knownCredit(row[key])
+		}
+		capacity, spent := value("CycleCapacitySize"), value("CycleCapacityUsed")
+		if capacity == nil || *capacity <= 0 {
+			capacity, spent = value("CapacitySize"), value("CapacityUsed")
+		}
+		if capacity == nil {
+			grantedKnown = false
+		} else {
+			granted += *capacity
+		}
+		if spent == nil {
+			usedKnown = false
+		} else {
+			used += *spent
+		}
+	}
+	if grantedKnown {
+		result.Granted = &granted
+	}
+	if usedKnown {
+		result.Used = &used
+	}
+
+	return result
 }
 
 func fetchOldCredits(ctx context.Context, mgr Credential) *Credit {
 	url := mgr.Endpoint() + "/v2/billing/meter/get-user-resource"
 	now := time.Now().In(billingTimezone)
 	body := map[string]any{
-		"PageNumber": 1, "PageSize": 100, "ProductCode": "p_tcaca", "Status": []int{0, 3},
+		"PageNumber": 1, "PageSize": 100, "ProductCode": "p_tcaca", "Status": []int{0, 1, 2, 3},
 		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
 		"PackageEndTimeRangeEnd":   now.AddDate(10, 0, 0).Format("2006-01-02 15:04:05"),
 	}

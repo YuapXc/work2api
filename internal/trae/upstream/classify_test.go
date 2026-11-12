@@ -1,8 +1,13 @@
 package upstream
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"work2api/internal/trae/auth"
 )
 
 func TestClassifyLongContext5xxAsInputTooLarge(t *testing.T) {
@@ -78,5 +83,70 @@ func TestDynamicReasoningNativeMapping(t *testing.T) {
 	model.ReasoningOptions = append(model.ReasoningOptions, "max")
 	if got, ok := model.NativeEffort("max"); !ok || got != "max" {
 		t.Fatal("native max overwritten", got, ok)
+	}
+}
+
+func TestEnterpriseSeatUsageUsesOnlyOwnSeat(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Header.Get("Authorization") != "Cloud-IDE-JWT fixture" {
+			t.Error("missing identity")
+		}
+		switch {
+		case strings.HasSuffix(r.URL.Path, "get_personal_quota"):
+			w.Write([]byte(`{"code":0,"data":{"user_model_quota":{"user_id":"me","seat_pool_currency_quota":"100"}}}`))
+		case strings.HasSuffix(r.URL.Path, "get_user_model_usage"):
+			w.Write([]byte(`{"data":{"user_usage_list":[{"user_id":"other","in_seat_detail":{"chat_usage_details":[{"total_cost_currency":99}]}},{"user_id":"me","in_seat_detail":{"chat_usage_details":[{"total_cost_currency":"1.25"},{"total_cost_currency":2}]}}]}}`))
+		case strings.HasSuffix(r.URL.Path, "get_personal_core_data"):
+			w.Write([]byte(`{"Data":{"ResetTime":1800000000000}}`))
+		}
+	}))
+	defer srv.Close()
+	c := New()
+	c.EnterpriseHost = srv.URL
+	q, err := c.EnterpriseUsage(context.Background(), &auth.Auth{AccessToken: "fixture", Variant: "cn"})
+	if err != nil || q.Used == nil || *q.Used != 3.25 || q.Limit == nil || *q.Limit != 100 || q.Reset == nil || *q.Reset != 1800000000 || q.Partial || calls != 3 {
+		t.Fatal("incorrect seat usage", q, err, calls)
+	}
+	quota := map[string]any{"user_model_quota": map[string]any{"seat_pool_currency_quota": 100.0}}
+	spent := map[string]any{"user_usage_list": []any{map[string]any{"user_id": "a"}, map[string]any{"user_id": "b"}}}
+	q, err = parseEnterpriseQuota(quota, spent, nil)
+	if err != nil || q.Used != nil {
+		t.Fatal("ambiguous seats guessed", q, err)
+	}
+	q, err = parseEnterpriseQuota(quota, nil, nil)
+	if err != nil || q.Used != nil {
+		t.Fatal("missing spend became zero", q, err)
+	}
+	quota["user_model_quota"].(map[string]any)["seat_pool_currency_quota"] = 9999999999.0
+	q, err = parseEnterpriseQuota(quota, nil, nil)
+	if err != nil || !q.Unlimited || q.Limit != nil {
+		t.Fatal("unlimited became budget", q, err)
+	}
+}
+
+func TestEnterpriseAgentRequestsUseFixedConsole(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "get_model") || strings.Contains(r.URL.Path, "get_config") {
+			w.Write([]byte(`{"config_info_list":[]}`))
+			return
+		}
+		w.Write([]byte(`{"config_info_list":[]}`))
+	}))
+	defer srv.Close()
+	c := New()
+	c.EnterpriseHost = srv.URL
+	c.AgentHost = "http://127.0.0.1:1"
+	a := &auth.Auth{AccessToken: "fixture", Variant: "cn", EnterpriseConsole: true}
+	if _, err := c.FetchModels(a); err != nil {
+		t.Fatal("enterprise catalog used personal endpoint", err)
+	}
+	rc, status, _, _, err := c.ChatPreparedStreamWithHeaders(a, []byte(`{}`))
+	if err != nil || status != 200 {
+		t.Fatal("enterprise chat used personal endpoint", status, err)
+	}
+	if rc != nil {
+		rc.Close()
 	}
 }

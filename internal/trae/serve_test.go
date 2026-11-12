@@ -1312,3 +1312,117 @@ func TestReasoningCatalogMergePreservesNativeOptions(t *testing.T) {
 		t.Fatal("lost native options", got)
 	}
 }
+
+func TestEnterpriseAuthFlagSurvivesValidationAndSave(t *testing.T) {
+	a, err := auth.Parse([]byte(`{"accessToken":"fixture","variant":"cn","host":"https://console.enterprise.trae.cn"}`))
+	if err != nil || !a.EnterpriseConsole {
+		t.Fatal("enterprise host not recognized", err)
+	}
+	if err = validateAuth(a); err != nil || a.APIHost != upstream.OAuthHost || !a.EnterpriseConsole {
+		t.Fatal("host metadata changed network target", err)
+	}
+	a.FilePath = filepath.Join(t.TempDir(), "auth.json")
+	if err = a.SaveAtomic(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(a.FilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := auth.Parse(raw)
+	if err != nil || !next.EnterpriseConsole {
+		t.Fatal("enterprise identity lost after restart", err)
+	}
+}
+
+func TestEnterpriseQuotaPublicationKeepsCurrencyAndFailureScope(t *testing.T) {
+	var fail atomic.Bool
+	r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case strings.HasSuffix(req.URL.Path, "get_personal_quota"):
+			io.WriteString(w, `{"code":0,"user_model_quota":{"user_id":"me","seat_pool_currency_quota":100}}`)
+		case strings.HasSuffix(req.URL.Path, "get_user_model_usage"):
+			if fail.Load() {
+				w.WriteHeader(503)
+				return
+			}
+			io.WriteString(w, `{"user_usage_list":[{"user_id":"me","in_seat_detail":{"chat_usage_details":[{"total_cost_currency":25}]}}]}`)
+		case strings.HasSuffix(req.URL.Path, "get_personal_core_data"):
+			io.WriteString(w, `{"Data":{"ResetTime":1800000000000}}`)
+		default:
+			io.WriteString(w, `{"is_credits_billing":true,"user_entitlement_pack_list":[{"display_desc":"Consumer","entitlement_base_info":{"quota":{"credits_limit":4000}},"usage":{"credits_amount":4}}]}`)
+		}
+	})
+	a := &auth.Auth{UID: "me", Variant: "cn", AccessToken: "fixture", ExpiresAt: time.Now().Add(time.Hour).Unix(), EnterpriseConsole: true}
+	id := accountID(a.UID)
+	state := &accountState{Auth: a, Enabled: true, Identities: map[string]*auth.Auth{"cn": a}}
+	r.accounts[id] = state
+	if err := r.refreshQuota(context.Background(), id, true); err != nil {
+		t.Fatal(err)
+	}
+	if state.Remaining == nil || *state.Remaining != 75 || state.QuotaUnit != "CNY" || state.Expiry != nil || len(state.CreditPackages) != 2 || state.CreditPackages[1]["display_only"] != true {
+		t.Fatal("enterprise quota mixed with credits", state)
+	}
+	data := r.AdminData(context.Background())
+	if data.Accounts[0]["quota_unit"] != "CNY" || data.Budgets[0].Remaining == nil || *data.Budgets[0].Remaining != 75 {
+		t.Fatal("display-only credits subtracted", data)
+	}
+	fail.Store(true)
+	if err := r.refreshQuota(context.Background(), id, true); err == nil {
+		t.Fatal("partial quota reported as complete")
+	}
+	if !state.QuotaFailed || state.Remaining == nil || *state.Remaining != 75 {
+		t.Fatal("failed read destroyed snapshot", state)
+	}
+	if guard := r.authGuard().State(id+":cn:auth", a.MaintenanceIdentity()); guard.NeedsLogin {
+		t.Fatal("seat read failure invalidated sign-in", guard)
+	}
+}
+
+func TestMaintenanceIdentitySeparatesEnterpriseScope(t *testing.T) {
+	a := &auth.Auth{AccessToken: "fixture", UID: "me", Variant: "cn"}
+	before := a.MaintenanceIdentity()
+	a.EnterpriseConsole = true
+	if before == a.MaintenanceIdentity() {
+		t.Fatal("enterprise scope reused personal maintenance state")
+	}
+}
+
+func TestContextTransportKeepsRequestDeadlineAndOuterCancel(t *testing.T) {
+	for _, outerCancel := range []bool{false, true} {
+		outer, cancelOuter := context.WithCancel(context.Background())
+		inner, cancelInner := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		req, _ := http.NewRequestWithContext(inner, "GET", "https://example.test", nil)
+		transport := contextTransport{ctx: outer, base: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if outerCancel {
+				cancelOuter()
+			}
+			select {
+			case <-r.Context().Done():
+				return nil, r.Context().Err()
+			case <-time.After(time.Second):
+				t.Error("request deadline or parent cancellation was lost")
+				return nil, errors.New("timeout")
+			}
+		})}
+		_, err := transport.RoundTrip(req)
+		if err == nil {
+			t.Fatal("cancellation ignored")
+		}
+		cancelInner()
+		cancelOuter()
+	}
+}
+
+func TestEnterpriseCallbackHostIsFixed(t *testing.T) {
+	for _, host := range []string{"https://console.enterprise.trae.cn", "https://attacker.test", "https://console.enterprise.trae.cn.attacker.test", "https://user@console.enterprise.trae.cn"} {
+		r := &Runtime{logins: map[string]*loginState{"trace": {Callback: "http://127.0.0.1:1234/authorize", Expires: time.Now().Add(time.Minute)}}}
+		query := url.Values{"state": {"trace"}, "code": {"fixture"}, "userInfo": {`{"APIHost":"` + host + `"}`}}
+		if err := r.captureCallback("trace", "http://127.0.0.1:1234/authorize?"+query.Encode(), 0); err != nil {
+			t.Fatal(err)
+		}
+		if r.logins["trace"].EnterpriseConsole != (host == "https://console.enterprise.trae.cn") {
+			t.Fatal("unrecognized enterprise target", host)
+		}
+	}
+}

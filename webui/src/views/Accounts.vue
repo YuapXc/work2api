@@ -315,6 +315,7 @@ interface Pkg {
   unlimited?: boolean
   expire_at?: number | null
   reset_time?: string
+ display_only?: boolean
 }
 
 const pkgOpenFor = ref<string | null>(null) // `${provider}:${id}`
@@ -452,6 +453,7 @@ function healthDetails(r: Record<string, any>): { label: string; value: string }
   }
   if (a.quota_updated_at) details.push({ label: '额度更新', value: `${dt(a.quota_updated_at)}${a.quota_refresh_failed ? '，最近刷新失败' : a.quota_stale ? '，待刷新' : ''}` })
   else if (a.quota_refresh_failed) details.push({ label: '额度刷新', value: '刷新失败，调用状态单独判断' })
+  if (a.credits_reset_at || a.quota_reset_at) details.push({ label: '额度重置', value: dt(a.credits_reset_at || a.quota_reset_at) })
   if (a.catalog_stale) details.push({ label: '模型目录', value: '使用上次成功快照，等待刷新' })
   return details
 }
@@ -989,9 +991,11 @@ async function saveConfig() {
             <template v-if="row.raw.credits_remaining != null">
               <span class="mono text-ink">{{ fmtCredits(row.raw.credits_remaining) }}</span>
               <span v-if="row.raw.credits_total != null" class="mono text-faint"> / {{ fmtCredits(row.raw.credits_total) }}</span>
-              <span v-if="row.provider === 'qoder' && row.raw.quota_unit && row.raw.quota_unit !== 'credits'" class="ml-1 text-micro text-faint">{{ row.raw.quota_unit }}</span>
+              <span v-if="row.raw.quota_unit && row.raw.quota_unit !== 'credits'" class="ml-1 text-micro text-faint">{{ row.raw.quota_unit }}</span>
             </template>
-            <span v-else-if="row.raw.quota_mixed_units" class="text-muted" title="资源包的计量单位不同，明细按资源包列出">分项额度</span>
+            <span v-else-if="row.raw.quota_unlimited" class="text-muted">上游额度不限</span>
+ <span v-else-if="row.raw.credits_total != null" class="text-faint">未知 / {{fmtCredits(row.raw.credits_total)}} <span v-if="row.raw.quota_unit">{{row.raw.quota_unit}}</span></span>
+ <span v-else-if="row.raw.quota_mixed_units" class="text-muted" title="资源包的计量单位不同，明细按资源包列出">分项额度</span>
             <span v-else-if="row.raw.tier" class="text-muted">{{ row.raw.key_count }} {{ row.raw.tier === 'anonymous' ? '个入口' : '个密钥' }}</span>
             <span v-else class="text-faint">未上报</span>
             <div v-if="row.raw.quota_refresh_failed || row.raw.quota_stale || row.raw.plan" class="mt-1 flex justify-end gap-2 text-micro text-faint"><button v-if="row.raw.quota_reauthorize" type="button" class="text-warn hover:underline" @click="reauthorizeAccount(row)">需重新授权</button><span v-else-if="row.raw.quota_refresh_failed" class="text-warn" :title="row.raw.quota_updated_at ? '最后成功：' + dt(row.raw.quota_updated_at) : '尚未成功获取额度'">刷新失败</span><span v-else-if="row.raw.quota_stale">缓存过期</span><span v-if="row.raw.plan" :title="`上游账号套餐：${row.raw.plan}；不代表模型调用免费`">套餐：{{ String(row.raw.plan).toLowerCase() === 'free' ? '免费' : row.raw.plan }}</span></div>
@@ -1235,10 +1239,11 @@ async function saveConfig() {
         @mouseleave="closePkgs"
       >
         <div class="mb-3 flex items-start justify-between gap-3">
-          <span class="shrink-0 font-medium text-ink">积分构成</span>
+          <span class="shrink-0 font-medium text-ink">额度构成</span>
           <span class="min-w-0 break-words text-right text-micro leading-snug text-faint">{{ label(r) }}</span>
         </div>
-        <div class="space-y-3">
+        <div v-if="r.raw.credits_granted != null || r.raw.credits_used != null" class="mb-3 flex flex-wrap gap-3 text-micro text-muted"><span v-if="r.raw.credits_granted != null">累计发放 {{ fmtCredits(r.raw.credits_granted) }}</span><span v-if="r.raw.credits_used != null">累计消耗 {{ fmtCredits(r.raw.credits_used) }}</span></div>
+        <div class="max-h-[60vh] overflow-y-auto space-y-3">
           <div v-for="(p, i) in pkgsOf(r)" :key="i">
             <div class="flex items-start justify-between gap-3">
               <span class="min-w-0 break-words text-small leading-snug text-muted">{{ p.name }}</span>
@@ -1259,7 +1264,7 @@ async function saveConfig() {
             <div class="mt-1.5 flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-micro text-faint">
               <span class="mono whitespace-nowrap">{{ p.unlimited ? '上游额度不限' : '剩 ' + (p.remain == null ? '未知' : fmtCredits(p.remain)) + ' / ' + (p.total == null ? '未知' : fmtCredits(p.total)) }}</span>
               <span class="mono whitespace-nowrap">已用 {{ p.used == null ? '未知' : fmtCredits(p.used) }}</span>
-              <span v-if="p.unit" class="whitespace-nowrap">{{ p.unit }}</span>
+              <span v-if="p.unit" class="whitespace-nowrap">{{ p.unit }}</span><span v-if="p.display_only" class="text-faint">仅供参考</span>
               <!-- 临期包：过期时间精确到分钟并标黄，一眼看出紧迫度 -->
               <span v-if="p.expire_at" class="ml-auto mono whitespace-nowrap" :class="pkgExpiring(p) ? 'text-warn' : ''">
                 到期：{{ dt(p.expire_at, 'YYYY-MM-DD HH:mm') }}

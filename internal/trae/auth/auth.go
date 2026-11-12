@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,7 +28,7 @@ func (a *Auth) TryMaintenanceIdentity() (string, bool) {
 	return a.maintenanceIdentityLocked(), true
 }
 func (a *Auth) maintenanceIdentityLocked() string {
-	raw, _ := json.Marshal([]string{a.AccessToken, a.RefreshToken, a.Variant, a.UID})
+	raw, _ := json.Marshal([]any{a.AccessToken, a.RefreshToken, a.Variant, a.UID, a.EnterpriseConsole, a.EnterpriseID})
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }
@@ -35,20 +36,21 @@ func (a *Auth) maintenanceIdentityLocked() string {
 type Auth struct {
 	mu sync.RWMutex
 
-	AccessToken      string // Cloud-IDE-JWT 头用
-	RefreshToken     string // 每次 ExchangeToken 轮换
-	ExpiresAt        int64  // Unix 秒（accessToken 过期时刻）
-	Domain           string // "trae.cn"
-	APIHost          string // "https://api.trae.com.cn"（ExchangeToken host）
-	MachineID        string // x-machine-id
-	DeviceID         string // x-device-id
-	DevicePublicKey  string
-	DevicePrivateKey string
-	Variant          string // cn | solo (merged trae-solo-cn); intl handled by intl parser
-	UID              string
-	EnterpriseID     string
-	Nickname         string
-	FilePath         string // 落盘路径；refresh 后原子写回
+	AccessToken       string // Cloud-IDE-JWT 头用
+	RefreshToken      string // 每次 ExchangeToken 轮换
+	ExpiresAt         int64  // Unix 秒（accessToken 过期时刻）
+	Domain            string // "trae.cn"
+	APIHost           string // "https://api.trae.com.cn"（ExchangeToken host）
+	MachineID         string // x-machine-id
+	DeviceID          string // x-device-id
+	DevicePublicKey   string
+	DevicePrivateKey  string
+	Variant           string // cn | solo (merged trae-solo-cn); intl handled by intl parser
+	UID               string
+	EnterpriseID      string
+	EnterpriseConsole bool
+	Nickname          string
+	FilePath          string // 落盘路径；refresh 后原子写回
 }
 
 func (a *Auth) Lock()          { a.mu.Lock() }
@@ -174,6 +176,18 @@ func Parse(raw []byte) (*Auth, error) {
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return nil, fmt.Errorf("parse_error: missing accessToken")
 	}
+	var flat map[string]any
+	_ = json.Unmarshal(raw, &flat)
+	node := flat
+	if nested, ok := flat["auth"].(map[string]any); ok {
+		node = nested
+	}
+	host, _ := node["host"].(string)
+	if host == "" {
+		host, _ = node["apiHost"].(string)
+	}
+	parsed, _ := url.Parse(host)
+	a.EnterpriseConsole = parsed != nil && parsed.Scheme == "https" && parsed.User == nil && strings.EqualFold(parsed.Hostname(), "console.enterprise.trae.cn") || node["enterpriseConsole"] == true
 	return a, nil
 }
 func (a *Auth) SaveAtomic() error {
@@ -186,13 +200,14 @@ func (a *Auth) saveAtomicLocked() error {
 		return fmt.Errorf("no FilePath set")
 	}
 	authDoc := map[string]any{
-		"accessToken":  a.AccessToken,
-		"refreshToken": a.RefreshToken,
-		"expiresAt":    a.ExpiresAt,
-		"domain":       a.Domain,
-		"apiHost":      a.APIHost,
-		"machineId":    a.MachineID,
-		"deviceId":     a.DeviceID,
+		"accessToken":       a.AccessToken,
+		"refreshToken":      a.RefreshToken,
+		"expiresAt":         a.ExpiresAt,
+		"domain":            a.Domain,
+		"apiHost":           a.APIHost,
+		"enterpriseConsole": a.EnterpriseConsole,
+		"machineId":         a.MachineID,
+		"deviceId":          a.DeviceID,
 	}
 	if a.DevicePublicKey != "" {
 		authDoc["devicePublicKey"] = a.DevicePublicKey

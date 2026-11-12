@@ -56,6 +56,9 @@ func CreditBudget(row map[string]any, domain, label, unit string, now float64) B
 	if len(packages) > 0 && p.Remaining != nil {
 		remaining := *p.Remaining
 		for _, pkg := range packages {
+			if pkg["display_only"] == true {
+				continue
+			}
 			expiry, remain := resourceNumber(pkg["expire_at"]), resourceNumber(pkg["remain"])
 			if remain == nil || *remain <= 0 {
 				continue

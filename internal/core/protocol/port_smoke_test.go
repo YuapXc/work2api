@@ -1559,3 +1559,16 @@ func TestToolCallIndexesSeparateReusedSourceIndexes(t *testing.T) {
 		t.Fatal("invalid index silently accepted")
 	}
 }
+
+func TestToolIndexesStartAtZeroPerChoice(t *testing.T) {
+	var tracker ToolCallIndexes
+	for _, s := range []struct {
+		choice, index int
+		id            string
+		want          int
+	}{{0, 1, "a", 0}, {0, 1, "", 0}, {0, 1, "b", 1}, {0, 2, "c", 2}, {1, 9, "d", 0}, {1, 9, "", 0}, {0, 1, "a", 0}} {
+		if got := tracker.Resolve(s.choice, s.index, s.id); got != s.want {
+			t.Fatalf("%+v got %d", s, got)
+		}
+	}
+}

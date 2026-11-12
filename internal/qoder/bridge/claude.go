@@ -415,7 +415,13 @@ func MergeToolCallChunks(merged map[int]map[string]interface{}, chunks []interfa
 	if len(trackers) > 0 && trackers[0] != nil {
 		tracker = trackers[0]
 	} else {
-		for index, existing := range merged {
+		indices := make([]int, 0, len(merged))
+		for index := range merged {
+			indices = append(indices, index)
+		}
+		sort.Ints(indices)
+		for _, index := range indices {
+			existing := merged[index]
 			id, _ := existing["id"].(string)
 			local.Resolve(0, index, id)
 		}

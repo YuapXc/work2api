@@ -468,8 +468,7 @@ func readSSE(reader io.Reader, handler func(eventName, data string) error) error
 type ToolCallIndexes struct {
 	open map[[2]int]toolIndexSlot
 	ids  map[toolIndexID]toolIndexSlot
-	used map[int]bool
-	next int
+	next map[int]int
 }
 type toolIndexSlot struct {
 	index int
@@ -484,7 +483,7 @@ func (t *ToolCallIndexes) Resolve(choice, index int, id string) int {
 	if t.open == nil {
 		t.open = map[[2]int]toolIndexSlot{}
 		t.ids = map[toolIndexID]toolIndexSlot{}
-		t.used = map[int]bool{}
+		t.next = map[int]int{}
 	}
 	key := [2]int{choice, index}
 	slot, ok := t.open[key]
@@ -494,15 +493,8 @@ func (t *ToolCallIndexes) Resolve(choice, index int, id string) int {
 		}
 	}
 	if !ok || id != "" && slot.id != "" && slot.id != id {
-		n := index
-		if n < 0 || t.used[n] {
-			for t.used[t.next] {
-				t.next++
-			}
-			n = t.next
-		}
-		slot = toolIndexSlot{index: n}
-		t.used[n] = true
+		slot = toolIndexSlot{index: t.next[choice]}
+		t.next[choice]++
 	}
 	if id != "" {
 		slot.id = id

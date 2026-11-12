@@ -862,7 +862,7 @@ func (r *Registry) fetchCatalogURL(ctx context.Context, url string, headers map[
 	}
 	for _, raw := range modelsRaw {
 		m, _ := raw.(map[string]any)
-		if MediaKind(m) != "" && !seenIDs[str(m["id"])] {
+		if (MediaKind(m) != "" || strings.HasPrefix(str(m["id"]), "custom:")) && !seenIDs[str(m["id"])] {
 			cliIDs = append(cliIDs, m["id"])
 			seenIDs[str(m["id"])] = true
 		}

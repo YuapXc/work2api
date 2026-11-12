@@ -34,16 +34,17 @@ type Account struct {
 	Alias          string
 	Nickname       string
 
-	CooldownUntil   float64
-	otherCooldown   float64
-	creditRevision  uint64
-	FailureCount    int
-	CreditsRemain   *float64
-	CreditsTotal    *float64
-	CreditsExpireAt *float64
-	CreditPackages  []map[string]any
-	Priority        int
-	LastUsed        float64
+	CooldownUntil               float64
+	otherCooldown               float64
+	creditRevision              uint64
+	FailureCount                int
+	CreditsRemain               *float64
+	CreditsTotal                *float64
+	CreditsExpireAt             *float64
+	CreditPackages              []map[string]any
+	CreditsGranted, CreditsUsed *float64
+	Priority                    int
+	LastUsed                    float64
 }
 
 func safeProfile(mgr Credential) string {
@@ -431,6 +432,17 @@ func (p *Pool) SetAlias(uid, alias string) {
 	}
 }
 
+func (p *Pool) SetCreditCumulative(uid string, granted, used *float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, a := range p.accounts {
+		if a.UID == uid {
+			a.CreditsGranted, a.CreditsUsed = granted, used
+			return
+		}
+	}
+}
+
 // SetCredits updates an account's credit snapshot.
 func (p *Pool) SetCredits(uid string, remain, total, expireAt *float64, packages []map[string]any) {
 	p.mu.Lock()
@@ -618,9 +630,10 @@ func (p *Pool) AllAccounts() []map[string]any {
 			"credits_total":     deref(a.CreditsTotal),
 			"credits_expire_at": deref(a.CreditsExpireAt),
 			"credit_packages":   a.CreditPackages,
-			"priority":          a.Priority,
-			"weight":            round3(weight(a, now, true)),
-			"source":            p.accountSource(a),
+			"credits_granted":   deref(a.CreditsGranted), "credits_used": deref(a.CreditsUsed),
+			"priority": a.Priority,
+			"weight":   round3(weight(a, now, true)),
+			"source":   p.accountSource(a),
 		})
 	}
 	return out
