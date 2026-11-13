@@ -623,7 +623,7 @@ func (m *Manager) ChatIdentityPreview() (map[string]any, error) {
 	if err != nil {
 		return nil, errors.New("账号出站身份不可识别")
 	}
-	endpoint, err := siterouting.ChatURLForProfile(profile)
+	endpoint, err := siterouting.EndpointForAuth(session.Auth)
 	if err != nil {
 		return nil, err
 	}
@@ -641,5 +641,5 @@ func (m *Manager) ChatIdentityPreview() (map[string]any, error) {
 	if token, _ := session.Auth["accessToken"].(string); strings.TrimSpace(token) == "" || encryptedToken(session.Auth) {
 		present["Authorization"] = false
 	}
-	return map[string]any{"profile": profile, "endpoint": endpoint, "headers": safe, "present": present, "local_only": true}, nil
+	return map[string]any{"profile": profile, "endpoint": endpoint + "/v2/chat/completions", "headers": safe, "present": present, "local_only": true}, nil
 }

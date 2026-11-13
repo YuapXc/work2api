@@ -16,6 +16,7 @@ import (
 
 	"work2api/internal/core/provider"
 	"work2api/internal/statebackup"
+	"work2api/internal/workbuddy/httpclient"
 )
 
 type refreshTransport func(*http.Request) (*http.Response, error)
@@ -274,5 +275,47 @@ func TestConfirmedAuthExpiryStopsAllCredentialConsumers(t *testing.T) {
 	}
 	if m.AuthorizationInvalid() || calls.Load() != 2 {
 		t.Fatal("new credential could not recover")
+	}
+}
+
+func TestEnterpriseRedirectCannotForwardCredentialsToAnotherHost(t *testing.T) {
+	from, _ := http.NewRequest("GET", "https://team.sso.codebuddy.cn/v3/config", nil)
+	for _, target := range []string{"https://evil.test/x", "http://team.sso.codebuddy.cn/x", "https://team.sso.codebuddy.cn:444/x"} {
+		req, _ := http.NewRequest("GET", target, nil)
+		if httpclient.GuardRedirect(nil)(req, []*http.Request{from}) != http.ErrUseLastResponse {
+			t.Fatal("cross-origin redirect accepted", target)
+		}
+	}
+	req, _ := http.NewRequest("GET", "https://team.sso.codebuddy.cn/next", nil)
+	if err := httpclient.GuardRedirect(nil)(req, []*http.Request{from}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEnterpriseRenewalRetainsAccountOrigin(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "enterprise.info")
+	writeTestCredential(t, path, "old")
+	raw, _ := os.ReadFile(path)
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	doc["auth"].(map[string]any)["domain"] = "team.sso.codebuddy.cn"
+	raw, _ = json.Marshal(doc)
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(path)
+	m.client = &http.Client{Transport: refreshTransport(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host != "team.sso.codebuddy.cn" || r.URL.Path != "/v2/plugin/auth/token/refresh" || r.Header.Get("X-Domain") != "team.sso.codebuddy.cn" {
+			t.Error("renewal wrong origin", r.URL)
+		}
+		return refreshResponse(r, `{"code":0,"data":{"accessToken":"new","expiresIn":3600}}`), nil
+	})}
+	if _, err := m.GetChatHeadersContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if m.Endpoint() != "https://team.sso.codebuddy.cn" {
+		t.Fatal("renewal lost enterprise", m.Endpoint())
 	}
 }

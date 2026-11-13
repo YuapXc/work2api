@@ -110,12 +110,9 @@ func (s *Server) portalChannelImport(w http.ResponseWriter, r *http.Request) {
 		writeAPIErr(w, errBody(503, "贡献登记失败，可重新添加", "server_error"))
 		return
 	}
-	if name == "qoder" {
-		if channel, ok := rt.(*qoder.Runtime); ok {
-			_ = channel.RefreshOwnedAccount(ctx, str2(account["id"]))
-		}
-	}
-	writeJSON(w, 200, map[string]any{"ok": true, "contribution_id": contribution})
+	result := map[string]any{"ok": true, "contribution_id": contribution}
+	s.verifyAddedAccount(ctx, name, account, result)
+	writeJSON(w, 200, result)
 }
 
 func (s *Server) portalQoderOAuth(w http.ResponseWriter, r *http.Request) {

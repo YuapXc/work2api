@@ -105,8 +105,12 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 		copyBody["tools"] = tools
 		body = copyBody
 	}
-	url, _ := siterouting.ChatURLForProfile(acc.Profile)
+	url := acc.Endpoint() + "/v2/chat/completions"
 	nativeURL := nativeMessagesEndpoint(acc.Profile, model)
+	if nativeURL != "" {
+		base, _ := siterouting.EndpointForProfile(acc.Profile)
+		nativeURL = acc.Endpoint() + strings.TrimPrefix(nativeURL, base)
+	}
 	var nativeBody map[string]any
 	var thinkingOwner string
 	if nativeURL != "" {

@@ -17,7 +17,6 @@ import (
 
 	"work2api/internal/core/provider"
 	"work2api/internal/workbuddy/httpclient"
-	"work2api/internal/workbuddy/siterouting"
 )
 
 var defaultMediaClient = func() *http.Client {
@@ -379,10 +378,7 @@ func (o *Runtime) CallMedia(ctx context.Context, req provider.MediaRequest) (map
 	if err != nil {
 		return nil, errBody(401, "账号授权不可用，请重新授权", "auth_error")
 	}
-	endpoint, err := siterouting.EndpointForProfile(acc.Profile)
-	if err != nil {
-		return nil, err
-	}
+	endpoint := acc.Endpoint()
 	paths := map[string]string{"image": "/v2/images/generations", "image-edit": "/v2/images/edits", "video": "/v2/videos/generations", "video-query": "/v2/videos/tasks", "transcription": "/v2/async/tasks/create", "transcription-query": "/v2/async/tasks/query"}
 	path, ok := paths[req.Operation]
 	if !ok {
@@ -536,10 +532,7 @@ func (o *Runtime) UploadMedia(ctx context.Context, req provider.MediaRequest, da
 	if err != nil {
 		return "", err
 	}
-	endpoint, err := siterouting.EndpointForProfile(acc.Profile)
-	if err != nil {
-		return "", err
-	}
+	endpoint := acc.Endpoint()
 	return o.uploadMediaInput(ctx, endpoint, headers, data)
 }
 

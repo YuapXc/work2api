@@ -22,6 +22,17 @@ type Credential interface {
 	Path() string
 }
 
+func (a *Account) Endpoint() string {
+	if endpoint, ok := a.Mgr.(interface{ Endpoint() string }); ok {
+		value := endpoint.Endpoint()
+		if host, err := siterouting.NormalizeDomain(strings.TrimPrefix(value, "https://")); err == nil && value == "https://"+host {
+			return value
+		}
+	}
+	value, _ := siterouting.EndpointForProfile(a.Profile)
+	return value
+}
+
 // Account is one pooled account.
 type Account struct {
 	UID      string
@@ -393,8 +404,7 @@ func (p *Pool) ChatURLFor(uid string) string {
 	defer p.mu.Unlock()
 	for _, a := range p.accounts {
 		if a.UID == uid {
-			url, _ := siterouting.ChatURLForProfile(a.Profile)
-			return url
+			return a.Endpoint() + "/v2/chat/completions"
 		}
 	}
 	url, _ := siterouting.ChatURLForProfile(siterouting.DefaultProfile)

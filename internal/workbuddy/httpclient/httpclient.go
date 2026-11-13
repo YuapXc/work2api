@@ -7,8 +7,10 @@
 package httpclient
 
 import (
+	"errors"
 	"net/http"
 	"time"
+	"work2api/internal/workbuddy/siterouting"
 )
 
 // NoProxyTransport clones http.DefaultTransport (keeping its dial/keepalive/idle
@@ -21,5 +23,20 @@ func NoProxyTransport() *http.Transport {
 
 // New returns an *http.Client with the given timeout and no proxy.
 func New(timeout time.Duration) *http.Client {
-	return &http.Client{Timeout: timeout, Transport: NoProxyTransport()}
+	return &http.Client{Timeout: timeout, Transport: NoProxyTransport(), CheckRedirect: GuardRedirect(nil)}
+}
+
+func GuardRedirect(next func(*http.Request, []*http.Request) error) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) > 0 && siterouting.CloudHostedDomain(via[0].URL.Hostname()) && (req.URL.Scheme != "https" || req.URL.Host != via[0].URL.Host) {
+			return http.ErrUseLastResponse
+		}
+		if next != nil {
+			return next(req, via)
+		}
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		return nil
+	}
 }

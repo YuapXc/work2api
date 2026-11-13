@@ -74,3 +74,32 @@ func TestChatDeviceTokenIsAccountAndProductScoped(t *testing.T) {
 		t.Fatal("account token crossed identities")
 	}
 }
+
+func TestCloudEnterpriseRoutingAndIOA(t *testing.T) {
+	for _, tc := range []struct{ domain, endpoint string }{
+		{"team.sso.copilot.tencent.com", "https://team.sso.copilot.tencent.com"},
+		{"team.copilot.qq.com", "https://team.copilot.qq.com"},
+		{"team.sso.codebuddy.cn", "https://team.sso.codebuddy.cn"},
+		{"tencent.sso.copilot.tencent.com", siterouting.DomesticEndpoint},
+		{"tencent.sso.codebuddy.cn", siterouting.DomesticEndpoint},
+		{"www.workbuddy.cn", "https://www.workbuddy.cn"},
+	} {
+		a := siterouting.Auth{"domain": tc.domain}
+		endpoint, err := siterouting.EndpointForAuth(a)
+		if err != nil || endpoint != tc.endpoint {
+			t.Fatal(tc.domain, endpoint, err)
+		}
+		refresh, err := siterouting.RefreshURLForAuth(a)
+		if err != nil || refresh != tc.endpoint+"/v2/plugin/auth/token/refresh" {
+			t.Fatal(refresh, err)
+		}
+		if Domain := siterouting.DomainForAuth(a); Domain != tc.domain {
+			t.Fatal("wrong domain header", Domain)
+		}
+	}
+	for _, host := range []string{"team.sso.codebuddy.cn.evil.test", "a.b.sso.codebuddy.cn", "-a.sso.codebuddy.cn", "https://u@team.sso.codebuddy.cn", "https://team.sso.codebuddy.cn:443", "http://team.sso.codebuddy.cn", "127.0.0.1", "team.sso.codebuddy.cn/path"} {
+		if _, err := siterouting.NormalizeDomain(host); err == nil {
+			t.Fatal("unsafe enterprise host accepted", host)
+		}
+	}
+}

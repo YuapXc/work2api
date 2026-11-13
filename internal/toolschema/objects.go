@@ -501,6 +501,9 @@ func workBuddySchema(schema any) any {
 				}
 			}
 		}
+		if node["pattern"] == `^[^\uD800-\uDFFF]*$` {
+			remove("pattern")
+		}
 		if pattern, ok := node["pattern"].(string); ok && strings.Contains(pattern, `\0`) {
 			var text strings.Builder
 			for i := 0; i < len(pattern); i++ {

@@ -24,6 +24,7 @@ import (
 
 	"work2api/internal/streamwatch"
 	"work2api/internal/tokenusage"
+	"work2api/internal/workbuddy/httpclient"
 )
 
 // passthroughBodyKeys is the whitelist of body fields forwarded upstream.
@@ -71,7 +72,9 @@ func NewClient(client *http.Client) *Client {
 	if client == nil {
 		return Shared()
 	}
-	return &Client{hc: client}
+	copy := *client
+	copy.CheckRedirect = httpclient.GuardRedirect(client.CheckRedirect)
+	return &Client{hc: &copy}
 }
 
 // Shared returns the process-wide upstream client (reuses TCP/TLS conns).
@@ -94,7 +97,7 @@ func Shared() *Client {
 			// up a broken HTTP_PROXY.
 			Proxy: nil,
 		}
-		shared = &Client{hc: &http.Client{Transport: transport}}
+		shared = &Client{hc: &http.Client{Transport: transport, CheckRedirect: httpclient.GuardRedirect(nil)}}
 	})
 	return shared
 }
@@ -304,6 +307,12 @@ func streamSSE(resp *http.Response, yield LineFunc, names ...map[string]string) 
 		}
 		remapped := state.toolIndexes.NormalizeChunk(chunk)
 		renamed := restore.restore(chunk) || remapped
+		if usage, ok := chunk["usage"].(map[string]any); ok {
+			if normalized := tokenusage.ChatUsage(usage); normalized != nil {
+				chunk["usage"] = normalized
+				renamed = true
+			}
+		}
 		if err := state.observe(chunk); err != nil {
 			return err
 		}
@@ -507,6 +516,9 @@ func CollectStream(fallbackModel string, produce func(yield LineFunc) error) (ma
 		"choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": finishReason}},
 	}
 	if usage != nil {
+		if normalized := tokenusage.ChatUsage(usage); normalized != nil {
+			usage = normalized
+		}
 		result["usage"] = usage
 	}
 	return result, nil

@@ -477,3 +477,28 @@ func TestCollectStreamSeparatesIDsReusingIndex(t *testing.T) {
 		}
 	}
 }
+
+func TestAlternateCacheUsageReachesStreamingAndCollectedClients(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, `data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}`+"\n\n"+`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":2,"num_cached_tokens":12,"prompt_tokens_details":{"cached_tokens":0}}}`+"\n\ndata: [DONE]\n\n")
+	}))
+	defer server.Close()
+	seen := false
+	result, err := upstream.CollectStream("test", func(y upstream.LineFunc) error {
+		return upstream.NewClient(server.Client()).StreamUpstream(context.Background(), nil, map[string]any{"model": "test"}, server.URL, func(line string) error {
+			if strings.Contains(line, `"cached_tokens":12`) {
+				seen = true
+			}
+			return y(line)
+		})
+	})
+	if err != nil || !seen {
+		t.Fatal("stream alias not projected", err)
+	}
+	usage, _ := result["usage"].(map[string]any)
+	details, _ := usage["prompt_tokens_details"].(map[string]any)
+	if fmt.Sprint(details["cached_tokens"]) != "12" {
+		t.Fatal("collected cache lost", usage)
+	}
+}

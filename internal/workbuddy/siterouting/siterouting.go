@@ -1,4 +1,4 @@
-// Package siterouting decides the single fixed upstream endpoint for a
+// Package siterouting decides the permitted upstream endpoint for a
 // credential. Ported faithfully from workbuddy_one/site_routing.py.
 //
 // Core model: region (domestic/international) × product (CLI/WorkBuddy) are two
@@ -6,9 +6,8 @@
 // independent backends (separate model catalogs), so the profile — not the
 // region — is the smallest unit of routing and accounting.
 //
-// Security principle: a credential's domain is only a hint for *which* fixed
-// endpoint to pick, never used directly as a request target. Every URL comes
-// from the profileEndpoints allowlist, eliminating SSRF at the root.
+// Public origins are fixed. Enterprise origins must match the official
+// cloud-hosted domain forms and retain strict HTTPS host validation.
 package siterouting
 
 import (
@@ -16,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/url"
+	"regexp"
 	"strings"
 )
 
@@ -57,6 +57,19 @@ var domainProfiles = map[string]string{
 	"copilot.tencent.com": "cn-cli",
 	"www.codebuddy.ai":    "intl-cli",
 	"www.workbuddy.ai":    "intl-work",
+}
+
+var cloudHostedDomain = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.(?:sso\.copilot\.tencent\.com|copilot\.qq\.com|sso\.codebuddy\.cn)$`)
+
+func CloudHostedDomain(host string) bool { return cloudHostedDomain.MatchString(host) }
+func hostProfile(host string) string {
+	if profile := domainProfiles[host]; profile != "" {
+		return profile
+	}
+	if CloudHostedDomain(host) {
+		return DefaultProfile
+	}
+	return ""
 }
 
 // Auth is the credential's auth blob (subset used for routing).
@@ -133,7 +146,8 @@ func knownHost(value string, issuer bool) (string, error) {
 		return "", ErrInvalidHint
 	}
 	host := parsed.Hostname()
-	if _, known := domainProfiles[host]; !known {
+	host = strings.ToLower(host)
+	if hostProfile(host) == "" {
 		return "", ErrInvalidHint
 	}
 	// netloc must equal host exactly => rejects port and userinfo
@@ -198,7 +212,7 @@ func SiteForAuth(auth Auth) (string, error) {
 	sites := map[string]struct{}{}
 	for _, host := range []string{domain, issuer} {
 		if host != "" {
-			sites[ProfileSite(domainProfiles[host])] = struct{}{}
+			sites[ProfileSite(hostProfile(host))] = struct{}{}
 		}
 	}
 	if len(sites) > 1 {
@@ -222,7 +236,9 @@ func ProfileForAuth(auth Auth) (string, error) {
 	profiles := map[string]struct{}{}
 	for _, host := range []string{domain, issuer} {
 		if host != "" && host != "copilot.tencent.com" {
-			profiles[domainProfiles[host]] = struct{}{}
+			if !CloudHostedDomain(host) {
+				profiles[hostProfile(host)] = struct{}{}
+			}
 		}
 	}
 	if len(profiles) > 1 {
@@ -243,11 +259,23 @@ func EndpointForProfile(profile string) (string, error) {
 	return ep, nil
 }
 
-// EndpointForAuth maps a credential to its fixed upstream endpoint.
+// EndpointForAuth selects the public or official cloud-hosted enterprise origin.
 func EndpointForAuth(auth Auth) (string, error) {
 	profile, err := ProfileForAuth(auth)
 	if err != nil {
 		return "", err
+	}
+	domain, issuer := hints(auth)
+	if CloudHostedDomain(domain) && CloudHostedDomain(issuer) && domain != issuer {
+		return "", ErrConflict
+	}
+	for _, host := range []string{domain, issuer} {
+		if CloudHostedDomain(host) {
+			if host == "tencent.sso.copilot.tencent.com" || host == "tencent.sso.codebuddy.cn" {
+				return DomesticEndpoint, nil
+			}
+			return "https://" + host, nil
+		}
 	}
 	return profileEndpoints[profile], nil
 }
@@ -255,11 +283,11 @@ func EndpointForAuth(auth Auth) (string, error) {
 // RefreshURLForAuth maps a credential to its token refresh URL (must share the
 // chat origin, else international accounts cannot refresh).
 func RefreshURLForAuth(auth Auth) (string, error) {
-	profile, err := ProfileForAuth(auth)
+	endpoint, err := EndpointForAuth(auth)
 	if err != nil {
 		return "", err
 	}
-	return profileEndpoints[profile] + refreshPath, nil
+	return endpoint + refreshPath, nil
 }
 
 // DomainForAuth returns the X-Domain header value.

@@ -16,6 +16,7 @@ import (
 	"work2api/internal/core/provider"
 	"work2api/internal/jsonutil"
 	"work2api/internal/streamwatch"
+	"work2api/internal/tokenusage"
 )
 
 func TestResponsesContinuationCannotLoseHistoryDuringConversion(t *testing.T) {
@@ -1569,6 +1570,30 @@ func TestToolIndexesStartAtZeroPerChoice(t *testing.T) {
 	}{{0, 1, "a", 0}, {0, 1, "", 0}, {0, 1, "b", 1}, {0, 2, "c", 2}, {1, 9, "d", 0}, {1, 9, "", 0}, {0, 1, "a", 0}} {
 		if got := tracker.Resolve(s.choice, s.index, s.id); got != s.want {
 			t.Fatalf("%+v got %d", s, got)
+		}
+	}
+}
+
+func TestAlternateCacheFieldsRoundTripWithoutInventedUsage(t *testing.T) {
+	for _, field := range []string{"cached_tokens", "num_cached_tokens"} {
+		u := map[string]any{"prompt_tokens": float64(20), "completion_tokens": float64(2), field: float64(12), "prompt_tokens_details": map[string]any{"cached_tokens": float64(0), "vendor_detail": "keep"}}
+		out := tokenusage.ChatUsage(u)
+		if out == nil || out["prompt_tokens_details"].(map[string]any)["cached_tokens"] != 12 || u["prompt_tokens_details"].(map[string]any)["cached_tokens"] != float64(0) {
+			t.Fatal("alias lost or original changed", out)
+		}
+		if tokenusage.ChatUsage(out) != nil {
+			t.Fatal("normalization not idempotent")
+		}
+		usage := decodeOpenAIUsage(u)
+		if usage.Cached != 12 || !usage.CachedKnown || usage.Input != 20 {
+			t.Fatal("incorrect counts", usage)
+		}
+		for _, bad := range []any{float64(21), float64(-1), "12", nil} {
+			u[field] = bad
+			delete(u, "prompt_tokens_details")
+			if tokenusage.ChatUsage(u) != nil {
+				t.Fatal("invalid alias projected", bad)
+			}
 		}
 	}
 }

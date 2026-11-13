@@ -572,6 +572,9 @@ func TestMediaModelsOutsideChatWhitelistRemainTypedAndUnpriced(t *testing.T) {
 		if m == nil || m["model_type"] != kind || m["vision"] != false || m["credits"] != nil {
 			t.Fatalf("invalid media metadata: %#v", m)
 		}
+		if endpoints, ok := m["supported_endpoint_types"].([]string); !ok || len(endpoints) == 0 {
+			t.Fatal("missing media endpoint kind", m)
+		}
 		if len(r.CreditsByRegion(id)) != 0 {
 			t.Fatal("unknown media price became free")
 		}
@@ -598,5 +601,64 @@ func TestEnterpriseCustomModelsAppendWithoutLocalProviders(t *testing.T) {
 	}
 	if local, _ := r.CachedModel("local"); local != nil {
 		t.Fatal("local provider imported", local)
+	}
+}
+
+func TestNewAccountRefreshWaitsForCatalogPublication(t *testing.T) {
+	p := pool.New(map[string]pool.Credential{"new": catalogTestCredential{profile: "cn-cli"}}, "")
+	r := NewWithCatalogClient(p, nil, &http.Client{Transport: isolatedCatalogTransport(func(req *http.Request) (*http.Response, error) {
+		return catalogResponse(req, 200, catalogBody("fixture-model")), nil
+	})})
+	r.refreshMu.Lock()
+	done := make(chan bool, 1)
+	go func() { done <- r.RefreshAccount(context.Background(), "new") }()
+	select {
+	case <-done:
+		r.refreshMu.Unlock()
+		t.Fatal("new account refresh skipped an in-flight publication")
+	case <-time.After(25 * time.Millisecond):
+	}
+	r.refreshMu.Unlock()
+	if !<-done {
+		t.Fatal("new account catalog not published")
+	}
+	r.mu.Lock()
+	found := false
+	for _, m := range r.models {
+		for _, uid := range m["account_uids"].([]string) {
+			if uid == "new" {
+				found = true
+			}
+		}
+	}
+	r.mu.Unlock()
+	if !found {
+		t.Fatal("new account missing from dispatch scope")
+	}
+	r.refreshMu.Lock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if r.RefreshAccount(ctx, "new") {
+		t.Fatal("canceled refresh succeeded")
+	}
+	r.refreshMu.Unlock()
+}
+
+type enterpriseCatalogCredential struct{ catalogTestCredential }
+
+func (enterpriseCatalogCredential) Endpoint() string { return "https://team.sso.codebuddy.cn" }
+func TestEnterpriseCatalogUsesAccountOrigin(t *testing.T) {
+	p := pool.New(map[string]pool.Credential{"enterprise": enterpriseCatalogCredential{catalogTestCredential{profile: "cn-cli"}}}, "")
+	r := NewWithCatalogClient(p, nil, &http.Client{Transport: isolatedCatalogTransport(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host != "team.sso.codebuddy.cn" {
+			t.Error("catalog went to public origin", req.URL)
+		}
+		return catalogResponse(req, 200, catalogBody("model")), nil
+	})})
+	if !r.RefreshAccount(context.Background(), "enterprise") {
+		t.Fatal("enterprise catalog not published")
+	}
+	if p.ChatURLFor("enterprise") != "https://team.sso.codebuddy.cn/v2/chat/completions" {
+		t.Fatal("chat uses different origin")
 	}
 }

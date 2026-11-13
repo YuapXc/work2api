@@ -57,7 +57,7 @@ func detail(u map[string]any, key, field string) any {
 }
 
 func Cached(u map[string]any) *int {
-	return cacheCount(u["prompt_cache_hit_tokens"], u["cache_read_input_tokens"],
+	return cacheCount(u["prompt_cache_hit_tokens"], u["cache_read_input_tokens"], u["cached_tokens"], u["num_cached_tokens"],
 		detail(u, "prompt_tokens_details", "cached_tokens"), detail(u, "input_tokens_details", "cached_tokens"))
 }
 
@@ -157,4 +157,28 @@ func Merge(current, incoming map[string]any) map[string]any {
 		}
 	}
 	return result
+}
+
+// ChatUsage projects a valid alternate cache observation into OpenAI's detail field.
+func ChatUsage(u map[string]any) map[string]any {
+	read, _ := ValidCache(u)
+	if read == nil {
+		return nil
+	}
+	if current := number(detail(u, "prompt_tokens_details", "cached_tokens")); current != nil && *current == *read {
+		return nil
+	}
+	out := make(map[string]any, len(u)+1)
+	for k, v := range u {
+		out[k] = v
+	}
+	details := map[string]any{}
+	if old, ok := u["prompt_tokens_details"].(map[string]any); ok {
+		for k, v := range old {
+			details[k] = v
+		}
+	}
+	details["cached_tokens"] = *read
+	out["prompt_tokens_details"] = details
+	return out
 }

@@ -77,7 +77,7 @@ func (r *Runtime) RefreshOwnedAccount(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	return r.refreshAccountModels(ctx, a, s, modelCatalogKey(a, s))
+	return r.refreshAccountCatalog(ctx, a, s, modelCatalogKey(a, s), false)
 }
 
 // Restore every credential catalog before user model permissions are served.

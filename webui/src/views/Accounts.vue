@@ -758,7 +758,7 @@ async function beginOAuth() {
   oauthMessage.value = ''
   oauthPolling.value = true
   try {
-    let poll: () => Promise<{ status: string; message?: string }>
+    let poll: () => Promise<{ status: string; message?: string; models_verified?: boolean }>
     let deadline = Date.now() + 10 * 60_000
     const res = await api.providerOAuthBegin(provider, { ...oauthChoice.value }, controller.signal)
     if (generation !== pollGeneration) return
@@ -777,7 +777,7 @@ async function beginOAuth() {
       try {
         const p = await poll()
         if (generation !== pollGeneration) return
-        if (p.status === 'ready') { stopPoll(); toast.success('已添加账号'); addOpen.value = false; await load(); return }
+        if (p.status === 'ready') { stopPoll(); if (p.models_verified === false) toast.info(p.message || '账号已保存，请刷新模型目录'); else toast.success('已添加账号'); addOpen.value = false; await load(); return }
         if (p.status === 'expired' || p.status === 'error') { stopPoll(); oauthMessage.value = p.message || '授权已过期或失败，请重新开始'; return }
         failures = 0
         oauthMessage.value = '等待浏览器授权…'
@@ -809,8 +809,9 @@ async function onUpload(e: Event) {
   const file = (e.target as HTMLInputElement).files?.[0]
   if (!file) return
   try {
-    await api.uploadAuth(file)
-    toast.success('已上传账号凭据')
+    const result = await api.uploadAuth(file)
+    if (result.models_verified === false) toast.info(result.message || '账号已保存，请刷新模型目录')
+    else toast.success('已上传账号凭据')
     addOpen.value = false
     await load()
   } finally {
@@ -828,9 +829,10 @@ async function onAddByToken() {
   patSaving.value = true
   oauthMessage.value = ''
   try {
-    await api.providerImportAccount(addProvider.value, token, { ...oauthChoice.value })
+    const result = await api.providerImportAccount(addProvider.value, token, { ...oauthChoice.value })
     if (generation !== pollGeneration) { await load(); return }
-    toast.success('已添加账号')
+    if (result.models_verified === false) toast.info(result.message || '账号已保存，请刷新模型目录')
+    else toast.success('已添加账号')
     patToken.value = ''
     addOpen.value = false
     await load()

@@ -350,6 +350,7 @@ func (s *Server) adminUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res["ok"] = true
+	s.verifyAddedAccount(r.Context(), "workbuddy", res, res)
 	writeJSON(w, 200, res)
 }
 

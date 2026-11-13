@@ -180,3 +180,19 @@ func BenchmarkKimiReferencePreparation(b *testing.B) {
 		})
 	}
 }
+
+func TestWorkBuddySurrogatePathGuardIsWireOnly(t *testing.T) {
+	guard := `^[^\uD800-\uDFFF]*$`
+	schema := map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string", "pattern": guard}, "other": map[string]any{"type": "string", "pattern": "^[a-z]+$"}}, "required": []any{"path"}, "const": map[string]any{"pattern": guard}}
+	out := workBuddySchema(schema).(map[string]any)
+	fields := out["properties"].(map[string]any)
+	if fields["path"].(map[string]any)["pattern"] != nil {
+		t.Fatal("rejected wire guard retained")
+	}
+	if schema["properties"].(map[string]any)["path"].(map[string]any)["pattern"] != guard || fields["other"].(map[string]any)["pattern"] != "^[a-z]+$" || !reflect.DeepEqual(out["const"], schema["const"]) || !reflect.DeepEqual(out["required"], schema["required"]) {
+		t.Fatal("client contract mutated")
+	}
+	if !reflect.DeepEqual(ObjectUnions(schema), schema) {
+		t.Fatal("other providers changed")
+	}
+}

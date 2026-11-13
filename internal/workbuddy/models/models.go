@@ -611,10 +611,19 @@ func (r *Registry) fetchFromUpstreamContext(ctx context.Context) []fetchedModel 
 // RefreshAccount verifies only this account and merges its confirmed model IDs.
 // Do not extend the TTL of other accounts or infer permissions from a profile.
 func (r *Registry) RefreshAccount(ctx context.Context, uid string) bool {
-	if !r.refreshMu.TryLock() {
-		return false
+	for !r.refreshMu.TryLock() {
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
 	}
 	defer r.refreshMu.Unlock()
+	if ctx.Err() != nil {
+		return false
+	}
 	account := r.pool.Get(uid)
 	if account == nil || !account.Enabled {
 		return false
@@ -726,6 +735,10 @@ func (r *Registry) fetchOneContext(ctx context.Context, account *pool.Account) [
 	if err != nil {
 		noteCatalogFailure(ctx)
 		return nil
+	}
+	base, _ := siterouting.EndpointForProfile(account.Profile)
+	for i, source := range sources {
+		sources[i] = account.Endpoint() + strings.TrimPrefix(source, base)
 	}
 	merged := map[string]fetchedModel{}
 	var order []string
@@ -978,6 +991,20 @@ func withStandardFields(e map[string]any) map[string]any {
 					e["input_modalities"] = []string{"text", "image"}
 				}
 			}
+		}
+		if kind == "image" {
+			endpoints := []string{"image-generation"}
+			if tags, ok := e["media_tags"].([]any); ok {
+				for _, tag := range tags {
+					if tag == "image-to-image" {
+						endpoints = append(endpoints, "image-edit")
+						break
+					}
+				}
+			}
+			e["supported_endpoint_types"] = endpoints
+		} else if kind == "video" {
+			e["supported_endpoint_types"] = []string{"openai-video"}
 		}
 		e["output_modalities"] = []string{kind}
 		if kind == "audio" {

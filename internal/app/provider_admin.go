@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"time"
+	"work2api/internal/qoder"
 
 	"work2api/internal/core/provider"
 	"work2api/internal/store"
@@ -258,7 +260,9 @@ func (s *Server) adminProviderImportAccount(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, 502, errBody(502, err.Error(), "upstream_error").Body)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "account": acct})
+	result := map[string]any{"ok": true, "account": acct}
+	s.verifyAddedAccount(r.Context(), rt.Name(), acct, result)
+	writeJSON(w, 200, result)
 }
 
 // oauthRuntime resolves a provider name to its OAuthRuntime, or writes an error.
@@ -309,6 +313,13 @@ func (s *Server) adminProviderOAuthPoll(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		writeJSON(w, 502, errBody(502, err.Error(), "upstream_error").Body)
 		return
+	}
+	if res["status"] == "ready" {
+		account, _ := res["account"].(map[string]any)
+		if r.PathValue("name") == "workbuddy" {
+			account = res
+		}
+		s.verifyAddedAccount(r.Context(), r.PathValue("name"), account, res)
 	}
 	writeJSON(w, 200, res)
 }
@@ -495,4 +506,28 @@ func (s *Server) workbuddyAdmin(detail bool) map[string]any {
 func (s *Server) runWorkbuddyCheckin(ctx context.Context) map[string]any {
 	res, _ := s.o.wb.AdminCheckin(ctx)
 	return res
+}
+
+func (s *Server) verifyAddedAccount(ctx context.Context, name string, account, result map[string]any) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	verified := false
+	switch name {
+	case "workbuddy":
+		if uid := str2(account["uid"]); uid != "" {
+			verified = s.o.wb.Catalog.RefreshAccount(ctx, uid)
+		}
+	case "qoder":
+		if rt, ok := s.o.runtimes.ByName(name); ok {
+			if channel, ok := rt.(*qoder.Runtime); ok && str2(account["id"]) != "" {
+				verified = channel.RefreshOwnedAccount(ctx, str2(account["id"])) == nil
+			}
+		}
+	default:
+		return
+	}
+	result["models_verified"] = verified
+	if !verified {
+		result["message"] = "账号已保存，模型目录尚未验证，请在模型页刷新目录，无需重启网关"
+	}
 }

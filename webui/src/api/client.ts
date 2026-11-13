@@ -224,7 +224,7 @@ export const api = {
       `/admin/providers/${encodeURIComponent(name)}/accounts/${encodeURIComponent(id)}`),
   // 凭 token 添加账号（qoder PAT；无浏览器/扫码的服务器路径）
   providerImportAccount: (name: string, token: string, opts: Record<string, unknown>) =>
-    http.post<unknown, { ok: boolean; account: Record<string, unknown> }>(
+    http.post<unknown, { ok: boolean; account: Record<string, unknown>; models_verified?: boolean; message?: string }>(
       `/admin/providers/${encodeURIComponent(name)}/accounts/import`, { token, ...opts }),
 	providerImportLocal: (name:string) => http.post<unknown,{results:{status:string;message?:string}[]}>(`/admin/providers/${encodeURIComponent(name)}/accounts/import-local`,{}),
 
@@ -238,7 +238,7 @@ export const api = {
 	providerOAuthComplete: (name:string,loginId:string,callbackURL:string) => http.post(`/admin/providers/${encodeURIComponent(name)}/oauth/complete`,{login_id:loginId,callback_url:callbackURL}),
   // 轮询登录状态：pending 等待授权，ready 成功（含 account），error 失败（含 message）
   providerOAuthPoll: (name: string, loginId: string, signal?: AbortSignal) =>
-    http.post<unknown, { status: 'pending' | 'ready' | 'error' | 'expired'; message?: string; account?: Record<string, unknown> }>(
+    http.post<unknown, { status: 'pending' | 'ready' | 'error' | 'expired'; models_verified?: boolean; message?: string; account?: Record<string, unknown> }>(
       `/admin/providers/${encodeURIComponent(name)}/oauth/poll`, { login_id: loginId }, { signal }),
 
   // 供应商配置编辑（opencode 密钥层级）：读取 / 保存并热重载
@@ -263,7 +263,7 @@ export const api = {
   uploadAuth: (file: File) => {
     const form = new FormData()
     form.append('file', file)
-    return http.post<unknown, { ok: boolean; account: AccountInfo }>('/admin/accounts/upload', form, {
+    return http.post<unknown, { ok: boolean; account: AccountInfo; models_verified?: boolean; message?: string }>('/admin/accounts/upload', form, {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
   },
