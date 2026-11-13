@@ -504,6 +504,7 @@ func TestPortalQueuedRequestRefreshesAfterAdmission(t *testing.T) {
 		if ok {
 			s.refreshPortalRequest(w, r, p, payload)
 		}
+		release()
 		done <- w
 	}()
 	deadline := time.Now().Add(2 * time.Second)
