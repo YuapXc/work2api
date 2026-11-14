@@ -1360,18 +1360,18 @@ func TestEnterpriseQuotaPublicationKeepsCurrencyAndFailureScope(t *testing.T) {
 	if err := r.refreshQuota(context.Background(), id, true); err != nil {
 		t.Fatal(err)
 	}
-	if state.Remaining == nil || *state.Remaining != 75 || state.QuotaUnit != "CNY" || state.Expiry != nil || len(state.CreditPackages) != 2 || state.CreditPackages[1]["display_only"] != true {
+	if state.Remaining == nil || *state.Remaining != 3996 || state.QuotaUnit != "credits" || state.Expiry != nil || len(state.CreditPackages) != 2 || state.CreditPackages[1]["display_only"] != true {
 		t.Fatal("enterprise quota mixed with credits", state)
 	}
 	data := r.AdminData(context.Background())
-	if data.Accounts[0]["quota_unit"] != "CNY" || data.Budgets[0].Remaining == nil || *data.Budgets[0].Remaining != 75 {
+	if data.Accounts[0]["quota_unit"] != "credits" || data.Budgets[0].Remaining == nil || *data.Budgets[0].Remaining != 3996 {
 		t.Fatal("display-only credits subtracted", data)
 	}
 	fail.Store(true)
-	if err := r.refreshQuota(context.Background(), id, true); err == nil {
-		t.Fatal("partial quota reported as complete")
+	if err := r.refreshQuota(context.Background(), id, true); err != nil {
+		t.Fatal("reference quota blocked consumer credits", err)
 	}
-	if !state.QuotaFailed || state.Remaining == nil || *state.Remaining != 75 {
+	if state.QuotaFailed || state.Remaining == nil || *state.Remaining != 3996 {
 		t.Fatal("failed read destroyed snapshot", state)
 	}
 	if guard := r.authGuard().State(id+":cn:auth", a.MaintenanceIdentity()); guard.NeedsLogin {
@@ -1423,6 +1423,32 @@ func TestEnterpriseCallbackHostIsFixed(t *testing.T) {
 		}
 		if r.logins["trace"].EnterpriseConsole != (host == "https://console.enterprise.trae.cn") {
 			t.Fatal("unrecognized enterprise target", host)
+		}
+	}
+}
+
+func TestBareTextToolCallsBecomeCallsAndTruncationFails(t *testing.T) {
+	for _, truncate := range []bool{false, true} {
+		value := `{"tool_calls":[{"name":"unlisted","arguments":{"path":"file"}}]}`
+		if truncate {
+			value = `{"tool_calls":[`
+		}
+		first := &upstream.SOLOEvent{Event: "output", Response: value}
+		events := newEvents(strings.NewReader("event: done\ndata: {}\n\n"))
+		var output bytes.Buffer
+		err := normalizeStream(&output, events, first, "trae/test", nil)
+		if truncate {
+			if err == nil {
+				t.Fatal("partial tool sent as answer")
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, _, _, err := protocol.CollapseChatStreamAs(context.Background(), strings.NewReader(output.String()), protocol.Chat, "test", nil)
+		if err != nil || !bytes.Contains(result, []byte(`"finish_reason":"tool_calls"`)) || !bytes.Contains(result, []byte(`"name":"unlisted"`)) {
+			t.Fatal("text tool lost", string(result), err)
 		}
 	}
 }

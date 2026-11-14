@@ -126,7 +126,7 @@ func TestEnterpriseSeatUsageUsesOnlyOwnSeat(t *testing.T) {
 	}
 }
 
-func TestEnterpriseAgentRequestsUseFixedConsole(t *testing.T) {
+func TestEnterpriseAgentRequestsUseConsumerGateway(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "get_model") || strings.Contains(r.URL.Path, "get_config") {
 			w.Write([]byte(`{"config_info_list":[]}`))
@@ -136,15 +136,15 @@ func TestEnterpriseAgentRequestsUseFixedConsole(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := New()
-	c.EnterpriseHost = srv.URL
-	c.AgentHost = "http://127.0.0.1:1"
+	c.AgentHost = srv.URL
+	c.EnterpriseHost = "http://127.0.0.1:1"
 	a := &auth.Auth{AccessToken: "fixture", Variant: "cn", EnterpriseConsole: true}
 	if _, err := c.FetchModels(a); err != nil {
-		t.Fatal("enterprise catalog used personal endpoint", err)
+		t.Fatal("enterprise catalog did not use consumer gateway", err)
 	}
 	rc, status, _, _, err := c.ChatPreparedStreamWithHeaders(a, []byte(`{}`))
 	if err != nil || status != 200 {
-		t.Fatal("enterprise chat used personal endpoint", status, err)
+		t.Fatal("enterprise chat did not use consumer gateway", status, err)
 	}
 	if rc != nil {
 		rc.Close()

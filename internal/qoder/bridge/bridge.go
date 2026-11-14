@@ -480,6 +480,20 @@ func (b *Bridge) CallQoder(ctx context.Context, agent string, messages []interfa
 // 永不触发、请求挂起；错误由 CallQoder 在流结束后统一返回。
 func deltaDispatcher(onDelta func(Delta), upstreamErr *error) func(string) bool {
 	var toolIndexes protocol.ToolCallIndexes
+	var textTools protocol.TextToolParser
+	emitParts := func(text string, final bool) bool {
+		parts, err := textTools.Feed(text, final)
+		if err != nil {
+			*upstreamErr = err
+			return false
+		}
+		for _, part := range parts {
+			d := Delta{Content: part.Text, ToolCalls: part.Calls}
+			toolIndexes.NormalizeTools(0, d.ToolCalls)
+			onDelta(d)
+		}
+		return true
+	}
 	return func(line string) bool {
 		if *upstreamErr != nil {
 			return false
@@ -489,7 +503,7 @@ func deltaDispatcher(onDelta func(Delta), upstreamErr *error) func(string) bool 
 		}
 		dataPayload := strings.TrimSpace(line[5:])
 		if dataPayload == "[DONE]" {
-			return true
+			return emitParts("", true)
 		}
 		delta := ExtractDelta(dataPayload)
 		if delta.Err != nil {
@@ -497,8 +511,21 @@ func deltaDispatcher(onDelta func(Delta), upstreamErr *error) func(string) bool 
 			return false
 		}
 		if !delta.isEmpty() {
-			toolIndexes.NormalizeTools(0, delta.ToolCalls)
-			onDelta(delta)
+			content, finish := delta.Content, delta.FinishReason
+			delta.Content, delta.FinishReason = "", ""
+			if !delta.isEmpty() {
+				toolIndexes.NormalizeTools(0, delta.ToolCalls)
+				onDelta(delta)
+			}
+			if !emitParts(content, finish != "") {
+				return false
+			}
+			if finish != "" {
+				if textTools.Seen && finish == "stop" {
+					finish = "tool_calls"
+				}
+				onDelta(Delta{FinishReason: finish})
+			}
 		}
 		return true
 	}
@@ -690,8 +717,11 @@ func (b *Bridge) callQoderWithOpts(ctx context.Context, agent string, messages [
 			}
 			onDelta(d)
 		}
-		streamErr := b.client.openStreamLines(ctx, qurl, body, extra,
-			deltaDispatcher(onDeltaWrapped, &upstreamErr))
+		dispatch := deltaDispatcher(onDeltaWrapped, &upstreamErr)
+		streamErr := b.client.openStreamLines(ctx, qurl, body, extra, dispatch)
+		if streamErr == nil && upstreamErr == nil {
+			dispatch("data: [DONE]")
+		}
 		if upstreamErr != nil {
 			streamwatch.AttemptResult(ctx, ErrorStatus(upstreamErr))
 		}

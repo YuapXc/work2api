@@ -458,7 +458,11 @@ func (r *Runtime) coolWithDelay(id string, kind upstream.ErrKind, delay time.Dur
 
 func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent, model string, initialUsage map[string]any) error {
 	id := fmt.Sprintf("chatcmpl-trae-%d", time.Now().UnixNano())
+	var toolIndexes protocol.ToolCallIndexes
 	emit := func(delta map[string]any, finish any, usage map[string]any) error {
+		if calls, ok := delta["tool_calls"].([]any); ok {
+			toolIndexes.NormalizeTools(0, calls)
+		}
 		chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}}}
 		if usage != nil {
 			chunk["usage"] = usage
@@ -476,6 +480,26 @@ func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent
 			return err
 		}
 	}
+	var textTools protocol.TextToolParser
+	emitText := func(text string, final bool) error {
+		parts, err := textTools.Feed(text, final)
+		if err != nil {
+			return err
+		}
+		for _, part := range parts {
+			delta := map[string]any{}
+			if part.Text != "" {
+				delta["content"] = part.Text
+			}
+			if len(part.Calls) > 0 {
+				delta["tool_calls"] = part.Calls
+			}
+			if err := emit(delta, nil, nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	toolsSeen := false
 	for e := first; e != nil; {
 		switch e.Event {
@@ -484,7 +508,9 @@ func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent
 		case "output":
 			delta := map[string]any{}
 			if e.Response != "" {
-				delta["content"] = e.Response
+				if err := emitText(e.Response, false); err != nil {
+					return err
+				}
 			}
 			if e.Reasoning != "" {
 				delta["reasoning_content"] = e.Reasoning
@@ -541,11 +567,14 @@ func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent
 				return err
 			}
 		case "done":
+			if err := emitText("", true); err != nil {
+				return err
+			}
 			finish := e.FinishReason
 			if finish == "" {
 				finish = "stop"
 			}
-			if toolsSeen && finish == "stop" {
+			if (toolsSeen || textTools.Seen) && finish == "stop" {
 				finish = "tool_calls"
 			}
 			if err := emit(map[string]any{}, finish, nil); err != nil {

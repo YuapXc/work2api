@@ -207,6 +207,23 @@ func buildAccountFromToken(ctx context.Context, deviceToken, refreshToken string
 		return nil, err
 	}
 	id = acct.ID
+	previous, readErr := List()
+	if readErr != nil {
+		return nil, readErr
+	}
+	for _, old := range previous {
+		if old.ID != acct.ID {
+			continue
+		}
+		if NormalizeRegion(string(old.Region)) != NormalizeRegion(string(acct.Region)) || old.UpstreamID != "" && acct.UpstreamID != "" && old.UpstreamID != acct.UpstreamID {
+			return nil, fmt.Errorf("account identity collision")
+		}
+		acct.CheckinFingerprint, acct.CreatedAt = old.CheckinFingerprint, old.CreatedAt
+		acct.APIMode, acct.Tags, acct.SortOrder, acct.Active, acct.LastUsed = old.APIMode, old.Tags, old.SortOrder, old.Active, old.LastUsed
+		if old.Name != "" {
+			acct.Name = old.Name
+		}
+	}
 	secretPayload, err := json.Marshal(map[string]string{
 		"device_token":  deviceToken,
 		"refresh_token": refreshToken,

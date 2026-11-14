@@ -185,9 +185,6 @@ func New() *Client {
 
 func (c *Client) agentBase() string { return c.AgentHost }
 func (c *Client) agentBaseFor(a *auth.Auth) string {
-	if a.EnterpriseConsole {
-		return c.EnterpriseHost
-	}
 	return c.AgentHost
 }
 func (c *Client) ugBase() string    { return c.UgHost }

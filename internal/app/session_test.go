@@ -1407,3 +1407,68 @@ func TestResponseHistoryOriginOnlyCleansForeignRestoredItems(t *testing.T) {
 		t.Fatal("guessed mismatched history")
 	}
 }
+
+func TestFullHistoryRepostSharesOnlySameScopeCompleteSegments(t *testing.T) {
+	c := newResponseHistoryCache(1<<20, time.Hour)
+	original := json.RawMessage(`{"role":"user","content":"` + strings.Repeat("x", 8192) + `"}`)
+	origin := responseHistoryOrigin{"workbuddy", "account", "model"}
+	if !c.put(responseHistoryKey{"key", "one"}, nil, []json.RawMessage{original}, origin) {
+		t.Fatal("put")
+	}
+	cloned := append(json.RawMessage(nil), original...)
+	if p, _ := c.shareInput("another", []json.RawMessage{cloned}); p != nil {
+		t.Fatal("cross-key sharing")
+	}
+	prior, n := c.shareInput("key", []json.RawMessage{cloned})
+	if prior == nil || n != 1 || prior.segments[0].origin != origin {
+		t.Fatal("not shared or source lost")
+	}
+	if !c.put(responseHistoryKey{"key", "two"}, prior, []json.RawMessage{json.RawMessage(`{"role":"assistant","content":"done"}`)}, origin) {
+		t.Fatal("put child")
+	}
+	c.release(prior)
+	if c.used >= int64(2*len(original)) {
+		t.Fatal("history bytes duplicated", c.used)
+	}
+	c.mu.Lock()
+	c.drop(c.items[responseHistoryKey{"key", "one"}])
+	c.mu.Unlock()
+	p := c.acquire(responseHistoryKey{"key", "two"})
+	if len(p.segments) != 2 || !bytes.Equal(p.segments[0].items[0], original) {
+		t.Fatal("eviction lost shared history")
+	}
+	c.release(p)
+	c.mu.Lock()
+	c.drop(c.items[responseHistoryKey{"key", "two"}])
+	c.mu.Unlock()
+	if c.used != 0 {
+		t.Fatal("shared accounting leak", c.used)
+	}
+	c.timer.Stop()
+}
+
+func BenchmarkFullHistoryRepostRetention(b *testing.B) {
+	for _, share := range []bool{false, true} {
+		b.Run(fmt.Sprint("share=", share), func(b *testing.B) {
+			payload := json.RawMessage(`{"role":"user","content":"` + strings.Repeat("x", 128<<10) + `"}`)
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				c := newResponseHistoryCache(256<<20, time.Hour)
+				for turn := 0; turn < 20; turn++ {
+					copy := append(json.RawMessage(nil), payload...)
+					items := []json.RawMessage{copy}
+					var prior *responseHistoryEntry
+					if share {
+						var n int
+						prior, n = c.shareInput("key", items)
+						items = items[n:]
+					}
+					c.put(responseHistoryKey{"key", fmt.Sprint(turn)}, prior, items)
+					c.release(prior)
+				}
+				b.ReportMetric(float64(c.used), "retained-B/20-turns")
+				c.timer.Stop()
+			}
+		})
+	}
+}

@@ -203,6 +203,65 @@ func (c *responseHistoryCache) release(e *responseHistoryEntry) {
 	defer c.mu.Unlock()
 	c.releaseLocked(e)
 }
+
+// Share only complete immutable segments from a few recent turns of this key.
+func (c *responseHistoryCache) shareInput(scope string, items []json.RawMessage) (*responseHistoryEntry, int) {
+	c.mu.Lock()
+	var near []*responseHistoryEntry
+	for e, seen := c.order.Front(), 0; e != nil && len(near) < 4 && seen < 64; e, seen = e.Next(), seen+1 {
+		prior := e.Value.(*responseHistoryEntry)
+		if prior.key.scope != scope || c.now().Sub(prior.created) >= c.ttl {
+			continue
+		}
+		prior.refs++
+		near = append(near, prior)
+	}
+	c.mu.Unlock()
+	defer func() {
+		for _, entry := range near {
+			c.release(entry)
+		}
+	}()
+	var best []*responseHistorySegment
+	bestCount := 0
+	for _, prior := range near {
+		count, segments := 0, 0
+		for _, segment := range prior.segments {
+			if count+len(segment.items) > len(items) {
+				break
+			}
+			equal := true
+			for i, raw := range segment.items {
+				if !bytes.Equal(raw, items[count+i]) {
+					equal = false
+					break
+				}
+			}
+			if !equal {
+				break
+			}
+			count += len(segment.items)
+			segments++
+		}
+		if count > bestCount {
+			best, bestCount = prior.segments[:segments], count
+		}
+		if bestCount == len(items) {
+			break
+		}
+	}
+	if bestCount == 0 {
+		return nil, 0
+	}
+	lease := &responseHistoryEntry{refs: 1, segments: append([]*responseHistorySegment(nil), best...)}
+	c.mu.Lock()
+	for _, segment := range lease.segments {
+		segment.refs++
+	}
+	c.mu.Unlock()
+	return lease, bestCount
+}
+
 func (c *responseHistoryCache) put(key responseHistoryKey, parent *responseHistoryEntry, items []json.RawMessage, origins ...responseHistoryOrigin) bool {
 	if len(key.id) == 0 || len(key.id) > 512 {
 		return false
@@ -491,6 +550,13 @@ func (s *Server) prepareResponseHistory(w http.ResponseWriter, r *http.Request, 
 			return w, release, nil
 		}
 		inputs[i] = raw
+	}
+	if parent == nil {
+		shared, count := c.shareInput(scope, inputs)
+		if shared != nil {
+			parent = shared
+			inputs = append([]json.RawMessage(nil), inputs[count:]...)
+		}
 	}
 	capture := &responseHistoryWriter{ResponseWriter: w, limit: responseHistoryCaptureLimit}
 	var output http.ResponseWriter = capture

@@ -1597,3 +1597,69 @@ func TestAlternateCacheFieldsRoundTripWithoutInventedUsage(t *testing.T) {
 		}
 	}
 }
+
+func TestTextToolCallsMatchUpstreamWithoutEatingExamples(t *testing.T) {
+	valid := `{"tool_calls":[{"name":"unlisted","arguments":{"n":9007199254740993}},{"function":{"name":"second","arguments":"{\"x\":\"ok\"}"}}]}`
+	for _, width := range []int{1, 3, 9999} {
+		var p TextToolParser
+		var calls []any
+		var text strings.Builder
+		input := "before\n" + valid
+		for pos := 0; pos < len(input); pos += width {
+			parts, err := p.Feed(input[pos:min(pos+width, len(input))], false)
+			if err != nil {
+				t.Fatal(width, err)
+			}
+			for _, part := range parts {
+				text.WriteString(part.Text)
+				calls = append(calls, part.Calls...)
+			}
+		}
+		parts, err := p.Feed("", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, part := range parts {
+			text.WriteString(part.Text)
+			calls = append(calls, part.Calls...)
+		}
+		if len(calls) != 2 || text.String() != "before\n" || !p.Seen {
+			t.Fatal(width, text.String(), calls)
+		}
+		if !strings.Contains(calls[0].(map[string]any)["function"].(map[string]any)["arguments"].(string), "9007199254740993") {
+			t.Fatal("rounded arguments")
+		}
+	}
+	for _, input := range []string{"example " + valid, "```json\n" + valid + "\n```", "`" + valid + "`", `{"other":1,"tool_calls":[]}`, `{"tool_calls":[]}`} {
+		var p TextToolParser
+		var out strings.Builder
+		for _, b := range []byte(input) {
+			parts, err := p.Feed(string([]byte{b}), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, part := range parts {
+				if len(part.Calls) > 0 {
+					t.Fatal("example became tool", input)
+				}
+				out.WriteString(part.Text)
+			}
+		}
+		parts, err := p.Feed("", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, part := range parts {
+			out.WriteString(part.Text)
+		}
+		if out.String() != input {
+			t.Fatal("text changed", input, out.String())
+		}
+	}
+	for _, input := range []string{`{"tool_calls":[`, `{"tool_calls":[{"name":"x","arguments":"bad"}]}`, `{"tool_calls":[{"arguments":{}}]}`, `{"tool_calls":[{"name":"outer","arguments":{},"function":{"name":"inner"}}]}`} {
+		var p TextToolParser
+		if _, err := p.Feed(input, true); err == nil {
+			t.Fatal("malformed call accepted", input)
+		}
+	}
+}

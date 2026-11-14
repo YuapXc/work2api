@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestOAuthMetadataRejectsStatusMalformedAndOversizedResponses(t *testing.T) {
@@ -98,5 +99,49 @@ func TestPkgLabelFallbackChain(t *testing.T) {
 	// 全缺 → 通用名
 	if l := pkgLabel(map[string]interface{}{}); l != "专属积分" {
 		t.Errorf("generic fallback: %q", l)
+	}
+}
+
+func TestReauthorizationPreservesSameAccountDeviceAndPreferences(t *testing.T) {
+	oldRoot := DataRoot()
+	SetDataRoot(t.TempDir())
+	t.Cleanup(func() { SetDataRoot(oldRoot) })
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/userinfo" {
+			w.Write([]byte(`{"userId":"same","email":"same@example.test","name":"upstream"}`))
+		} else {
+			w.Write([]byte(`{"plan_tier_name":"pro"}`))
+		}
+	}))
+	defer server.Close()
+	ep := Endpoints{UserinfoBase: server.URL + "/userinfo", PlanEndpoint: server.URL + "/plan"}
+	original, err := buildAccountFromToken(context.Background(), "first", "refresh", RegionCN, ep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original.CheckinFingerprint = &CheckinFingerprint{MachineID: "stable", MachineToken: "token", MachineType: "desktop"}
+	original.CreatedAt = time.Unix(100, 0)
+	original.Tags = []string{"keep"}
+	original.APIMode = "anthropic"
+	if err := Save(original); err != nil {
+		t.Fatal(err)
+	}
+	next, err := buildAccountFromToken(context.Background(), "second", "refresh-2", RegionCN, ep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.CheckinFingerprint == nil || next.CheckinFingerprint.MachineID != "stable" || !next.CreatedAt.Equal(original.CreatedAt) || next.APIMode != "anthropic" || len(next.Tags) != 1 {
+		t.Fatal("reauthorization lost device or preferences", next)
+	}
+	if err := Save(next); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := Get(next.ID)
+	if err != nil || stored.CheckinFingerprint == nil {
+		t.Fatal("device not saved", err)
+	}
+	other, err := buildAccountFromToken(context.Background(), "other", "refresh-3", RegionGlobal, ep)
+	if err != nil || other.CheckinFingerprint != nil || other.ID == next.ID {
+		t.Fatal("cross-region fingerprint reused", err)
 	}
 }

@@ -768,3 +768,45 @@ func TestQoderStatelessToolMergeKeepsMissingIndexCompatibility(t *testing.T) {
 		t.Fatal("stateless merge regressed", merged)
 	}
 }
+
+func TestDispatcherRecoversBareToolJSONWithNoDeclaredTools(t *testing.T) {
+	for _, bad := range []bool{false, true} {
+		var failure error
+		var output []Delta
+		dispatch := deltaDispatcher(func(d Delta) { output = append(output, d) }, &failure)
+		text := `{"tool_calls":[{"name":"unlisted","arguments":{"n":1}}]}`
+		if bad {
+			text = `{"tool_calls":[`
+		}
+		for _, b := range []byte(text) {
+			raw, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"content": string([]byte{b})}}}})
+			frame, _ := json.Marshal(map[string]any{"body": string(raw), "statusCodeValue": 200})
+			if !dispatch("data: " + string(frame)) {
+				break
+			}
+		}
+		inner := `{"choices":[{"delta":{},"finish_reason":"stop"}]}`
+		frame, _ := json.Marshal(map[string]any{"body": inner, "statusCodeValue": 200})
+		dispatch("data: " + string(frame))
+		if bad {
+			if failure == nil {
+				t.Fatal("partial tool accepted")
+			}
+			continue
+		}
+		if failure != nil {
+			t.Fatal(failure)
+		}
+		calls := 0
+		finish := ""
+		for _, d := range output {
+			calls += len(d.ToolCalls)
+			if d.FinishReason != "" {
+				finish = d.FinishReason
+			}
+		}
+		if calls != 1 || finish != "tool_calls" {
+			t.Fatal("tool lost", output)
+		}
+	}
+}
