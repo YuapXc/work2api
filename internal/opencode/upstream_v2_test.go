@@ -138,3 +138,31 @@ func TestProxyRecoveryUsesFailingServiceOrigin(t *testing.T) {
 		}
 	}
 }
+
+func TestForeignIDsRecoverOnceAndRecheckPermission(t *testing.T) {
+	for _, deny := range []bool{false, true} {
+		calls, checks := 0, 0
+		req, _ := newUpstreamRequest(context.Background(), "https://example.test", protocol.Responses, []byte(`{"store":false,"input":[{"role":"assistant","id":"old","content":"before"},{"role":"user","content":"next"}]}`), RequestIDs{}, "k")
+		client := &http.Client{Transport: catalogTestTransport(func(r *http.Request) (*http.Response, error) {
+			calls++
+			raw, _ := io.ReadAll(r.Body)
+			if calls > 1 && strings.Contains(string(raw), `"id":"old"`) {
+				t.Fatal("foreign ID retained")
+			}
+			return &http.Response{StatusCode: 400, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":{"message":"created under a different resource"}}`))}, nil
+		})}
+		resp, err := doCompatibleInferenceAttempt(client, req, protocol.Responses, time.Second, func() error {
+			checks++
+			if deny {
+				return errors.New("revoked")
+			}
+			return nil
+		})
+		if checks != 1 || deny && (err == nil || calls != 1) || !deny && (err != nil || calls != 2) {
+			t.Fatal(calls, checks, err)
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}
+}

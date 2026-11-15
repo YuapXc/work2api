@@ -122,13 +122,25 @@ func (r *Runtime) refreshQuotaRaw(ctx context.Context, id string, force bool) (r
 	a.QuotaFailed = err != nil
 	if err == nil {
 		a.QuotaUnit, a.QuotaReset, a.QuotaUnlimited = "credits", nil, false
-		pool := upstream.CreditsPoolUsage(usage.UserEntitlementPackList, usage.IsCreditsBilling)
+		now := float64(time.Now().Unix())
+		live := make([]upstream.EntitlementPack, 0, len(usage.UserEntitlementPackList))
+		for _, pack := range usage.UserEntitlementPackList {
+			end := float64(pack.EntitlementBaseInfo.EndTime)
+			if end > 1e12 {
+				end /= 1000
+			}
+			if end > 0 && end <= now {
+				continue
+			}
+			live = append(live, pack)
+		}
+		pool := upstream.CreditsPoolUsage(live, usage.IsCreditsBilling)
 		remaining := 0.0
 		total := 0.0
 		known := false
 		var expiry *float64
 		packages := []map[string]any{}
-		for _, pack := range usage.UserEntitlementPackList {
+		for _, pack := range live {
 			if pack.Excluded() {
 				continue
 			}
@@ -170,7 +182,7 @@ func (r *Runtime) refreshQuotaRaw(ctx context.Context, id string, force bool) (r
 			if end > 1e12 {
 				end /= 1000
 			}
-			if creditRemain != nil && *creditRemain > 0 && end > 0 && end < 4102444800 && (expiry == nil || end < *expiry) {
+			if creditRemain != nil && *creditRemain > 0 && end > now && end < 4102444800 && (expiry == nil || end < *expiry) {
 				v := end
 				expiry = &v
 			}

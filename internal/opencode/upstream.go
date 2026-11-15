@@ -288,8 +288,14 @@ func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies 
 		if ids.AccountUID != nil {
 			*ids.AccountUID = "opencode:anonymous"
 		}
-		resp, err := doCompatibleInferenceAttempt(node.proxy.client, req, route.Protocol, time.Duration(rt.cfg.Performance.AttemptTimeoutSeconds)*time.Second)
+		resp, err := doCompatibleInferenceAttempt(node.proxy.client, req, route.Protocol, time.Duration(rt.cfg.Performance.AttemptTimeoutSeconds)*time.Second, func() error {
+			return provider.CheckDispatch(ctx, provider.AccountRef{Provider: runtimeName, LocalID: "opencode:anonymous"}, runtimePrefix+route.ID)
+		})
 		err = classifyProxyRoute(node.proxy, err)
+		var denied *dispatchRecheckError
+		if errors.As(err, &denied) {
+			return nil, denied.error, attempts
+		}
 		attemptStatus := 0
 		if resp != nil {
 			attemptStatus = resp.StatusCode
@@ -518,8 +524,14 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies routeB
 		if ids.AccountUID != nil {
 			*ids.AccountUID = uid
 		}
-		resp, err := doCompatibleInferenceAttempt(proxy.client, req, route.Protocol, time.Duration(rt.cfg.Performance.AttemptTimeoutSeconds)*time.Second)
+		resp, err := doCompatibleInferenceAttempt(proxy.client, req, route.Protocol, time.Duration(rt.cfg.Performance.AttemptTimeoutSeconds)*time.Second, func() error {
+			return provider.CheckDispatch(ctx, provider.AccountRef{Provider: runtimeName, LocalID: uid}, runtimePrefix+route.ID)
+		})
 		err = classifyProxyRoute(proxy, err)
+		var denied *dispatchRecheckError
+		if errors.As(err, &denied) {
+			return nil, denied.error, attempts
+		}
 		attemptStatus := 0
 		if resp != nil {
 			attemptStatus = resp.StatusCode

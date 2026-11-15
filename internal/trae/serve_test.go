@@ -585,7 +585,7 @@ func TestQuotaRecoveryCoalescesAndPreservesOtherCooldowns(t *testing.T) {
 			close(started)
 			<-release
 		}
-		io.WriteString(w, `{"is_credits_billing":true,"user_entitlement_pack_list":[{"display_desc":"Credits","entitlement_base_info":{"product_type":1,"end_time":1793462400,"quota":{"credits_limit":100}},"usage":{"credits_amount":99.75}}]}`)
+		io.WriteString(w, `{"is_credits_billing":true,"user_entitlement_pack_list":[{"display_desc":"Credits","entitlement_base_info":{"product_type":1,"end_time":4100000000,"quota":{"credits_limit":100}},"usage":{"credits_amount":99.75}}]}`)
 	})
 	id := accountID("fixture")
 	identity := &auth.Auth{UID: "fixture", Variant: "cn", AccessToken: "fixture"}
@@ -1451,4 +1451,69 @@ func TestBareTextToolCallsBecomeCallsAndTruncationFails(t *testing.T) {
 			t.Fatal("text tool lost", string(result), err)
 		}
 	}
+}
+
+func TestQuotaOnlyLiveBalanceDeterminesExpiry(t *testing.T) {
+	now := time.Now().Unix()
+	early, late := now+86400, now+864000
+	r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+		fmt.Fprintf(w, `{"is_credits_billing":true,"user_entitlement_pack_list":[
+        {"entitlement_base_info":{"end_time":%d,"quota":{"credits_limit":100}},"usage":{"credits_amount":0}},
+        {"entitlement_base_info":{"end_time":%d,"quota":{"credits_limit":100}},"usage":{"credits_amount":90}},
+        {"entitlement_base_info":{"end_time":%d,"quota":{"credits_limit":100}},"usage":{"credits_amount":80}},
+        {"entitlement_base_info":{"end_time":%d,"quota":{"credits_limit":100}},"usage":{"credits_amount":0}}]}`, now-1, early, early, late)
+	})
+	id := accountID("fixture")
+	identity := &auth.Auth{UID: "fixture", Variant: "cn", AccessToken: "fixture"}
+	a := &accountState{Auth: identity, Enabled: true, Identities: map[string]*auth.Auth{"cn": identity}}
+	r.accounts[id] = a
+	if err := r.refreshQuota(context.Background(), id, true); err != nil {
+		t.Fatal(err)
+	}
+	if a.Remaining == nil || *a.Remaining != 130 || a.Expiry == nil || *a.Expiry != float64(early) {
+		t.Fatal("expired credits affected balance", a.Remaining, a.Expiry)
+	}
+	b := provider.CreditBudget(map[string]any{"credits_remaining": a.Remaining, "credit_packages": a.CreditPackages}, "credits", "", "", float64(now))
+	if b.Expiring != 30 || b.ExpiresAt == nil || *b.ExpiresAt != float64(early) {
+		t.Fatal("unrelated balance counted as expiring", b)
+	}
+}
+
+func TestLiveTraeQuotaExpiryProjection(t *testing.T) {
+	path := os.Getenv("WORK2API_TEST_TRAE_CREDENTIAL")
+	if path == "" {
+		t.Skip("explicit live credential required")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal("credential unavailable")
+	}
+	identity, err := auth.Parse(raw)
+	if err != nil {
+		t.Fatal("invalid credential")
+	}
+	if identity.NeedsRefresh(5 * time.Minute) {
+		t.Fatal("live test requires a valid access token; will not rotate copied refresh token")
+	}
+	r := fixtureRuntime(t, nil)
+	id := accountID(identity.UID)
+	state := &accountState{Auth: identity, Enabled: true, Identities: map[string]*auth.Auth{identity.Variant: identity}}
+	r.accounts[id] = state
+	ctx, cancel := context.WithTimeout(t.Context(), 35*time.Second)
+	defer cancel()
+	if err := r.refreshQuota(ctx, id, true); err != nil {
+		t.Fatalf("live quota unavailable: %T", err)
+	}
+	now := nowSec()
+	budget := provider.CreditBudget(map[string]any{"credits_remaining": state.Remaining, "credit_packages": state.CreditPackages}, "credits", "", "", now)
+	if state.Expiry != nil && *state.Expiry <= now {
+		t.Fatal("expired package selected")
+	}
+	if state.Remaining != nil && budget.Remaining != nil && *state.Remaining != *budget.Remaining {
+		t.Fatal("expired balance included")
+	}
+	if (state.Expiry == nil) != (budget.ExpiresAt == nil) || state.Expiry != nil && *state.Expiry != *budget.ExpiresAt {
+		t.Fatal("expiry projection disagrees with account")
+	}
+	t.Logf("real quota verified: packages=%d remaining_known=%t expiry_known=%t expiring_balance_not_entire_pool=%t", len(state.CreditPackages), state.Remaining != nil, state.Expiry != nil, state.Remaining != nil && budget.Expiring < *state.Remaining)
 }

@@ -18,6 +18,10 @@ import (
 	"work2api/internal/streamwatch"
 )
 
+type dispatchRecheckError struct{ error }
+
+func (e *dispatchRecheckError) Unwrap() error { return e.error }
+
 type attemptError struct {
 	err   error
 	phase string
@@ -47,9 +51,58 @@ func (e *attemptError) Unwrap() error { return e.err }
 // Only a missing official 2.1 route can fall back to its 2.0 equivalent.
 // Reuse the identity, body and remaining first-event budget; never replay a
 // generated response or interpret an authentication/payload error as a route miss.
-func doCompatibleInferenceAttempt(client *http.Client, req *http.Request, from protocol.Protocol, timeout time.Duration) (*http.Response, error) {
+func doCompatibleInferenceAttempt(client *http.Client, req *http.Request, from protocol.Protocol, timeout time.Duration, recheck ...func() error) (*http.Response, error) {
 	start := time.Now()
 	resp, err := doInferenceAttempt(client, req, from, timeout)
+	if from == protocol.Responses && err == nil && resp != nil && (resp.StatusCode == 400 || resp.StatusCode == 404 || resp.StatusCode == 422) && req.GetBody != nil && req.Context().Err() == nil {
+		saved := bufferedErrorResponse(resp)
+		resp = saved
+
+		rejected, errBody := io.ReadAll(saved.Body)
+		_ = saved.Body.Close()
+		saved.Body = io.NopCloser(bytes.NewReader(rejected))
+		if errBody == nil && protocol.IsForeignResponseIDRejection(rejected, saved.StatusCode) {
+			original, readErr := req.GetBody()
+			if readErr != nil {
+				return saved, nil
+			}
+			raw, readErr := io.ReadAll(original)
+			_ = original.Close()
+			if readErr == nil && errBody == nil {
+				if corrected, changed := protocol.RecoverForeignResponseIDs(raw, rejected, saved.StatusCode); changed {
+					remaining := timeout
+					if timeout > 0 {
+						remaining -= time.Since(start)
+					}
+					if timeout <= 0 || remaining > 0 {
+						if len(recheck) > 0 {
+							if e := recheck[0](); e != nil {
+								_ = saved.Body.Close()
+								return nil, &dispatchRecheckError{e}
+							}
+						}
+						retry := req.Clone(req.Context())
+						retry.Body = io.NopCloser(bytes.NewReader(corrected))
+						retry.ContentLength = int64(len(corrected))
+						retry.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(corrected)), nil }
+
+						streamwatch.StartAttempt(req.Context())
+						next, e := doInferenceAttempt(client, retry, from, remaining)
+						if e == nil {
+							_ = saved.Body.Close()
+							return next, nil
+						}
+						if req.Context().Err() != nil {
+							_ = saved.Body.Close()
+							return nil, req.Context().Err()
+						}
+					}
+					return saved, nil
+				}
+			}
+		}
+	}
+
 	if err != nil || resp == nil || resp.StatusCode != http.StatusNotFound || req.GetBody == nil || req.Context().Err() != nil || req.URL.Host != "opencode.ai" || req.URL.Scheme != "https" {
 		return resp, err
 	}
@@ -80,6 +133,13 @@ func doCompatibleInferenceAttempt(client *http.Client, req *http.Request, from p
 		if remaining <= 0 {
 			_ = body.Close()
 			return saved, nil
+		}
+	}
+	if len(recheck) > 0 {
+		if e := recheck[0](); e != nil {
+			_ = body.Close()
+			_ = saved.Body.Close()
+			return nil, &dispatchRecheckError{e}
 		}
 	}
 	streamwatch.StartAttempt(req.Context())

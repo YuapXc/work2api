@@ -44,13 +44,25 @@ func decodeOpenAIBlocksChecked(value any) ([]bridgeBlock, error) {
 				blocks = append(blocks, bridgeBlock{Kind: "image", URL: jsonutil.StringAt(part, "image_url")})
 			case "file", "input_file":
 				file := jsonutil.MapAt(part, "file")
-				blocks = append(blocks, bridgeBlock{
+				block := bridgeBlock{
 					Kind:      "file",
 					FileID:    jsonutil.FirstString(jsonutil.StringAt(part, "file_id"), jsonutil.StringAt(file, "file_id")),
 					Filename:  jsonutil.FirstString(jsonutil.StringAt(part, "filename"), jsonutil.StringAt(file, "filename")),
 					MediaType: jsonutil.FirstString(jsonutil.StringAt(part, "media_type"), jsonutil.StringAt(file, "media_type")),
 					Data:      jsonutil.FirstString(jsonutil.StringAt(part, "file_data"), jsonutil.StringAt(file, "file_data")),
-				})
+				}
+				if strings.HasPrefix(block.Data, "data:") {
+					head, data, ok := strings.Cut(block.Data, ",")
+					if !ok || !strings.HasSuffix(head, ";base64") {
+						return nil, errors.New("file data URI must use base64")
+					}
+					block.MediaType = strings.TrimSuffix(strings.TrimPrefix(head, "data:"), ";base64")
+					block.Data = data
+				}
+				if block.MediaType == "application/pdf" && block.Filename == "" {
+					block.Filename = "document.pdf"
+				}
+				blocks = append(blocks, block)
 			default:
 				return nil, fmt.Errorf("unsupported OpenAI content block type %q", jsonutil.StringAt(part, "type"))
 			}
@@ -261,7 +273,7 @@ func encodeChatBlocks(blocks []bridgeBlock) any {
 		case "file":
 			file := map[string]any{}
 			jsonutil.Put(file, "file_id", block.FileID)
-			jsonutil.Put(file, "file_data", block.Data)
+			jsonutil.Put(file, "file_data", fileDataURI(block))
 			jsonutil.Put(file, "filename", block.Filename)
 			parts = append(parts, map[string]any{"type": "file", "file": file})
 		}
@@ -533,4 +545,11 @@ func stripAnthropicReasoningEnvelopes(body map[string]any) {
 	if next != nil {
 		body["input"] = next
 	}
+}
+
+func fileDataURI(block bridgeBlock) string {
+	if block.Data != "" && block.MediaType != "" && !strings.HasPrefix(block.Data, "data:") {
+		return "data:" + block.MediaType + ";base64," + block.Data
+	}
+	return block.Data
 }

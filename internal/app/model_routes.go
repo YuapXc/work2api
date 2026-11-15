@@ -16,6 +16,7 @@ import (
 	"work2api/internal/config"
 	"work2api/internal/streamwatch"
 
+	"work2api/internal/core/protocol"
 	"work2api/internal/core/provider"
 	"work2api/internal/store"
 )
@@ -485,9 +486,13 @@ func (a *routeAffinity) bind(key, member string) {
 	a.bindings[key] = routeBinding{member, now}
 }
 
-// Error responses are held until a retry decision. Successful streams are
-// forwarded immediately; once their headers/body are sent there is no replay.
+// Hold errors and a bounded empty-response prelude only while fallback is possible.
+// Once headers or body are delivered, the attempt cannot be replayed.
 type routeWriter struct {
+	probe     *protocol.EmptyReplyProbe
+	prelude   []byte
+	fallback  bool
+	protocol  protocol.Protocol
 	dst       http.ResponseWriter
 	header    http.Header
 	status    int
@@ -555,6 +560,27 @@ func (w *routeWriter) Write(data []byte) (int, error) {
 		}
 		return w.errorBody.Write(data)
 	}
+	if w.probe != nil {
+		if len(w.prelude)+len(data) > 64<<10 {
+			held := w.prelude
+			w.prelude = nil
+			w.probe = nil
+			if _, err := w.Write(held); err != nil {
+				return 0, err
+			}
+			return w.Write(data)
+		}
+		w.prelude = append(w.prelude, data...)
+		w.probe.Observe(data)
+		if !w.probe.Ready {
+			return len(data), nil
+		}
+		held := w.prelude
+		w.prelude = nil
+		w.probe = nil
+		_, err := w.Write(held)
+		return len(data), err
+	}
 	limit := w.limit
 	if w.stream {
 		limit = streamwatch.DefaultMaxLineBytes
@@ -562,7 +588,9 @@ func (w *routeWriter) Write(data []byte) (int, error) {
 	if !w.stream && limit > 0 && len(w.line)+len(data) > limit {
 		return 0, fmt.Errorf("统一模型响应超过已配置的响应缓冲上限")
 	}
-	w.start()
+	if w.stream || !w.fallback {
+		w.start()
+	}
 	if !w.stream {
 		w.line = append(w.line, data...)
 		return len(data), nil
@@ -596,13 +624,29 @@ func (w *routeWriter) Write(data []byte) (int, error) {
 func (w *routeWriter) Flush() { _ = w.FlushError() }
 
 func (w *routeWriter) FlushError() error {
-	if w.status >= 400 {
+	if w.status >= 400 || w.probe != nil || w.fallback && !w.stream {
 		return nil
 	}
 	w.start()
 	return http.NewResponseController(w.dst).Flush()
 }
+func (w *routeWriter) emptySuccess() bool {
+	if !w.fallback || w.started || w.status >= 400 {
+		return false
+	}
+	if w.stream {
+		return w.probe != nil && w.probe.Done && w.probe.Empty
+	}
+	return protocol.CompleteEmptyResponse(w.protocol, w.line)
+}
 func (w *routeWriter) finish() {
+	if w.probe != nil {
+		held := w.prelude
+		w.prelude = nil
+		w.probe = nil
+		_, _ = w.Write(held)
+	}
+
 	if !w.started {
 		w.start()
 		_, _ = w.dst.Write(w.errorBody.Bytes())
@@ -768,10 +812,18 @@ func (s *Server) dispatchModelRoute(w http.ResponseWriter, r *http.Request, prot
 			diagnostic.PhysicalModel = member
 		}
 		proxy := &routeWriter{dst: w, header: make(http.Header), logical: route.Model, stream: boolVal(payload["stream"]), limit: positiveOr(int(s.o.cfg.MaxResponseBytes), config.DefaultMaxResponseBytes)}
+		proxy.fallback = i < len(members)-1
+		proxy.protocol = protocol.Protocol(proto)
+		if proxy.fallback && proxy.stream {
+			proxy.probe = protocol.NewEmptyReplyProbe(proxy.protocol)
+		}
 		result := &routeAttemptResult{}
 		req = req.WithContext(context.WithValue(req.Context(), routeAttemptResultKey{}, result))
 		s.dispatchRuntimeTo(proxy, req, proto, body, &attempt)
 		finish()
+		if result.ok && req.Context().Err() == nil && proxy.emptySuccess() {
+			continue
+		}
 		if proxy.started || proxy.status < 400 {
 			proxy.finish()
 			if proxy.status < 400 && result.ok {

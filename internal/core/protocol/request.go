@@ -1,6 +1,8 @@
 package protocol
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -674,6 +676,9 @@ func validateBridgeRequest(protocol Protocol, request bridgeRequest) error {
 		blocks = append(blocks, message.Blocks...)
 	}
 	for _, block := range blocks {
+		if block.Kind == "file" && protocol == Anthropic && block.Data != "" && block.MediaType != "application/pdf" {
+			return errors.New("Anthropic binary documents require application/pdf; use text content for other files")
+		}
 		if block.Kind == "file" && protocol == Anthropic && block.FileID != "" && block.Data == "" && block.URL == "" {
 			return fmt.Errorf("file %q cannot be represented by Anthropic Messages without file data or a URL", block.FileID)
 		}
@@ -1026,8 +1031,12 @@ func encodeResponsesRequest(request bridgeRequest) map[string]any {
 			case "file":
 				item := map[string]any{"type": "input_file"}
 				jsonutil.Put(item, "file_id", block.FileID)
-				jsonutil.Put(item, "file_data", block.Data)
-				jsonutil.Put(item, "filename", block.Filename)
+				jsonutil.Put(item, "file_data", fileDataURI(block))
+				filename := block.Filename
+				if filename == "" && block.MediaType == "application/pdf" {
+					filename = "document.pdf"
+				}
+				jsonutil.Put(item, "filename", filename)
 				content = append(content, item)
 			case "tool_call":
 				flushContent()
@@ -1208,4 +1217,103 @@ func FunctionToolSubset(input map[string]any, from Protocol) (map[string]any, er
 		out["tools"] = kept
 	}
 	return out, nil
+}
+
+func IsForeignResponseIDRejection(rejection []byte, status int) bool {
+	if status != 400 && status != 404 && status != 422 {
+		return false
+	}
+	var errDoc map[string]json.RawMessage
+	if json.Unmarshal(rejection, &errDoc) != nil {
+		return false
+	}
+	var failure struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(errDoc["error"], &failure) != nil {
+		return false
+	}
+	message := strings.ToLower(failure.Message)
+	return strings.Contains(message, "created under a different") && strings.Contains(message, "resource")
+}
+
+// RecoverForeignResponseIDs preserves tool links while removing refused resource IDs.
+func RecoverForeignResponseIDs(body, rejection []byte, status int) ([]byte, bool) {
+	if !IsForeignResponseIDRejection(rejection, status) {
+		return body, false
+	}
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(body, &payload) != nil {
+		return body, false
+	}
+	if id := bytes.TrimSpace(payload["previous_response_id"]); len(id) > 0 && string(id) != "null" && string(id) != `""` {
+		return body, false
+	}
+	var items []json.RawMessage
+	if json.Unmarshal(payload["input"], &items) != nil || len(items) < 2 {
+		return body, false
+	}
+	optional := func(item map[string]json.RawMessage) bool {
+		var kind string
+		_ = json.Unmarshal(item["type"], &kind)
+		if kind == "" {
+			var role string
+			_ = json.Unmarshal(item["role"], &role)
+			if role == "user" || role == "assistant" || role == "system" || role == "developer" {
+				kind = "message"
+			}
+		}
+		switch kind {
+		case "message", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "reasoning":
+			return true
+		}
+		return false
+	}
+	replay := false
+	for _, raw := range items[:len(items)-1] {
+		var item map[string]json.RawMessage
+		if json.Unmarshal(raw, &item) == nil && item["id"] != nil && optional(item) {
+			replay = true
+			break
+		}
+	}
+	if !replay {
+		return body, false
+	}
+	out := make([]json.RawMessage, 0, len(items))
+	changed := false
+	for _, raw := range items {
+		var item map[string]json.RawMessage
+		if json.Unmarshal(raw, &item) != nil || item["id"] == nil || !optional(item) {
+			out = append(out, raw)
+			continue
+		}
+		changed = true
+		if string(item["type"]) == `"reasoning"` {
+			var encrypted string
+			_ = json.Unmarshal(item["encrypted_content"], &encrypted)
+			if encrypted == "" {
+				continue
+			}
+		}
+		delete(item, "id")
+		v, err := json.Marshal(item)
+		if err != nil {
+			return body, false
+		}
+		out = append(out, v)
+	}
+	if !changed {
+		return body, false
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return body, false
+	}
+	payload["input"] = raw
+	raw, err = json.Marshal(payload)
+	if err != nil {
+		return body, false
+	}
+	return raw, true
 }

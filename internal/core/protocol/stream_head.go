@@ -102,3 +102,94 @@ func ReadStreamHead(reader *bufio.Reader, from Protocol) ([]byte, error) {
 		data = data[:0]
 	}
 }
+
+// EmptyReplyProbe delays only a bounded SSE prelude until output is known.
+type EmptyReplyProbe struct {
+	parser             *bridgeStreamParser
+	line               []byte
+	data               string
+	event              string
+	stop               string
+	Done, Empty, Ready bool
+}
+
+func NewEmptyReplyProbe(from Protocol) *EmptyReplyProbe {
+	return &EmptyReplyProbe{parser: &bridgeStreamParser{protocol: from, tools: map[string]bool{}, toolIDs: map[string]string{}, toolNames: map[string]string{}, responseArgs: map[string]bool{}, responseReasoning: map[string]bool{}}}
+}
+func (p *EmptyReplyProbe) Observe(data []byte) {
+	for _, b := range data {
+		if p.Ready {
+			return
+		}
+		if b != '\n' {
+			p.line = append(p.line, b)
+			continue
+		}
+		line := strings.TrimSuffix(string(p.line), "\r")
+		p.line = p.line[:0]
+		if strings.HasPrefix(line, "event:") {
+			p.event = strings.TrimSpace(line[6:])
+		}
+		if strings.HasPrefix(line, "data:") {
+			if p.data != "" {
+				p.data += "\n"
+			}
+			p.data += strings.TrimSpace(line[5:])
+		}
+		if line != "" {
+			continue
+		}
+		if p.data == "" {
+			p.event = ""
+			continue
+		}
+		if p.parser.protocol == Responses {
+			var terminal struct {
+				Type     string          `json:"type"`
+				Response json.RawMessage `json:"response"`
+			}
+			if json.Unmarshal([]byte(p.data), &terminal) == nil && terminal.Type == "response.completed" {
+				if !CompleteEmptyResponse(Responses, terminal.Response) {
+					p.Ready = true
+					return
+				}
+			}
+		}
+		events, err := p.parser.Parse(p.event, p.data)
+		p.event, p.data = "", ""
+		if err != nil {
+			p.Ready = true
+			return
+		}
+		for _, ev := range events {
+			switch ev.Kind {
+			case "text", "reasoning":
+				if ev.Text != "" || ev.Encrypted != "" || ev.NativeThinking != nil {
+					p.Ready = true
+				}
+			case "tool_start", "tool_delta", "error":
+				p.Ready = true
+			case "finish":
+				p.stop = ev.Stop
+				if ev.Stop != "stop" {
+					p.Ready = true
+				}
+			case "done":
+				p.Done = true
+				p.Empty = !p.Ready && p.stop == "stop"
+				p.Ready = p.Ready || !p.Empty
+			}
+		}
+	}
+}
+func CompleteEmptyResponse(from Protocol, body []byte) bool {
+	var doc map[string]any
+	if json.Unmarshal(body, &doc) != nil {
+		return false
+	}
+	if from == Responses && doc["status"] != "completed" {
+		return false
+	}
+	r, err := decodeBridgeResponse(from, doc)
+	return err == nil && r.Stop == "stop" && r.Error == "" && r.Text == "" && len(r.Tools) == 0 && len(r.Reasoning) == 0
+}

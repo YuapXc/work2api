@@ -828,13 +828,11 @@ func (r *Runtime) selectAccountFor(req provider.ServeRequest, model, session str
 			waiting = true
 			continue
 		}
-		days := math.Inf(1)
-		amount := 0.0
-		if a.Expiry != nil {
-			days = (*a.Expiry - nowSec()) / 86400
-			if a.Remaining != nil {
-				amount = *a.Remaining
-			}
+		days, amount := math.Inf(1), 0.0
+		budget := provider.CreditBudget(map[string]any{"uid": id, "credits_remaining": a.Remaining, "credits_expire_at": a.Expiry, "credit_packages": a.CreditPackages}, "credits", "", "积分", nowSec())
+		if budget.ExpiresAt != nil {
+			days = (*budget.ExpiresAt - nowSec()) / 86400
+			amount = budget.Expiring
 		}
 		choices = append(choices, provider.Candidate{ID: id, Domestic: true, Remaining: a.Remaining, Total: a.Total, ExpiryDays: days, ExpiringAmount: amount, Priority: a.Priority, Failures: a.Failures, LastUsed: a.LastUsed})
 	}

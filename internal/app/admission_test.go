@@ -2167,6 +2167,7 @@ func TestCommonSessionObservationIsolationAndCompletion(t *testing.T) {
 }
 
 type routeProtocolProbe struct {
+	empty bool
 	registryProbe
 	status  int
 	partial bool
@@ -2185,6 +2186,14 @@ func (p *routeProtocolProbe) Serve(ctx context.Context, req provider.ServeReques
 	if p.status >= 400 {
 		writeJSON(req.Writer, p.status, map[string]any{"error": map[string]any{"message": "fixture failure"}})
 		return provider.UsageReport{Status: "error"}, nil
+	}
+	if p.empty {
+		if req.Payload["stream"] == true {
+			io.WriteString(req.Writer, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+		} else {
+			writeJSON(req.Writer, 200, map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": ""}, "finish_reason": "stop"}}})
+		}
+		return provider.UsageReport{Status: "ok"}, nil
 	}
 	req.Writer.Header().Set("Content-Type", "text/event-stream")
 	if req.Payload["stream"] == true {
@@ -2208,11 +2217,11 @@ func TestUnifiedRouteFallbackAndNoReplayAfterOutput(t *testing.T) {
 		second  int
 		code    int
 	}{
-		{"retry-before-response", 503, false, 1, 200}, {"request-rejection", 400, false, 0, 400}, {"partial-output", 0, true, 0, 200},
+		{"retry-before-response", 503, false, 1, 200}, {"request-rejection", 400, false, 0, 400}, {"partial-output", 0, true, 0, 200}, {"empty-success", 0, false, 1, 200},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			o, _ := newDNSFailoverOrch(t, &failingUpstream{})
-			first := &routeProtocolProbe{registryProbe: registryProbe{name: "first", prefix: "first/"}, status: tc.status, partial: tc.partial}
+			first := &routeProtocolProbe{registryProbe: registryProbe{name: "first", prefix: "first/"}, status: tc.status, partial: tc.partial, empty: tc.name == "empty-success"}
 			second := &routeProtocolProbe{registryProbe: registryProbe{name: "second", prefix: "second/"}}
 			if err := o.runtimes.Register(first); err != nil {
 				t.Fatal(err)
@@ -2472,5 +2481,59 @@ func TestRouteVisionReflectsAuthorizedCapableMembers(t *testing.T) {
 	members, aerr = s.routeCandidatesIn(p, route, image, catalog)
 	if aerr != nil || len(members) != 1 || members[0] != "second/model" {
 		t.Fatal("image dispatched to text-only member", members, aerr)
+	}
+}
+
+func TestRouteEmptyReplyGateNeverReplaysOutput(t *testing.T) {
+	for _, tc := range []struct {
+		name, body    string
+		stream, empty bool
+	}{
+		{"json-empty", `{"choices":[{"message":{"content":""},"finish_reason":"stop"}]}`, false, true},
+		{"json-length", `{"choices":[{"message":{"content":""},"finish_reason":"length"}]}`, false, false},
+		{"sse-empty", "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", true, true},
+		{"sse-text", "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\ndata: [DONE]\n\n", true, false},
+		{"sse-reasoning", "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n", true, false},
+		{"sse-filter", "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n", true, false},
+		{"sse-truncated", "data: {\"choices\":[{\"delta\":{}}]}\n\n", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dst := httptest.NewRecorder()
+			w := &routeWriter{dst: dst, header: make(http.Header), logical: "g", stream: tc.stream, fallback: true, protocol: protocol.Chat}
+			if tc.stream {
+				w.probe = protocol.NewEmptyReplyProbe(protocol.Chat)
+			}
+			for _, b := range []byte(tc.body) {
+				if _, err := w.Write([]byte{b}); err != nil {
+					t.Fatal(err)
+				}
+				w.Flush()
+			}
+			if w.emptySuccess() != tc.empty {
+				t.Fatal("wrong empty decision", w.started, w.emptySuccess())
+			}
+			if tc.empty {
+				if dst.Body.Len() != 0 || w.started {
+					t.Fatal("empty committed")
+				}
+				return
+			}
+			w.finish()
+			if dst.Body.Len() == 0 {
+				t.Fatal("original response lost")
+			}
+		})
+	}
+}
+
+func TestRoutePreludeObservationBudgetFallsOpen(t *testing.T) {
+	dst := httptest.NewRecorder()
+	w := &routeWriter{dst: dst, header: make(http.Header), logical: "g", stream: true, fallback: true, protocol: protocol.Chat, probe: protocol.NewEmptyReplyProbe(protocol.Chat)}
+	raw := ":" + strings.Repeat("x", 65<<10) + "\n\n"
+	if _, err := w.Write([]byte(raw)); err != nil {
+		t.Fatal(err)
+	}
+	if !w.started || w.emptySuccess() || dst.Body.String() != raw {
+		t.Fatal("observation budget blocked response")
 	}
 }

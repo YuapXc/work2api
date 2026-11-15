@@ -1663,3 +1663,53 @@ func TestTextToolCallsMatchUpstreamWithoutEatingExamples(t *testing.T) {
 		}
 	}
 }
+
+func TestPDFDataURIConversionPreservesBytes(t *testing.T) {
+	input := map[string]any{"model": "m", "messages": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "file", "file": map[string]any{"file_data": "data:application/pdf;base64,JVBERi0="}}}}}}
+	a, err := ConvertRequest(Chat, Anthropic, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(a)
+	if !bytes.Contains(raw, []byte(`"media_type":"application/pdf"`)) || !bytes.Contains(raw, []byte(`"data":"JVBERi0="`)) {
+		t.Fatal(string(raw))
+	}
+	b, err := ConvertRequest(Anthropic, Responses, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = json.Marshal(b)
+	if !bytes.Contains(raw, []byte(`"filename":"document.pdf"`)) || !bytes.Contains(raw, []byte(`"file_data":"data:application/pdf;base64,JVBERi0="`)) {
+		t.Fatal(string(raw))
+	}
+	input["messages"].([]any)[0].(map[string]any)["content"].([]any)[0].(map[string]any)["file"].(map[string]any)["file_data"] = "data:application/octet-stream;base64,AA=="
+	if _, err := ConvertRequest(Chat, Anthropic, input); err == nil {
+		t.Fatal("unknown binary silently accepted")
+	}
+}
+func TestForeignResponseIDRecoveryPreservesToolContract(t *testing.T) {
+	rejection := []byte(`{"error":{"message":"Item was created under a different API resource"}}`)
+	body := []byte(`{"store":false,"input":[{"type":"function_call","id":"old","call_id":"call","name":"f","arguments":"{\"n\":9007199254740993}"},{"type":"reasoning","id":"ref"},{"type":"reasoning","id":"sealed","encrypted_content":"cipher"},{"type":"function_call_output","call_id":"call","output":"ok"}]}`)
+	got, changed := RecoverForeignResponseIDs(body, rejection, 400)
+	if !changed || bytes.Contains(got, []byte(`"id":`)) || !bytes.Contains(got, []byte(`"call_id":"call"`)) || !bytes.Contains(got, []byte("9007199254740993")) || !bytes.Contains(got, []byte(`"encrypted_content":"cipher"`)) {
+		t.Fatal(string(got), changed)
+	}
+	for _, b := range []string{`{"input":[{"type":"message","id":"one","role":"user"}]}`, `{"previous_response_id":"resp","input":[{"id":"old","role":"assistant"},{"role":"user"}]}`} {
+		if _, changed := RecoverForeignResponseIDs([]byte(b), rejection, 400); changed {
+			t.Fatal("unsafe recovery", b)
+		}
+	}
+	if _, changed := RecoverForeignResponseIDs(body, []byte(`{"error":{"message":"permission denied"}}`), 400); changed {
+		t.Fatal("unrelated error recovered")
+	}
+}
+
+func TestEmptyProbeKeepsTerminalOnlyResponseOutput(t *testing.T) {
+	for _, out := range []string{`[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}]`, `[{"type":"reasoning","encrypted_content":"opaque"}]`} {
+		probe := NewEmptyReplyProbe(Responses)
+		probe.Observe([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":" + out + "}}\n\n"))
+		if probe.Empty || !probe.Ready {
+			t.Fatal("terminal output treated as empty", out, probe)
+		}
+	}
+}
