@@ -613,9 +613,9 @@ type responseHistoryWriter struct {
 	published     bool
 	saved         bool
 	savedID       string
-	terminal      bool
-	frameBoundary bool
-	tail          string
+	events        responseHistoryEvents
+	bodyMeta      responseHistoryJSON
+	completeTried bool
 }
 
 func (w *responseHistoryWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
@@ -655,43 +655,15 @@ func (w *responseHistoryWriter) Write(p []byte) (int, error) {
 					w.close()
 				} else {
 					w.kept += int64(len(p))
+					ready := false
 					if strings.Contains(w.Header().Get("Content-Type"), "event-stream") {
-						// The marker can be split across writes; ordinary deltas never rescan the spool.
-						prefix := p
-						if len(prefix) > 64 {
-							prefix = prefix[:64]
+						ready = w.events.observe(p)
+					} else if !w.completeTried {
+						for _, ch := range p {
+							w.bodyMeta.add(ch)
 						}
-						text := w.tail + string(prefix)
-						boundaryTail := w.tail
-						if len(boundaryTail) > 3 {
-							boundaryTail = boundaryTail[len(boundaryTail)-3:]
-						}
-						boundaryPrefix := p
-						if len(boundaryPrefix) > 4 {
-							boundaryPrefix = boundaryPrefix[:4]
-						}
-						boundary := boundaryTail + string(boundaryPrefix)
-						w.frameBoundary = bytes.Contains(p, []byte("\n\n")) || bytes.Contains(p, []byte("\r\n\r\n")) || strings.Contains(boundary, "\n\n") || strings.Contains(boundary, "\r\n\r\n")
-						for _, marker := range []string{`"type":"response.completed"`, `"type": "response.completed"`, `"type":"response.incomplete"`, `"type": "response.incomplete"`, "event: response.completed", "event: response.incomplete"} {
-							if bytes.Contains(p, []byte(marker)) || strings.Contains(text, marker) {
-								w.terminal = true
-								break
-							}
-						}
-						if len(p) >= 64 {
-							w.tail = string(p[len(p)-64:])
-						} else {
-							if len(text) > 64 {
-								text = text[len(text)-64:]
-							}
-							w.tail = text
-						}
-					} else {
-						w.terminal = len(bytes.TrimSpace(p)) > 0 && bytes.TrimSpace(p)[len(bytes.TrimSpace(p))-1] == '}'
-					}
-					ready := w.terminal
-					if strings.Contains(w.Header().Get("Content-Type"), "event-stream") {
-						ready = ready && w.frameBoundary
+						ready = w.bodyMeta.done
+						w.completeTried = ready
 					}
 					if ready && w.publish != nil {
 						w.published = w.publish()
@@ -839,4 +811,175 @@ func readResponseHistoryResult(reader io.Reader, contentType string) (string, []
 	}
 	// An unterminated SSE frame is not an acknowledged terminal response.
 	return final.ID, final.Output, scanner.Err() == nil && valid(final)
+}
+
+// Only top-level JSON type and SSE framing are retained; response bodies stay on disk.
+type responseHistoryJSON struct {
+	depth                                                int
+	inString, escaped, capture, keyString, wantKey, done bool
+	key, kind                                            string
+	token                                                []byte
+}
+
+func (j *responseHistoryJSON) add(ch byte) {
+	if j.inString {
+		if j.capture {
+			if len(j.token) < 128 {
+				j.token = append(j.token, ch)
+			} else {
+				j.capture = false
+			}
+		}
+		if j.escaped {
+			j.escaped = false
+			return
+		}
+		if ch == '\\' {
+			j.escaped = true
+			return
+		}
+		if ch != '"' {
+			return
+		}
+		j.inString = false
+		if j.capture {
+			value := ""
+			if bytes.IndexByte(j.token, '\\') >= 0 {
+				_ = json.Unmarshal(j.token, &value)
+			} else {
+				switch string(j.token) {
+				case `"type"`:
+					value = "type"
+				case `"response.completed"`:
+					value = "response.completed"
+				case `"response.incomplete"`:
+					value = "response.incomplete"
+				case `""`:
+				default:
+					value = "other"
+				}
+			}
+			if j.keyString {
+				j.key = ""
+				if value == "type" {
+					j.key = "type"
+				}
+				j.wantKey = false
+			} else {
+				j.kind = value
+			}
+		} else if j.keyString {
+			j.key = ""
+			j.wantKey = false
+		}
+		return
+	}
+	switch ch {
+	case '"':
+		j.inString = true
+		j.keyString = j.depth == 1 && j.wantKey
+		j.capture = j.keyString || j.depth == 1 && j.key == "type"
+		if j.depth == 1 && !j.wantKey && j.key == "type" {
+			j.kind = ""
+		}
+		j.token = j.token[:0]
+		if j.capture {
+			j.token = append(j.token, ch)
+		}
+	case '{', '[':
+		if j.depth == 1 && j.key == "type" {
+			j.kind = ""
+		}
+		j.depth++
+		if j.depth == 1 {
+			j.wantKey = ch == '{'
+		}
+	case '}', ']':
+		j.depth--
+		if j.depth == 0 {
+			j.done = true
+		}
+	case ',':
+		if j.depth == 1 {
+			j.wantKey = true
+			j.key = ""
+		}
+	case ':', ' ', '\t', '\r', '\n':
+	default:
+		if j.depth == 1 && j.key == "type" {
+			j.kind = ""
+		}
+	}
+}
+
+type responseHistoryEvents struct {
+	header, name          []byte
+	field                 byte
+	line, data, skipSpace bool
+	json                  responseHistoryJSON
+}
+
+func (e *responseHistoryEvents) observe(p []byte) bool {
+	ready := false
+	for _, ch := range p {
+		if ch == '\r' {
+			continue
+		}
+		if ch == '\n' {
+			if !e.line {
+				kind := e.json.kind
+				if kind == "" {
+					kind = strings.TrimSpace(string(e.name))
+				}
+				ready = ready || e.data && (kind == "response.completed" || kind == "response.incomplete")
+				e.name = e.name[:0]
+				e.data = false
+				token := e.json.token[:0]
+				e.json = responseHistoryJSON{token: token}
+			} else if e.field == 2 {
+				e.json.add('\n')
+			}
+			e.header = e.header[:0]
+			e.field = 0
+			e.line = false
+			e.skipSpace = false
+			continue
+		}
+		e.line = true
+		if e.field == 0 {
+			if ch == ':' {
+				switch string(e.header) {
+				case "event":
+					e.field = 1
+					e.name = e.name[:0]
+				case "data":
+					e.field = 2
+					e.data = true
+				default:
+					e.field = 3
+				}
+				e.skipSpace = true
+			} else if len(e.header) < 6 {
+				e.header = append(e.header, ch)
+			} else {
+				e.field = 3
+			}
+			continue
+		}
+		if e.skipSpace {
+			e.skipSpace = false
+			if ch == ' ' {
+				continue
+			}
+		}
+		switch e.field {
+		case 1:
+			if len(e.name) < 128 {
+				e.name = append(e.name, ch)
+			}
+		case 2:
+			e.json.add(ch)
+		}
+	}
+	return ready
 }

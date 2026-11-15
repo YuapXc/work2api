@@ -76,12 +76,13 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 		output = customWriter
 	}
 	request := provider.ServeRequest{
-		Caller:   call.Caller,
-		Protocol: proto,
-		Payload:  payload,
-		Writer:   output,
-		AppName:  principal.AppName,
-		Headers:  r.Header,
+		InputNormalized: r.Context().Value(normalizedInputKey{}) == proto,
+		Caller:          call.Caller,
+		Protocol:        proto,
+		Payload:         payload,
+		Writer:          output,
+		AppName:         principal.AppName,
+		Headers:         r.Header,
 	}
 	// Channel normalization must not mutate the body captured by authorization
 	// refresh callbacks (in particular, stripping a model namespace).

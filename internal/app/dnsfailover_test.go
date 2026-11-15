@@ -1455,3 +1455,26 @@ func TestUnifiedRouteFlushFailureReachesProvider(t *testing.T) {
 		t.Fatal("flush error did not reach the provider", err, ctx.Err(), route.started)
 	}
 }
+
+func TestDispatchValidationRetainsRevocationBoundary(t *testing.T) {
+	for _, denyAt := range []int{0, 1, 2} {
+		client := &failingUpstream{lines: []string{`data: {"choices":[{"delta":{"content":"OK"}}]}`, `data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`, "data: [DONE]"}}
+		o, acc := newDNSFailoverOrch(t, client)
+		checks := 0
+		ctx := provider.WithInvocation(t.Context(), provider.Invocation{Provider: "workbuddy", Check: func(context.Context, provider.AccountRef, string) error {
+			checks++
+			if checks == denyAt {
+				return errors.New("revoked")
+			}
+			return nil
+		}})
+		_, err := o.openUpstream(ctx, acc, map[string]any{"model": "deepseek-v4.1-flash", "messages": []any{map[string]any{"role": "user", "content": "OK"}}}, "deepseek-v4.1-flash", "", func(string) error { return nil }, nil)
+		if denyAt == 0 {
+			if err != nil || client.calls != 1 || checks != 2 {
+				t.Fatal("unexpected dispatch checks", checks, client.calls, err)
+			}
+		} else if err == nil || client.calls != 0 {
+			t.Fatal("revocation crossed send boundary", checks, client.calls, err)
+		}
+	}
+}

@@ -11,6 +11,8 @@ import (
 	wbruntime "work2api/internal/workbuddy/runtime"
 )
 
+type normalizedInputKey struct{}
+
 var sseWriter = streamwatch.SSEWriter
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -29,6 +31,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	payload = coreprotocol.NormalizeInput(coreprotocol.Chat, payload)
+	r = r.WithContext(context.WithValue(r.Context(), normalizedInputKey{}, provider.ProtocolChat))
 	if aerr := s.prepareModel(principal, payload); aerr != nil {
 		writeAPIErr(w, aerr)
 		return
@@ -105,6 +108,7 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 		defer finish()
 	}
 	payload = coreprotocol.NormalizeInput(coreprotocol.Protocol(protocol), payload)
+	r = r.WithContext(context.WithValue(r.Context(), normalizedInputKey{}, provider.Protocol(protocol)))
 	if aerr := s.prepareModel(principal, payload); aerr != nil {
 		writeAPIErr(w, aerr)
 		return

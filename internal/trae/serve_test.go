@@ -1517,3 +1517,135 @@ func TestLiveTraeQuotaExpiryProjection(t *testing.T) {
 	}
 	t.Logf("real quota verified: packages=%d remaining_known=%t expiry_known=%t expiring_balance_not_entire_pool=%t", len(state.CreditPackages), state.Remaining != nil, state.Expiry != nil, state.Remaining != nil && budget.Expiring < *state.Remaining)
 }
+
+func TestExpiredQuotaRecoveryKeepsHealthyCallsFast(t *testing.T) {
+	for _, scenario := range []string{"renewed", "empty", "failed", "healthy-other", "unknown", "revoked", "disabled", "reference"} {
+		t.Run(scenario, func(t *testing.T) {
+			var reads atomic.Int32
+			now := time.Now()
+			expired := now.Add(-time.Second).Unix()
+			future := now.Add(time.Hour).Unix()
+			r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+				reads.Add(1)
+				if scenario == "failed" {
+					w.WriteHeader(503)
+					return
+				}
+				end := future
+				if scenario == "empty" {
+					end = expired
+				}
+				fmt.Fprintf(w, `{"user_entitlement_pack_list":[{"entitlement_base_info":{"end_time":%d,"quota":{"credits_limit":100}},"usage":{"credits_amount":0}}]}`, end)
+			})
+			a := &auth.Auth{UID: "expired", Variant: "cn", AccessToken: "fixture", ExpiresAt: now.Add(time.Hour).Unix()}
+			balance := 100.0
+			prior := now.Add(-10 * time.Second)
+			state := &accountState{Auth: a, Enabled: true, Identities: map[string]*auth.Auth{"cn": a}, Catalogs: map[string][]upstream.ModelInfo{"cn": {{ID: "m"}}}, Remaining: &balance, Total: &balance, QuotaAt: prior, QuotaProbeAt: prior, CreditPackages: []map[string]any{{"remain": 100.0, "expire_at": float64(expired)}}}
+			expiredID := accountID("expired")
+			r.accounts[expiredID] = state
+			r.affinities["session"] = expiredID
+			r.affinityUsed["session"] = now
+			req := provider.ServeRequest{}
+			switch scenario {
+			case "healthy-other":
+				b := &auth.Auth{UID: "live", Variant: "cn", AccessToken: "fixture"}
+				r.accounts[accountID("live")] = &accountState{Auth: b, Enabled: true, Identities: map[string]*auth.Auth{"cn": b}, Catalogs: map[string][]upstream.ModelInfo{"cn": {{ID: "m"}}}}
+			case "unknown":
+				state.Remaining = nil
+			case "disabled":
+				state.Enabled = false
+			case "reference":
+				state.CreditPackages[0]["display_only"] = true
+			}
+			ctx := t.Context()
+			if scenario == "revoked" {
+				ctx = provider.WithInvocation(ctx, provider.Invocation{Check: func(context.Context, provider.AccountRef, string) error { return errors.New("revoked") }})
+			}
+			before, beforeErr := r.selectAccountFor(req, "m", "session", nil, nil, false)
+			if scenario == "renewed" || scenario == "empty" || scenario == "failed" {
+				if beforeErr == nil || before != "" {
+					t.Fatal("expired sticky account selected before recovery", before, beforeErr)
+				}
+			}
+			r.refreshBlockedQuotas(ctx, req, "m", false)
+			r.refreshBlockedQuotas(ctx, req, "m", false)
+			expected := int32(0)
+			if scenario == "renewed" || scenario == "empty" || scenario == "failed" {
+				expected = 1
+			}
+			if reads.Load() != expected {
+				t.Fatal("unexpected quota requests", reads.Load(), expected)
+			}
+			selected, err := r.selectAccountFor(req, "m", "session", nil, nil, false)
+			switch scenario {
+			case "renewed":
+				if err != nil || selected != expiredID {
+					t.Fatal("new credits not restored", selected, err)
+				}
+			case "empty", "failed", "disabled":
+				if err == nil || selected != "" {
+					t.Fatal("unusable account still selected", selected, err)
+				}
+			case "healthy-other":
+				if err != nil || selected != accountID("live") {
+					t.Fatal("live account delayed by expired sticky", selected, err)
+				}
+			case "unknown", "reference":
+				if err != nil || selected != expiredID {
+					t.Fatal("unknown or reference balance blocked", selected, err)
+				}
+			}
+		})
+	}
+}
+func TestQuotaBudgetTracksPartialExpiryWithoutQuery(t *testing.T) {
+	r := fixtureRuntime(t, nil)
+	now := nowSec()
+	remaining := 100.0
+	a := &auth.Auth{UID: "mixed", Variant: "cn", AccessToken: "fixture"}
+	state := &accountState{Auth: a, Enabled: true, Identities: map[string]*auth.Auth{"cn": a}, Catalogs: map[string][]upstream.ModelInfo{"cn": {{ID: "m"}}}, Remaining: &remaining, CreditPackages: []map[string]any{{"remain": 30.0, "expire_at": now - 1}, {"remain": 70.0, "expire_at": now + 3600}}}
+	r.accounts["mixed"] = state
+	budget := state.creditBudget(now)
+	if budget.Remaining == nil || *budget.Remaining != 70 || budget.Expiring != 70 || budget.ExpiredAt == nil || *budget.ExpiredAt != now-1 {
+		t.Fatal("partial expiry projection incorrect", budget)
+	}
+	selected, err := r.selectAccountFor(provider.ServeRequest{}, "m", "", nil, nil, false)
+	if err != nil || selected != "mixed" {
+		t.Fatal("partly usable account blocked", selected, err)
+	}
+}
+
+func TestExpiryRecoveryCoalescesAndDoesNotRepeatFailedProbe(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var reads atomic.Int32
+	r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+		if reads.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		w.WriteHeader(503)
+	})
+	now := time.Now()
+	balance := 100.0
+	a := &auth.Auth{UID: "expiry-flight", Variant: "cn", AccessToken: "fixture", ExpiresAt: now.Add(time.Hour).Unix()}
+	id := accountID(a.UID)
+	r.accounts[id] = &accountState{Auth: a, Enabled: true, Identities: map[string]*auth.Auth{"cn": a}, Remaining: &balance, QuotaAt: now.Add(-10 * time.Second), QuotaProbeAt: now.Add(-10 * time.Second), CreditPackages: []map[string]any{{"remain": 100.0, "expire_at": float64(now.Add(-time.Second).Unix())}}}
+	var group sync.WaitGroup
+	group.Add(1)
+	go func() { defer group.Done(); _ = r.refreshQuota(t.Context(), id, false, true) }()
+	<-started
+	for i := 0; i < 7; i++ {
+		group.Add(1)
+		go func() { defer group.Done(); _ = r.refreshQuota(t.Context(), id, false, true) }()
+	}
+	close(release)
+	group.Wait()
+	_ = r.refreshQuota(t.Context(), id, false, true)
+	if reads.Load() != 1 {
+		t.Fatal("expiry caused repeated failed probes", reads.Load())
+	}
+	budget := r.accounts[id].creditBudget(nowSec())
+	if budget.Remaining == nil || *budget.Remaining != 0 {
+		t.Fatal("failed query reactivated expired credits", budget)
+	}
+}

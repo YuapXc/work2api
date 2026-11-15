@@ -94,9 +94,6 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 	if err != nil {
 		return false, err
 	}
-	if err := provider.CheckDispatch(ctx, ref, model); err != nil {
-		return false, err
-	}
 	if tools := toolschema.WorkBuddyToolsForModel(body["tools"], model); reflectToolsChanged(body["tools"], tools) {
 		copyBody := make(map[string]any, len(body))
 		for k, v := range body {

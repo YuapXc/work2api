@@ -53,6 +53,8 @@ type UsageReport struct {
 
 // ServeRequest carries a single inference call to a Runtime.
 type ServeRequest struct {
+	InputNormalized bool // core-owned metadata, never read from the client JSON
+
 	Caller   Caller
 	Protocol Protocol
 	Payload  map[string]any // parsed client body; Payload["model"] is still namespaced

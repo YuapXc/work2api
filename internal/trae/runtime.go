@@ -798,6 +798,10 @@ func (r *Runtime) Maintain(ctx context.Context, settings map[string]string, now 
 func (r *Runtime) selectAccount(req provider.ServeRequest, model, session string, tried, busy map[string]bool) (string, error) {
 	return r.selectAccountFor(req, model, session, tried, busy, false)
 }
+func (a *accountState) creditBudget(now float64) provider.BudgetPool {
+	return provider.CreditBudget(map[string]any{"credits_remaining": a.Remaining, "credits_expire_at": a.Expiry, "credit_packages": a.CreditPackages}, "credits", "", "积分", now)
+}
+
 func (r *Runtime) selectAccountFor(req provider.ServeRequest, model, session string, tried, busy map[string]bool, image bool) (string, error) {
 	excluded, err := r.db.PrivatePoolExcludedUIDs()
 	if err != nil {
@@ -807,8 +811,10 @@ func (r *Runtime) selectAccountFor(req provider.ServeRequest, model, session str
 	defer r.mu.Unlock()
 	choices := []provider.Candidate{}
 	waiting := false
+	now := time.Now()
+	nowFloat := float64(now.UnixNano()) / 1e9
 	for id, a := range r.accounts {
-		if !a.Enabled || tried[id] || time.Now().Before(a.Cooldown) {
+		if !a.Enabled || tried[id] || now.Before(a.Cooldown) {
 			continue
 		}
 		if req.Caller.UserID > 0 || req.Caller.TestAccount != "" {
@@ -821,7 +827,8 @@ func (r *Runtime) selectAccountFor(req provider.ServeRequest, model, session str
 		if identity, _ := a.modelIdentityFor(model, image, r.identityAvailableLocked); identity == nil {
 			continue
 		}
-		if a.Remaining != nil && *a.Remaining == 0 {
+		budget := a.creditBudget(nowFloat)
+		if budget.Remaining != nil && *budget.Remaining <= 0 {
 			continue
 		}
 		if busy[id] {
@@ -829,12 +836,11 @@ func (r *Runtime) selectAccountFor(req provider.ServeRequest, model, session str
 			continue
 		}
 		days, amount := math.Inf(1), 0.0
-		budget := provider.CreditBudget(map[string]any{"uid": id, "credits_remaining": a.Remaining, "credits_expire_at": a.Expiry, "credit_packages": a.CreditPackages}, "credits", "", "积分", nowSec())
 		if budget.ExpiresAt != nil {
-			days = (*budget.ExpiresAt - nowSec()) / 86400
+			days = (*budget.ExpiresAt - nowFloat) / 86400
 			amount = budget.Expiring
 		}
-		choices = append(choices, provider.Candidate{ID: id, Domestic: true, Remaining: a.Remaining, Total: a.Total, ExpiryDays: days, ExpiringAmount: amount, Priority: a.Priority, Failures: a.Failures, LastUsed: a.LastUsed})
+		choices = append(choices, provider.Candidate{ID: id, Domestic: true, Remaining: budget.Remaining, Total: a.Total, ExpiryDays: days, ExpiringAmount: amount, Priority: a.Priority, Failures: a.Failures, LastUsed: a.LastUsed})
 	}
 	if session != "" {
 		sticky := r.affinities[session]

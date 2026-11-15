@@ -16,6 +16,7 @@ type BudgetPool struct {
 	Excluded                       float64
 	Reason                         string
 	EstimateUnavailable            string
+	ExpiredAt                      *float64 // latest known expiry already excluded from the balance
 	ExpiresAt                      *float64
 	Expiring                       float64
 }
@@ -50,7 +51,7 @@ func CreditBudget(row map[string]any, domain, label, unit string, now float64) B
 	if expiry := resourceNumber(row["credits_expire_at"]); len(packages) == 0 && expiry != nil && *expiry > 0 && *expiry <= now {
 		if p.Remaining != nil {
 			zero := float64(0)
-			p.Excluded, p.Remaining = *p.Remaining, &zero
+			p.Excluded, p.Remaining, p.ExpiredAt = *p.Remaining, &zero, expiry
 		}
 	}
 	if len(packages) > 0 && p.Remaining != nil {
@@ -66,6 +67,9 @@ func CreditBudget(row map[string]any, domain, label, unit string, now float64) B
 			switch {
 			case pkg["budget_restricted"] == true || expiry != nil && *expiry > 0 && *expiry <= now:
 				p.Excluded += *remain
+				if pkg["budget_restricted"] != true && expiry != nil && *expiry > 0 && *expiry <= now && (p.ExpiredAt == nil || *expiry > *p.ExpiredAt) {
+					p.ExpiredAt = expiry
+				}
 			case expiry != nil && *expiry > now:
 				if p.ExpiresAt == nil || *expiry < *p.ExpiresAt {
 					p.ExpiresAt, p.Expiring = expiry, *remain

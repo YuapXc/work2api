@@ -1117,3 +1117,28 @@ func TestStaleReasoningRecoveryKeepsServerConversation(t *testing.T) {
 		t.Fatal("recovery is not idempotent")
 	}
 }
+
+func TestNormalizedRoutePreparationMatchesInternalInput(t *testing.T) {
+	rt := &Runtime{cfg: defaultConfig()}
+	input := map[string]any{"model": "test", "messages": []any{map[string]any{"role": "system", "content": "system", "tools": []any{map[string]any{"name": "f", "inputSchema": map[string]any{"type": "object"}}}}, map[string]any{"role": "user", "content": []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,_w"}}}}}}
+	normalized := protocol.NormalizeInput(protocol.Chat, input)
+	for _, target := range []protocol.Protocol{protocol.Chat, protocol.Anthropic, protocol.Responses} {
+		route := Route{Tier: TierZen, Protocol: target}
+		a, _, err := rt.prepareRouteBody(protocol.Chat, route, input, false, TierZen)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _, err := rt.prepareRouteBody(protocol.Chat, route, normalized, false, TierZen, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var x, y any
+		json.Unmarshal(a, &x)
+		json.Unmarshal(b, &y)
+		ax, _ := json.Marshal(x)
+		by, _ := json.Marshal(y)
+		if string(ax) != string(by) {
+			t.Fatal("normalized path changed contract", target, string(a), string(b))
+		}
+	}
+}

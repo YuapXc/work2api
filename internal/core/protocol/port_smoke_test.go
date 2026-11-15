@@ -94,7 +94,7 @@ func BenchmarkRequestNormalization(b *testing.B) {
 			tools[i] = map[string]any{"type": "function", "function": map[string]any{"name": fmt.Sprintf("tool_%d", i), "description": strings.Repeat("tool description ", 32), "parameters": map[string]any{"type": "object", "properties": map[string]any{"value": map[string]any{"type": "string"}}, "required": []any{"value"}}}}
 		}
 		body := NormalizeInput(Chat, map[string]any{"model": "fixture", "messages": messages, "tools": tools})
-		for _, mode := range []string{"scan-only", "single", "duplicate"} {
+		for _, mode := range []string{"scan-only", "single", "duplicate", "normalized"} {
 			b.Run(fmt.Sprintf("messages-%d/blocks-%t/image-%t/%s", count, fixture.blocks, fixture.image, mode), func(b *testing.B) {
 				b.ReportAllocs()
 				for b.Loop() {
@@ -106,7 +106,11 @@ func BenchmarkRequestNormalization(b *testing.B) {
 					if mode == "duplicate" {
 						input = NormalizeInput(Chat, input)
 					}
-					if _, err := PrepareRequest(Chat, Responses, input, ""); err != nil {
+					prepare := PrepareRequest
+					if mode == "normalized" {
+						prepare = PrepareNormalizedRequest
+					}
+					if _, err := prepare(Chat, Responses, input, ""); err != nil {
 						b.Fatal(err)
 					}
 				}

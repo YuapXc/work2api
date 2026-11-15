@@ -106,7 +106,7 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 			}
 		}()
 	}
-	bodies, bodyLimits, err := rt.prepareRouteBodiesWithLimits(external, route, payload, free)
+	bodies, bodyLimits, err := rt.prepareRouteBodiesWithLimits(external, route, payload, free, req.InputNormalized)
 	if err != nil {
 		protocol.WriteError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
 		return provider.UsageReport{Status: "error", Error: err.Error()}, nil
@@ -314,7 +314,7 @@ func (w flushingWriter) Write(data []byte) (int, error) {
 
 type routeBody func(Tier) ([]byte, error)
 
-func (rt *Runtime) prepareRouteBodiesWithLimits(from protocol.Protocol, route Route, input map[string]any, free bool) (routeBody, map[Tier]map[string]int, error) {
+func (rt *Runtime) prepareRouteBodiesWithLimits(from protocol.Protocol, route Route, input map[string]any, free bool, normalized ...bool) (routeBody, map[Tier]map[string]int, error) {
 	type prepared struct {
 		body []byte
 		err  error
@@ -325,7 +325,7 @@ func (rt *Runtime) prepareRouteBodiesWithLimits(from protocol.Protocol, route Ro
 		if p, ok := cache[tier]; ok {
 			return p.body, p.err
 		}
-		body, effective, err := rt.prepareRouteBody(from, route, input, free, tier)
+		body, effective, err := rt.prepareRouteBody(from, route, input, free, tier, normalized...)
 		cache[tier] = prepared{body, err}
 		limits[tier] = effective
 		return body, err
@@ -336,7 +336,7 @@ func (rt *Runtime) prepareRouteBodiesWithLimits(from protocol.Protocol, route Ro
 	return get, limits, nil
 }
 
-func (rt *Runtime) prepareRouteBody(from protocol.Protocol, route Route, input map[string]any, free bool, tier Tier) ([]byte, map[string]int, error) {
+func (rt *Runtime) prepareRouteBody(from protocol.Protocol, route Route, input map[string]any, free bool, tier Tier, normalized ...bool) ([]byte, map[string]int, error) {
 	if tier != TierZen && tier != TierGo {
 		return nil, nil, errors.New("no usable upstream tier")
 	}
@@ -345,7 +345,11 @@ func (rt *Runtime) prepareRouteBody(from protocol.Protocol, route Route, input m
 	if tier == TierGo {
 		baseURL = rt.cfg.Upstream.Go
 	}
-	upstreamPayload, err := protocol.PrepareRequest(from, proto, input, baseURL)
+	prepare := protocol.PrepareRequest
+	if len(normalized) > 0 && normalized[0] {
+		prepare = protocol.PrepareNormalizedRequest
+	}
+	upstreamPayload, err := prepare(from, proto, input, baseURL)
 	if err != nil {
 		return nil, nil, fmt.Errorf("prepare %s upstream request: %w", tier, err)
 	}

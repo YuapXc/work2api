@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -16,8 +17,10 @@ import (
 	"work2api/internal/config"
 	"work2api/internal/core/protocol"
 	"work2api/internal/core/provider"
+	"work2api/internal/workbuddy/credentials"
 	"work2api/internal/workbuddy/models"
 	"work2api/internal/workbuddy/pool"
+	"work2api/internal/workbuddy/siterouting"
 	"work2api/internal/workbuddy/upstream"
 )
 
@@ -1471,4 +1474,171 @@ func BenchmarkFullHistoryRepostRetention(b *testing.B) {
 			}
 		})
 	}
+}
+
+func TestResponseHistoryStructuredTerminalPublication(t *testing.T) {
+	for _, frame := range []string{
+		"event: response.completed\ndata: {\"response\":{\"id\":\"resp_kind\",\"status\":\"completed\",\"output\":[]}}\n\n",
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_kind\",\"status\":\"completed\",\"output\":[]}}\r\n\r\n",
+		"event: response.incomplete\ndata: {\"response\":{\"id\":\"resp_kind\",\"status\":\"incomplete\",\"output\":[]}}\n\n",
+		"data: {\"response\":{\"id\":\"resp_kind\",\"status\":\"completed\",\"output\":[]},\n" + "data: \"type\":\"response.\\u0063ompleted\"}\n\n",
+	} {
+		for _, stride := range []int{1, 7, 4096} {
+			s := historyTestServer(t)
+			w, finish := historyTestPrepare(t, s, "key", map[string]any{"input": "hello"})
+			w.Header().Set("Content-Type", "text/event-stream")
+			capture := w.(*responseHistoryFlushWriter).responseHistoryWriter
+			calls := 0
+			publish := capture.publish
+			capture.publish = func() bool { calls++; return publish() }
+			falseFrame := `event: response.completed` + "\n" + `data: {"type":"response.output_text.delta","delta":"event: response.completed","nested":{"type":"response.completed"}}` + "\n\n"
+			for i := 0; i < 100; i++ {
+				io.WriteString(w, falseFrame)
+			}
+			if calls != 0 {
+				t.Fatal("body text triggered publication", calls)
+			}
+			for offset := 0; offset < len(frame); offset += stride {
+				end := min(offset+stride, len(frame))
+				w.Write([]byte(frame[offset:end]))
+			}
+			if calls != 1 || len(s.responseHistory.items) != 1 {
+				t.Fatal("complete terminal not published immediately", calls, len(s.responseHistory.items))
+			}
+			_, release := historyTestPrepare(t, s, "key", map[string]any{"previous_response_id": "resp_kind", "input": "next", "store": false})
+			release()
+			finish()
+			if calls != 1 {
+				t.Fatal("terminal parsed repeatedly", calls)
+			}
+		}
+	}
+}
+func BenchmarkResponseHistoryCapture(b *testing.B) {
+	for _, marked := range []bool{false, true} {
+		b.Run(fmt.Sprint(marked), func(b *testing.B) {
+			text := strings.Repeat("x", 256)
+			if marked {
+				text = "event: response.completed " + text
+			}
+			delta := []byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"" + text + "\"}\n\n")
+			terminal := []byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[]}}\n\n")
+			b.ReportAllocs()
+			for b.Loop() {
+				w := &responseHistoryWriter{ResponseWriter: httptest.NewRecorder(), limit: 64 << 20}
+				w.Header().Set("Content-Type", "text/event-stream")
+				calls := 0
+				w.publish = func() bool {
+					calls++
+					w.file.Seek(0, io.SeekStart)
+					_, _, ok := readResponseHistoryResult(w.file, "text/event-stream")
+					w.file.Seek(0, io.SeekEnd)
+					return ok
+				}
+				for i := 0; i < 1000; i++ {
+					if _, err := w.Write(delta); err != nil {
+						b.Fatal(err)
+					}
+				}
+				w.Write(terminal)
+				w.close()
+				if calls != 1 || !w.published {
+					b.Fatal("unexpected full scans", calls)
+				}
+			}
+		})
+	}
+}
+
+func TestResponseHistoryEventMetadataStaysBounded(t *testing.T) {
+	var events responseHistoryEvents
+	body := `data: {"payload":"` + strings.Repeat("x", 2<<20) + `","nested":{"type":"response.completed"},"type":"response.output_text.delta"}` + "\n\n"
+	for offset := 0; offset < len(body); offset += 97 {
+		if events.observe([]byte(body[offset:min(offset+97, len(body))])) {
+			t.Fatal("nested type is not a terminal")
+		}
+	}
+	if cap(events.json.token) > 256 || cap(events.name) > 256 || cap(events.header) > 32 {
+		t.Fatal("body retained in event metadata")
+	}
+	terminal := "data: {\"response\":{\"output\":[]},\"type\":\"response.completed\"}\n\n"
+	if !events.observe([]byte(terminal)) {
+		t.Fatal("type after payload not recognized")
+	}
+}
+
+func TestLiveDomesticResponsesCacheContinuation(t *testing.T) {
+	if os.Getenv("WORK2API_LIVE_CN_RESPONSES_CACHE") != "1" {
+		t.Skip("explicit domestic synthetic verification only")
+	}
+	var mgr *credentials.Manager
+	for _, file := range append(credentials.FindAuthFiles(filepath.Join("..", "..", "auths"), ""), credentials.FindAuthFiles("", "")...) {
+		candidate := credentials.NewManager(file)
+		if siterouting.ProfileSite(candidate.Profile()) != siterouting.Domestic {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+		_, err := candidate.GetChatHeadersContext(ctx)
+		cancel()
+		if err == nil {
+			mgr = candidate
+			break
+		}
+	}
+	if mgr == nil {
+		t.Fatal("domestic credential unavailable")
+	}
+	o, _ := newDNSFailoverOrch(t, &failingUpstream{})
+	o.wb.Pool = pool.New(map[string]pool.Credential{"domestic-live": mgr}, "")
+	o.wb.Managers = map[string]*credentials.Manager{"domestic-live": mgr}
+	o.wb.Catalog = models.New(o.wb.Pool, o.db)
+	o.wb.Catalog.Refresh()
+	o.wb.UpstreamClient = upstream.Shared()
+	o.cfg.ResponseHistoryBytes = 256 << 20
+	o.cfg.ResponseHistoryTTLSeconds = 21600
+	if _, err := o.db.CreateApp("live-cache", o.hashKey("live-cache-key"), "", "", "", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(o)
+	t.Cleanup(func() {
+		c := s.responseHistory
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.timer != nil {
+			c.timer.Stop()
+		}
+	})
+	invoke := func(body map[string]any) *httptest.ResponseRecorder {
+		t.Helper()
+		raw, _ := json.Marshal(body)
+		ctx, cancel := context.WithTimeout(t.Context(), 75*time.Second)
+		defer cancel()
+		checks := 0
+		ctx = provider.WithInvocation(ctx, provider.Invocation{Check: func(context.Context, provider.AccountRef, string) error { checks++; return nil }})
+		req := httptest.NewRequest("POST", "/v1/responses", bytes.NewReader(raw)).WithContext(ctx)
+		req.Header.Set("Authorization", "Bearer live-cache-key")
+		w := httptest.NewRecorder()
+		start := time.Now()
+		s.handleResponses(w, req)
+		if w.Code != 200 {
+			t.Fatalf("real gateway call failed HTTP=%d", w.Code)
+		}
+		t.Logf("responses stream=%t completed=true checks=%d elapsed_ms=%d", body["stream"] == true, checks, time.Since(start).Milliseconds())
+		return w
+	}
+	first := invoke(map[string]any{"model": "workbuddy/deepseek-v4.1-flash", "stream": true, "max_output_tokens": 128, "reasoning": map[string]any{"effort": "off"}, "input": "For a transport check, output exactly this plain text without quotes or Markdown: event: response.completed"})
+	id, firstOutput, ok := readResponseHistoryResult(bytes.NewReader(first.Body.Bytes()), first.Header().Get("Content-Type"))
+	if !ok || id == "" {
+		t.Fatal("live SSE did not complete")
+	}
+	firstJSON, _ := json.Marshal(firstOutput)
+	if !bytes.Contains(firstJSON, []byte("event: response.completed")) {
+		t.Fatal("live reply did not contain the terminal-name fixture")
+	}
+	second := invoke(map[string]any{"model": "workbuddy/deepseek-v4.1-flash", "stream": false, "max_output_tokens": 64, "reasoning": map[string]any{"effort": "off"}, "previous_response_id": id, "input": "Reply exactly OK.", "store": false})
+	var reply map[string]any
+	if json.Unmarshal(second.Body.Bytes(), &reply) != nil || reply["status"] != "completed" || !strings.Contains(second.Body.String(), "OK") {
+		t.Fatal("live cached continuation did not complete")
+	}
+	t.Log("real upstream SSE and immediate previous_response_id continuation verified")
 }

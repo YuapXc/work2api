@@ -2167,7 +2167,8 @@ func TestCommonSessionObservationIsolationAndCompletion(t *testing.T) {
 }
 
 type routeProtocolProbe struct {
-	empty bool
+	normalized []bool
+	empty      bool
 	registryProbe
 	status  int
 	partial bool
@@ -2179,6 +2180,7 @@ func (p *routeProtocolProbe) Models(context.Context) []provider.CatalogModel {
 	return []provider.CatalogModel{{ID: p.prefix + "model", Name: "Fixture"}}
 }
 func (p *routeProtocolProbe) Serve(ctx context.Context, req provider.ServeRequest) (provider.UsageReport, error) {
+	p.normalized = append(p.normalized, req.InputNormalized)
 	p.calls++
 	if err := provider.CheckDispatch(ctx, provider.AccountRef{Provider: p.name, LocalID: "fixture"}, p.prefix+"model"); err != nil {
 		return provider.UsageReport{}, err
@@ -2535,5 +2537,29 @@ func TestRoutePreludeObservationBudgetFallsOpen(t *testing.T) {
 	}
 	if !w.started || w.emptySuccess() || dst.Body.String() != raw {
 		t.Fatal("observation budget blocked response")
+	}
+}
+
+func TestNormalizationMetadataComesFromTrustedEntry(t *testing.T) {
+	o, _ := newDNSFailoverOrch(t, &failingUpstream{})
+	probe := &routeProtocolProbe{registryProbe: registryProbe{name: "normalized", prefix: "normalized/"}}
+	if err := o.runtimes.Register(probe); err != nil {
+		t.Fatal(err)
+	}
+	appID, err := o.db.CreateApp("caller", o.hashKey("key"), "", "", "", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(o)
+	r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"normalized/model","input_normalized":true,"messages":[{"role":"user","content":"hello"}]}`))
+	r.Header.Set("Authorization", "Bearer key")
+	s.handleChat(httptest.NewRecorder(), r)
+	if len(probe.normalized) != 1 || !probe.normalized[0] {
+		t.Fatal("HTTP normalization metadata missing", probe.normalized)
+	}
+	body := map[string]any{"model": "normalized/model", "input_normalized": true, "messages": []any{map[string]any{"role": "user", "content": "hello"}}}
+	s.dispatchRuntimeTo(httptest.NewRecorder(), httptest.NewRequest("POST", "/", nil), provider.ProtocolChat, body, &Principal{AppID: appID})
+	if len(probe.normalized) != 2 || probe.normalized[1] {
+		t.Fatal("client field bypassed normalization", probe.normalized)
 	}
 }

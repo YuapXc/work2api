@@ -17,7 +17,11 @@ import (
 // the bridge. Target-protocol normalization then repairs reasoning history in
 // either case.
 func PrepareRequest(from, to Protocol, input map[string]any, upstreamURL string) (map[string]any, error) {
-	input = NormalizeInput(from, input)
+	return PrepareNormalizedRequest(from, to, NormalizeInput(from, input), upstreamURL)
+}
+
+// PrepareNormalizedRequest accepts only input already processed by NormalizeInput.
+func PrepareNormalizedRequest(from, to Protocol, input map[string]any, upstreamURL string) (map[string]any, error) {
 	output, err := ConvertRequest(from, to, input)
 	if err != nil {
 		return nil, err

@@ -37,7 +37,7 @@ func (r *Runtime) AdminRefreshCredits(ctx context.Context) (map[string]any, erro
 
 // One in-flight quota read per resource, even when several Agents discover an
 // expired zero balance together. Callers can cancel without detached probes.
-func (r *Runtime) refreshQuota(ctx context.Context, id string, force bool) error {
+func (r *Runtime) refreshQuota(ctx context.Context, id string, force bool, expiryRecovery ...bool) error {
 	r.mu.Lock()
 	a := r.accounts[id]
 	r.mu.Unlock()
@@ -47,14 +47,14 @@ func (r *Runtime) refreshQuota(ctx context.Context, id string, force bool) error
 	if err := r.ensureMaintenance(ctx, a.Auth); err != nil {
 		return err
 	}
-	probe := func(ctx context.Context) error { return r.refreshQuotaRaw(ctx, id, force) }
+	probe := func(ctx context.Context) error { return r.refreshQuotaRaw(ctx, id, force, expiryRecovery...) }
 	ran, err := r.authGuard().Recover(ctx, id+":"+a.Auth.Variant+":quota", a.Auth.MaintenanceIdentity(), probe)
 	if err != nil || ran {
 		return err
 	}
 	return probe(ctx)
 }
-func (r *Runtime) refreshQuotaRaw(ctx context.Context, id string, force bool) (result error) {
+func (r *Runtime) refreshQuotaRaw(ctx context.Context, id string, force bool, expiryRecovery ...bool) (result error) {
 	r.mu.Lock()
 	a := r.accounts[id]
 	if a == nil {
@@ -75,6 +75,10 @@ func (r *Runtime) refreshQuotaRaw(ctx context.Context, id string, force bool) (r
 			return errors.New("Trae 额度刷新失败")
 		}
 		return nil
+	}
+	if !force && len(expiryRecovery) > 0 && expiryRecovery[0] {
+		budget := a.creditBudget(nowSec())
+		force = budget.Remaining != nil && *budget.Remaining <= 0 && budget.ExpiredAt != nil && float64(a.QuotaProbeAt.UnixNano())/1e9 < *budget.ExpiredAt
 	}
 	if !force && time.Since(a.QuotaProbeAt) < time.Minute {
 		r.mu.Unlock()
@@ -124,7 +128,11 @@ func (r *Runtime) refreshQuotaRaw(ctx context.Context, id string, force bool) (r
 		a.QuotaUnit, a.QuotaReset, a.QuotaUnlimited = "credits", nil, false
 		now := float64(time.Now().Unix())
 		live := make([]upstream.EntitlementPack, 0, len(usage.UserEntitlementPackList))
+		creditsKnown := usage.IsCreditsBilling
 		for _, pack := range usage.UserEntitlementPackList {
+			if !pack.Excluded() && pack.EffectiveQuota().CreditsLimit != nil {
+				creditsKnown = true
+			}
 			end := float64(pack.EntitlementBaseInfo.EndTime)
 			if end > 1e12 {
 				end /= 1000
@@ -134,7 +142,7 @@ func (r *Runtime) refreshQuotaRaw(ctx context.Context, id string, force bool) (r
 			}
 			live = append(live, pack)
 		}
-		pool := upstream.CreditsPoolUsage(live, usage.IsCreditsBilling)
+		pool := upstream.CreditsPoolUsage(live, creditsKnown)
 		remaining := 0.0
 		total := 0.0
 		known := false
@@ -247,6 +255,8 @@ func (r *Runtime) refreshBlockedQuotas(ctx context.Context, req provider.ServeRe
 	}
 	r.mu.Lock()
 	ids := []string{}
+	now := time.Now()
+	nowFloat := float64(now.UnixNano()) / 1e9
 	for id, a := range r.accounts {
 		if !a.Enabled || req.Caller.UserID > 0 && !req.Caller.AccountScope[id] || req.Caller.UserID <= 0 && excluded[id] {
 			continue
@@ -256,13 +266,16 @@ func (r *Runtime) refreshBlockedQuotas(ctx context.Context, req provider.ServeRe
 		}
 		// Healthy resources should serve immediately; recovery reads must not
 		// delay a working pool because a different resource is frozen.
-		if !time.Now().Before(a.Cooldown) && (a.Remaining == nil || *a.Remaining > 0) {
+		budget := a.creditBudget(nowFloat)
+		empty := budget.Remaining != nil && *budget.Remaining <= 0
+		if !now.Before(a.Cooldown) && !empty {
 			r.mu.Unlock()
 			return
 		}
-		zero := a.Remaining != nil && *a.Remaining == 0 && time.Since(a.QuotaAt) >= time.Minute
+		zero := empty && now.Sub(a.QuotaAt) >= time.Minute
+		crossed := empty && budget.ExpiredAt != nil && float64(a.QuotaProbeAt.UnixNano())/1e9 < *budget.ExpiredAt
 		frozen := a.CooldownKind == upstream.ErrPlanLimit && time.Since(a.QuotaProbeAt) >= 5*time.Minute
-		if zero || frozen {
+		if zero || frozen || crossed {
 			ids = append(ids, id)
 		}
 	}
@@ -276,7 +289,7 @@ func (r *Runtime) refreshBlockedQuotas(ctx context.Context, req provider.ServeRe
 			break
 		}
 		if provider.CheckDispatch(probeCtx, provider.AccountRef{Provider: "trae", LocalID: id}, "trae/"+model) == nil {
-			_ = r.refreshQuota(probeCtx, id, false)
+			_ = r.refreshQuota(probeCtx, id, false, true)
 		}
 	}
 }
