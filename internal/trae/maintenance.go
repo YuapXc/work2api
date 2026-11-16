@@ -93,16 +93,25 @@ func (r *Runtime) refreshQuotaRaw(ctx context.Context, id string, force bool, ex
 	err := r.ensure(ctx, identity)
 	var usage *upstream.EntUsageResult
 	var enterprise *upstream.EnterpriseQuota
+	enterprisePrimary := identity.UsesEnterpriseConsole()
 	if err == nil {
 		fingerprint = identity.MaintenanceIdentity()
 		bounded, cancel := context.WithTimeout(ctx, 25*time.Second)
 		defer cancel()
 		ctx = bounded
-		usage, err = r.client(ctx).UserEntUsage(identity)
-		if identity.EnterpriseConsole && err == nil && force {
-			bounded, cancel := context.WithTimeout(ctx, 30*time.Second)
-			enterprise, _ = r.client(bounded).EnterpriseUsage(bounded, identity)
-			cancel()
+		if enterprisePrimary {
+			enterprise, err = r.client(ctx).EnterpriseUsage(ctx, identity)
+			usage = &upstream.EntUsageResult{}
+			if err == nil && force {
+				if reference, referenceErr := r.client(ctx).UserEntUsage(identity); referenceErr == nil {
+					usage = reference
+				}
+			}
+		} else {
+			usage, err = r.client(ctx).UserEntUsage(identity)
+			if identity.EnterpriseConsole && err == nil && force {
+				enterprise, _ = r.client(ctx).EnterpriseUsage(ctx, identity)
+			}
 		}
 	}
 	r.mu.Lock()
@@ -110,13 +119,14 @@ func (r *Runtime) refreshQuotaRaw(ctx context.Context, id string, force bool, ex
 	defer close(done)
 	a.QuotaProbeDone = nil
 	current, readable := identity.TryMaintenanceIdentity()
-	if r.accounts[id] != a || !readable || current != fingerprint {
+	currentRoute, routeReadable := identity.TryUsesEnterpriseConsole()
+	if r.accounts[id] != a || !readable || !routeReadable || current != fingerprint || currentRoute != enterprisePrimary {
 		if r.accounts[id] == a {
 			a.QuotaFailed = true
 		}
 		return errors.New("Trae 账号已变更")
 	}
-	if a.QuotaUnit == "CNY" {
+	if a.QuotaUnit == "CNY" && !enterprisePrimary {
 		a.Remaining, a.Total, a.Expiry = nil, nil, nil
 		a.QuotaUnit, a.QuotaReset, a.QuotaUnlimited = "credits", nil, false
 		for _, pkg := range a.CreditPackages {
@@ -124,6 +134,7 @@ func (r *Runtime) refreshQuotaRaw(ctx context.Context, id string, force bool, ex
 		}
 	}
 	a.QuotaFailed = err != nil
+	oldRemain, oldTotal, oldReset, oldUnit := a.Remaining, a.Total, a.QuotaReset, a.QuotaUnit
 	if err == nil {
 		a.QuotaUnit, a.QuotaReset, a.QuotaUnlimited = "credits", nil, false
 		now := float64(time.Now().Unix())
@@ -208,6 +219,11 @@ func (r *Runtime) refreshQuotaRaw(ctx context.Context, id string, force bool, ex
 		}
 		a.Expiry = expiry
 		a.QuotaAt = time.Now()
+		if enterprisePrimary {
+			for _, pkg := range packages {
+				pkg["unit"], pkg["display_only"] = "credits", true
+			}
+		}
 		if enterprise != nil {
 			reference := map[string]any{"name": "企业席位额度（非当前调用余额）", "unit": "CNY", "total": enterprise.Limit, "used": enterprise.Used, "remain": nil, "display_only": true, "unlimited": enterprise.Unlimited}
 			if enterprise.Limit != nil && enterprise.Used != nil {
@@ -231,8 +247,22 @@ func (r *Runtime) refreshQuotaRaw(ctx context.Context, id string, force bool, ex
 			}
 			packages = append(packages, reference)
 		}
+		if enterprisePrimary {
+			a.QuotaUnit, a.QuotaReset, a.QuotaUnlimited = "CNY", enterprise.Reset, enterprise.Unlimited
+			a.Total, a.Remaining, a.Expiry = enterprise.Limit, nil, nil
+			if enterprise.Limit != nil && enterprise.Used != nil && !enterprise.Unlimited {
+				left := max(0.0, *enterprise.Limit-*enterprise.Used)
+				a.Remaining = &left
+			}
+			if enterprise.Used == nil && oldUnit == "CNY" && oldRemain != nil && oldTotal != nil && enterprise.Limit != nil && *oldTotal == *enterprise.Limit && oldReset != nil && enterprise.Reset != nil && *oldReset == *enterprise.Reset {
+				a.Remaining = oldRemain
+			}
+			primary := packages[len(packages)-1]
+			primary["name"], primary["display_only"], primary["remain"] = "企业席位额度", false, a.Remaining
+			a.QuotaFailed = enterprise.Partial
+		}
 		a.CreditPackages = packages
-		if a.CooldownKind == upstream.ErrPlanLimit && (pool.Unlimited || pool.Known && remaining > 0) {
+		if a.CooldownKind == upstream.ErrPlanLimit && (!enterprisePrimary && (pool.Unlimited || pool.Known && remaining > 0) || enterprisePrimary && !enterprise.Partial && (enterprise.Unlimited || a.Remaining != nil && *a.Remaining > 0)) {
 			// This allows a bounded chat recheck, not a promise that positive
 			// credits imply remaining model quota. A rejection re-freezes it.
 			a.Cooldown, a.CooldownKind = time.Time{}, upstream.ErrNone
@@ -240,6 +270,9 @@ func (r *Runtime) refreshQuotaRaw(ctx context.Context, id string, force bool, ex
 	}
 	if err != nil {
 		return &quotaRefreshError{cause: err}
+	}
+	if enterprisePrimary && enterprise.Partial {
+		return &quotaRefreshError{cause: errors.New("企业席位消费或重置时间暂不可用")}
 	}
 	return nil
 }

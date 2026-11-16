@@ -575,6 +575,9 @@ func (b *Bridge) callQoderWithOpts(ctx context.Context, agent string, messages [
 	if model != originalModel {
 		logger.Debug("mapModel %s/%s -> %s", agent, originalModel, model)
 	}
+	if strings.HasPrefix(strings.ToLower(model), "kmodel") || strings.Contains(strings.ToLower(model+" "+originalModel), "kimi") {
+		messages = kimiToolCallText(messages)
+	}
 	body := DeepCopyMap(b.templateBase)
 
 	nid := cosy.NewUUID()

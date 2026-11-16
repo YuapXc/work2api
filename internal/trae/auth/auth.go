@@ -49,6 +49,7 @@ type Auth struct {
 	UID               string
 	EnterpriseID      string
 	EnterpriseConsole bool
+	ConsoleChat       *bool
 	Nickname          string
 	FilePath          string // 落盘路径；refresh 后原子写回
 }
@@ -188,6 +189,9 @@ func Parse(raw []byte) (*Auth, error) {
 	}
 	parsed, _ := url.Parse(host)
 	a.EnterpriseConsole = parsed != nil && parsed.Scheme == "https" && parsed.User == nil && strings.EqualFold(parsed.Hostname(), "console.enterprise.trae.cn") || node["enterpriseConsole"] == true
+	if v, ok := node["consoleChat"].(bool); ok {
+		a.ConsoleChat = &v
+	}
 	return a, nil
 }
 func (a *Auth) SaveAtomic() error {
@@ -206,6 +210,7 @@ func (a *Auth) saveAtomicLocked() error {
 		"domain":            a.Domain,
 		"apiHost":           a.APIHost,
 		"enterpriseConsole": a.EnterpriseConsole,
+		"consoleChat":       a.ConsoleChat,
 		"machineId":         a.MachineID,
 		"deviceId":          a.DeviceID,
 	}
@@ -302,4 +307,31 @@ func IssuedTooLongLocked(jwtRaw string) bool {
 		return false
 	}
 	return time.Since(iat) >= issuedRotateMax
+}
+
+func (a *Auth) UsesEnterpriseConsole() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.EnterpriseConsole && (a.ConsoleChat == nil || *a.ConsoleChat)
+}
+func (a *Auth) FallbackToConsumer() (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.EnterpriseConsole || a.ConsoleChat != nil && !*a.ConsoleChat {
+		return false, nil
+	}
+	disabled := false
+	a.ConsoleChat = &disabled
+	if a.FilePath == "" {
+		return true, nil
+	}
+	return true, a.saveAtomicLocked()
+}
+
+func (a *Auth) TryUsesEnterpriseConsole() (bool, bool) {
+	if !a.mu.TryRLock() {
+		return false, false
+	}
+	defer a.mu.RUnlock()
+	return a.EnterpriseConsole && (a.ConsoleChat == nil || *a.ConsoleChat), true
 }

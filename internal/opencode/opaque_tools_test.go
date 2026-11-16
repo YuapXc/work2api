@@ -130,3 +130,35 @@ func TestInterleavedAliasArgumentsAcrossStreamAndCollapse(t *testing.T) {
 		t.Fatal(string(body), usage, known, err)
 	}
 }
+
+func TestZenExactDescriptionsKeepToolContracts(t *testing.T) {
+	for _, proto := range []protocol.Protocol{protocol.Chat, protocol.Responses, protocol.Anthropic} {
+		for description, replacement := range zenToolDescriptions {
+			definition := map[string]any{"name": "skill", "description": " " + description + " ", "parameters": map[string]any{"const": description, "required": []any{"name"}}}
+			var tool any = definition
+			if proto == protocol.Chat {
+				tool = map[string]any{"type": "function", "function": definition}
+			}
+			body := map[string]any{"tools": []any{tool}}
+			before, _ := json.Marshal(body)
+			out, _ := aliasClientTools(body, proto, false, false)
+			actual := out["tools"].([]any)[0].(map[string]any)
+			if proto == protocol.Chat {
+				actual = actual["function"].(map[string]any)
+			}
+			if actual["description"] != replacement || actual["parameters"].(map[string]any)["const"] != description {
+				t.Fatal(actual)
+			}
+			after, _ := json.Marshal(body)
+			if string(before) != string(after) {
+				t.Fatal("mutated input")
+			}
+			definition["description"] = description + " additional user instruction"
+			preserved, _ := aliasClientTools(body, proto, false, false)
+			raw, _ := json.Marshal(preserved)
+			if !strings.Contains(string(raw), "additional user instruction") {
+				t.Fatal("rewrote unknown description")
+			}
+		}
+	}
+}

@@ -1360,18 +1360,18 @@ func TestEnterpriseQuotaPublicationKeepsCurrencyAndFailureScope(t *testing.T) {
 	if err := r.refreshQuota(context.Background(), id, true); err != nil {
 		t.Fatal(err)
 	}
-	if state.Remaining == nil || *state.Remaining != 3996 || state.QuotaUnit != "credits" || state.Expiry != nil || len(state.CreditPackages) != 2 || state.CreditPackages[1]["display_only"] != true {
+	if state.Remaining == nil || *state.Remaining != 75 || state.QuotaUnit != "CNY" || state.Expiry != nil || len(state.CreditPackages) != 2 || state.CreditPackages[0]["display_only"] != true {
 		t.Fatal("enterprise quota mixed with credits", state)
 	}
 	data := r.AdminData(context.Background())
-	if data.Accounts[0]["quota_unit"] != "credits" || data.Budgets[0].Remaining == nil || *data.Budgets[0].Remaining != 3996 {
+	if data.Accounts[0]["quota_unit"] != "CNY" || data.Budgets[0].Remaining == nil || *data.Budgets[0].Remaining != 75 {
 		t.Fatal("display-only credits subtracted", data)
 	}
 	fail.Store(true)
-	if err := r.refreshQuota(context.Background(), id, true); err != nil {
-		t.Fatal("reference quota blocked consumer credits", err)
+	if err := r.refreshQuota(context.Background(), id, true); err == nil {
+		t.Fatal("partial enterprise read must be reported")
 	}
-	if state.QuotaFailed || state.Remaining == nil || *state.Remaining != 3996 {
+	if !state.QuotaFailed || state.Remaining == nil || *state.Remaining != 75 {
 		t.Fatal("failed read destroyed snapshot", state)
 	}
 	if guard := r.authGuard().State(id+":cn:auth", a.MaintenanceIdentity()); guard.NeedsLogin {
@@ -1647,5 +1647,148 @@ func TestExpiryRecoveryCoalescesAndDoesNotRepeatFailedProbe(t *testing.T) {
 	budget := r.accounts[id].creditBudget(nowSec())
 	if budget.Remaining == nil || *budget.Remaining != 0 {
 		t.Fatal("failed query reactivated expired credits", budget)
+	}
+}
+
+func TestEnterprise4245FallbackBeforeOutputOnly(t *testing.T) {
+	for _, mode := range []string{"http", "json", "json-no-type", "sse", "sse-no-event", "after-output", "consumer-error", "revoked", "other-error"} {
+		t.Run(mode, func(t *testing.T) {
+			var consoleCalls, consumerCalls atomic.Int32
+			r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+				if req.URL.Path == upstream.EpModels {
+					io.WriteString(w, `{"config_info_list":[{"config_name":"m","config_switch":true,"display_config":{"display_name":"M"}}]}`)
+					return
+				}
+				if req.URL.Path != upstream.EpChat {
+					io.WriteString(w, `{"is_credits_billing":true,"user_entitlement_pack_list":[{"entitlement_base_info":{"quota":{"credits_limit":100}},"usage":{"credits_amount":10}}]}`)
+					return
+				}
+				if req.Host == "console.enterprise.trae.cn" {
+					consoleCalls.Add(1)
+					switch mode {
+					case "http", "revoked", "consumer-error":
+						w.WriteHeader(400)
+						io.WriteString(w, `{"code":4245}`)
+					case "other-error":
+						w.WriteHeader(400)
+						io.WriteString(w, `{"code":4999}`)
+					case "json-no-type":
+						io.WriteString(w, `{"code":4245}`)
+					case "sse-no-event":
+						io.WriteString(w, "data: {\"code\":4245}\n\n")
+					case "json":
+						w.Header().Set("Content-Type", "application/json")
+						io.WriteString(w, `{"code":4245}`)
+					case "sse":
+						io.WriteString(w, "event: error\ndata: {\"code\":4245}\n\n")
+					case "after-output":
+						io.WriteString(w, "event: output\ndata: {\"response\":\"partial\"}\n\nevent: error\ndata: {\"code\":4245}\n\n")
+					}
+					return
+				}
+				consumerCalls.Add(1)
+				if mode == "consumer-error" {
+					w.WriteHeader(400)
+					io.WriteString(w, `{"code":4245}`)
+					return
+				}
+				io.WriteString(w, "event: output\ndata: {\"response\":\"OK\"}\n\nevent: done\ndata: {}\n\n")
+			})
+			a := &auth.Auth{UID: "one", Variant: "cn", AccessToken: "fixture", ExpiresAt: time.Now().Add(time.Hour).Unix(), EnterpriseConsole: true, FilePath: filepath.Join(t.TempDir(), "account.json")}
+			if err := a.SaveAtomic(); err != nil {
+				t.Fatal(err)
+			}
+			id := accountID(a.UID)
+			r.accounts[id] = &accountState{Auth: a, Enabled: true, Identities: map[string]*auth.Auth{"cn": a}, Catalogs: map[string][]upstream.ModelInfo{"cn": {{ID: "m", Name: "M"}}}}
+			ctx := context.Background()
+			if mode == "revoked" {
+				ctx = provider.WithInvocation(ctx, provider.Invocation{Check: func(context.Context, provider.AccountRef, string) error {
+					if consoleCalls.Load() > 0 {
+						return provider.NewAPIError(403, "revoked", "model_not_allowed")
+					}
+					return nil
+				}})
+			}
+			w := httptest.NewRecorder()
+			_, err := r.Serve(ctx, provider.ServeRequest{Writer: w, Protocol: provider.ProtocolChat, Payload: map[string]any{"model": "trae/m", "stream": true, "messages": []any{map[string]any{"role": "user", "content": "hi"}}}})
+			expectConsumer := int32(1)
+			if mode == "after-output" || mode == "other-error" || mode == "revoked" {
+				expectConsumer = 0
+			}
+			if consoleCalls.Load() != 1 || consumerCalls.Load() != expectConsumer {
+				t.Fatalf("wrong sends: console=%d consumer=%d err=%v", consoleCalls.Load(), consumerCalls.Load(), err)
+			}
+			success := mode == "http" || mode == "json" || mode == "json-no-type" || mode == "sse" || mode == "sse-no-event"
+			if success && (err != nil || !strings.Contains(w.Body.String(), "OK")) {
+				t.Fatal("fallback failed", err, w.Body.String())
+			}
+			shouldFallback := mode != "after-output" && mode != "other-error"
+			raw, readErr := os.ReadFile(a.FilePath)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			loaded, parseErr := auth.Parse(raw)
+			if parseErr != nil || loaded.UsesEnterpriseConsole() == shouldFallback {
+				t.Fatal("route not persisted", parseErr)
+			}
+			if shouldFallback && (r.accounts[id].QuotaUnit != "credits" || r.accounts[id].Remaining == nil || *r.accounts[id].Remaining != 90) {
+				t.Fatal("wrong quota after switch", r.accounts[id])
+			}
+		})
+	}
+}
+
+func TestEnterpriseCatalogSnapshotIsRouteBound(t *testing.T) {
+	r := fixtureRuntime(t, nil)
+	a := &auth.Auth{UID: "me", Variant: "cn", EnterpriseConsole: true}
+	id := accountID(a.UID)
+	state := func() *accountState {
+		return &accountState{Auth: a, Identities: map[string]*auth.Auth{"cn": a}, Catalogs: map[string][]upstream.ModelInfo{}, CatalogTimes: map[string]time.Time{}}
+	}
+	models := []upstream.ModelInfo{{ID: "m", Name: "M", ConsoleRoute: true}}
+	if err := r.writeCatalog(id, "cn", models, time.Now(), true); err != nil {
+		t.Fatal(err)
+	}
+	current := state()
+	r.loadCatalog(id, "cn", current)
+	if len(current.Catalogs["cn"]) != 1 || !current.Catalogs["cn"][0].ConsoleRoute {
+		t.Fatal("console snapshot missing")
+	}
+	if changed, err := a.FallbackToConsumer(); !changed || err != nil {
+		t.Fatal(err)
+	}
+	switched := state()
+	r.loadCatalog(id, "cn", switched)
+	if len(switched.Catalogs["cn"]) != 0 {
+		t.Fatal("console catalog reached consumer route")
+	}
+	if err := r.writeCatalog(id, "cn", []upstream.ModelInfo{{ID: "m", Name: "M"}}, time.Now(), false); err != nil {
+		t.Fatal(err)
+	}
+	r.loadCatalog(id, "cn", switched)
+	if len(switched.Catalogs["cn"]) != 1 {
+		t.Fatal("consumer snapshot not restored")
+	}
+}
+
+func TestStaleEnterpriseFallbackCannotOverwriteNewCredentials(t *testing.T) {
+	r := fixtureRuntime(t, nil)
+	path := filepath.Join(t.TempDir(), "account.json")
+	old := &auth.Auth{UID: "one", Variant: "cn", AccessToken: "old", EnterpriseConsole: true, FilePath: path}
+	current := &auth.Auth{UID: "one", Variant: "cn", AccessToken: "new", EnterpriseConsole: true, FilePath: path}
+	if err := current.SaveAtomic(); err != nil {
+		t.Fatal(err)
+	}
+	r.accounts[accountID("one")] = &accountState{Auth: current, Identities: map[string]*auth.Auth{"cn": current}}
+	if r.switchToConsumer(old) {
+		t.Fatal("stale request changed imported resource")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, err := auth.Parse(raw)
+	if err != nil || saved.JWT() != "new" || !saved.UsesEnterpriseConsole() {
+		t.Fatal("overwrote new credentials", err)
 	}
 }

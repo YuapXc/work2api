@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -156,9 +157,10 @@ func BusinessCode(body []byte) int64 {
 }
 
 type Client struct {
-	EnterpriseHost string
-	HTTP           *http.Client
-	StreamHTTP     *http.Client
+	FallbackConsole func(*auth.Auth) bool
+	EnterpriseHost  string
+	HTTP            *http.Client
+	StreamHTTP      *http.Client
 
 	AgentHost string // https://trae-api-cn.mchost.guru
 	UgHost    string // https://api.trae.cn
@@ -185,6 +187,9 @@ func New() *Client {
 
 func (c *Client) agentBase() string { return c.AgentHost }
 func (c *Client) agentBaseFor(a *auth.Auth) string {
+	if a.UsesEnterpriseConsole() {
+		return c.EnterpriseHost
+	}
 	return c.AgentHost
 }
 func (c *Client) ugBase() string    { return c.UgHost }
@@ -198,7 +203,7 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200), BizCode: int32(BusinessCode(raw))}
 	}
 	return raw, nil
 }
@@ -310,7 +315,7 @@ func (c *Client) ChatPreparedStreamWithHeaders(a *auth.Auth, prepared []byte) (r
 		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
 		return nil, 0, nil, nil, err
 	}
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode >= 400 || strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "application/json") {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		kind := Classify(resp.StatusCode, string(raw))
@@ -321,6 +326,7 @@ func (c *Client) ChatPreparedStreamWithHeaders(a *auth.Auth, prepared []byte) (r
 }
 
 type ModelInfo struct {
+	ConsoleRoute           bool     `json:"-"`
 	ReasoningOptions       []string `json:"reasoning_options,omitempty"`
 	DefaultReasoning       string   `json:"default_reasoning,omitempty"`
 	ID                     string
@@ -347,6 +353,7 @@ func configIsSoloAgentOnly(configName string) bool {
 	return dead
 }
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
+	enterpriseRoute := a.UsesEnterpriseConsole()
 	body := map[string]any{
 		"function":            FunctionFor(a.Variant),
 		"config_names":        nil,
@@ -363,6 +370,25 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	}
 	SOLOHeaders(req, a, false)
 	data, err := c.doJSON(req)
+	if enterpriseRoute && !a.UsesEnterpriseConsole() {
+		return c.FetchModels(a)
+	}
+	var fault *Error
+	if a.UsesEnterpriseConsole() && (BusinessCode(data) == 4245 || errors.As(err, &fault) && fault.BizCode == 4245) {
+		changed := false
+		if c.FallbackConsole != nil {
+			changed = c.FallbackConsole(a)
+		} else {
+			var saveErr error
+			changed, saveErr = a.FallbackToConsumer()
+			if saveErr != nil {
+				log.Printf("trae console fallback persistence failed: %T", saveErr)
+			}
+		}
+		if changed {
+			return c.FetchModels(a)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -432,6 +458,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			}
 		}
 		out = append(out, ModelInfo{
+			ConsoleRoute:           enterpriseRoute,
 			ReasoningOptions:       options,
 			DefaultReasoning:       cfg.ReasoningEffortConfig.DefaultLevel,
 			ID:                     cfg.ConfigName,

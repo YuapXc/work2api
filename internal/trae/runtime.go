@@ -295,6 +295,7 @@ func (b *contextResponseBody) Close() error {
 }
 func (r *Runtime) client(ctx context.Context) *upstream.Client {
 	c := upstream.New()
+	c.FallbackConsole = r.switchToConsumer
 	t := contextTransport{ctx: ctx, base: r.transport}
 	noRedirect := func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 	c.HTTP = &http.Client{Transport: t, Timeout: 30 * time.Second, CheckRedirect: noRedirect}
@@ -544,7 +545,7 @@ func (r *Runtime) importAccount(ctx context.Context, token string, opts map[stri
 		state.QuotaUnit, state.QuotaReset, state.QuotaUnlimited = previous.QuotaUnit, previous.QuotaReset, previous.QuotaUnlimited
 		state.QuotaAt, state.QuotaFailed, state.CreditPackages = previous.QuotaAt, previous.QuotaFailed, previous.CreditPackages
 	}
-	if previous != nil && previous.Auth != nil && previous.Auth.EnterpriseConsole != a.EnterpriseConsole {
+	if previous != nil && previous.Auth != nil && (previous.QuotaUnit == "CNY") != a.UsesEnterpriseConsole() {
 		state.Remaining, state.Total, state.Expiry = nil, nil, nil
 		state.QuotaUnit, state.QuotaReset, state.QuotaUnlimited = "", nil, false
 		state.QuotaAt, state.QuotaFailed, state.CreditPackages = time.Time{}, false, nil
@@ -555,7 +556,7 @@ func (r *Runtime) importAccount(ctx context.Context, token string, opts map[stri
 	state.mergeModels()
 	r.accounts[id] = state
 	r.mu.Unlock()
-	if err := r.writeCatalog(id, a.Variant, models, state.CatalogAt); err != nil {
+	if err := r.writeCatalog(id, a.Variant, models, state.CatalogAt, a.UsesEnterpriseConsole()); err != nil {
 		r.mu.Lock()
 		state.CatalogErrors[a.Variant] = true
 		r.mu.Unlock()
@@ -799,7 +800,11 @@ func (r *Runtime) selectAccount(req provider.ServeRequest, model, session string
 	return r.selectAccountFor(req, model, session, tried, busy, false)
 }
 func (a *accountState) creditBudget(now float64) provider.BudgetPool {
-	return provider.CreditBudget(map[string]any{"credits_remaining": a.Remaining, "credits_expire_at": a.Expiry, "credit_packages": a.CreditPackages}, "credits", "", "积分", now)
+	domain, unit := "credits", "积分"
+	if a.QuotaUnit == "CNY" {
+		domain, unit = "CNY", "元"
+	}
+	return provider.CreditBudget(map[string]any{"credits_remaining": a.Remaining, "credits_expire_at": a.Expiry, "credit_packages": a.CreditPackages}, domain, "", unit, now)
 }
 
 func (r *Runtime) selectAccountFor(req provider.ServeRequest, model, session string, tried, busy map[string]bool, image bool) (string, error) {

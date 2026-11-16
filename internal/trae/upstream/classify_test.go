@@ -3,6 +3,8 @@ package upstream
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -126,7 +128,7 @@ func TestEnterpriseSeatUsageUsesOnlyOwnSeat(t *testing.T) {
 	}
 }
 
-func TestEnterpriseAgentRequestsUseConsumerGateway(t *testing.T) {
+func TestEnterpriseAgentRequestsUseConsoleGateway(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "get_model") || strings.Contains(r.URL.Path, "get_config") {
 			w.Write([]byte(`{"config_info_list":[]}`))
@@ -136,17 +138,45 @@ func TestEnterpriseAgentRequestsUseConsumerGateway(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := New()
-	c.AgentHost = srv.URL
-	c.EnterpriseHost = "http://127.0.0.1:1"
+	c.EnterpriseHost = srv.URL
+	c.AgentHost = "http://127.0.0.1:1"
 	a := &auth.Auth{AccessToken: "fixture", Variant: "cn", EnterpriseConsole: true}
 	if _, err := c.FetchModels(a); err != nil {
-		t.Fatal("enterprise catalog did not use consumer gateway", err)
+		t.Fatal("enterprise catalog did not use console gateway", err)
 	}
 	rc, status, _, _, err := c.ChatPreparedStreamWithHeaders(a, []byte(`{}`))
 	if err != nil || status != 200 {
-		t.Fatal("enterprise chat did not use consumer gateway", status, err)
+		t.Fatal("enterprise chat did not use console gateway", status, err)
 	}
 	if rc != nil {
 		rc.Close()
+	}
+}
+
+func TestEnterpriseDirectory4245Fallback(t *testing.T) {
+	for _, status := range []int{200, 400} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if calls == 1 {
+					w.WriteHeader(status)
+					io.WriteString(w, `{"code":4245}`)
+					return
+				}
+				io.WriteString(w, `{"config_info_list":[]}`)
+			}))
+			defer server.Close()
+			c := New()
+			c.EnterpriseHost = server.URL
+			c.AgentHost = server.URL
+			a := &auth.Auth{AccessToken: "fixture", Variant: "cn", EnterpriseConsole: true}
+			if _, err := c.FetchModels(a); err != nil || calls != 2 || a.UsesEnterpriseConsole() {
+				t.Fatal("directory fallback", calls, err)
+			}
+			if _, err := c.FetchModels(a); err != nil || calls != 3 {
+				t.Fatal("repeated console request", calls, err)
+			}
+		})
 	}
 }

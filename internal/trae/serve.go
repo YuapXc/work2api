@@ -47,6 +47,9 @@ func (r *eventReader) next() (*upstream.SOLOEvent, error) {
 			r.event = ""
 			continue
 		}
+		if r.event == "" && len(r.data) == 0 && strings.HasPrefix(strings.TrimSpace(line), "{") && upstream.BusinessCode([]byte(line)) == 4245 {
+			return nil, &upstream.SOLOStreamError{Code: 4245}
+		}
 		if strings.HasPrefix(line, "event:") {
 			r.event = strings.TrimSpace(line[6:])
 		} else if strings.HasPrefix(line, "data:") {
@@ -270,6 +273,10 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 			return report, lastTransportFailure
 		}
 		if stream == nil {
+			if upstream.BusinessCode(errorBody) == 4245 && identity.UsesEnterpriseConsole() && attempt < 2 && ctx.Err() == nil && r.fallbackEnterprise(ctx, ref.LocalID, identity) {
+				delete(tried, ref.LocalID)
+				continue
+			}
 			kind := upstream.Classify(status, string(errorBody))
 			if kind == upstream.ErrSessionDead && !refreshed[identity] && identity.RefreshTokenValue() != "" && attempt < 2 {
 				refreshed[identity] = true
@@ -296,6 +303,10 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 				}
 			}
 			if stream == nil {
+				if upstream.BusinessCode(errorBody) == 4245 && identity.UsesEnterpriseConsole() && attempt < 2 && ctx.Err() == nil && r.fallbackEnterprise(ctx, ref.LocalID, identity) {
+					delete(tried, ref.LocalID)
+					continue
+				}
 				log.Printf("trae rejection stage=http model=%q status=%d kind=%s code=%d", model, status, kind, upstream.BusinessCode(errorBody))
 				lastRejection = rejectionError(kind, status, upstream.BusinessCode(errorBody))
 				lastRetryDelay = 0
@@ -341,6 +352,11 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 			stream.Close()
 			var rejection *upstream.SOLOStreamError
 			if errors.As(err, &rejection) {
+				if rejection.Code == 4245 && identity.UsesEnterpriseConsole() && attempt < 2 && ctx.Err() == nil && r.fallbackEnterprise(ctx, ref.LocalID, identity) {
+					watch.Close()
+					delete(tried, ref.LocalID)
+					continue
+				}
 				kind := rejection.Kind()
 				log.Printf("trae rejection stage=first_event model=%q kind=%s code=%d", model, kind, rejection.Code)
 				lastRejection = rejectionError(kind, 0, rejection.Code)

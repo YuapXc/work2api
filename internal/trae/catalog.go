@@ -16,11 +16,12 @@ import (
 )
 
 type catalogSnapshot struct {
-	Version   int                  `json:"version"`
-	Account   string               `json:"account"`
-	Product   string               `json:"product"`
-	FetchedAt time.Time            `json:"fetched_at"`
-	Models    []upstream.ModelInfo `json:"models"`
+	ConsoleRoute *bool                `json:"console_route,omitempty"`
+	Version      int                  `json:"version"`
+	Account      string               `json:"account"`
+	Product      string               `json:"product"`
+	FetchedAt    time.Time            `json:"fetched_at"`
+	Models       []upstream.ModelInfo `json:"models"`
 }
 
 func (r *Runtime) catalogPath(id, product string) string {
@@ -37,6 +38,17 @@ func (r *Runtime) loadCatalog(id, product string, a *accountState) {
 	if json.NewDecoder(io.LimitReader(f, 8<<20)).Decode(&snapshot) != nil || snapshot.Version != 1 || snapshot.Account != id || snapshot.Product != product || snapshot.FetchedAt.IsZero() || snapshot.FetchedAt.After(time.Now().Add(5*time.Minute)) {
 		return
 	}
+	identity := a.Identities[product]
+	if identity == nil {
+		return
+	}
+	storedRoute := snapshot.ConsoleRoute != nil && *snapshot.ConsoleRoute
+	if storedRoute != identity.UsesEnterpriseConsole() {
+		return
+	}
+	for i := range snapshot.Models {
+		snapshot.Models[i].ConsoleRoute = storedRoute
+	}
 	for _, model := range snapshot.Models {
 		if model.ID == "" || model.Name == "" || model.ContextWindow < 0 || model.MaxTokens < 0 {
 			return
@@ -51,8 +63,9 @@ func (r *Runtime) loadCatalog(id, product string, a *accountState) {
 
 // The caller holds writeMu and the backup writer gate. Separate snapshots keep
 // token refresh from overwriting discovery data; deletion removes both files.
-func (r *Runtime) writeCatalog(id, product string, models []upstream.ModelInfo, at time.Time) error {
-	raw, err := json.Marshal(catalogSnapshot{Version: 1, Account: id, Product: product, FetchedAt: at, Models: models})
+func (r *Runtime) writeCatalog(id, product string, models []upstream.ModelInfo, at time.Time, routes ...bool) error {
+	consoleRoute := len(routes) > 0 && routes[0]
+	raw, err := json.Marshal(catalogSnapshot{ConsoleRoute: &consoleRoute, Version: 1, Account: id, Product: product, FetchedAt: at, Models: models})
 	if err != nil {
 		return err
 	}
@@ -85,8 +98,17 @@ func (r *Runtime) commitCatalog(id, product string, identity *auth.Auth, models 
 	if a == nil || a.Identities[product] != identity {
 		return nil
 	}
+	consoleRoute, readable := identity.TryUsesEnterpriseConsole()
+	if !readable {
+		return provider.ErrMaintenancePaused
+	}
+	for _, model := range models {
+		if model.ConsoleRoute != consoleRoute {
+			return provider.ErrMaintenancePaused
+		}
+	}
 	at := time.Now()
-	err := r.writeCatalog(id, product, models, at)
+	err := r.writeCatalog(id, product, models, at, consoleRoute)
 	a.Catalogs[product] = models
 	if a.CatalogTimes == nil {
 		a.CatalogTimes = map[string]time.Time{}

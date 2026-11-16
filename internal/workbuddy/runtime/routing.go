@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"maps"
 	"math"
 	"strconv"
 	"strings"
@@ -166,26 +167,18 @@ func (o *Runtime) PickAccountExcludingIn(model, sessionKey string, tried map[str
 	}
 	ready := map[string]bool{}
 	now := nowSec()
-	candidates := 0
 	for uid := range allowed {
 		if tried[uid] || o.authorizationInvalid(uid) {
 			continue
 		}
-		candidates++
 		if o.ModelCooldownUntil(uid, model) <= now {
 			ready[uid] = true
 		}
 	}
-	if len(allowed) > 0 && candidates == 0 {
-		return nil, ErrPoolExhausted(model, tried)
-	}
 	if len(allowed) > 0 && len(ready) == 0 {
-		if len(tried) > 0 {
-			// 换号重试时候选已耗尽（都试过或都在冷却），交由调用方返回上一次的错误。
-			return nil, errBody(503, "模型 "+model+" 的可用账号均已尝试或冷却", "auth_error")
-		}
-		return nil, errBody(429, "模型 "+model+" 的可用账号暂处于冷却，请稍后重试", "rate_limit_error")
+		return nil, o.accountUnavailable(model, allowed, tried)
 	}
+
 	// 会话粘性：此前绑定的账号若仍可用（在候选集、未模型冷却、账号冷却≤30s、启用、
 	// 且本轮未试过），直接复用以保住上游 prompt cache 命中；否则解粘回池按权重重选并重绑。
 	if sessionKey != "" {
@@ -200,10 +193,10 @@ func (o *Runtime) PickAccountExcludingIn(model, sessionKey string, tried map[str
 	}
 	acc := o.pickModel(model, ready, o.ModelCostByUID(model, ready), o.ExpiryWindowDays())
 	if acc == nil {
-		return nil, errBody(503, "模型 "+model+" 无可用账号（全部冷却或额度耗尽），请检查账号状态", "auth_error")
+		return nil, o.accountUnavailable(model, allowed, tried)
 	}
 	if acc.CooldownUntil-now > SessionStickyMaxCooldown {
-		return nil, errBody(503, "上游限流中，所有账号均在冷却，请稍后重试", "rate_limit_error")
+		return nil, o.accountUnavailable(model, allowed, tried)
 	}
 	if sessionKey != "" {
 		o.Sessions.Bind(sessionKey, acc.UID)
@@ -221,11 +214,15 @@ func (o *Runtime) PickInScope(model, sessionKey string, tried map[string]bool, s
 		return nil, aerr
 	}
 	if len(allowed) == 0 {
-		return nil, errBody(503, "共享池中模型 "+model+" 暂无可用账号，请稍后重试", "model_unavailable")
+		return nil, errBody(503, "模型 "+model+" 当前授权范围内没有可用账号", "model_unavailable")
+	}
+	for uid := range allowed {
+		if !scope[uid] {
+			delete(allowed, uid)
+		}
 	}
 	ready := map[string]bool{}
 	now := nowSec()
-	scopedCandidates := 0
 	for uid := range allowed {
 		if tried[uid] || !scope[uid] {
 			continue
@@ -233,18 +230,14 @@ func (o *Runtime) PickInScope(model, sessionKey string, tried map[string]bool, s
 		if account := o.Pool.Get(uid); account == nil || !account.Enabled || o.authorizationInvalid(uid) {
 			continue
 		}
-		scopedCandidates++
 		if o.ModelCooldownUntil(uid, model) <= now {
 			ready[uid] = true
 		}
 	}
 	if len(ready) == 0 {
-		// Only real enabled scoped candidates in model cooldown justify a 429.
-		if len(tried) == 0 && scopedCandidates > 0 {
-			return nil, errBody(429, "模型 "+model+" 的授权账号暂处于冷却，请稍后重试", "rate_limit_error")
-		}
-		return nil, ErrPoolExhausted(model, tried)
+		return nil, o.accountUnavailable(model, allowed, tried)
 	}
+
 	if sessionKey != "" {
 		if uid := o.Sessions.Lookup(sessionKey); uid != "" {
 			if ready[uid] {
@@ -257,10 +250,10 @@ func (o *Runtime) PickInScope(model, sessionKey string, tried map[string]bool, s
 	}
 	acc := o.pickModel(model, ready, o.ModelCostByUID(model, ready), o.ExpiryWindowDays())
 	if acc == nil {
-		return nil, ErrPoolExhausted(model, nil)
+		return nil, o.accountUnavailable(model, allowed, nil)
 	}
 	if acc.CooldownUntil-now > SessionStickyMaxCooldown {
-		return nil, ErrPoolExhausted(model, tried)
+		return nil, o.accountUnavailable(model, allowed, tried)
 	}
 	if sessionKey != "" {
 		o.Sessions.Bind(sessionKey, acc.UID)
@@ -654,6 +647,10 @@ func (o *Runtime) AccountSelector(model, preferred string, tried map[string]bool
 			}
 		}
 	}
+	diagnosticAllowed := allowed
+	if len(tried) > 0 {
+		diagnosticAllowed = maps.Clone(allowed)
+	}
 	for uid := range tried {
 		delete(allowed, uid)
 	}
@@ -673,7 +670,7 @@ func (o *Runtime) AccountSelector(model, preferred string, tried map[string]bool
 			ready[candidate.UID] = true
 		}
 		if len(ready) == 0 {
-			return nil, ErrPoolExhausted(model, tried)
+			return nil, o.accountUnavailable(model, diagnosticAllowed, tried)
 		}
 		// Preserve original routing before considering occupancy. Busy accounts
 		// must not lose affinity or cost/expiry preference merely to fill slots.
@@ -786,10 +783,59 @@ func (o *Runtime) PreferDomesticSession(model, key string, current *pool.Account
 	return current
 }
 func ErrPoolExhausted(model string, tried map[string]bool) *apiError {
+	message := "模型 " + model + " 当前授权范围内没有可用账号，请检查账号状态"
 	if len(tried) > 0 {
-		return errBody(503, "共享池中模型 "+model+" 的可用账号均已尝试或冷却", "auth_error")
+		message = "模型 " + model + " 本次可用候选已尝试完毕，请检查上游返回的错误"
 	}
-	return errBody(503, "共享池中模型 "+model+" 暂无可用账号（冷却或额度耗尽），请稍后重试", "auth_error")
+	return errBody(503, message, "account_unavailable")
+}
+
+func (o *Runtime) accountUnavailable(model string, allowed, tried map[string]bool) *apiError {
+	counts := map[string]int{}
+	now := nowSec()
+	for uid := range allowed {
+		a := o.Pool.Get(uid)
+		reason := "unavailable"
+		switch {
+		case tried[uid]:
+			reason = "attempted"
+		case a == nil:
+			reason = "removed"
+		case !a.Enabled:
+			reason = "disabled"
+		case o.authorizationInvalid(uid):
+			reason = "authorization_invalid"
+		case !a.CallableFor(o.ModelFree(a, model)):
+			reason = "quota_exhausted"
+		case o.ModelCooldownUntil(uid, model) > now:
+			reason = "model_cooldown"
+		case a.CooldownUntil > now:
+			reason = "account_cooldown"
+		}
+		counts[reason]++
+	}
+	status, kind := 503, "account_unavailable"
+	cooldown := counts["model_cooldown"] + counts["account_cooldown"]
+	if len(tried) == 0 && cooldown > 0 && cooldown == len(allowed) {
+		status, kind = 429, "rate_limit_error"
+	}
+	parts := []string{}
+	for _, item := range [][2]string{{"disabled", "已停用"}, {"authorization_invalid", "授权失效"}, {"quota_exhausted", "额度不可用"}, {"model_cooldown", "模型冷却"}, {"account_cooldown", "账号冷却"}, {"attempted", "本次已尝试"}, {"removed", "账号已移除"}, {"unavailable", "暂不可用"}} {
+		if n := counts[item[0]]; n > 0 {
+			parts = append(parts, item[1]+" "+strconv.Itoa(n))
+		}
+	}
+	message := "模型 " + model + " 当前授权范围内没有可用账号"
+	if len(parts) > 0 {
+		message += "（" + strings.Join(parts, "；") + "）"
+	}
+	result := errBody(status, message, kind)
+	if len(counts) > 0 {
+		if detail, ok := result.Body["error"].(map[string]any); ok {
+			detail["availability"] = counts
+		}
+	}
+	return result
 }
 
 // Free entitlement comes only from this account's own model quote. Regional

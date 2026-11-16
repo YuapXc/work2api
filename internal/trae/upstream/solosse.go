@@ -77,6 +77,9 @@ func ParseSOLOLine(eventName, dataLine string) (*SOLOEvent, error) {
 	if err := json.Unmarshal([]byte(dataLine), &raw); err != nil {
 		return nil, err
 	}
+	if ev.Event == "" && BusinessCode([]byte(dataLine)) == 4245 {
+		ev.Event = "error"
+	}
 	switch ev.Event {
 	case "output":
 		if v, ok := raw["response"].(string); ok {

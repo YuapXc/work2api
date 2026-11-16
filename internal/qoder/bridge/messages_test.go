@@ -810,3 +810,38 @@ func TestDispatcherRecoversBareToolJSONWithNoDeclaredTools(t *testing.T) {
 		}
 	}
 }
+
+func TestKimiCallOnlyTextPreservesToolsAndOtherContent(t *testing.T) {
+	calls := []any{map[string]any{"id": "c", "function": map[string]any{"name": "read", "arguments": "{\"path\":\"a\"}"}}}
+	image := []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://example.invalid/image"}}}
+	messages := []any{
+		map[string]any{"role": "assistant", "content": nil, "tool_calls": calls},
+		map[string]any{"role": "assistant", "content": "", "tool_calls": calls, "reasoning_content": "kept"},
+		map[string]any{"role": "assistant", "content": "text", "tool_calls": calls},
+		map[string]any{"role": "assistant", "content": image, "tool_calls": calls},
+		map[string]any{"role": "tool", "content": "", "tool_call_id": "c"},
+	}
+	before, _ := json.Marshal(messages)
+	out := kimiToolCallText(messages)
+	for i := 0; i < 2; i++ {
+		if out[i].(map[string]any)["content"] != " " {
+			t.Fatal(out)
+		}
+	}
+	for i := 2; i < len(messages); i++ {
+		a, _ := json.Marshal(out[i])
+		b, _ := json.Marshal(messages[i])
+		if string(a) != string(b) {
+			t.Fatal("changed nonempty content", i)
+		}
+	}
+	after, _ := json.Marshal(messages)
+	if string(before) != string(after) {
+		t.Fatal("mutated source")
+	}
+	once, _ := json.Marshal(out)
+	twice, _ := json.Marshal(kimiToolCallText(out))
+	if string(once) != string(twice) {
+		t.Fatal("not idempotent")
+	}
+}

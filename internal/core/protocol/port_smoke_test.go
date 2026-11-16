@@ -1717,3 +1717,85 @@ func TestEmptyProbeKeepsTerminalOnlyResponseOutput(t *testing.T) {
 		}
 	}
 }
+
+func TestThinkingDisplayOnlyGoesToClaudeMessages(t *testing.T) {
+	for _, tc := range []struct {
+		model string
+		keep  bool
+	}{{"glm-5.3", false}, {"kimi-k3.1-pro", false}, {"deepseek-v4.1-flash", false}, {"claude-sonnet-4-5", true}, {"vendor/Claude-Opus-5.5", true}, {"anthropic/opus-4-7", true}, {"sonnet-4-5", true}, {"haiku-4-5", true}, {"", true}} {
+		model, keep := tc.model, tc.keep
+		for _, mode := range []string{"enabled", "adaptive"} {
+			body := map[string]any{"model": model, "max_tokens": 8192, "thinking": map[string]any{"type": mode, "budget_tokens": float64(1024), "display": "summarized", "extension": "keep"}, "messages": []any{map[string]any{"role": "user", "content": "hi"}}}
+			before, _ := json.Marshal(body)
+			for _, prepare := range []func(Protocol, Protocol, map[string]any, string) (map[string]any, error){PrepareRequest, PrepareNormalizedRequest} {
+				out, err := prepare(Anthropic, Anthropic, body, "https://example.test/v1/messages")
+				if err != nil {
+					t.Fatal(err)
+				}
+				thought := out["thinking"].(map[string]any)
+				if (thought["display"] != nil) != keep || thought["type"] != mode || thought["budget_tokens"] != float64(1024) || thought["extension"] != "keep" {
+					t.Fatal("thinking contract changed", model, thought)
+				}
+				after, _ := json.Marshal(body)
+				if !bytes.Equal(before, after) {
+					t.Fatal("original body mutated")
+				}
+			}
+		}
+	}
+}
+
+func TestResponsesInstructionOrderAndStrictDefaults(t *testing.T) {
+	for _, from := range []Protocol{Chat, Anthropic} {
+		body := map[string]any{"model": "m", "messages": []any{
+			map[string]any{"role": "system", "content": "initial"},
+			map[string]any{"role": "user", "content": "question"},
+			map[string]any{"role": "system", "content": "hook"},
+			map[string]any{"role": "developer", "content": "new mode"},
+			map[string]any{"role": "assistant", "content": "answer"},
+		}}
+		before, _ := json.Marshal(body)
+		got, err := ConvertRequest(from, Responses, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		items := got["input"].([]any)
+		if len(items) != 4 {
+			t.Fatalf("%s wrong history: %v", from, got)
+		}
+		for i, role := range []string{"user", "developer", "developer", "assistant"} {
+			item := items[i].(map[string]any)
+			if item["role"] != role {
+				t.Fatalf("%s wrong role/order: %v", from, items)
+			}
+		}
+		after, _ := json.Marshal(body)
+		if !bytes.Equal(before, after) {
+			t.Fatal("mutated caller messages")
+		}
+	}
+	for _, strict := range []any{nil, false, true} {
+		schema := map[string]any{"name": "answer", "schema": map[string]any{"type": "object"}}
+		if strict != nil {
+			schema["strict"] = strict
+		}
+		body := map[string]any{"messages": []any{map[string]any{"role": "user", "content": "hi"}}, "response_format": map[string]any{"type": "json_schema", "json_schema": schema}}
+		out, err := ConvertRequest(Chat, Responses, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		value := out["text"].(map[string]any)["format"].(map[string]any)["strict"]
+		expected := strict
+		if strict == nil {
+			expected = false
+		}
+		if value != expected {
+			t.Fatalf("strict=%v got %v", strict, value)
+		}
+		if strict == nil {
+			if _, changed := schema["strict"]; changed {
+				t.Fatal("mutated caller schema")
+			}
+		}
+	}
+}

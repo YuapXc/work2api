@@ -33,6 +33,12 @@ var officialTools = func() map[string]struct {
 	return definitions
 }()
 
+var zenToolDescriptions = map[string]string{
+	"Edit an existing UTF-8 text file by replacing literal text.":                                                                                 "Replace an exact piece of text in a UTF-8 file that already exists.",
+	"Read a UTF-8 text file and return line-numbered content.":                                                                                    "Read a UTF-8 text file. Each line comes back with its number.",
+	"Load the full instructions for a skill. Call it before acting on a task that names or clearly matches a skill in the session skill catalog.": "Open a skill's whole instructions. Use it first when a task names a skill from the session's skill catalog, or plainly fits one.",
+}
+
 // Isolate conflicting names and prefixes from compatibility tools and aliases.
 // Schemas and tool argument strings stay opaque.
 func aliasClientTools(input map[string]any, proto protocol.Protocol, anonymous, compatibilityTools bool) (map[string]any, map[string]string) {
@@ -52,7 +58,19 @@ func aliasClientTools(input map[string]any, proto protocol.Protocol, anonymous, 
 			reserved = append(reserved, name)
 		}
 	}
-	if !anonymous && len(reserved) == 0 {
+
+	reword := false
+	for _, raw := range jsonutil.SliceAt(input, "tools") {
+		tool, _ := raw.(map[string]any)
+		if proto == protocol.Chat {
+			tool = jsonutil.MapAt(tool, "function")
+		}
+		if zenToolDescriptions[strings.TrimSpace(jsonutil.StringAt(tool, "description"))] != "" {
+			reword = true
+			break
+		}
+	}
+	if !anonymous && len(reserved) == 0 && !reword {
 		return input, nil
 	}
 	sort.Strings(reserved)
@@ -70,12 +88,20 @@ func aliasClientTools(input map[string]any, proto protocol.Protocol, anonymous, 
 		}
 		forward[name], reverse[alias] = alias, name
 	}
-	if len(forward) == 0 {
+	if len(forward) == 0 && !reword {
 		return input, nil
 	}
 	out := copyAliasMap(input)
 	tools := append([]any(nil), jsonutil.SliceAt(input, "tools")...)
 	out["tools"] = tools
+	description := func(obj map[string]any) {
+		if obj == nil {
+			return
+		}
+		if value := zenToolDescriptions[strings.TrimSpace(jsonutil.StringAt(obj, "description"))]; value != "" {
+			obj["description"] = value
+		}
+	}
 	rename := func(obj map[string]any) {
 		if name := jsonutil.StringAt(obj, "name"); forward[name] != "" {
 			obj["name"] = forward[name]
@@ -89,8 +115,10 @@ func aliasClientTools(input map[string]any, proto protocol.Protocol, anonymous, 
 			fn := copyAliasMap(jsonutil.MapAt(tool, "function"))
 			tool["function"] = fn
 			rename(fn)
+			description(fn)
 		} else {
 			rename(tool)
+			description(tool)
 		}
 	}
 	choice := copyAliasMap(jsonutil.MapAt(input, "tool_choice"))

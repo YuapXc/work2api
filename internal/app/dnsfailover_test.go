@@ -1478,3 +1478,90 @@ func TestDispatchValidationRetainsRevocationBoundary(t *testing.T) {
 		}
 	}
 }
+
+func TestUnavailableAccountReasonsAreScopedAndNotAuthenticationFailures(t *testing.T) {
+	for _, reason := range []string{"disabled", "authorization_invalid", "quota_exhausted", "model_cooldown", "account_cooldown", "attempted"} {
+		t.Run(reason, func(t *testing.T) {
+			o, a := newDNSFailoverOrch(t, &failingUpstream{})
+			o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+			o.wb.Catalog.Refresh()
+			tried := map[string]bool{}
+			want := 503
+			switch reason {
+			case "disabled":
+				o.wb.Pool.SetEnabled(a.UID, false, "manual")
+			case "authorization_invalid":
+				mgr := o.wb.Managers[a.UID]
+				identity, _ := mgr.MaintenanceIdentity()
+				guard := provider.NewMaintenanceGuard("")
+				mgr.BindMaintenance(guard, a.UID)
+				guard.State(a.UID, identity)
+				guard.Observe(a.UID, identity, "authorization_expired", true)
+			case "quota_exhausted":
+				zero := 0.0
+				o.wb.Pool.SetCredits(a.UID, &zero, &zero, nil, nil)
+			case "model_cooldown":
+				o.wb.Cooldowns[a.UID+"|test-model"] = wbruntime.CooldownEntry{Until: float64(time.Now().Unix() + 60)}
+				want = 429
+			case "account_cooldown":
+				o.wb.Pool.OnFailure(a.UID, 60)
+				want = 429
+			case "attempted":
+				tried[a.UID] = true
+			}
+			scope := map[string]bool{a.UID: true}
+			check := func(e *provider.APIError) {
+				t.Helper()
+				if e == nil || e.Status != want {
+					t.Fatal("wrong unavailable status", e, want)
+				}
+				raw, _ := json.Marshal(e.Body)
+				if strings.Contains(string(raw), a.UID) || strings.Contains(string(raw), "共享池") || strings.Contains(string(raw), "auth_error") {
+					t.Fatal("identity or misleading auth error exposed", string(raw))
+				}
+				detail := e.Body["error"].(map[string]any)
+				counts := detail["availability"].(map[string]int)
+				if counts[reason] != 1 || len(counts) != 1 {
+					t.Fatal("wrong reason", counts)
+				}
+			}
+			_, err := o.wb.PickAccountExcludingIn("test-model", "", tried, scope)
+			check(err)
+			selectFn, err := o.wb.AccountSelector("test-model", "", tried, scope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = selectFn(nil)
+			check(err)
+			_, err = o.wb.PickAccountExcludingIn("test-model", "", nil, map[string]bool{})
+			raw, _ := json.Marshal(err.Body)
+			if strings.Contains(string(raw), reason) || strings.Contains(string(raw), a.UID) {
+				t.Fatal("out-of-scope state exposed", string(raw))
+			}
+		})
+	}
+}
+func TestMixedUnavailableAccountsDoNotClaimAllCooling(t *testing.T) {
+	o, a := newDNSFailoverOrch(t, &failingUpstream{})
+	mgr := o.wb.Managers[a.UID]
+	o.wb.Pool = pool.New(map[string]pool.Credential{a.UID: mgr, "other-private": mgr}, "")
+	o.wb.Managers["other-private"] = mgr
+	o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+	o.wb.Catalog.Refresh()
+	o.wb.Pool.SetEnabled(a.UID, false, "manual")
+	o.wb.Pool.OnFailure("other-private", 60)
+	_, err := o.wb.PickAccountExcludingIn("test-model", "", nil, nil)
+	if err == nil || err.Status != 503 {
+		t.Fatal("mixed unavailability falsely returned rate limit", err)
+	}
+	detail := err.Body["error"].(map[string]any)
+	counts := detail["availability"].(map[string]int)
+	if counts["disabled"] != 1 || counts["account_cooldown"] != 1 {
+		t.Fatal("mixed reasons lost", counts)
+	}
+	_, err = o.wb.PickAccountExcludingIn("test-model", "", nil, map[string]bool{a.UID: true})
+	raw, _ := json.Marshal(err.Body)
+	if strings.Contains(string(raw), "account_cooldown") || strings.Contains(string(raw), "other-private") {
+		t.Fatal("private account state exposed", string(raw))
+	}
+}

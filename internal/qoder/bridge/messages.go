@@ -413,3 +413,30 @@ func NormalizeMessageContent(msg map[string]interface{}) string {
 	}
 	return textBlocks(arr, "\n\n")
 }
+
+func kimiToolCallText(messages []interface{}) []interface{} {
+	out := messages
+	copied := false
+	for i, raw := range messages {
+		message, ok := raw.(map[string]interface{})
+		if !ok || message["role"] != "assistant" {
+			continue
+		}
+		calls, _ := message["tool_calls"].([]interface{})
+		content, textOnly := message["content"].(string)
+		if len(calls) == 0 || message["content"] != nil && (!textOnly || content != "") {
+			continue
+		}
+		if !copied {
+			out = append([]interface{}(nil), messages...)
+			copied = true
+		}
+		clone := make(map[string]interface{}, len(message))
+		for key, value := range message {
+			clone[key] = value
+		}
+		clone["content"] = " "
+		out[i] = clone
+	}
+	return out
+}

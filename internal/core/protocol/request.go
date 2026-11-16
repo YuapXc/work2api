@@ -26,8 +26,29 @@ func PrepareNormalizedRequest(from, to Protocol, input map[string]any, upstreamU
 	if err != nil {
 		return nil, err
 	}
+	if to == Anthropic {
+		model := strings.ToLower(jsonutil.StringAt(output, "model"))
+		if model != "" && !claudeThinkingModel(model) {
+			if thinking, ok := output["thinking"].(map[string]any); ok {
+				delete(thinking, "display")
+			}
+		}
+	}
 	normalizeToolReasoningHistory(to, jsonutil.StringAt(output, "model"), upstreamURL, output)
 	return output, nil
+}
+
+func claudeThinkingModel(model string) bool {
+	if strings.Contains(model, "claude") {
+		return true
+	}
+	base := model[strings.LastIndex(model, "/")+1:]
+	for _, family := range []string{"opus", "sonnet", "haiku"} {
+		if base == family || strings.HasPrefix(base, family+"-") {
+			return true
+		}
+	}
+	return false
 }
 
 // ReasoningEnabled projects native controls for providers with a boolean switch.
@@ -386,7 +407,8 @@ func anthropicReasoning(input map[string]any) any {
 	return input["thinking"]
 }
 
-func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest, error) {
+func decodeBridgeRequest(protocol Protocol, input map[string]any, targets ...Protocol) (bridgeRequest, error) {
+	orderedInstructions := len(targets) > 0 && targets[0] == Responses
 	request := bridgeRequest{
 		Model:       jsonutil.StringAt(input, "model"),
 		Stream:      jsonutil.BoolAt(input, "stream"),
@@ -433,9 +455,17 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 			}
 			switch role {
 			case "system":
-				request.System = append(request.System, blocks...)
+				if orderedInstructions && len(request.Messages) > 0 {
+					request.Messages = append(request.Messages, bridgeMessage{Role: "developer", Blocks: blocks})
+				} else {
+					request.System = append(request.System, blocks...)
+				}
 			case "developer":
-				request.Developer = append(request.Developer, blocks...)
+				if orderedInstructions && len(request.Messages) > 0 {
+					request.Messages = append(request.Messages, bridgeMessage{Role: "developer", Blocks: blocks})
+				} else {
+					request.Developer = append(request.Developer, blocks...)
+				}
 			case "tool":
 				request.Messages = append(request.Messages, bridgeMessage{Role: "user", Blocks: []bridgeBlock{{
 					Kind:   "tool_result",
@@ -515,9 +545,17 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 						return request, fmt.Errorf("input[%d]: %w", i, err)
 					}
 					if role == "system" {
-						request.System = append(request.System, blocks...)
+						if orderedInstructions && len(request.Messages) > 0 {
+							request.Messages = append(request.Messages, bridgeMessage{Role: "developer", Blocks: blocks})
+						} else {
+							request.System = append(request.System, blocks...)
+						}
 					} else if role == "developer" {
-						request.Developer = append(request.Developer, blocks...)
+						if orderedInstructions && len(request.Messages) > 0 {
+							request.Messages = append(request.Messages, bridgeMessage{Role: "developer", Blocks: blocks})
+						} else {
+							request.Developer = append(request.Developer, blocks...)
+						}
 					} else if role == "user" || role == "assistant" {
 						request.Messages = append(request.Messages, bridgeMessage{Role: role, Blocks: blocks})
 					}
@@ -571,7 +609,11 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 				if err != nil {
 					return request, fmt.Errorf("messages[%d]: %w", i, err)
 				}
-				request.System = append(request.System, blocks...)
+				if orderedInstructions && len(request.Messages) > 0 {
+					request.Messages = append(request.Messages, bridgeMessage{Role: "developer", Blocks: blocks})
+				} else {
+					request.System = append(request.System, blocks...)
+				}
 				continue
 			}
 			if role == "developer" {
@@ -579,7 +621,11 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 				if err != nil {
 					return request, fmt.Errorf("messages[%d]: %w", i, err)
 				}
-				request.Developer = append(request.Developer, blocks...)
+				if orderedInstructions && len(request.Messages) > 0 {
+					request.Messages = append(request.Messages, bridgeMessage{Role: "developer", Blocks: blocks})
+				} else {
+					request.Developer = append(request.Developer, blocks...)
+				}
 				continue
 			}
 			if role != "user" && role != "assistant" {

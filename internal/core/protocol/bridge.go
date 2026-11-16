@@ -131,7 +131,7 @@ func ConvertRequest(from, to Protocol, input map[string]any) (map[string]any, er
 	if err != nil {
 		return nil, err
 	}
-	request, err := decodeBridgeRequest(from, filtered)
+	request, err := decodeBridgeRequest(from, filtered, to)
 	if err != nil {
 		return nil, err
 	}
@@ -148,8 +148,8 @@ func RequireFullResponsesInput(input map[string]any) error {
 }
 
 func normalizeResponsesRole(role string) string {
-	if role == "assistant" {
-		return "assistant"
+	if role == "assistant" || role == "developer" {
+		return role
 	}
 	return "user"
 }
@@ -211,6 +211,9 @@ func responsesTextFormat(format any) any {
 				flattened[key] = value
 			}
 			flattened["type"] = "json_schema"
+			if _, explicit := flattened["strict"]; !explicit {
+				flattened["strict"] = false
+			}
 			return flattened
 		}
 		return object

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"work2api/internal/core/provider"
+	"work2api/internal/statebackup"
 	"work2api/internal/trae/auth"
 	"work2api/internal/trae/upstream"
 )
@@ -104,4 +106,71 @@ func (r *Runtime) forceRefresh(ctx context.Context, id string, identity *auth.Au
 		r.observeMaintenance(identity, "auth", before, err)
 	}
 	return err
+}
+
+func (r *Runtime) fallbackEnterprise(ctx context.Context, id string, identity *auth.Auth) bool {
+	if !r.switchToConsumer(identity) {
+		return false
+	}
+	if ctx.Err() == nil {
+		_ = r.RefreshAccount(ctx, id)
+		_ = r.refreshQuota(ctx, id, false)
+	}
+	return true
+}
+
+func (r *Runtime) invalidateConsoleRoute(identity *auth.Auth) {
+	id := accountID(identity.UID)
+	r.mu.Lock()
+	a := r.accounts[id]
+	if a == nil || a.Identities[identity.Variant] != identity {
+		r.mu.Unlock()
+		return
+	}
+	var siblings []*auth.Auth
+	for product, candidate := range a.Identities {
+		if candidate.EnterpriseConsole {
+			siblings = append(siblings, candidate)
+			delete(a.Catalogs, product)
+			delete(a.CatalogTimes, product)
+		}
+	}
+	a.mergeModels()
+	a.Remaining, a.Total, a.Expiry = nil, nil, nil
+	a.QuotaUnit, a.QuotaReset, a.QuotaUnlimited = "credits", nil, false
+	a.CreditPackages, a.QuotaAt, a.QuotaProbeAt = nil, time.Time{}, time.Time{}
+	if a.CooldownKind == upstream.ErrPlanLimit {
+		a.Cooldown, a.CooldownKind = time.Time{}, upstream.ErrNone
+	}
+	r.mu.Unlock()
+	for _, candidate := range siblings {
+		if _, err := candidate.FallbackToConsumer(); err != nil {
+			log.Printf("trae console fallback persistence failed: %T", err)
+		}
+	}
+}
+
+func (r *Runtime) switchToConsumer(identity *auth.Auth) bool {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	leave := statebackup.Enter()
+	defer leave()
+	r.mu.Lock()
+	a := r.accounts[accountID(identity.UID)]
+	current := a != nil && a.Identities[identity.Variant] == identity
+	r.mu.Unlock()
+	if !current && identity.FilePath != "" {
+		return false
+	}
+	changed, saveErr := identity.FallbackToConsumer()
+	if !changed {
+		return false
+	}
+	if saveErr != nil {
+		log.Printf("trae console fallback persistence failed: %T", saveErr)
+	}
+	if current {
+		r.invalidateConsoleRoute(identity)
+	}
+	return true
 }
