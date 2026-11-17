@@ -556,7 +556,9 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any, targets ...Pro
 						} else {
 							request.Developer = append(request.Developer, blocks...)
 						}
-					} else if role == "user" || role == "assistant" {
+					} else if role == "assistant" {
+						appendBridgeBlock(&request.Messages, role, blocks...)
+					} else if role == "user" {
 						request.Messages = append(request.Messages, bridgeMessage{Role: role, Blocks: blocks})
 					}
 				default:
@@ -672,15 +674,15 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any, targets ...Pro
 	return request, nil
 }
 
-func appendBridgeBlock(messages *[]bridgeMessage, role string, block bridgeBlock) {
+func appendBridgeBlock(messages *[]bridgeMessage, role string, blocks ...bridgeBlock) {
 	if len(*messages) > 0 {
 		last := &(*messages)[len(*messages)-1]
-		if last.Role == role && bridgeBlocksOnlyTools(last.Blocks) {
-			last.Blocks = append(last.Blocks, block)
+		if last.Role == role && (role == "assistant" || bridgeBlocksOnlyTools(last.Blocks)) {
+			last.Blocks = append(last.Blocks, blocks...)
 			return
 		}
 	}
-	*messages = append(*messages, bridgeMessage{Role: role, Blocks: []bridgeBlock{block}})
+	*messages = append(*messages, bridgeMessage{Role: role, Blocks: blocks})
 }
 
 func bridgeBlocksOnlyTools(blocks []bridgeBlock) bool {

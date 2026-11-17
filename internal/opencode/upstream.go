@@ -156,12 +156,9 @@ func (rt *Runtime) doUpstreamTiers(ctx context.Context, route Route, bodies rout
 	}
 	if ctx.Err() != nil {
 		if lastResponse != nil {
-			return lastResponse, effectiveRoute, attempts, nil
+			_ = lastResponse.Body.Close()
 		}
-		if lastErr == nil {
-			lastErr = ctx.Err()
-		}
-		return nil, effectiveRoute, attempts, lastErr
+		return nil, effectiveRoute, attempts, ctx.Err()
 	}
 	keyTiers := route.KeyTiers
 	if !route.Anonymous && len(keyTiers) == 0 && (route.Tier == TierZen || route.Tier == TierGo) {
@@ -224,7 +221,16 @@ func (rt *Runtime) doUpstreamTiers(ctx context.Context, route Route, bodies rout
 // Preserve a real rejection while trying a different tier. A subsequent
 // connection failure must not hide its status, Retry-After or provider body.
 // Only error bodies are buffered; successful generation stays streaming.
+type bufferedErrorBody struct{ *bytes.Reader }
+
+func (*bufferedErrorBody) Close() error { return nil }
+
 func bufferedErrorResponse(resp *http.Response) *http.Response {
+	if resp != nil {
+		if _, ok := resp.Body.(*bufferedErrorBody); ok {
+			return resp
+		}
+	}
 	if resp == nil || resp.Body == nil {
 		return resp
 	}
@@ -232,7 +238,7 @@ func bufferedErrorResponse(resp *http.Response) *http.Response {
 	_ = resp.Body.Close()
 	copy := *resp
 	copy.Header = resp.Header.Clone()
-	copy.Body = io.NopCloser(bytes.NewReader(body))
+	copy.Body = &bufferedErrorBody{bytes.NewReader(body)}
 	copy.ContentLength = int64(len(body))
 	copy.Header.Del("Content-Length")
 	return &copy
@@ -240,8 +246,17 @@ func bufferedErrorResponse(resp *http.Response) *http.Response {
 
 // doAnonymousUpstream tries every currently available proxy at most once via
 // the shared "public" credential lane.
-func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies routeBody, ids RequestIDs, attemptOffset int) (*http.Response, error, int) {
+func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies routeBody, ids RequestIDs, attemptOffset int) (response *http.Response, resultErr error, used int) {
 	var lastResponse *http.Response
+	lastUID := ""
+	defer func() {
+		if lastResponse != nil && lastResponse != response {
+			_ = lastResponse.Body.Close()
+		}
+		if response != nil && response == lastResponse && ids.AccountUID != nil {
+			*ids.AccountUID = lastUID
+		}
+	}()
 	var lastErr error
 	cursor := rt.anonymous.CursorFor(ids.Session)
 	limit := rt.anonymous.Len()
@@ -266,8 +281,7 @@ func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies 
 		}
 		attempts++
 		if lastResponse != nil {
-			drainAndClose(lastResponse.Body)
-			lastResponse = nil
+			lastResponse = bufferedErrorResponse(lastResponse)
 		}
 		attemptBody := body
 		if route.Protocol == protocol.Responses {
@@ -301,12 +315,17 @@ func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies 
 			attemptStatus = resp.StatusCode
 		}
 		streamwatch.AttemptResult(req.Context(), attemptStatus)
-		if ctx.Err() != nil {
-			lastResponse, lastErr = resp, err
-			if lastErr == nil && lastResponse == nil {
-				lastErr = ctx.Err()
+		if resp != nil {
+			if lastResponse != nil && lastResponse != resp {
+				_ = lastResponse.Body.Close()
 			}
-			break
+			lastResponse = resp
+			if ids.AccountUID != nil {
+				lastUID = *ids.AccountUID
+			}
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err(), attempts
 		}
 		if err == nil && deterministicRequestRejection(resp) {
 			// A malformed/oversized request says nothing about this exit's health.
@@ -316,8 +335,10 @@ func (rt *Runtime) doAnonymousUpstream(ctx context.Context, route Route, bodies 
 		if err == nil && resp.StatusCode/100 == 2 {
 			return resp, nil, attempts
 		}
-		lastResponse = resp
 		lastErr = err
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err(), attempts
 	}
 	if lastResponse != nil {
 		return lastResponse, nil, attempts
@@ -448,8 +469,20 @@ func anonymousTool(proto protocol.Protocol, name string) map[string]any {
 	}
 }
 
-func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies routeBody, ids RequestIDs, attemptOffset int) (*http.Response, error, int) {
+func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies routeBody, ids RequestIDs, attemptOffset int) (response *http.Response, resultErr error, used int) {
+	if active, _ := rt.subscriptionSnapshot(); route.Tier == TierGo && active {
+		return rt.doSubscriptionUpstream(ctx, route, bodies, ids, attemptOffset)
+	}
 	var lastResponse *http.Response
+	lastUID := ""
+	defer func() {
+		if lastResponse != nil && lastResponse != response {
+			_ = lastResponse.Body.Close()
+		}
+		if response != nil && response == lastResponse && ids.AccountUID != nil {
+			*ids.AccountUID = lastUID
+		}
+	}()
 	var lastErr error
 	nodes := rt.zenNodes
 	baseURL := rt.cfg.Upstream.Zen
@@ -495,12 +528,10 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies routeB
 			}
 		}
 		if err := provider.CheckDispatch(ctx, provider.AccountRef{Provider: runtimeName, LocalID: uid}, runtimePrefix+route.ID); err != nil {
-			lastErr = err
-			continue
+			return nil, err, attempts
 		}
 		if lastResponse != nil {
-			drainAndClose(lastResponse.Body)
-			lastResponse = nil
+			lastResponse = bufferedErrorResponse(lastResponse)
 		}
 		attempts++
 		attemptBody := body
@@ -537,12 +568,17 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies routeB
 			attemptStatus = resp.StatusCode
 		}
 		streamwatch.AttemptResult(req.Context(), attemptStatus)
-		if ctx.Err() != nil {
-			lastResponse, lastErr = resp, err
-			if lastErr == nil && lastResponse == nil {
-				lastErr = ctx.Err()
+		if resp != nil {
+			if lastResponse != nil && lastResponse != resp {
+				_ = lastResponse.Body.Close()
 			}
-			break
+			lastResponse = resp
+			if ids.AccountUID != nil {
+				lastUID = *ids.AccountUID
+			}
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err(), attempts
 		}
 		rt.observeKeyResult(ctx, nodes, node, proxy, baseURL, resp, err)
 		if err == nil && resp.StatusCode/100 == 2 {
@@ -551,8 +587,10 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies routeB
 		if isNonRetryableClientResponse(resp, err) {
 			return resp, nil, attempts
 		}
-		lastResponse = resp
 		lastErr = err
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err(), attempts
 	}
 	if lastResponse != nil {
 		return lastResponse, nil, attempts

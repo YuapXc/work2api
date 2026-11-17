@@ -242,6 +242,8 @@ export const api = {
       `/admin/providers/${encodeURIComponent(name)}/oauth/poll`, { login_id: loginId }, { signal }),
 
   // 供应商配置编辑（opencode 密钥层级）：读取 / 保存并热重载
+  providerDeviceAuthorization: (name: string, action: string, payload: Record<string, unknown> = {}, signal?: AbortSignal) =>
+    http.post<unknown, Record<string, any>>(`/admin/providers/${encodeURIComponent(name)}/device-authorization`, { ...payload, action }, { signal }),
   providerGetConfig: (name: string) =>
     http.get<unknown, Record<string, unknown>>(`/admin/providers/${encodeURIComponent(name)}/config`),
   providerSaveConfig: (name: string, patch: Record<string, unknown>) =>

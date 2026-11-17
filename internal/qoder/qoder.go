@@ -714,6 +714,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 		return candidate.bridge, nil
 	}
 	ctx = bridge.WithAccountFallback(ctx, next)
+	ctx = bridge.WithQueueDispatchCheck(ctx, func(ctx context.Context) error { return accountAllowed(ctx, selected.ID, requestedModel) })
 
 	if err := accountAllowed(ctx, acct.ID, str(req.Payload["model"])); err != nil {
 		writeServeError(req, err)

@@ -18,6 +18,7 @@ import WModal from '@/components/ui/WModal.vue'
 import WTag from '@/components/ui/WTag.vue'
 import WToggle from '@/components/ui/WToggle.vue'
 import ResourceActions from '@/components/accounts/ResourceActions.vue'
+import GoSubscriptionLogin from '@/components/accounts/GoSubscriptionLogin.vue'
 import WLed from '@/components/ui/WLed.vue'
 import WEmpty from '@/components/ui/WEmpty.vue'
 import WSpinner from '@/components/ui/WSpinner.vue'
@@ -1200,11 +1201,12 @@ async function saveConfig() {
       <WSpinner v-if="cfgLoading" label="加载中" />
       <template v-else>
         <div class="mb-3 rounded-lg border border-line bg-bg/40 p-3 text-micro text-faint">
-          凭证是 OpenCode Zen 的 API Key（在 opencode.ai 控制台生成，或本地 <code class="mono text-muted">opencode auth login</code> 后取用）。
+          手动 Zen／Go Key 在 OpenCode 官方控制台管理，Go 订阅也可在下方授权登录。
           写入 <code class="mono text-muted">{{ cfgPath }}</code>，保存即热重载，无需重启。
         </div>
         <label class="mb-1.5 block text-small text-muted">Zen 层密钥（每行一个）</label>
         <WTextarea v-model="zenText" :rows="3" placeholder="sk-..." class="mb-3" />
+        <GoSubscriptionLogin v-if="cfgOpen" class="mb-4" @changed="load" />
         <label class="mb-1.5 block text-small text-muted">Go 层密钥（每行一个）</label>
         <WTextarea v-model="goText" :rows="3" placeholder="sk-..." class="mb-3" />
         <div class="flex items-center justify-between">

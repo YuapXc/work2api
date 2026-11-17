@@ -37,6 +37,14 @@ func (rt *Runtime) routeAccountUIDs(route Route) []string {
 	for _, tier := range tiers {
 		p := rt.zenNodes
 		if tier == TierGo {
+			if active, c := rt.subscriptionSnapshot(); active {
+				if c != nil {
+					if _, ok := c.Routes[route.ID]; ok {
+						ids = append(ids, subscriptionUID(c))
+					}
+				}
+				continue
+			}
 			p = rt.goNodes
 		}
 		if p == nil {

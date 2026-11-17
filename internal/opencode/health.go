@@ -176,10 +176,19 @@ func (rt *Runtime) refreshModels(ctx context.Context) error {
 	var zen, goModels []string
 	var capabilities Capabilities
 	var capabilitiesErr error
+	var subscriptionErr error
+	activeSubscription, _ := rt.subscriptionSnapshot()
 	var wg sync.WaitGroup
 	wg.Add(3)
 	go func() { defer wg.Done(); zen = rt.refreshZen(ctx) }()
-	go func() { defer wg.Done(); goModels = rt.refreshTier(ctx, rt.cfg.Upstream.Go, rt.goNodes) }()
+	go func() {
+		defer wg.Done()
+		if activeSubscription {
+			subscriptionErr = rt.refreshSubscriptionCatalog(ctx)
+		} else if rt.goKeyCount() > 0 {
+			goModels = rt.refreshTier(ctx, rt.cfg.Upstream.Go, rt.goNodes)
+		}
+	}()
 	go func() { defer wg.Done(); capabilities, capabilitiesErr = rt.refreshProtocolCapabilities(ctx) }()
 	wg.Wait()
 	saveMu.Lock()
@@ -193,13 +202,13 @@ func (rt *Runtime) refreshModels(ctx context.Context) error {
 		rt.catalog.mu.Unlock()
 		return ctx.Err()
 	}
-	if zen == nil && goModels == nil {
+	if zen == nil && goModels == nil && (!activeSubscription || subscriptionErr != nil) {
 		rt.catalog.mu.Lock()
 		rt.catalog.stale = true
 		rt.catalog.mu.Unlock()
 		return errors.New("OpenCode 模型目录刷新失败，保留现有目录")
 	}
-	partial := capabilitiesErr != nil || (zen == nil && (rt.zenNodes.Len() > 0 || rt.cfg.Anonymous)) || (goModels == nil && rt.goNodes.Len() > 0)
+	partial := capabilitiesErr != nil || subscriptionErr != nil || (zen == nil && (rt.zenNodes.Len() > 0 || rt.cfg.Anonymous)) || (goModels == nil && rt.goKeyCount() > 0)
 	rt.catalog.ReplaceWithCapabilities(zen, goModels, capabilities.Protocols, capabilities.Unsupported, capabilities.Metadata)
 	rt.catalog.mu.Lock()
 	rt.catalog.stale = partial

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
+	"work2api/internal/core/provider"
 
 	"work2api/internal/qoder/cosy"
 )
@@ -111,6 +113,10 @@ func TestResourceRejectionsDoNotReplayOrEmitSuccess(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var hits atomic.Int32
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" {
+					w.WriteHeader(404)
+					return
+				}
 				hits.Add(1)
 				if tc.httpStatus != 200 {
 					w.WriteHeader(tc.httpStatus)
@@ -142,5 +148,226 @@ func TestResourceRejectionsDoNotReplayOrEmitSuccess(t *testing.T) {
 				t.Fatal(err, hits.Load(), emitted)
 			}
 		})
+	}
+}
+
+func TestQueueRecoveryAndTermination(t *testing.T) {
+	for _, mode := range []string{"ready", "unsupported", "rejected", "invalid", "cancel", "revoke", "diagnostic", "after_output", "budget"} {
+		t.Run(mode, func(t *testing.T) {
+			var sends, queries atomic.Int32
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" {
+					queries.Add(1)
+					if r.URL.Path != "/algo/api/v2/service/ask/queue/status" || r.URL.Query().Get("requestSetId") == "" || r.URL.Query().Get("modelKey") != "qfmodel" || r.Header.Get("X-Request-ID") == "" || r.Header.Get("X-Session-ID") == "" {
+						t.Error("lost queue identity")
+					}
+					switch mode {
+					case "unsupported":
+						w.WriteHeader(404)
+					case "rejected":
+						w.WriteHeader(403)
+						fmt.Fprint(w, `{"message":"permission denied"}`)
+					case "invalid":
+						fmt.Fprint(w, `{"code":0}`)
+					case "cancel":
+						cancel()
+						<-r.Context().Done()
+					case "revoke":
+						fmt.Fprint(w, `{"isQueued":false}`)
+					default:
+						fmt.Fprint(w, `{"data":{"isQueued":false}}`)
+					}
+					return
+				}
+				count := sends.Add(1)
+				w.Header().Set("Content-Type", "text/event-stream")
+				emit := func(raw string) {
+					encoded, _ := json.Marshal(map[string]any{"statusCodeValue": 200, "body": raw})
+					fmt.Fprintf(w, "data: %s\n\n", encoded)
+				}
+				if count == 1 || mode == "budget" {
+					if mode == "after_output" {
+						emit(`{"choices":[{"delta":{"content":"first"}}]}`)
+					}
+					_, business, _ := queueErrorFixture()
+					emit(business)
+					return
+				}
+				emit(`{"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}`)
+				fmt.Fprint(w, "data: [DONE]\n\n")
+			}))
+			defer srv.Close()
+			sess, e := cosy.NewSession(cosy.AuthIdentity{Uid: "fixture", UserType: "personal_standard"}, "fixture", "fixture", "fixture")
+			if e != nil {
+				t.Fatal(e)
+			}
+			b := &Bridge{sess: sess, client: NewBearerClient(sess), templateBase: map[string]any{}, chatStreamURL: srv.URL}
+			var beats, waits atomic.Int32
+			call := provider.Invocation{Diagnostic: mode == "diagnostic", Wait: func(ctx context.Context, fn func(context.Context) error) error { waits.Add(1); return fn(ctx) }}
+			ctx = provider.WithInvocation(ctx, call)
+			ctx = WithQueueDispatchCheck(ctx, func(context.Context) error {
+				if mode == "revoke" && queries.Load() > 0 {
+					return errors.New("revoked")
+				}
+				return nil
+			})
+			ctx = withQueueHeartbeat(ctx, func() { beats.Add(1) })
+			var out strings.Builder
+			err := b.CallQoderWithOpts(ctx, "codex", nil, "qfmodel", nil, CallOpts{Stream: true}, func(d Delta) { out.WriteString(d.Content) })
+			switch mode {
+			case "ready":
+				if err != nil || out.String() != "OK" || sends.Load() != 2 || queries.Load() != 1 || beats.Load() != 1 || waits.Load() != 1 {
+					t.Fatal(err, out.String(), sends.Load(), queries.Load(), beats.Load(), waits.Load())
+				}
+			case "budget":
+				if err == nil || sends.Load() != 3 || queries.Load() != 2 {
+					t.Fatal(err, sends.Load(), queries.Load())
+				}
+			case "cancel":
+				if !errors.Is(err, context.Canceled) || sends.Load() != 1 {
+					t.Fatal(err, sends.Load())
+				}
+			case "revoke":
+				if err == nil || err.Error() != "revoked" || sends.Load() != 1 {
+					t.Fatal(err, sends.Load())
+				}
+			case "rejected":
+				if ErrorStatus(err) != 403 || sends.Load() != 1 {
+					t.Fatal(err, sends.Load())
+				}
+			case "diagnostic", "after_output":
+				if err == nil || queries.Load() != 0 || sends.Load() != 1 {
+					t.Fatal(err, sends.Load(), queries.Load())
+				}
+			default:
+				if err == nil || sends.Load() != 1 || queries.Load() != 1 {
+					t.Fatal(err, sends.Load(), queries.Load())
+				}
+			}
+		})
+	}
+}
+
+func TestQueueStateProgressAndBounds(t *testing.T) {
+	now := time.Now()
+	waiting, done := true, false
+	state := queueState{Queued: &waiting}
+	key := queueStuckKey(state)
+	if _, _, stalled := queueProgress(state, key, now.Add(-5*time.Minute), now); !stalled {
+		t.Fatal("stalled queue not stopped")
+	}
+	if _, _, stalled := queueProgress(state, key, now.Add(-4*time.Minute), now); stalled {
+		t.Fatal("queue stopped early")
+	}
+	count := 2.
+	state.Count = &count
+	if _, _, stalled := queueProgress(state, key, now.Add(-time.Hour), now); stalled {
+		t.Fatal("stopped with others ahead")
+	}
+	state.Count = nil
+	state.Queued = &done
+	if _, _, stalled := queueProgress(state, queueStuckKey(state), now.Add(-time.Hour), now); stalled {
+		t.Fatal("ready queue stopped")
+	}
+
+	for _, raw := range []string{`{"data":"{\"isQueued\":false}"}`, `{"result":{"isQueued":false}}`} {
+		s, ok := readQueueState([]byte(raw))
+		if !ok || s.Queued == nil || *s.Queued {
+			t.Fatal(raw, s, ok)
+		}
+	}
+	if _, ok := readQueueState([]byte(`{"messages":[{"isQueued":true}]}`)); ok {
+		t.Fatal("parsed user content")
+	}
+	if _, ok := readQueueState([]byte(strings.Repeat(" ", 65537))); ok {
+		t.Fatal("accepted oversized status")
+	}
+	n := 2.
+	s := queueState{Count: &n}
+	if queueStuckKey(s) != "" {
+		t.Fatal("stopped with others ahead")
+	}
+	n = 1
+	if queueStuckKey(s) == "" {
+		t.Fatal("missing stuck detector")
+	}
+	for _, n := range []float64{-1, 0, .1, 1, 300} {
+		s.Retry = &n
+		d := queuePause(s)
+		if d < 500*time.Millisecond || d > 30*time.Second {
+			t.Fatal(d)
+		}
+	}
+}
+
+func TestQueuedRequestsAcrossPublicProtocols(t *testing.T) {
+	for _, proto := range []string{"chat", "messages", "responses"} {
+		for _, streaming := range []bool{false, true} {
+			for _, recover := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/stream=%v/recover=%v", proto, streaming, recover), func(t *testing.T) {
+					var sends atomic.Int32
+					srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if r.Method == "GET" {
+							if recover {
+								fmt.Fprint(w, `{"isQueued":false}`)
+							} else {
+								w.WriteHeader(404)
+							}
+							return
+						}
+						w.Header().Set("Content-Type", "text/event-stream")
+						var raw string
+						if sends.Add(1) == 1 {
+							_, raw, _ = queueErrorFixture()
+						} else {
+							raw = `{"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}`
+						}
+						frame, _ := json.Marshal(map[string]any{"statusCodeValue": 200, "body": raw})
+						fmt.Fprintf(w, "data: %s\n\n", frame)
+					}))
+					defer srv.Close()
+					sess, err := cosy.NewSession(cosy.AuthIdentity{Uid: "fixture", UserType: "personal_standard"}, "fixture", "fixture", "fixture")
+					if err != nil {
+						t.Fatal(err)
+					}
+					b := &Bridge{sess: sess, client: NewBearerClient(sess), templateBase: map[string]any{}, chatStreamURL: srv.URL}
+					req := map[string]any{"model": "qfmodel", "stream": streaming, "messages": []any{map[string]any{"role": "user", "content": "hi"}}, "input": "hi"}
+					w := httptest.NewRecorder()
+					switch proto {
+					case "chat":
+						_, err = b.ServeChat(t.Context(), w, req)
+					case "messages":
+						_, err = b.ServeClaude(t.Context(), w, req)
+					case "responses":
+						_, err = b.ServeCodex(t.Context(), w, req)
+					}
+					text := w.Body.String()
+					if recover {
+						if err != nil || !strings.Contains(text, "OK") || sends.Load() != 2 {
+							t.Fatal(err, text, sends.Load())
+						}
+					} else {
+						if err == nil || sends.Load() != 1 {
+							t.Fatal("queue refusal became success", err, text)
+						}
+					}
+					if streaming {
+						if !strings.Contains(text, ": queued\n\n") {
+							t.Fatal("missing queue heartbeat", text)
+						}
+					} else {
+						if strings.Contains(text, ": queued") {
+							t.Fatal("SSE in JSON", text)
+						}
+						var v any
+						if json.Unmarshal(w.Body.Bytes(), &v) != nil {
+							t.Fatal("invalid nonstream response", text)
+						}
+					}
+				})
+			}
+		}
 	}
 }

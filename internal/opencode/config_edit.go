@@ -21,16 +21,17 @@ func (rt *Runtime) ConfigDoc() (map[string]any, error) {
 	active := map[string]any{"zen": 0, "go": 0}
 	if rt.ready {
 		active["zen"] = rt.zenNodes.Len()
-		active["go"] = rt.goNodes.Len()
+		active["go"] = rt.goKeyCount()
 	}
 	return map[string]any{
-		"config_path": rt.path,
-		"ready":       rt.ready,
-		"zen_keys":    cfg.ZenKeys,
-		"go_keys":     cfg.GoKeys,
-		"anonymous":   cfg.Anonymous,
-		"prefer":      string(cfg.Prefer),
-		"active":      active,
+		"config_path":     rt.path,
+		"ready":           rt.ready,
+		"zen_keys":        cfg.ZenKeys,
+		"go_keys":         cfg.GoKeys,
+		"anonymous":       cfg.Anonymous,
+		"prefer":          string(cfg.Prefer),
+		"active":          active,
+		"go_subscription": rt.subscriptionView(),
 	}, nil
 }
 
@@ -80,6 +81,9 @@ func (rt *Runtime) SaveConfigDoc(patch map[string]any) error {
 	if rt.ready && rt.catalog != nil {
 		newRt.catalog.CopyState(rt.catalog)
 	}
+	newRt.subscriptionMu.Lock()
+	newRt.goSubscription = rt.subscription()
+	newRt.subscriptionMu.Unlock()
 	newRt.BindRegistry(registry)
 	if err := registry.Replace(rt, newRt); err != nil {
 		_ = newRt.Close()
@@ -95,12 +99,16 @@ func (rt *Runtime) SaveConfigDoc(patch map[string]any) error {
 // tuning, not credentials).
 func (rt *Runtime) ExportCredentials() (map[string]any, error) {
 	cfg := rt.baseConfig()
-	return map[string]any{
+	out := map[string]any{
 		"zen_keys":  cfg.ZenKeys,
 		"go_keys":   cfg.GoKeys,
 		"prefer":    string(cfg.Prefer),
 		"anonymous": cfg.Anonymous,
-	}, nil
+	}
+	if active, c := rt.subscriptionSnapshot(); active {
+		out["go_subscription"] = c
+	}
+	return out, nil
 }
 
 // baseConfig picks the best starting point: the live config when ready, else

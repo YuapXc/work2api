@@ -47,3 +47,6 @@
 .idea/
 .vscode/
 .DS_Store
+
+*.go-oauth.json
+.go-oauth-*

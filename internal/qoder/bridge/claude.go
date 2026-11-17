@@ -105,6 +105,8 @@ func (b *Bridge) ServeClaude(ctx context.Context, w http.ResponseWriter, req map
 			send("event: " + eventType + "\ndata: " + string(d) + "\n\n")
 		}
 
+		callCtx = withQueueHeartbeat(callCtx, func() { send(": queued\n\n") })
+
 		writeSse("message_start", map[string]interface{}{
 			"type": "message_start",
 			"message": map[string]interface{}{

@@ -1640,5 +1640,19 @@ func TestLiveDomesticResponsesCacheContinuation(t *testing.T) {
 	if json.Unmarshal(second.Body.Bytes(), &reply) != nil || reply["status"] != "completed" || !strings.Contains(second.Body.String(), "OK") {
 		t.Fatal("live cached continuation did not complete")
 	}
+
+	toolHistory := invoke(map[string]any{"model": "workbuddy/deepseek-v4.1-flash", "stream": false, "store": false, "max_output_tokens": 128, "reasoning": map[string]any{"effort": "off"}, "input": []any{
+		map[string]any{"role": "user", "content": "Use echo_check once to check ok."},
+		map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "Checking."}}},
+		map[string]any{"type": "function_call", "call_id": "synthetic_call", "name": "echo_check", "arguments": "{\"value\":\"ok\"}"},
+		map[string]any{"type": "function_call_output", "call_id": "synthetic_call", "output": "OK"},
+		map[string]any{"role": "user", "content": "The check is complete. Reply exactly OK without another tool call."},
+	}})
+	_, historyOutput, historyOK := readResponseHistoryResult(bytes.NewReader(toolHistory.Body.Bytes()), toolHistory.Header().Get("Content-Type"))
+	encodedHistory, _ := json.Marshal(historyOutput)
+	if !historyOK || !bytes.Contains(encodedHistory, []byte("OK")) {
+		t.Fatal("real Responses tool history did not complete")
+	}
+
 	t.Log("real upstream SSE and immediate previous_response_id continuation verified")
 }

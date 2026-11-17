@@ -74,7 +74,7 @@ func aliasClientTools(input map[string]any, proto protocol.Protocol, anonymous, 
 		return input, nil
 	}
 	sort.Strings(reserved)
-	const aliasPrefix = "w2a_"
+	const aliasPrefix = "mcp_"
 	for name := range used {
 		i := sort.SearchStrings(reserved, name)
 		conflicts := i < len(reserved) && strings.HasPrefix(reserved[i], name)

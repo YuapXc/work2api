@@ -66,6 +66,14 @@ func (b *Bridge) ServeCodex(ctx context.Context, w http.ResponseWriter, req map[
 	}
 	callCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	if stream {
+		callCtx = withQueueHeartbeat(callCtx, func() {
+			send(": queued\n\n")
+			if writeErr != nil {
+				cancel()
+			}
+		})
+	}
 	toolsSeen := false
 	var input, output int
 	err := b.CallQoderWithOpts(callCtx, "codex", messages, model, tools, requestCallOpts(req), func(d Delta) {

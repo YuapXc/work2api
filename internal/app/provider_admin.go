@@ -33,6 +33,7 @@ func (s *Server) mountProviderAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/providers/{name}/accounts/import-local", s.adminProviderImportLocal)
 	mux.HandleFunc("DELETE /admin/providers/{name}/accounts/{id}", s.adminProviderDeleteAccount)
 	mux.HandleFunc("GET /admin/providers/{name}/config", s.adminProviderGetConfig)
+	mux.HandleFunc("POST /admin/providers/{name}/device-authorization", s.adminProviderDeviceAuthorization)
 	mux.HandleFunc("POST /admin/providers/{name}/config", s.adminProviderSaveConfig)
 }
 
@@ -530,4 +531,29 @@ func (s *Server) verifyAddedAccount(ctx context.Context, name string, account, r
 	if !verified {
 		result["message"] = "账号已保存，模型目录尚未验证，请在模型页刷新目录，无需重启网关"
 	}
+}
+
+func (s *Server) adminProviderDeviceAuthorization(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	rt, ok := s.accountManager(w, r.PathValue("name"))
+	if !ok {
+		return
+	}
+	auth, ok := rt.(provider.DeviceAuthorizationRuntime)
+	if !ok {
+		writeAPIErr(w, errBody(400, "该渠道不支持设备授权", "invalid_request_error"))
+		return
+	}
+	body, err := readJSON(r)
+	if err != nil {
+		writeAPIErr(w, errBody(400, "请求格式错误", "invalid_request_error"))
+		return
+	}
+	action, _ := body["action"].(string)
+	result, err := auth.DeviceAuthorization(r.Context(), action, body)
+	if err != nil {
+		writeAPIErr(w, errBody(400, err.Error(), "authorization_error"))
+		return
+	}
+	writeJSON(w, 200, result)
 }

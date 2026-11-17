@@ -151,6 +151,8 @@ func (b *Bridge) ServeChat(ctx context.Context, w http.ResponseWriter, req map[s
 			}
 		}
 
+		callCtx = withQueueHeartbeat(callCtx, func() { send(": queued\n\n") })
+
 		var toolCallBuf []interface{}
 		var totalInputTokens, totalOutputTokens int
 		streamFull := provider.NewLogCapture(ctx)

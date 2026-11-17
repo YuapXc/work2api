@@ -1,0 +1,285 @@
+package bridge
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"math"
+	"net/http"
+	"net/url"
+	"strconv"
+	"time"
+
+	"work2api/internal/core/provider"
+)
+
+type queueCheckKey struct{}
+type queueHeartbeatKey struct{}
+
+func WithQueueDispatchCheck(ctx context.Context, check func(context.Context) error) context.Context {
+	return context.WithValue(ctx, queueCheckKey{}, check)
+}
+func withQueueHeartbeat(ctx context.Context, beat func()) context.Context {
+	return context.WithValue(ctx, queueHeartbeatKey{}, beat)
+}
+
+type queueState struct {
+	Queued    *bool    `json:"isQueued"`
+	Available *bool    `json:"serviceAvailable"`
+	Model     string   `json:"modelKey"`
+	Type      string   `json:"queueType"`
+	Retry     *float64 `json:"retryAfterSeconds"`
+	Count     *float64 `json:"queueCount"`
+	Sub       string   `json:"subCode"`
+}
+
+func readQueueState(raw []byte) (queueState, bool) {
+	var walk func([]byte, int) (queueState, bool)
+	nodes := 32
+	walk = func(raw []byte, depth int) (queueState, bool) {
+		if depth > 6 || nodes == 0 || len(raw) > 65536 {
+			return queueState{}, false
+		}
+		nodes--
+		var m map[string]json.RawMessage
+		if json.Unmarshal(raw, &m) != nil {
+			return queueState{}, false
+		}
+		flag := func(key string) *bool {
+			var value bool
+			if json.Unmarshal(m[key], &value) == nil && string(m[key]) != "null" {
+				return &value
+			}
+			var text string
+			if json.Unmarshal(m[key], &text) == nil && (text == "true" || text == "false") {
+				value = text == "true"
+				return &value
+			}
+			return nil
+		}
+		number := func(key string) *float64 {
+			var n float64
+			if json.Unmarshal(m[key], &n) == nil && string(m[key]) != "null" {
+				return &n
+			}
+			var text string
+			if json.Unmarshal(m[key], &text) == nil && text != "" {
+				if n, err := strconv.ParseFloat(text, 64); err == nil && !math.IsNaN(n) && !math.IsInf(n, 0) {
+					return &n
+				}
+			}
+			return nil
+		}
+		state := queueState{Queued: flag("isQueued"), Available: flag("serviceAvailable"), Retry: number("retryAfterSeconds"), Count: number("queueCount")}
+		_ = json.Unmarshal(m["modelKey"], &state.Model)
+		_ = json.Unmarshal(m["queueType"], &state.Type)
+		_ = json.Unmarshal(m["subCode"], &state.Sub)
+		if state.Queued != nil || state.Available != nil {
+			return state, true
+		}
+		for _, key := range []string{"data", "result", "message", "body", "error", "details"} {
+			child := m[key]
+			var text string
+			if json.Unmarshal(child, &text) == nil {
+				child = []byte(text)
+			}
+			if result, ok := walk(child, depth+1); ok {
+				return result, true
+			}
+		}
+		return queueState{}, false
+	}
+	return walk(raw, 0)
+}
+
+func queuedFailure(err error) (queueState, bool) {
+	var upstream *UpstreamError
+	if !errors.As(err, &upstream) || upstream.ErrType != "upstream_queued" {
+		return queueState{}, false
+	}
+	state, ok := readQueueState([]byte(upstream.Detail))
+	return state, ok && (state.Queued == nil || *state.Queued)
+}
+
+func queuePause(state queueState) time.Duration {
+	if state.Retry == nil {
+		return 30 * time.Second
+	}
+	n := *state.Retry
+	if n >= 30 {
+		return 30 * time.Second
+	}
+	if n <= .5 {
+		return 500 * time.Millisecond
+	}
+	return time.Duration(n * float64(time.Second))
+}
+
+func queueStuckKey(state queueState) string {
+	if state.Count != nil && *state.Count > 1 {
+		return ""
+	}
+	// Model names do not affect whether the queue has progressed.
+	state.Model = ""
+	raw, _ := json.Marshal(state)
+	return string(raw)
+}
+
+var errQueueStalled = errors.New("queue stalled")
+
+func queueProgress(state queueState, previous string, since, now time.Time) (string, time.Time, bool) {
+	key := queueStuckKey(state)
+	if key == "" || key != previous {
+		return key, now, false
+	}
+	return key, since, now.Sub(since) >= 5*time.Minute && (state.Queued == nil || *state.Queued)
+}
+
+func (b *Bridge) waitQueued(ctx context.Context, endpoint string, body map[string]interface{}, extra map[string]string, first queueState) (bool, error) {
+	if provider.CurrentInvocation(ctx).Diagnostic {
+		return false, nil
+	}
+	ready := false
+	err := provider.Wait(ctx, func(ctx context.Context) error {
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		type result struct {
+			ready bool
+			err   error
+		}
+		done := make(chan result, 1)
+		go func() { ok, err := b.pollQueue(ctx, endpoint, body, extra, first); done <- result{ok, err} }()
+		beat, _ := ctx.Value(queueHeartbeatKey{}).(func())
+		if beat != nil {
+			beat()
+		}
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case r := <-done:
+				ready = r.ready
+				return r.err
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ticker.C:
+				if beat != nil {
+					beat()
+				}
+			}
+		}
+	})
+	return ready, err
+}
+
+func (b *Bridge) pollQueue(ctx context.Context, endpoint string, body map[string]interface{}, extra map[string]string, state queueState) (bool, error) {
+	base, err := url.Parse(endpoint)
+	if err != nil {
+		return false, err
+	}
+	base.Path, base.RawPath, base.RawQuery = "/algo/api/v2/service/ask/queue/status", "", ""
+	model, _ := body["model_config"].(map[string]interface{})
+	if state.Model == "" {
+		state.Model = StrVal(model, "key")
+	}
+	requestSet := StrVal(body, "request_set_id")
+	if requestSet == "" || state.Model == "" {
+		return false, nil
+	}
+	key, since, failures := queueStuckKey(state), time.Now(), 0
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 {
+			if err := sleepCtx(ctx, queuePause(state)); err != nil {
+				return false, err
+			}
+		}
+		if check, _ := ctx.Value(queueCheckKey{}).(func(context.Context) error); check != nil {
+			if err := check(ctx); err != nil {
+				return false, err
+			}
+		}
+		q := url.Values{"requestSetId": {requestSet}, "modelKey": {state.Model}}
+		if state.Type != "" {
+			q.Set("queueType", state.Type)
+		}
+		base.RawQuery = q.Encode()
+		askCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		req, err := http.NewRequestWithContext(askCtx, http.MethodGet, base.String(), nil)
+		if err != nil {
+			cancel()
+			return false, err
+		}
+		path, err := PathSigFrom(base.String())
+		if err != nil {
+			cancel()
+			return false, err
+		}
+		headers, err := b.client.buildHeaders(path, "", "application/json", extra)
+		if err != nil {
+			cancel()
+			return false, err
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		req.Header.Del("Content-Type")
+		req.Header.Set("X-Request-ID", StrVal(body, "request_id"))
+		req.Header.Set("X-Session-ID", StrVal(body, "session_id"))
+		resp, err := streamHTTPClient.Do(req)
+		var raw []byte
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+			raw, err = io.ReadAll(io.LimitReader(resp.Body, 65537))
+			resp.Body.Close()
+		}
+		cancel()
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		if err == nil && status == 404 {
+			return false, nil
+		}
+		if err == nil && status >= 400 && status < 500 && status != 429 {
+			return false, NewUpstreamError(status, string(raw))
+		}
+		if err != nil || status != 200 || len(raw) > 65536 {
+			failures++
+			if failures >= 3 {
+				return false, nil
+			}
+			state.Retry = nil
+			continue
+		}
+		next, ok := readQueueState(raw)
+		if !ok {
+			return false, nil
+		}
+		failures = 0
+		if next.Model == "" {
+			next.Model = state.Model
+		}
+		if next.Type == "" {
+			next.Type = state.Type
+		}
+		state = next
+		var stalled bool
+		key, since, stalled = queueProgress(state, key, since, time.Now())
+		if stalled {
+			return false, errQueueStalled
+		}
+		if state.Queued != nil && !*state.Queued {
+			if state.Retry != nil && *state.Retry > 0 {
+				if err := sleepCtx(ctx, queuePause(state)); err != nil {
+					return false, err
+				}
+			}
+			return true, nil
+		}
+		if state.Queued != nil && *state.Queued || state.Available != nil && !*state.Available {
+			continue
+		}
+		return false, nil
+	}
+}

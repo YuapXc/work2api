@@ -53,12 +53,17 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 	// upstream body must carry it too.
 	payload["model"] = model
 
-	if !rt.catalog.Supported(model) {
+	_, subscription := rt.subscriptionSnapshot()
+	subscriptionModel := false
+	if subscription != nil {
+		_, subscriptionModel = subscription.Routes[model]
+	}
+	if !rt.catalog.Supported(model) && !subscriptionModel {
 		msg := "the model uses an upstream protocol that opencode does not expose"
 		protocol.WriteError(w, external, http.StatusBadRequest, msg, "invalid_request_error", "model")
 		return provider.UsageReport{Status: "error", Error: msg}, nil
 	}
-	route, err := rt.catalog.Route(model, rt.zenNodes.Len() > 0, rt.goNodes.Len() > 0, rt.cfg.Anonymous)
+	route, err := rt.resolveRoute(model, req.Caller)
 	if err != nil {
 		protocol.WriteError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "model")
 		return provider.UsageReport{Status: "error", Error: err.Error()}, nil
@@ -81,7 +86,7 @@ func (rt *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (result
 		return rt.serveSystemOne(ctx, w, external, payload, route, ids)
 	}
 
-	free := rt.catalog.IsFreeModel(model)
+	free := rt.catalog.IsFreeModel(model) && !(subscriptionModel && route.Tier == TierGo)
 	compatibilityTools := route.Anonymous || free
 	payload, toolNames := aliasClientTools(payload, external, route.Anonymous, compatibilityTools)
 	payload = describeClientTools(payload, external, toolNames, compatibilityTools)

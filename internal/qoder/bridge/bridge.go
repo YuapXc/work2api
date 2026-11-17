@@ -446,6 +446,7 @@ func DeepCopyMap(m map[string]interface{}) map[string]interface{} {
 
 // CallOpts 控制单次 CallQoder 的可选行为。
 type CallOpts struct {
+	Stream          bool
 	ReasoningSet    bool
 	ReasoningEffort string
 	IsReasoning     bool // 是否启用推理模式（对应上游 model_config.is_reasoning）
@@ -454,7 +455,8 @@ type CallOpts struct {
 
 func requestCallOpts(req map[string]interface{}) CallOpts {
 	enabled, specified := protocol.ReasoningEnabled(req)
-	opts := CallOpts{IsReasoning: enabled, ReasoningSet: specified, ReasoningEffort: protocol.ExplicitReasoningEffort(req)}
+	stream, _ := req["stream"].(bool)
+	opts := CallOpts{Stream: stream, IsReasoning: enabled, ReasoningSet: specified, ReasoningEffort: protocol.ExplicitReasoningEffort(req)}
 	for _, key := range []string{"max_output_tokens", "max_completion_tokens", "max_tokens"} {
 		switch n := req[key].(type) {
 		case int:
@@ -568,6 +570,11 @@ func WithAccountFallback(ctx context.Context, next AccountFallback) context.Cont
 }
 
 func (b *Bridge) callQoderWithOpts(ctx context.Context, agent string, messages []interface{}, model string, tools interface{}, opts CallOpts, onDelta func(Delta)) error {
+	budget := 4 * time.Minute
+	if opts.Stream {
+		budget = time.Hour
+	}
+	began := time.Now()
 	// 将客户端模型名（claude-sonnet-4-6 等）映射成 Qoder 上游内部 model.key（auto/qmodel_38max/gmodel/dmodel 等）。
 	// 上游对未知 key 会走兜底返回内容，但不会把这次调用计入 quota，这是「请求成功但 dashboard 无用量」的根因。
 	originalModel := model
@@ -704,13 +711,20 @@ func (b *Bridge) callQoderWithOpts(ctx context.Context, agent string, messages [
 	// 说明：连接阶段错误已在 openStreamLines 内部重试过；此处重开是
 	// 已耗尽的连接重试不会再次进入外层；外层仅覆盖建流后的信封/读取错误。
 	var lastErr error
+	queuedResume := false
 	for attempt := 0; attempt <= TransientMaxRetries; attempt++ {
-		if attempt > 0 {
+		if attempt > 0 && !queuedResume {
 			if serr := sleepCtx(ctx, RetryBackoff(attempt)); serr != nil {
 				return lastErr
 			}
 			logger.Info("reopen upstream after in-stream error (try %d/%d): %v",
 				attempt+1, TransientMaxRetries+1, lastErr)
+		}
+		queuedResume = false
+		if check, _ := ctx.Value(queueCheckKey{}).(func(context.Context) error); check != nil {
+			if err := check(ctx); err != nil {
+				return err
+			}
 		}
 		emitted := false
 		var upstreamErr error
@@ -741,6 +755,32 @@ func (b *Bridge) callQoderWithOpts(ctx context.Context, agent string, messages [
 			lastErr = upstreamErr
 		} else {
 			lastErr = streamErr
+		}
+		if !emitted && attempt < TransientMaxRetries && ctx.Err() == nil {
+			if state, ok := queuedFailure(lastErr); ok {
+				queueCtx, cancel := context.WithDeadline(ctx, began.Add(budget))
+				ready, err := b.waitQueued(queueCtx, qurl, body, extra, state)
+				cancel()
+				if errors.Is(err, errQueueStalled) {
+					var upstream *UpstreamError
+					if errors.As(lastErr, &upstream) {
+						copy := *upstream
+						copy.Message += "（队列5分钟无进展且前方无人，已停止等待）"
+						return &copy
+					}
+					return lastErr
+				}
+				if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+					return lastErr
+				}
+				if err != nil {
+					return err
+				}
+				if ready {
+					queuedResume = true
+					continue
+				}
+			}
 		}
 		var exhausted *streamOpenError
 		if emitted || errors.As(lastErr, &exhausted) || attempt >= TransientMaxRetries || !isRetryableStreamError(lastErr) {

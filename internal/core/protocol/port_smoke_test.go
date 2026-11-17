@@ -1799,3 +1799,54 @@ func TestResponsesInstructionOrderAndStrictDefaults(t *testing.T) {
 		}
 	}
 }
+
+func TestResponsesAssistantBlocksStayInOneTurn(t *testing.T) {
+	body := map[string]any{"model": "m", "input": []any{
+		map[string]any{"role": "user", "content": "question"},
+		map[string]any{"type": "reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": "plan"}}},
+		map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "Checking"}}},
+		map[string]any{"type": "function_call", "call_id": "a", "name": "lookup", "arguments": "{\"n\":1}"},
+		map[string]any{"type": "function_call", "call_id": "b", "name": "lookup", "arguments": "{\"n\":2}"},
+		map[string]any{"type": "function_call_output", "call_id": "a", "output": "first"},
+		map[string]any{"type": "function_call_output", "call_id": "b", "output": "second"},
+		map[string]any{"role": "user", "content": "next"},
+	}}
+	before, _ := json.Marshal(body)
+	for _, target := range []Protocol{Chat, Anthropic} {
+		out, err := ConvertRequest(Responses, target, body)
+		if err != nil {
+			t.Fatal(target, err)
+		}
+		assistant := 0
+		for _, raw := range out["messages"].([]any) {
+			message := raw.(map[string]any)
+			if message["role"] != "assistant" {
+				continue
+			}
+			assistant++
+			if target == Chat {
+				if message["content"] != "Checking" || len(message["tool_calls"].([]any)) != 2 || message["reasoning_content"] != "plan" {
+					t.Fatal(message)
+				}
+			} else {
+				calls := 0
+				for _, rawBlock := range message["content"].([]any) {
+					block := rawBlock.(map[string]any)
+					if block["type"] == "tool_use" {
+						calls++
+					}
+				}
+				if calls != 2 {
+					t.Fatal(message)
+				}
+			}
+		}
+		if assistant != 1 {
+			t.Fatal("split assistant turn", target, assistant)
+		}
+	}
+	after, _ := json.Marshal(body)
+	if !bytes.Equal(before, after) {
+		t.Fatal("mutated input")
+	}
+}

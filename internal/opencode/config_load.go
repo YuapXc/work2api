@@ -81,9 +81,6 @@ func Normalize(path string, cfg Config) (Config, error) {
 			return Config{}, fmt.Errorf("%s must be an http or https URL", name)
 		}
 	}
-	if !cfg.Anonymous && len(cfg.ZenKeys) == 0 && len(cfg.GoKeys) == 0 {
-		return Config{}, errors.New("zen_keys or go_keys must contain at least one upstream key unless anonymous is enabled")
-	}
 	if cfg.Retry.MaxAttempts < 1 {
 		return Config{}, errors.New("retry.max_attempts must be at least 1")
 	}

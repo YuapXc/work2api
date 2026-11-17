@@ -144,3 +144,7 @@ func ResourceMetadata(row map[string]any, kind string, actions map[string]Resour
 	return ResourceSummary{ID: id, Kind: kind, Label: label, Source: str("source"), Region: region, Status: status, Actions: actions,
 		Quota: ResourceQuota{Unit: str("quota_unit"), Remaining: resourceNumber(row["credits_remaining"]), Total: resourceNumber(row["credits_total"]), ExpiresAt: resourceNumber(row["credits_expire_at"]), Stale: row["quota_stale"] == true, RefreshFailed: row["quota_refresh_failed"] == true}}
 }
+
+type DeviceAuthorizationRuntime interface {
+	DeviceAuthorization(context.Context, string, map[string]any) (map[string]any, error)
+}

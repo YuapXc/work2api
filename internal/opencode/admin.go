@@ -7,9 +7,7 @@ import (
 	"work2api/internal/core/provider"
 )
 
-// opencode exposes read-only admin data: it has no persisted accounts (its
-// "accounts" are config key tiers) and no checkin/credits. Management = editing
-// the config file, surfaced as the "config" capability + a Notes hint.
+// API keys remain configuration resources; Go OAuth adds one administrator-owned subscription.
 var _ provider.AdminRuntime = (*Runtime)(nil)
 
 // AdminData reports opencode's key tiers, models and status for the WebUI.
@@ -30,13 +28,17 @@ func (rt *Runtime) AdminData(ctx context.Context) provider.AdminData {
 	// counts only (keys themselves are never exposed).
 	accts := []map[string]any{
 		{"id": "zen", "label": "Zen 层", "tier": "zen", "key_count": rt.zenNodes.Len()},
-		{"id": "go", "label": "Go 层", "tier": "go", "key_count": rt.goNodes.Len()},
+		{"id": "go", "label": "Go 层", "tier": "go", "key_count": rt.goKeyCount()},
 	}
 	if rt.cfg.Anonymous {
 		accts = append(accts, map[string]any{"id": "anonymous", "label": "匿名（public）", "tier": "anonymous", "key_count": 1})
 	}
 	now := time.Now().UnixNano()
 	for _, row := range accts {
+		if active, _ := rt.subscriptionSnapshot(); active && row["tier"] == "go" {
+			row["label"], row["available_count"], row["total_count"] = "Go 手动 Key · 已暂停", 0, 0
+			continue
+		}
 		available, total := 0, 0
 		if row["tier"] == "anonymous" {
 			for _, node := range rt.anonymous.nodes {
@@ -65,6 +67,9 @@ func (rt *Runtime) AdminData(ctx context.Context) provider.AdminData {
 		name string
 		pool *nodePool
 	}{{"zen", rt.zenNodes}, {"go", rt.goNodes}} {
+		if tier.name == "go" && rt.goKeyCount() == 0 {
+			continue
+		}
 		for _, node := range tier.pool.nodes {
 			uid := PortalKeyUID(node.key)
 			available := false
@@ -87,6 +92,9 @@ func (rt *Runtime) AdminData(ctx context.Context) provider.AdminData {
 			accts = append(accts, row)
 		}
 	}
+	if row := rt.subscriptionAccount(); row != nil {
+		accts = append(accts, row)
+	}
 	d.Accounts = accts
 	d.Resources = []provider.ResourceSummary{}
 	for _, row := range accts {
@@ -95,7 +103,11 @@ func (rt *Runtime) AdminData(ctx context.Context) provider.AdminData {
 			kind = "anonymous"
 		}
 		if row["credential"] == true {
-			d.Resources = append(d.Resources, provider.ResourceMetadata(row, "api_key", map[string]provider.ResourceAction{}))
+			resourceKind := "api_key"
+			if row["subscription"] == true {
+				resourceKind = "subscription"
+			}
+			d.Resources = append(d.Resources, provider.ResourceMetadata(row, resourceKind, map[string]provider.ResourceAction{}))
 			continue
 		}
 		d.Resources = append(d.Resources, provider.ResourceMetadata(row, kind, map[string]provider.ResourceAction{
@@ -113,8 +125,13 @@ func (rt *Runtime) AdminData(ctx context.Context) provider.AdminData {
 	}
 	d.Models = models
 
+	subscriptionCount := 0
+	if active, _ := rt.subscriptionSnapshot(); active {
+		subscriptionCount = 1
+	}
+
 	d.Status = map[string]any{
-		"account_count": rt.zenNodes.Len() + rt.goNodes.Len(),
+		"account_count": rt.zenNodes.Len() + rt.goKeyCount() + subscriptionCount,
 		"model_count":   len(models),
 		"prefer":        string(rt.cfg.Prefer),
 		"anonymous":     rt.cfg.Anonymous,

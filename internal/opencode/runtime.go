@@ -23,22 +23,24 @@ const (
 // found it stays inert: Ready() is false, Models() is empty, and Serve()
 // returns an error.
 type Runtime struct {
-	keyModelsMu  sync.RWMutex
-	keyModels    map[string][]string
-	modelRefresh provider.RefreshGate
-	lifecycleCtx context.Context
-	registry     atomic.Pointer[provider.Registry]
-	cfg          Config
-	logger       *slog.Logger
-	path         string // resolved config path (for display + hot-reload writes)
-	cancel       context.CancelFunc
-	transports   *transportPool
-	zenNodes     *nodePool
-	goNodes      *nodePool
-	anonymous    *anonymousPool
-	catalog      *Catalog
-	pricing      *PricingStore
-	ready        bool
+	subscriptionMu sync.Mutex
+	goSubscription *subscriptionState
+	keyModelsMu    sync.RWMutex
+	keyModels      map[string][]string
+	modelRefresh   provider.RefreshGate
+	lifecycleCtx   context.Context
+	registry       atomic.Pointer[provider.Registry]
+	cfg            Config
+	logger         *slog.Logger
+	path           string // resolved config path (for display + hot-reload writes)
+	cancel         context.CancelFunc
+	transports     *transportPool
+	zenNodes       *nodePool
+	goNodes        *nodePool
+	anonymous      *anonymousPool
+	catalog        *Catalog
+	pricing        *PricingStore
+	ready          bool
 }
 
 // compile-time assertion that Runtime satisfies the shared contract.
@@ -202,7 +204,7 @@ func (rt *Runtime) catalogModels(requested map[string]bool) []provider.CatalogMo
 	if !rt.Ready() {
 		return nil
 	}
-	routes, snapshot := rt.catalog.AvailableModels(rt.zenNodes.Len() > 0, rt.goNodes.Len() > 0, rt.cfg.Anonymous)
+	routes, snapshot := rt.catalog.AvailableModels(rt.zenNodes.Len() > 0, rt.goKeyCount() > 0, rt.cfg.Anonymous)
 	pricingSnapshot := rt.pricing.Snapshot()
 	out := make([]provider.CatalogModel, 0, len(routes))
 	for _, route := range routes {
@@ -258,7 +260,7 @@ func (rt *Runtime) catalogModels(requested map[string]bool) []provider.CatalogMo
 			Extra:      extra,
 		})
 	}
-	return out
+	return rt.subscriptionModels(out, requested)
 }
 
 func hasImageModality(modalities []string) bool {
@@ -281,5 +283,5 @@ func (rt *Runtime) Close() error {
 }
 
 func (r *Runtime) StateSources() []provider.StateSource {
-	return []provider.StateSource{{Path: r.path, Required: os.Getenv("OPENCODE_CONFIG") != ""}}
+	return []provider.StateSource{{Path: r.path, Required: os.Getenv("OPENCODE_CONFIG") != ""}, {Path: r.subscriptionPath()}}
 }
