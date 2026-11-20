@@ -18,6 +18,44 @@ import (
 	"work2api/internal/streamwatch"
 )
 
+func TestResolvedCatalogKeyReachesQoderOnAllProtocols(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		encoded, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		raw, err := cosy.Decode(string(encoded))
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		var wire struct {
+			ModelConfig struct {
+				Key string `json:"key"`
+			} `json:"model_config"`
+		}
+		if err := json.Unmarshal(raw, &wire); err != nil || wire.ModelConfig.Key != "qmodel_latest" {
+			t.Error("wrong physical SKU", wire.ModelConfig.Key, err)
+		}
+		frame, _ := json.Marshal(map[string]any{"statusCodeValue": 200, "body": `{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`})
+		fmt.Fprintf(w, "data: %s\n\n", frame)
+	}))
+	defer srv.Close()
+	sess, err := cosy.NewSession(cosy.AuthIdentity{Uid: "fixture", UserType: "personal_standard"}, "fixture", "fixture", "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &Bridge{sess: sess, client: NewBearerClient(sess), templateBase: map[string]any{}, chatStreamURL: srv.URL}
+	for _, serve := range []func(context.Context, http.ResponseWriter, map[string]any) (ServeResult, error){b.ServeChat, b.ServeCodex, b.ServeClaude} {
+		w := httptest.NewRecorder()
+		_, err := serve(WithResolvedModel(t.Context(), "qmodel_latest"), w, map[string]any{"model": "Qwen4-Max-Preview", "input": "hi", "messages": []any{map[string]any{"role": "user", "content": "hi"}}})
+		if err != nil || w.Code != 200 || !strings.Contains(w.Body.String(), "ok") {
+			t.Fatal(w.Code, err, w.Body.String())
+		}
+	}
+}
+
 func TestQoderResponsesKeepStableItemsAndIncompleteUsage(t *testing.T) {
 	frames := []string{
 		`{"choices":[{"delta":{"reasoning_content":"think"}}]}`,

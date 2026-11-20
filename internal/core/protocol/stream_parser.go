@@ -11,10 +11,12 @@ import (
 
 	"work2api/internal/jsonutil"
 	"work2api/internal/streamwatch"
+	"work2api/internal/tokenusage"
 )
 
 type bridgeStreamParser struct {
 	chatIndexes              ToolCallIndexes
+	usageSnapshot            map[string]any
 	responseReasonHashes     map[string]hash.Hash
 	responseReasoningDone    map[string]bool
 	anthropicThinking        map[string]bool
@@ -120,7 +122,7 @@ func (parser *bridgeStreamParser) parseChatEvent(eventName string, value map[str
 		}
 	}
 	if usageMap := jsonutil.MapAt(value, "usage"); len(usageMap) > 0 {
-		usage := decodeOpenAIUsage(usageMap)
+		usage := parser.readUsage(usageMap, false)
 		events = append(events, bridgeStreamEvent{Kind: "usage", Usage: &usage})
 	}
 	for _, raw := range jsonutil.SliceAt(value, "choices") {
@@ -183,6 +185,17 @@ func (parser *bridgeStreamParser) parseAnthropic(value map[string]any) ([]bridge
 	return parser.parseAnthropicEvent("", value)
 }
 
+func (parser *bridgeStreamParser) readUsage(usage map[string]any, native bool) Usage {
+	if parser.usageSnapshot != nil {
+		usage = tokenusage.Merge(parser.usageSnapshot, usage)
+	}
+	parser.usageSnapshot = usage
+	if native {
+		return decodeAnthropicUsage(usage)
+	}
+	return decodeOpenAIUsage(usage)
+}
+
 func (parser *bridgeStreamParser) parseAnthropicEvent(eventName string, value map[string]any) ([]bridgeStreamEvent, error) {
 	typeName := jsonutil.StringAt(value, "type")
 	if typeName == "" {
@@ -193,7 +206,7 @@ func (parser *bridgeStreamParser) parseAnthropicEvent(eventName string, value ma
 		message := jsonutil.MapAt(value, "message")
 		events := []bridgeStreamEvent{{Kind: "start", ResponseID: jsonutil.StringAt(message, "id"), Model: jsonutil.StringAt(message, "model")}}
 		if usageMap := jsonutil.MapAt(message, "usage"); len(usageMap) > 0 {
-			usage := decodeAnthropicUsage(usageMap)
+			usage := parser.readUsage(usageMap, true)
 			events = append(events, bridgeStreamEvent{Kind: "usage", Usage: &usage})
 		}
 		return events, nil
@@ -250,7 +263,7 @@ func (parser *bridgeStreamParser) parseAnthropicEvent(eventName string, value ma
 	case "message_delta":
 		events := make([]bridgeStreamEvent, 0, 2)
 		if usageMap := jsonutil.MapAt(value, "usage"); len(usageMap) > 0 {
-			usage := decodeAnthropicUsage(usageMap)
+			usage := parser.readUsage(usageMap, true)
 			events = append(events, bridgeStreamEvent{Kind: "usage", Usage: &usage})
 		}
 		if stop := jsonutil.StringAt(value, "delta", "stop_reason"); stop != "" {
@@ -278,9 +291,17 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 	switch typeName {
 	case "error":
 		return []bridgeStreamEvent{{Kind: "error", Error: streamErrorMessage(value, "upstream Responses stream error"), ErrorType: streamErrorType(value)}}
-	case "response.created":
+	case "response.created", "response.in_progress":
 		response := jsonutil.MapAt(value, "response")
-		return []bridgeStreamEvent{{Kind: "start", ResponseID: jsonutil.StringAt(response, "id"), Model: jsonutil.StringAt(response, "model")}}
+		var events []bridgeStreamEvent
+		if typeName == "response.created" {
+			events = append(events, bridgeStreamEvent{Kind: "start", ResponseID: jsonutil.StringAt(response, "id"), Model: jsonutil.StringAt(response, "model")})
+		}
+		if u := jsonutil.MapAt(response, "usage"); len(u) > 0 {
+			usage := parser.readUsage(u, false)
+			events = append(events, bridgeStreamEvent{Kind: "usage", Usage: &usage})
+		}
+		return events
 	case "response.output_text.delta":
 		return []bridgeStreamEvent{{Kind: "text", Text: jsonutil.StringAt(value, "delta")}}
 	case "response.refusal.delta":
@@ -372,7 +393,7 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 			message := jsonutil.FirstString(jsonutil.StringAt(response, "error", "message"), jsonutil.StringAt(value, "error", "message"), "upstream Responses request failed")
 			events := []bridgeStreamEvent{{Kind: "error", Error: message, ErrorType: jsonutil.FirstString(jsonutil.StringAt(response, "error", "code"), "upstream_error")}}
 			if len(usageMap) > 0 {
-				usage := decodeOpenAIUsage(usageMap)
+				usage := parser.readUsage(usageMap, false)
 				events = append([]bridgeStreamEvent{{Kind: "usage", Usage: &usage}}, events...)
 			}
 			return events
@@ -394,7 +415,7 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 			}
 		}
 		if len(usageMap) > 0 {
-			usage := decodeOpenAIUsage(usageMap)
+			usage := parser.readUsage(usageMap, false)
 			events = append(events, bridgeStreamEvent{Kind: "usage", Usage: &usage})
 		}
 		return append(events, bridgeStreamEvent{Kind: "finish", Stop: stop}, bridgeStreamEvent{Kind: "done"})

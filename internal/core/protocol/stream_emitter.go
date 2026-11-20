@@ -750,15 +750,19 @@ func mergeBridgeUsage(destination *Usage, source Usage) {
 	if source.FinishReason != "" {
 		destination.FinishReason = source.FinishReason
 	}
-	if source.Input != 0 {
+	if source.InputKnown || source.Input != 0 {
 		destination.Input = source.Input
 	}
-	if source.Output != 0 {
+	if source.OutputKnown || source.Output != 0 {
 		destination.Output = source.Output
 	}
-	if source.Total != 0 {
+	if source.InputKnown || source.OutputKnown {
+		destination.Total = source.Total
+	} else if source.Total != 0 {
 		destination.Total = max(destination.Total, source.Total)
 	}
+	destination.InputKnown = destination.InputKnown || source.InputKnown
+	destination.OutputKnown = destination.OutputKnown || source.OutputKnown
 	if source.CachedKnown || source.Cached != 0 {
 		destination.Cached = source.Cached
 	}
@@ -767,6 +771,12 @@ func mergeBridgeUsage(destination *Usage, source Usage) {
 		destination.CacheCreation = source.CacheCreation
 	}
 	destination.CacheCreationKnown = destination.CacheCreationKnown || source.CacheCreationKnown
+	if source.CreationBreakdown.FiveMinutes != nil {
+		destination.CreationBreakdown.FiveMinutes = source.CreationBreakdown.FiveMinutes
+	}
+	if source.CreationBreakdown.OneHour != nil {
+		destination.CreationBreakdown.OneHour = source.CreationBreakdown.OneHour
+	}
 	if source.ReasoningKnown || source.Reasoning != 0 {
 		destination.Reasoning = source.Reasoning
 	}

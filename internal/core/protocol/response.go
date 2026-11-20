@@ -275,44 +275,44 @@ func decodeOpenAIUsage(usage map[string]any) Usage {
 	if total == 0 {
 		total = input + output
 	}
-	cached := jsonutil.FirstNonZero(jsonutil.IntAt(usage, "prompt_tokens_details", "cached_tokens"), jsonutil.IntAt(usage, "input_tokens_details", "cached_tokens"))
-	cacheCreation := jsonutil.FirstNonZero(
-		jsonutil.IntAt(usage, "cache_creation_input_tokens"),
-		jsonutil.IntAt(usage, "prompt_tokens_details", "cache_creation_input_tokens"),
-		jsonutil.IntAt(usage, "prompt_tokens_details", "cache_write_tokens"),
-		jsonutil.IntAt(usage, "input_tokens_details", "cache_creation_input_tokens"),
-	)
-	reasoning := jsonutil.FirstNonZero(jsonutil.IntAt(usage, "completion_tokens_details", "reasoning_tokens"), jsonutil.IntAt(usage, "output_tokens_details", "reasoning_tokens"))
-	if observed := tokenusage.Cached(usage); observed != nil {
-		cached = *observed
+	out := Usage{Input: input, Output: output, Total: total}
+	out.InputKnown, out.OutputKnown = tokenusage.KnownTotals(usage)
+	read, write := tokenusage.ValidCacheForInput(usage, input)
+	if read != nil {
+		out.Cached, out.CachedKnown = *read, true
 	}
-	reasoningKnown := false
+	if write != nil {
+		out.CacheCreation, out.CacheCreationKnown = *write, true
+		out.CreationBreakdown = tokenusage.CreationBreakdown(usage)
+	}
 	if observed := tokenusage.Reasoning(usage); observed != nil {
-		reasoning = *observed
-		reasoningKnown = true
+		out.Reasoning, out.ReasoningKnown = *observed, true
 	}
-	creationKnown := false
-	if observed := tokenusage.Created(usage); observed != nil && *observed >= 0 && *observed <= input {
-		cacheCreation = *observed
-		creationKnown = true
-	}
-	return Usage{Input: input, Output: output, Total: total, Cached: cached, CachedKnown: tokenusage.Cached(usage) != nil, CacheCreation: cacheCreation, CacheCreationKnown: creationKnown, Reasoning: reasoning, ReasoningKnown: reasoningKnown}
+	return out
 }
 
 func decodeAnthropicUsage(usage map[string]any) Usage {
 	input := jsonutil.IntAt(usage, "input_tokens")
 	cached := jsonutil.IntAt(usage, "cache_read_input_tokens")
-	cacheCreation := jsonutil.IntAt(usage, "cache_creation_input_tokens")
+	created := tokenusage.Created(usage)
+	cacheCreation := 0
+	if created != nil {
+		cacheCreation = *created
+	}
 	output := jsonutil.IntAt(usage, "output_tokens")
 	input += cached + cacheCreation
+	inputKnown, outputKnown := tokenusage.KnownTotals(usage)
 	return Usage{
+		InputKnown:         inputKnown,
+		OutputKnown:        outputKnown,
 		Input:              input,
 		Output:             output,
 		Total:              input + output,
 		Cached:             cached,
 		CachedKnown:        tokenusage.Cached(usage) != nil,
 		CacheCreation:      cacheCreation,
-		CacheCreationKnown: tokenusage.Created(usage) != nil,
+		CacheCreationKnown: created != nil,
+		CreationBreakdown:  tokenusage.CreationBreakdown(usage),
 	}
 }
 
@@ -326,7 +326,12 @@ func openAIUsage(usage Usage) map[string]any {
 	// invented zero would claim an upstream measurement that never happened,
 	// and a Chat document that invents one re-enters the bridge as a real
 	// observation when it is converted again for Responses.
-	if details := cacheDetails(usage); len(details) > 0 {
+	details := cacheDetails(usage)
+	if usage.CacheCreationKnown {
+		details["cache_write_tokens"] = usage.CacheCreation
+	}
+	usage.CreationBreakdown.WriteTo(out)
+	if len(details) > 0 {
 		out["prompt_tokens_details"] = details
 	}
 	if usage.ReasoningKnown {
@@ -350,6 +355,10 @@ func responsesUsage(usage Usage) map[string]any {
 	if details := cacheDetails(usage); len(details) > 0 {
 		out["input_tokens_details"] = details
 	}
+	if usage.CacheCreationKnown {
+		out["cache_creation_input_tokens"] = usage.CacheCreation
+	}
+	usage.CreationBreakdown.WriteTo(out)
 	if usage.ReasoningKnown {
 		out["output_tokens_details"] = map[string]any{"reasoning_tokens": usage.Reasoning}
 	}
@@ -366,10 +375,13 @@ func cacheDetails(usage Usage) map[string]any {
 
 func anthropicUsage(usage Usage) map[string]any {
 	out := map[string]any{
-		"input_tokens":                max(usage.Input-usage.Cached-usage.CacheCreation, 0),
-		"output_tokens":               usage.Output,
-		"cache_creation_input_tokens": usage.CacheCreation,
+		"input_tokens":  max(usage.Input-usage.Cached-usage.CacheCreation, 0),
+		"output_tokens": usage.Output,
 	}
+	if usage.CacheCreationKnown || usage.CacheCreation != 0 {
+		out["cache_creation_input_tokens"] = usage.CacheCreation
+	}
+	usage.CreationBreakdown.WriteTo(out)
 	if usage.CachedKnown || usage.Cached != 0 {
 		out["cache_read_input_tokens"] = usage.Cached
 	}

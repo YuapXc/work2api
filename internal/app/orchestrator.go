@@ -54,10 +54,12 @@ type Principal struct {
 	SharedModels  map[string]bool
 	// EffectiveModel is the resolved model name after prepareModel (empty
 	// before). Keeps queue accounting and post-wait model authorization aligned.
-	EffectiveModel string
-	RouteModel     string // logical route; channel/account permissions remain physical
-	routeFacts     *routeRequestFacts
-	quota          *portalQuotaReservation
+	EffectiveModel       string
+	modelProtocol        provider.Protocol
+	catalogModelResolved bool
+	RouteModel           string // logical route; channel/account permissions remain physical
+	routeFacts           *routeRequestFacts
+	quota                *portalQuotaReservation
 }
 
 // Orchestrator holds shared runtime state and the request pipeline.
@@ -328,6 +330,10 @@ func parseJSONStringArray(raw string) []string {
 // key is separately gated by PortalModels, and portal authorization is deny by
 // default). Retry/failover must not widen this: both paths share modelAllowed.
 func (s *Server) authorizeModel(principal *Principal, requestedModel string) *apiError {
+	return s.authorizeResolvedModel(principal, requestedModel, s.o.resolveModel(requestedModel))
+}
+
+func (s *Server) authorizeResolvedModel(principal *Principal, requestedModel, resolved string) *apiError {
 	if principal == nil {
 		return nil
 	}
@@ -336,7 +342,7 @@ func (s *Server) authorizeModel(principal *Principal, requestedModel string) *ap
 		if model == "" {
 			model = "auto"
 		}
-		if !s.portalModelAllowed(principal, model, s.o.resolveModel(model)) {
+		if !s.portalModelAllowed(principal, model, resolved) {
 			return errBody(403, "该模型不在当前用户或 Key 的调用范围（模型："+model+"）", "model_not_allowed")
 		}
 		return nil
@@ -348,7 +354,7 @@ func (s *Server) authorizeModel(principal *Principal, requestedModel string) *ap
 	if model == "" {
 		model = "auto"
 	}
-	if modelAllowed(principal, model, s.o.resolveModel(model)) {
+	if modelAllowed(principal, model, resolved) {
 		return nil
 	}
 	return errBody(403, "该 API 密钥未被授权使用模型 "+model+"（可在 WebUI「API 密钥」中调整可用模型）", "model_not_allowed")
@@ -396,7 +402,7 @@ func modelAllowed(principal *Principal, model, resolved string) bool {
 	return false
 }
 
-func (s *Server) prepareModel(principal *Principal, payload map[string]any) *apiError {
+func (s *Server) prepareModel(principal *Principal, payload map[string]any, protocols ...provider.Protocol) *apiError {
 	if payload == nil {
 		return errBody(400, "请求体必须是 JSON 对象", "invalid_request_error")
 	}
@@ -458,16 +464,55 @@ func (s *Server) prepareModel(principal *Principal, payload map[string]any) *api
 		return nil
 	}
 	principal.EffectiveModel = s.o.resolveModel(model)
-	if aerr := s.authorizeModel(principal, model); aerr != nil {
+	principal.catalogModelResolved = false
+	if len(protocols) > 0 {
+		principal.modelProtocol = protocols[0]
+	}
+	if strings.Contains(principal.EffectiveModel, "/") {
+		rt, _ := s.o.runtimes.ForModel(principal.EffectiveModel)
+		if resolver, ok := rt.(provider.CatalogNameResolver); ok {
+			target, known, err := resolver.ResolveCatalogName(principal.modelProtocol, principal.EffectiveModel, s.catalogNameVisibility(principal, model))
+			if err != nil {
+				return errBody(400, err.Error(), "invalid_request_error")
+			}
+			if target != "" {
+				principal.EffectiveModel = target
+				principal.catalogModelResolved = known
+			}
+		}
+	}
+	if aerr := s.authorizeResolvedModel(principal, model, principal.EffectiveModel); aerr != nil {
 		return aerr
 	}
 	if principal != nil && principal.UserID > 0 {
-		principal.AccountScope = principal.ModelScopes[s.o.resolveModel(model)]
+		principal.AccountScope = principal.ModelScopes[principal.EffectiveModel]
 		if principal.AccountScope == nil {
 			principal.AccountScope = map[string]bool{}
 		}
 	}
 	return nil
+}
+
+func (s *Server) catalogNameVisibility(p *Principal, requested string) func(string, string) bool {
+	if p.UserID == 0 {
+		if len(p.AllowedModels) == 0 {
+			return nil
+		}
+		return func(id, _ string) bool { return modelAllowed(p, requested, id) }
+	}
+	var fixed map[string]bool
+	if p.ModelPolicy != "follow" {
+		settings, _ := s.o.db.GetSettings()
+		aliases := parseModelAliases(settings["model_aliases"])
+		fixed = make(map[string]bool, len(p.AllowedModels))
+		for _, id := range p.AllowedModels {
+			if target, ok := aliases[id]; ok {
+				id = target
+			}
+			fixed[strings.TrimPrefix(id, "workbuddy/")] = true
+		}
+	}
+	return func(id, uid string) bool { return p.ModelScopes[id][uid] && (fixed == nil || fixed[id]) }
 }
 
 func (o *Orchestrator) limiter(uid string) *ratelimit.Limiter {

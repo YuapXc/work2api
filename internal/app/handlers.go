@@ -32,7 +32,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	payload = coreprotocol.NormalizeInput(coreprotocol.Chat, payload)
 	r = r.WithContext(context.WithValue(r.Context(), normalizedInputKey{}, provider.ProtocolChat))
-	if aerr := s.prepareModel(principal, payload); aerr != nil {
+	if aerr := s.prepareModel(principal, payload, provider.ProtocolChat); aerr != nil {
 		writeAPIErr(w, aerr)
 		return
 	}
@@ -109,7 +109,7 @@ func (s *Server) handleConverted(w http.ResponseWriter, r *http.Request, protoco
 	}
 	payload = coreprotocol.NormalizeInput(coreprotocol.Protocol(protocol), payload)
 	r = r.WithContext(context.WithValue(r.Context(), normalizedInputKey{}, provider.Protocol(protocol)))
-	if aerr := s.prepareModel(principal, payload); aerr != nil {
+	if aerr := s.prepareModel(principal, payload, provider.Protocol(protocol)); aerr != nil {
 		writeAPIErr(w, aerr)
 		return
 	}

@@ -32,7 +32,7 @@ func (s *Server) portalTraeOAuth(w http.ResponseWriter, r *http.Request) {
 			writeAPIErr(w, errBody(403, "请确认贡献及共享范围，且门户必须已启用", "forbidden"))
 			return
 		}
-		result, err = channel.BeginOwnedLogin(map[string]any{"product": body["product"]}, owner)
+		result, err = channel.BeginOwnedLogin(map[string]any{"product": body["product"], "account_type": body["account_type"]}, owner)
 		if err == nil {
 			result = map[string]any{"task_id": result["login_id"], "auth_url": result["login_url"], "manual_callback": true, "expires_at": time.Now().Add(10 * time.Minute).Unix()}
 		}

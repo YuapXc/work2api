@@ -14,10 +14,12 @@ import (
 )
 
 type accountModelSnapshot struct {
-	models    map[string]bool
-	catalog   []provider.CatalogModel
-	accountID string
-	expires   time.Time
+	models     map[string]bool
+	names      map[string][]string
+	generation uint64
+	catalog    []provider.CatalogModel
+	accountID  string
+	expires    time.Time
 }
 type servingAccount struct {
 	account *account.Account
@@ -187,6 +189,7 @@ func (r *Runtime) nextAccountBridge(ctx context.Context, region account.Region, 
 		r.mu.Lock()
 		cool := time.Now().Before(r.accountCooldowns[key])
 		snapshot := r.accountModels[key]
+		current := snapshot.generation == r.bridgeGeneration[acct.ID]
 		r.mu.Unlock()
 		if cool {
 			continue
@@ -194,7 +197,7 @@ func (r *Runtime) nextAccountBridge(ctx context.Context, region account.Region, 
 		tried[acct.ID] = true
 		probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		var probeErr error
-		if !snapshot.expires.After(time.Now()) {
+		if !current || !snapshot.expires.After(time.Now()) {
 			probeErr = r.refreshAccountCatalog(probeCtx, acct, secret, key, false)
 			if probeErr == nil {
 				r.mu.Lock()

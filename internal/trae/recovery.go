@@ -22,7 +22,7 @@ import (
 	"work2api/internal/trae/upstream"
 )
 
-func (r *Runtime) sendPreparedChat(ctx context.Context, identity *auth.Auth, body []byte) (io.ReadCloser, int, []byte, http.Header, error, bool) {
+func (r *Runtime) sendPreparedChat(ctx context.Context, identity *auth.Auth, body []byte, console bool) (io.ReadCloser, int, []byte, http.Header, error, bool) {
 	var connected, handshakeFailed atomic.Bool
 	trace := &httptrace.ClientTrace{
 		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
@@ -30,7 +30,7 @@ func (r *Runtime) sendPreparedChat(ctx context.Context, identity *auth.Auth, bod
 			handshakeFailed.Store(err != nil && (transientConnectError(err) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)))
 		},
 	}
-	stream, status, raw, headers, err := r.client(httptrace.WithClientTrace(ctx, trace)).ChatPreparedStreamWithHeaders(identity, body)
+	stream, status, raw, headers, err := r.client(httptrace.WithClientTrace(ctx, trace)).ChatPreparedStreamWithHeaders(identity, body, console)
 	var dial *net.OpError
 	var dns *net.DNSError
 	beforeSend := err != nil && ctx.Err() == nil && !connected.Load() && (handshakeFailed.Load() ||

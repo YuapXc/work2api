@@ -246,6 +246,10 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 		if a == nil || identity == nil {
 			continue
 		}
+		consoleRoute := identity.UsesEnterpriseConsole()
+		if identityInfo.Enterprise != nil && !consoleRoute {
+			continue
+		}
 		if err = r.ensure(ctx, identity); err != nil {
 			if ctx.Err() == nil && attempt < 2 {
 				r.cool(ref.LocalID, upstream.ErrSessionDead)
@@ -259,7 +263,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 		streamwatch.StartAttempt(ctx)
 		prepared, limits := upstream.PrepareBodyResolvedWithLimits(encoded, identity.Variant, identityModel, identityInfo)
 		report.EffectiveLimits = limits
-		stream, status, errorBody, headers, sendErr, beforeSend := r.sendPreparedChat(ctx, identity, prepared)
+		stream, status, errorBody, headers, sendErr, beforeSend := r.sendPreparedChat(ctx, identity, prepared, consoleRoute)
 		streamwatch.AttemptHeaders(ctx, status, headers)
 		streamwatch.AttemptResult(ctx, status)
 		if sendErr != nil {
@@ -286,7 +290,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 					}
 					attempt++ // the same-identity retry shares the total dispatch budget
 					streamwatch.StartAttempt(ctx)
-					stream, status, errorBody, headers, sendErr, beforeSend = r.sendPreparedChat(ctx, identity, prepared)
+					stream, status, errorBody, headers, sendErr, beforeSend = r.sendPreparedChat(ctx, identity, prepared, consoleRoute)
 					streamwatch.AttemptHeaders(ctx, status, headers)
 					streamwatch.AttemptResult(ctx, status)
 					if sendErr != nil {
@@ -385,7 +389,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 		go func() {
 			defer close(readerDone)
 			defer stream.Close()
-			pipeWriter.CloseWithError(normalizeStream(pipeWriter, events, first, "trae/"+model, initialUsage))
+			pipeWriter.CloseWithError(normalizeStream(pipeWriter, events, first, "trae/"+model, initialUsage, limits["max_tokens"]))
 		}()
 		stop := context.AfterFunc(ctx, func() { stream.Close(); pipeReader.CloseWithError(ctx.Err()) })
 		var usage protocol.Usage
@@ -472,7 +476,7 @@ func (r *Runtime) coolWithDelay(id string, kind upstream.ErrKind, delay time.Dur
 	}
 }
 
-func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent, model string, initialUsage map[string]any) error {
+func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent, model string, initialUsage map[string]any, sentLimit ...int) error {
 	id := fmt.Sprintf("chatcmpl-trae-%d", time.Now().UnixNano())
 	var toolIndexes protocol.ToolCallIndexes
 	emit := func(delta map[string]any, finish any, usage map[string]any) error {
@@ -517,6 +521,7 @@ func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent
 		return nil
 	}
 	toolsSeen := false
+	completionTokens, _ := initialUsage["completion_tokens"].(float64)
 	for e := first; e != nil; {
 		switch e.Event {
 		case "error":
@@ -559,7 +564,7 @@ func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent
 						}
 					}
 					delta["tool_calls"] = list
-					toolsSeen = true
+					toolsSeen = toolsSeen || len(list) != 0
 				}
 			}
 			if len(delta) > 0 {
@@ -579,6 +584,9 @@ func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent
 				}
 			}
 		case "token_usage":
+			if n, ok := e.Usage["completion_tokens"].(float64); ok {
+				completionTokens = n
+			}
 			if err := emit(map[string]any{}, nil, e.Usage); err != nil {
 				return err
 			}
@@ -592,6 +600,8 @@ func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent
 			}
 			if (toolsSeen || textTools.Seen) && finish == "stop" {
 				finish = "tool_calls"
+			} else if finish == "stop" && len(sentLimit) != 0 && sentLimit[0] > 0 && completionTokens >= float64(sentLimit[0]) {
+				finish = "length"
 			}
 			if err := emit(map[string]any{}, finish, nil); err != nil {
 				return err

@@ -797,6 +797,7 @@ func (s *Server) dispatchModelRoute(w http.ResponseWriter, r *http.Request, prot
 		attempt := *p
 		attempt.RouteModel = ""
 		attempt.EffectiveModel = s.o.resolveModel(member)
+		attempt.catalogModelResolved = true // route members already passed physical catalog and account checks
 		if p.UserID > 0 {
 			attempt.AccountScope = p.ModelScopes[attempt.EffectiveModel]
 		}

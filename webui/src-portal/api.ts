@@ -131,7 +131,7 @@ export const api = {
   contributions: (signal?: AbortSignal) => call<{ contributions: ContributionInfo[] }>('GET', '/portal/api/contributions', undefined, signal),
   contributionBegin: (site: string, accepted: boolean) =>
     call<{ task_id: string; auth_url: string; site: string; expires_at: number }>('POST', '/portal/api/contributions/begin', { site, accepted }),
-	traeBegin: (product:string,accepted:boolean) => call<{task_id:string;auth_url:string;expires_at:number}>('POST','/portal/api/providers/trae/oauth/begin',{product,accepted}),
+	traeBegin: (product:string,accepted:boolean,account_type:'personal'|'enterprise'='personal') => call<{task_id:string;auth_url:string;expires_at:number}>('POST','/portal/api/providers/trae/oauth/begin',{product,accepted,account_type}),
 	traePoll: (task_id:string) => call<{status:string;message?:string;account_uid_masked?:string;models_verified?:boolean}>('POST','/portal/api/providers/trae/oauth/poll',{task_id}),
 	traeComplete: (task_id:string,callback_url:string) => call('POST','/portal/api/providers/trae/oauth/complete',{task_id,callback_url}),
 	traeCancel: (task_id:string) => call('POST','/portal/api/providers/trae/oauth/cancel',{task_id}),

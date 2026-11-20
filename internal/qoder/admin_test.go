@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -131,6 +132,50 @@ func TestCatalogEmptySnapshotAndAccountIsolation(t *testing.T) {
 	got = r.Models(context.Background())
 	if len(got) != 2 || got[0].ID == "qoder/authorized" || got[0].Extra["catalog_source"] != "fallback" {
 		t.Fatal("credential rotation reused old catalog", got)
+	}
+}
+
+func TestCatalogNameResolvesOnlyOneVisiblePhysicalModel(t *testing.T) {
+	previous := account.DataRoot()
+	account.SetDataRoot(t.TempDir())
+	t.Cleanup(func() { account.SetDataRoot(previous) })
+	r := &Runtime{accountModels: map[[32]byte]accountModelSnapshot{}, bridgeGeneration: map[string]uint64{"old": 1}}
+	add := func(id, key, name string) {
+		r.accountModels[sha256.Sum256([]byte(id))] = accountModelSnapshot{accountID: id, models: map[string]bool{key: true}, names: catalogNames([]provider.CatalogModel{{ID: "qoder/" + key, Name: name}})}
+	}
+	add("one", "qmodel_latest", "Qwen4-Max-Preview")
+	add("two", "jmodel", "Qwen4 Max Preview")
+	add("old", "retired", "Old SKU")
+	visible := func(id, uid string) bool { return id == "qoder/qmodel_latest" && uid == PortalAccountUID("one") }
+	for _, name := range []string{"qoder/Qwen4_Max Preview", "qoder/qwen4maxpreview", "qoder/qmodel_latest"} {
+		if key, ok, err := r.ResolveCatalogName(provider.ProtocolResponses, name, visible); err != nil || !ok || key != "qoder/qmodel_latest" {
+			t.Fatal(name, key, err)
+		}
+	}
+	if _, _, err := r.ResolveCatalogName(provider.ProtocolChat, "qoder/Qwen4-Max-Preview", nil); err == nil {
+		t.Fatal("ambiguous name selected a SKU")
+	}
+	if key, _, _ := r.ResolveCatalogName(provider.ProtocolChat, "qoder/Old SKU", nil); key == "qoder/retired" {
+		t.Fatal("stale credential used")
+	}
+	cold := &Runtime{}
+	for _, tc := range []struct {
+		name, target string
+		known        bool
+	}{
+		{"Qwen4-Max-Preview", "qmodel_latest", true}, {"Qwen4 Max", "qmodel_latest", true},
+		{"Step_5 Preview", "jmodel", true}, {"DeepSeek-V4-Pro", "dmodel", true}, {"Sonus", "smodel", true},
+		{"Future-SKU", "future-sku", false}, {"Qwen4-Max-Unlisted", "qwen4-max-unlisted", false},
+	} {
+		if key, known, err := cold.ResolveCatalogName(provider.ProtocolChat, "qoder/"+tc.name, nil); err != nil || known != tc.known || key != "qoder/"+tc.target || bridge.MapModel("codex", tc.name) != tc.target {
+			t.Fatal(tc, key, known, err)
+		}
+	}
+	if err := account.SaveSettings(&account.Settings{ModelMappings: map[string]map[string]string{"claude": {"Qwen4-Max-Preview": "manual"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if key, _, err := r.ResolveCatalogName(provider.ProtocolAnthropic, "qoder/Qwen4-Max-Preview", nil); err != nil || key != "qoder/manual" {
+		t.Fatal(key, err)
 	}
 }
 
@@ -275,6 +320,11 @@ func TestPrivateFailoverEligibilityAndAffinityInvalidation(t *testing.T) {
 	save("a-global", account.RegionGlobal, "qfmodel")
 	save("b-other-model", account.RegionCN, "other")
 	backup := save("c-backup", account.RegionCN, "qfmodel")
+	w := httptest.NewRecorder()
+	_, missing := r.Serve(t.Context(), provider.ServeRequest{Writer: w, Protocol: provider.ProtocolChat, CatalogModelResolved: true, Payload: map[string]any{"model": "qoder/absent"}})
+	if missing == nil || w.Code != 503 || !strings.Contains(w.Body.String(), `"type":"model_unavailable"`) {
+		t.Fatal(w.Code, w.Body.String(), missing)
+	}
 	candidate, e := r.nextAccountBridge(context.Background(), account.RegionCN, "qfmodel", map[string]bool{primary.ID: true})
 	if e != nil || candidate == nil || candidate.account.ID != backup.ID {
 		t.Fatal(candidate, e)

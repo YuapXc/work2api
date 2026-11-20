@@ -409,7 +409,14 @@ func (r *Runtime) ActivateAccount(id string) error {
 	}
 	r.mu.Lock()
 	delete(r.bridges, id) // rebuild bridge on next use
+	previous := r.bridgeGeneration[id]
 	r.bridgeGeneration[id]++
+	for key, snapshot := range r.accountModels {
+		if snapshot.accountID == id && snapshot.generation == previous {
+			snapshot.generation = r.bridgeGeneration[id]
+			r.accountModels[key] = snapshot
+		}
+	}
 	r.mu.Unlock()
 	return nil
 }

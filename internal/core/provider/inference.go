@@ -53,7 +53,8 @@ type UsageReport struct {
 
 // ServeRequest carries a single inference call to a Runtime.
 type ServeRequest struct {
-	InputNormalized bool // core-owned metadata, never read from the client JSON
+	InputNormalized      bool // core-owned metadata, never read from the client JSON
+	CatalogModelResolved bool // physical key already resolved before authorization
 
 	Caller   Caller
 	Protocol Protocol
@@ -87,6 +88,11 @@ type Runtime interface {
 // ModelRefresher discovers models on explicit or scheduled refresh. Ordinary
 // Models calls remain read-only snapshots for management/catalog polling.
 type ModelRefresher interface{ RefreshModels(context.Context) error }
+
+type CatalogNameResolver interface {
+	// Return the wire model ID even for an unknown literal; known distinguishes a catalog or mapping hit.
+	ResolveCatalogName(Protocol, string, func(modelID, accountUID string) bool) (string, bool, error)
+}
 
 // BackgroundMaintainer participates in the shared cancellable scheduler.
 type BackgroundMaintainer interface {

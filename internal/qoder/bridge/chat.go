@@ -78,6 +78,7 @@ func (r *ServeResult) anthropicUsage() map[string]any {
 	if write != nil {
 		out["cache_creation_input_tokens"] = *write
 		fresh -= *write
+		tokenusage.CreationBreakdown(r.Usage).WriteTo(out)
 	}
 	if r.inputTokensKnown {
 		out["input_tokens"] = fresh

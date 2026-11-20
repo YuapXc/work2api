@@ -209,7 +209,57 @@ func Sanitize(body Body, efforts map[string][]string) Body {
 	body = InjectThinking(body)
 	body = BackfillReasoningContent(body)
 	body = MirrorUpstreamReasoning(body)
+	body = kimiCallText(body)
 	body, _ = GuardEmptyTextParts(body, false)
+	return body
+}
+
+func kimiCallText(body Body) Body {
+	model, _ := body["model"].(string)
+	model = strings.ToLower(model)
+	if model != "kimi-k3.1-pro" && !strings.HasPrefix(model, "kimi-k3.1-pro-") {
+		return body
+	}
+	messages, _ := body["messages"].([]any)
+	var out []any
+	for i, raw := range messages {
+		msg, _ := raw.(map[string]any)
+		calls, _ := msg["tool_calls"].([]any)
+		if msg["role"] != "assistant" || len(calls) == 0 {
+			continue
+		}
+		switch content := msg["content"].(type) {
+		case nil:
+		case string:
+			if content != "" {
+				continue
+			}
+		case []any:
+			empty := true
+			for _, part := range content {
+				p, _ := part.(map[string]any)
+				if p["type"] != "text" || (p["text"] != nil && p["text"] != "") {
+					empty = false
+					break
+				}
+			}
+			if !empty {
+				continue
+			}
+		default:
+			continue
+		}
+		if out == nil {
+			out = append([]any(nil), messages...)
+		}
+		m := maps.Clone(msg)
+		m["content"] = " "
+		out[i] = m
+	}
+	if out != nil {
+		body = maps.Clone(body)
+		body["messages"] = out
+	}
 	return body
 }
 

@@ -135,7 +135,7 @@ func (c *AnthropicStreamConverter) Finish() string {
 func anthropicUsage(u map[string]any) map[string]any {
 	input, output := tokenusage.Totals(u)
 	out := map[string]any{"input_tokens": input, "output_tokens": output}
-	read, write := tokenusage.ValidCache(u)
+	read, write := tokenusage.ValidCacheForInput(u, input)
 	fresh := input
 	if read != nil {
 		fresh -= *read
@@ -144,10 +144,7 @@ func anthropicUsage(u map[string]any) map[string]any {
 	if write != nil {
 		fresh -= *write
 		out["cache_creation_input_tokens"] = *write
-	}
-	// Preserve the established zero creation field when a read observation exists.
-	if read != nil && write == nil {
-		out["cache_creation_input_tokens"] = 0
+		tokenusage.CreationBreakdown(u).WriteTo(out)
 	}
 	out["input_tokens"] = fresh
 	return out

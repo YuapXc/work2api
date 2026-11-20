@@ -33,6 +33,7 @@ const importing=ref(false)
 async function importCredential(){if(importing.value||!accepted.value||!credential.value.trim()||disposed)return;importing.value=true;try{await api.importContribution(channel.value as 'qoder'|'opencode',credential.value.trim(),channel.value==='qoder'?{region:qoderRegion.value}:{tier:opencodeTier.value},accepted.value);credential.value='';if(disposed)return;await load();emit('refresh');toast.success('个人凭据已贡献')}catch(e:any){toast.error(e.message)}finally{importing.value=false}}
 	const workbuddySite=ref<'cn' | 'intl' | 'intl-codebuddy'>('cn')
 	const product=ref('cn')
+const traeAccountType=ref<'personal'|'enterprise'>('personal')
 	const taskChannel=ref('workbuddy')
 	const callbackURL=ref('')
 	const callbackBusy=ref(false)
@@ -54,7 +55,7 @@ async function begin() {
   pollStatus.value = ''
   try {
     taskChannel.value=channel.value
-    const res = channel.value==='trae' ? await api.traeBegin(product.value,accepted.value) : channel.value==='qoder' ? await api.qoderBegin(qoderRegion.value,accepted.value) : await api.contributionBegin(workbuddySite.value, accepted.value)
+    const res = channel.value==='trae' ? await api.traeBegin(product.value,accepted.value,traeAccountType.value) : channel.value==='qoder' ? await api.qoderBegin(qoderRegion.value,accepted.value) : await api.contributionBegin(workbuddySite.value, accepted.value)
     if (disposed) { void cancelTask(res.task_id).catch(() => {}); return }
     authUrl.value = res.auth_url
     taskId.value = res.task_id
@@ -158,6 +159,7 @@ async function share(c: ContributionInfo) {
         <select v-model="channel" aria-label="账号渠道" :disabled="!!taskId || begining || importing" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="workbuddy">WorkBuddy</option><option value="trae">Trae</option><option value="qoder">Qoder</option><option value="opencode">OpenCode</option></select>
         <select v-if="channel==='workbuddy'" v-model="workbuddySite" aria-label="登录站点" :disabled="!!taskId || begining || importing" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="cn">国内 CodeBuddy</option><option value="intl">国际 WorkBuddy</option><option value="intl-codebuddy">国际 CodeBuddy</option></select>
         <select v-if="channel==='trae'" v-model="product" aria-label="Trae 产品" :disabled="!!taskId || begining || importing" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="cn">国内 IDE</option><option value="solo">国内 Work/SOLO</option></select>
+        <select v-if="channel==='trae'" v-model="traeAccountType" aria-label="Trae 账号类型" :disabled="!!taskId || begining || importing" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="personal">个人账号</option><option value="enterprise">企业账号</option></select>
         <template v-if="channel==='qoder'"><select v-model="qoderRegion" aria-label="Qoder 区域" :disabled="!!taskId || begining || importing" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="cn">国内</option><option value="global">国际</option></select><select v-model="qoderMethod" aria-label="Qoder 授权方式" :disabled="!!taskId || begining || importing" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="oauth">扫码授权</option><option value="pat">个人 PAT</option></select></template>
         <select v-if="channel==='opencode'" v-model="opencodeTier" aria-label="OpenCode 密钥类型" :disabled="importing" class="rounded-lg border border-line bg-bg p-2 text-small"><option value="zen">Zen API Key</option><option value="go">Go API Key</option></select>
       </div>

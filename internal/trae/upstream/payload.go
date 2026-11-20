@@ -85,7 +85,49 @@ func PrepareBodyResolvedWithLimits(src []byte, variant, resolvedModel string, mo
 			out[k] = v
 		}
 	}
+	if v, ok := obj["max_completion_tokens"].(float64); ok {
+		out["max_tokens"] = v
+	}
 	if len(models) > 0 {
+		info := models[0]
+		if info.ID == model && info.ConsoleRoute && info.Enterprise != nil {
+			ent := info.Enterprise
+			out["config_source"], out["is_custom_model"] = 2, true
+			if ent.ModelName != "" {
+				out["model_name"] = ent.ModelName
+			}
+			if ent.Provider != "" {
+				out["provider"] = ent.Provider
+			}
+		}
+		asked, exists := obj["max_completion_tokens"]
+		if !exists {
+			asked, exists = obj["max_tokens"]
+		}
+		if info.ID == model {
+			limit := float64(info.MaxTokens)
+			if exists {
+				n, _ := asked.(float64)
+				if n <= 0 || n > 1<<53 || n != float64(int64(n)) {
+					limit = 0
+				} else if limit <= 0 || n < limit {
+					limit = n
+				}
+			}
+			if limit > 0 {
+				out["max_tokens"] = limit
+				if ent := info.Enterprise; info.ConsoleRoute && ent != nil {
+					hyper := map[string]any{"max_tokens": limit}
+					if ent.PromptMax > 0 {
+						hyper["prompt_max_tokens"] = ent.PromptMax
+					}
+					if info.Multimodal != nil {
+						hyper["multimodal"] = *info.Multimodal
+					}
+					out["enterprise_custom_hyper_params"] = hyper
+				}
+			}
+		}
 		if re, ok := obj["reasoning_effort"].(string); ok {
 			if native, known := models[0].NativeEffort(re); known {
 				obj["reasoning_effort"] = native

@@ -403,17 +403,12 @@ func (c *ResponsesStreamConverter) responseObj(status string) map[string]any {
 	if c.usage != nil {
 		// cached_tokens 用上游真实值（未上报则省略该字段）——硬编码 0 会让
 		// 客户端把每次请求都当成全量 miss。
-		details := map[string]any{}
-		cached := upstreamCachedTokens(c.usage)
-		if cached != nil {
-			details["cached_tokens"] = *cached
-		}
 		inputTokens, outputTokens := tokenusage.Totals(c.usage)
+		cached, write := tokenusage.ValidCacheForInput(c.usage, inputTokens)
 		usageMap := map[string]any{
-			"input_tokens":         inputTokens,
-			"input_tokens_details": details,
-			"output_tokens":        outputTokens,
-			"total_tokens":         inputTokens + outputTokens,
+			"input_tokens":  inputTokens,
+			"output_tokens": outputTokens,
+			"total_tokens":  inputTokens + outputTokens,
 		}
 		// Codex treats this optional object as a complete structure: an empty
 		// object fails to decode because reasoning_tokens is required. Preserve
@@ -422,7 +417,12 @@ func (c *ResponsesStreamConverter) responseObj(status string) map[string]any {
 			usageMap["output_tokens_details"] = map[string]any{"reasoning_tokens": *reasoning}
 		}
 		if cached != nil {
+			usageMap["input_tokens_details"] = map[string]any{"cached_tokens": *cached}
 			usageMap["cache_read_input_tokens"] = *cached
+		}
+		if write != nil {
+			usageMap["cache_creation_input_tokens"] = *write
+			tokenusage.CreationBreakdown(c.usage).WriteTo(usageMap)
 		}
 		usage = usageMap
 	}
@@ -501,12 +501,6 @@ func intOrAny(m map[string]any, keys ...string) int {
 		}
 	}
 	return 0
-}
-
-// upstreamCachedTokens returns only valid observations; absence stays unknown.
-func upstreamCachedTokens(u map[string]any) *int {
-	read, _ := tokenusage.ValidCache(u)
-	return read
 }
 
 func itoa(n int) string {

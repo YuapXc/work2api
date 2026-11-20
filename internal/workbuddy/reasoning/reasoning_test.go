@@ -29,6 +29,31 @@ func BenchmarkUpstreamHistoryGuards(b *testing.B) {
 	}
 }
 
+func TestKimiToolContinuationKeepsCallAndSource(t *testing.T) {
+	calls := []any{map[string]any{"id": "call_1", "type": "function", "function": map[string]any{"name": "lookup", "arguments": `{"value":""}`}}}
+	for _, tc := range []struct {
+		model         string
+		content, want any
+	}{
+		{"kimi-k3.1-pro", nil, " "}, {"Kimi-K3.1-Pro-Highspeed", "", " "},
+		{"kimi-k3.1-pro", []any{map[string]any{"type": "text", "text": ""}}, " "},
+		{"kimi-k3.1-pro", "answer", "answer"}, {"kimi-k3.1-pro", "  ", "  "},
+		{"kimi-k3", nil, nil}, {"kimi-k3.1-prototype", nil, nil}, {"deepseek-v4.1-flash", "", ""},
+	} {
+		msg := map[string]any{"role": "assistant", "content": tc.content, "tool_calls": calls}
+		body := Body{"model": tc.model, "messages": []any{msg}}
+		got := kimiCallText(body)["messages"].([]any)[0].(map[string]any)
+		if !reflect.DeepEqual(got["content"], tc.want) || !reflect.DeepEqual(msg["content"], tc.content) || !reflect.DeepEqual(got["tool_calls"], calls) {
+			t.Fatalf("%s: %#v", tc.model, got)
+		}
+	}
+	body := Body{"model": "kimi-k3.1-pro", "messages": []any{map[string]any{"role": "user", "content": "ask"}, map[string]any{"role": "assistant", "content": nil, "tool_calls": calls}, map[string]any{"role": "tool", "tool_call_id": "call_1", "content": "found"}}}
+	msgs := Sanitize(body, nil)["messages"].([]any)
+	if m := msgs[len(msgs)-2].(map[string]any); m["content"] != " " || !reflect.DeepEqual(m["tool_calls"], calls) || msgs[len(msgs)-1].(map[string]any)["tool_call_id"] != "call_1" {
+		t.Fatal(msgs)
+	}
+}
+
 func TestWorkBuddyDeepseekReasoningReplay(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

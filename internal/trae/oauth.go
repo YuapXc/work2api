@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"work2api/internal/trae/auth"
@@ -20,6 +21,7 @@ import (
 )
 
 type loginState struct {
+	EnterpriseLogin                              bool
 	Product, Verifier, Machine, Device, Callback string
 	Expires                                      time.Time
 	Listener                                     net.Listener
@@ -41,7 +43,10 @@ func randomID() string {
 	return hex.EncodeToString(b)
 }
 func (r *Runtime) OAuthOptions() []map[string]any {
-	return []map[string]any{{"key": "product", "label": "产品", "values": []map[string]any{{"value": "cn", "label": "国内 Trae IDE"}, {"value": "solo", "label": "国内 Work/SOLO"}}}}
+	return []map[string]any{
+		{"key": "product", "label": "产品", "values": []map[string]any{{"value": "cn", "label": "国内 Trae IDE"}, {"value": "solo", "label": "国内 Work/SOLO"}}},
+		{"key": "account_type", "label": "账号类型", "values": []map[string]any{{"value": "personal", "label": "个人账号"}, {"value": "enterprise", "label": "企业账号"}}},
+	}
 }
 func (r *Runtime) OAuthBegin(opts map[string]any) (map[string]any, error) {
 	return r.beginLogin(opts, 0)
@@ -53,6 +58,14 @@ func (r *Runtime) beginLogin(opts map[string]any, ownerID int64) (map[string]any
 	product := text(opts["product"])
 	if product != "cn" && product != "solo" {
 		return nil, errors.New("请选择国内 IDE 或 SOLO")
+	}
+	loginOrigin := "https://www.trae.cn"
+	switch text(opts["account_type"]) {
+	case "", "personal":
+	case "enterprise":
+		loginOrigin = "https://console.enterprise.trae.cn"
+	default:
+		return nil, errors.New("请选择个人或企业账号")
 	}
 	r.mu.Lock()
 	for id, state := range r.logins {
@@ -86,8 +99,9 @@ func (r *Runtime) beginLogin(opts map[string]any, ownerID int64) (map[string]any
 	callback := "http://" + listener.Addr().String() + "/authorize"
 	state := &loginState{Product: product, Verifier: verifier, Machine: randomID(), Device: randomID(), Callback: callback, Expires: time.Now().Add(10 * time.Minute), Listener: listener, OwnerID: ownerID}
 	state.Context, state.Cancel = context.WithDeadline(context.Background(), state.Expires)
+	state.EnterpriseLogin = loginOrigin == "https://console.enterprise.trae.cn"
 	params := url.Values{"auth_from": {map[bool]string{true: "solo", false: "trae"}[product == "solo"]}, "client_id": {upstream.ClientIDFor(product)}, "login_trace_id": {id}, "auth_callback_url": {callback}, "code_challenge": {base64.RawURLEncoding.EncodeToString(sum[:])}, "code_challenge_method": {"S256"}, "machine_id": {state.Machine}, "device_id": {state.Device}, "app_version": {upstream.IdeVersion}, "plugin_version": {"1.0.0"}, "device_brand": {upstream.DeviceBrand}, "device_type": {"windows"}, "os_version": {upstream.OSVersion}, "env": {"prod"}, "app_type": {"desktop"}}
-	if product == "solo" {
+	if product == "solo" || state.EnterpriseLogin {
 		params.Set("hide_saas_login", "false")
 	}
 	for key, value := range map[string]string{"login_version": "1", "login_channel": "native_ide", "auth_type": "local", "redirect": "0", "x_device_id": state.Device, "x_machine_id": state.Machine, "x_device_brand": upstream.DeviceBrand, "x_device_type": "windows", "x_os_version": upstream.OSVersion, "x_env": "prod", "x_app_version": upstream.IdeVersion, "x_app_type": "desktop"} {
@@ -113,7 +127,7 @@ func (r *Runtime) beginLogin(opts map[string]any, ownerID int64) (map[string]any
 	r.mu.Unlock()
 	server := &http.Server{ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 5 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		origin := req.Header.Get("Origin")
-		if origin != "" && origin != "https://www.trae.cn" {
+		if origin != "" && origin != loginOrigin {
 			http.Error(w, "回调来源不匹配", 403)
 			return
 		}
@@ -142,7 +156,7 @@ func (r *Runtime) beginLogin(opts map[string]any, ownerID int64) (map[string]any
 	})}
 	go func() { _ = server.Serve(listener) }()
 	go func() { <-state.Context.Done(); _ = server.Close() }()
-	return map[string]any{"login_id": id, "login_url": "https://www.trae.cn/authorization?" + params.Encode(), "callback_url": callback, "manual_callback": true}, nil
+	return map[string]any{"login_id": id, "login_url": loginOrigin + "/authorization?" + params.Encode(), "callback_url": callback, "manual_callback": true}, nil
 }
 
 func (r *Runtime) captureCallback(id, callback string, ownerID int64) error {
@@ -239,8 +253,14 @@ func (r *Runtime) captureCallback(id, callback string, ownerID int64) error {
 	if enterpriseHost == "" {
 		enterpriseHost, _ = userInfo["apiHost"].(string)
 	}
-	if parsed, e := url.Parse(enterpriseHost); e == nil && parsed.Scheme == "https" && parsed.Hostname() == "console.enterprise.trae.cn" && parsed.User == nil {
-		state.EnterpriseConsole = true
+	if enterpriseHost == "" && state.EnterpriseLogin {
+		enterpriseHost = query.Get("consoleHost")
+	}
+	parsed, e := url.Parse(enterpriseHost)
+	if enterpriseHost == "" {
+		state.EnterpriseConsole = state.EnterpriseConsole || state.EnterpriseLogin
+	} else {
+		state.EnterpriseConsole = e == nil && parsed.Scheme == "https" && strings.EqualFold(parsed.Host, "console.enterprise.trae.cn") && parsed.User == nil
 	}
 	state.Code = code
 	state.RefreshToken = refresh

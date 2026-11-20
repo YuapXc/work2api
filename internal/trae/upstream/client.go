@@ -186,8 +186,8 @@ func New() *Client {
 }
 
 func (c *Client) agentBase() string { return c.AgentHost }
-func (c *Client) agentBaseFor(a *auth.Auth) string {
-	if a.UsesEnterpriseConsole() {
+func (c *Client) agentBaseFor(console bool) string {
+	if console {
 		return c.EnterpriseHost
 	}
 	return c.AgentHost
@@ -296,12 +296,12 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, resolvedModel string) (rc
 }
 func (c *Client) ChatStreamWithHeaders(a *auth.Auth, body []byte, resolvedModel string) (rc io.ReadCloser, status int, respBody []byte, headers http.Header, err error) {
 	prepared := PrepareBodyResolved(body, a.Variant, resolvedModel)
-	return c.ChatPreparedStreamWithHeaders(a, prepared)
+	return c.ChatPreparedStreamWithHeaders(a, prepared, a.UsesEnterpriseConsole())
 }
 
 // prepared is request-local and already normalized for this identity/model.
-func (c *Client) ChatPreparedStreamWithHeaders(a *auth.Auth, prepared []byte) (rc io.ReadCloser, status int, respBody []byte, headers http.Header, err error) {
-	req, err := http.NewRequest(http.MethodPost, c.agentBaseFor(a)+EpChat, bytes.NewReader(prepared))
+func (c *Client) ChatPreparedStreamWithHeaders(a *auth.Auth, prepared []byte, console bool) (rc io.ReadCloser, status int, respBody []byte, headers http.Header, err error) {
+	req, err := http.NewRequest(http.MethodPost, c.agentBaseFor(console)+EpChat, bytes.NewReader(prepared))
 	if err != nil {
 		return nil, 0, nil, nil, err
 	}
@@ -326,9 +326,10 @@ func (c *Client) ChatPreparedStreamWithHeaders(a *auth.Auth, prepared []byte) (r
 }
 
 type ModelInfo struct {
-	ConsoleRoute           bool     `json:"-"`
-	ReasoningOptions       []string `json:"reasoning_options,omitempty"`
-	DefaultReasoning       string   `json:"default_reasoning,omitempty"`
+	ConsoleRoute           bool             `json:"-"`
+	Enterprise             *EnterpriseModel `json:"enterprise,omitempty"`
+	ReasoningOptions       []string         `json:"reasoning_options,omitempty"`
+	DefaultReasoning       string           `json:"default_reasoning,omitempty"`
 	ID                     string
 	Name                   string
 	ContextWindow          int64 // = context_window_tokens.dev（目录未给则 0）
@@ -339,6 +340,12 @@ type ModelInfo struct {
 	ToolResponseMultimodal *bool        `json:"tool_response_multimodal,omitempty"`
 	EntitlementCosts       []float64    `json:"entitlement_usage_cost,omitempty"`
 	Pricing                []ModelPrice `json:"pricing,omitempty"`
+}
+
+type EnterpriseModel struct {
+	ModelName string `json:"model_name,omitempty"`
+	Provider  string `json:"provider,omitempty"`
+	PromptMax int64  `json:"prompt_max_tokens,omitempty"`
 }
 
 var soloAgentOnlyDeadNames = map[string]struct{}{
@@ -364,7 +371,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		"agent_type":          nil,
 	}
 	raw, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, c.agentBaseFor(a)+EpModels, bytes.NewReader(raw))
+	req, err := http.NewRequest(http.MethodPost, c.agentBaseFor(enterpriseRoute)+EpModels, bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -394,9 +401,17 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	}
 	var resp struct {
 		ConfigInfoList *[]struct {
-			ConfigName          string `json:"config_name"`
-			ConfigSwitch        *bool  `json:"config_switch"`
-			IsInvisibleToUser   *bool  `json:"is_invisible_to_user"`
+			ConfigName          string          `json:"config_name"`
+			ConfigSource        json.RawMessage `json:"config_source"`
+			Status              *bool           `json:"status"`
+			Custom              bool            `json:"is_custom_model"`
+			Usage               string          `json:"usage"`
+			Provider            string          `json:"provider"`
+			DisplayName         string          `json:"display_name"`
+			DisplayModelName    string          `json:"display_model_name"`
+			Multimodal          *bool           `json:"multimodal"`
+			ConfigSwitch        *bool           `json:"config_switch"`
+			IsInvisibleToUser   *bool           `json:"is_invisible_to_user"`
 			ContextWindowTokens struct {
 				Dev int64 `json:"dev"`
 			} `json:"context_window_tokens"`
@@ -408,6 +423,9 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 				DefaultLevel    string            `json:"default_level"`
 			} `json:"reasoning_effort_config"`
 			Details []struct {
+				ModelName       string          `json:"model_name"`
+				Provider        string          `json:"provider"`
+				PromptMax       int64           `json:"prompt_max_tokens"`
 				MaxTokens       int64           `json:"max_tokens"`
 				EntitlementCost json.RawMessage `json:"model_entitlement_usage_cost"`
 			} `json:"model_detail_list"`
@@ -430,24 +448,61 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		if cfg.IsInvisibleToUser != nil && *cfg.IsInvisibleToUser {
 			continue // 内部配置，非用户可选模型
 		}
-		if cfg.DisplayConfig.DisplayName == "" {
-			continue // 租户自定义占位模板
+		source := strings.Trim(strings.TrimSpace(string(cfg.ConfigSource)), `"`)
+		enterprise := source == "2" && enterpriseRoute
+		if cfg.DisplayConfig.Invisible || cfg.Usage != "" && cfg.Usage != "chat_completion" {
+			continue
 		}
-		if cfg.DisplayConfig.Invisible || cfg.DisplayConfig.Custom || builderPresent(cfg.DisplayConfig.Builder) {
+		name := cfg.DisplayConfig.DisplayName
+		if enterprise {
+			if cfg.Status != nil && !*cfg.Status {
+				continue
+			}
+			if name == "" {
+				name = cfg.DisplayName
+			}
+			if name == "" {
+				name = cfg.DisplayModelName
+			}
+			if name == "" {
+				name = cfg.ConfigName
+			}
+		} else if source == "2" || source == "3" || name == "" || cfg.Custom || strings.HasPrefix(strings.ToLower(cfg.ConfigName), "custom_model") || cfg.DisplayConfig.Custom || builderPresent(cfg.DisplayConfig.Builder) {
 			continue
 		}
 		if configIsSoloAgentOnly(cfg.ConfigName) {
 			continue
 		}
 		maxTokens := int64(0)
+		selected := -1
 		costs := []float64{}
-		for _, detail := range cfg.Details {
+		for i, detail := range cfg.Details {
+			if detail.ModelName != "" && (selected < 0 || strings.HasSuffix(detail.ModelName, "__dev") && !strings.HasSuffix(cfg.Details[selected].ModelName, "__dev")) {
+				selected = i
+			}
 			var cost *float64
 			if json.Unmarshal(detail.EntitlementCost, &cost) == nil && cost != nil && *cost >= 0 {
 				costs = append(costs, *cost)
 			}
 			if detail.MaxTokens > 0 && (maxTokens == 0 || detail.MaxTokens < maxTokens) {
 				maxTokens = detail.MaxTokens
+			}
+		}
+		var enterpriseInfo *EnterpriseModel
+		multimodal := cfg.DisplayConfig.Multimodal
+		if cfg.Multimodal != nil {
+			multimodal = cfg.Multimodal
+		}
+		if enterprise {
+			enterpriseInfo = &EnterpriseModel{Provider: cfg.Provider}
+			maxTokens = 0
+			if selected >= 0 {
+				d := cfg.Details[selected]
+				enterpriseInfo.ModelName, enterpriseInfo.PromptMax = d.ModelName, d.PromptMax
+				if enterpriseInfo.Provider == "" {
+					enterpriseInfo.Provider = d.Provider
+				}
+				maxTokens = max(d.MaxTokens, 0)
 			}
 		}
 		options := []string{}
@@ -458,14 +513,15 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			}
 		}
 		out = append(out, ModelInfo{
+			Enterprise:             enterpriseInfo,
 			ConsoleRoute:           enterpriseRoute,
 			ReasoningOptions:       options,
 			DefaultReasoning:       cfg.ReasoningEffortConfig.DefaultLevel,
 			ID:                     cfg.ConfigName,
-			Name:                   cfg.DisplayConfig.DisplayName,
+			Name:                   name,
 			ContextWindow:          cfg.ContextWindowTokens.Dev,
 			MaxTokens:              maxTokens,
-			Multimodal:             cfg.DisplayConfig.Multimodal,
+			Multimodal:             multimodal,
 			Capability:             cfg.DisplayConfig.Capability,
 			ThinkingControl:        cfg.ReasoningEffortConfig.SupportThinking,
 			ToolResponseMultimodal: cfg.DisplayConfig.ToolResponseMultimodal,

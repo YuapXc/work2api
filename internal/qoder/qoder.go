@@ -479,9 +479,13 @@ func (r *Runtime) refreshAccountCatalog(ctx context.Context, acct *account.Accou
 			return flight.err
 		}
 	}
-	if !force && r.accountModels[key].expires.After(time.Now()) {
+	if snapshot := r.accountModels[key]; !force && snapshot.generation == r.bridgeGeneration[snapshot.accountID] && snapshot.expires.After(time.Now()) {
 		r.mu.Unlock()
 		return nil
+	}
+	if acct == nil {
+		r.mu.Unlock()
+		return errors.New("刷新 Qoder 模型目录需要有效账号")
 	}
 	if r.modelRefresh == nil {
 		r.modelRefresh = make(map[[32]byte]*modelCatalogFlight)
@@ -580,11 +584,11 @@ func (r *Runtime) refreshAccountModels(ctx context.Context, acct *account.Accoun
 	}
 	now := time.Now()
 	for id, snapshot := range r.accountModels {
-		if id != key && snapshot.accountID == acct.ID && !snapshot.expires.After(now) {
+		if id != key && snapshot.accountID == acct.ID {
 			delete(r.accountModels, id)
 		}
 	}
-	r.accountModels[key] = accountModelSnapshot{models: available, catalog: out, accountID: acct.ID, expires: now.Add(5 * time.Minute)}
+	r.accountModels[key] = accountModelSnapshot{models: available, names: catalogNames(out), generation: generation, catalog: out, accountID: acct.ID, expires: now.Add(5 * time.Minute)}
 	if updateActive {
 		r.modelCache = out
 		r.modelCacheKey = key
@@ -597,6 +601,73 @@ func (r *Runtime) refreshAccountModels(ctx context.Context, acct *account.Accoun
 func modelCatalogKey(acct *account.Account, secret string) [32]byte {
 	fp, _ := json.Marshal(acct.CheckinFingerprint)
 	return sha256.Sum256([]byte(acct.ID + "\x00" + string(acct.Region) + "\x00" + secret + "\x00" + string(fp)))
+}
+
+func catalogNames(models []provider.CatalogModel) map[string][]string {
+	names := make(map[string][]string, len(models))
+	for _, m := range models {
+		if name := bridge.DisplayNameKey(m.Name); name != "" {
+			names[name] = append(names[name], strings.TrimPrefix(m.ID, runtimePrefix))
+		}
+	}
+	return names
+}
+
+func qoderAgent(proto provider.Protocol, model string) string {
+	switch proto {
+	case provider.ProtocolAnthropic:
+		return "claude"
+	case provider.ProtocolResponses:
+		return "codex"
+	}
+	return bridge.InferAgent(model)
+}
+
+func (r *Runtime) ResolveCatalogName(proto provider.Protocol, model string, visible func(string, string) bool) (string, bool, error) {
+	bare := strings.TrimPrefix(model, runtimePrefix)
+	if bare == "" {
+		return model, false, nil
+	}
+	if configured := bridge.ConfiguredModel(qoderAgent(proto, bare), bare); configured != "" {
+		return runtimePrefix + configured, true, nil
+	}
+	key, name := strings.ToLower(bare), bridge.DisplayNameKey(bare)
+	var target string
+	ambiguous, haveLowerKey := false, false
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, snap := range r.accountModels {
+		if snap.generation != r.bridgeGeneration[snap.accountID] {
+			continue
+		}
+		if snap.models[bare] {
+			return runtimePrefix + bare, true, nil
+		}
+		haveLowerKey = haveLowerKey || snap.models[key]
+		for _, matched := range snap.names[name] {
+			if visible != nil && !visible(runtimePrefix+matched, PortalAccountUID(snap.accountID)) {
+				continue
+			}
+			if target != "" && target != matched {
+				ambiguous = true
+			} else {
+				target = matched
+			}
+		}
+	}
+	if haveLowerKey {
+		return runtimePrefix + key, true, nil
+	}
+	if ambiguous {
+		return model, false, errors.New("Qoder 模型显示名不唯一，请使用 /v1/models 中的模型 ID")
+	}
+	if target != "" {
+		return runtimePrefix + target, true, nil
+	}
+	if target := bridge.BuiltinModelAlias(bare); target != "" {
+		return runtimePrefix + target, true, nil
+	}
+	return runtimePrefix + key, false, nil
 }
 
 func (r *Runtime) markCatalogStale(key [32]byte) {
@@ -650,8 +721,14 @@ func (r *Runtime) fallbackModels() []provider.CatalogModel {
 func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provider.UsageReport, error) {
 	report := provider.UsageReport{Status: "ok"}
 	requestedModel := str(req.Payload["model"])
+	model := strings.TrimPrefix(requestedModel, runtimePrefix)
+	if !req.CatalogModelResolved {
+		model = bridge.MapModel(qoderAgent(req.Protocol, model), model)
+	}
+	permissionModel := runtimePrefix + model
+	ctx = bridge.WithResolvedModel(ctx, model)
 
-	acct, secret, err := r.pickServingAccount(ctx, str(req.Payload["model"]))
+	acct, secret, err := r.pickServingAccount(ctx, permissionModel)
 	if err != nil {
 		writeServeError(req, err)
 		report.Status = "error"
@@ -660,31 +737,28 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 	}
 	preferredKey := modelCatalogKey(acct, secret)
 	affinityKey, hasAffinity := requestAffinityKey(req)
-	if sticky, stickySecret := r.affinityAccount(affinityKey, hasAffinity, preferredKey); sticky != nil && accountAllowed(ctx, sticky.ID, str(req.Payload["model"])) == nil {
+	if sticky, stickySecret := r.affinityAccount(affinityKey, hasAffinity, preferredKey); sticky != nil && accountAllowed(ctx, sticky.ID, permissionModel) == nil {
 		acct, secret = sticky, stickySecret
 	}
 	selected := acct
 	selectedSecret := secret
 	tried := map[string]bool{acct.ID: true}
-	model := strings.TrimPrefix(str(req.Payload["model"]), runtimePrefix)
-	agent := bridge.InferAgent(model)
-	if req.Protocol == provider.ProtocolAnthropic {
-		agent = "claude"
-	}
-	if req.Protocol == provider.ProtocolResponses {
-		agent = "codex"
-	}
-	model = bridge.MapModel(agent, model)
 	r.mu.Lock()
-	coolUntil := r.accountCooldowns[modelCatalogKey(acct, secret)]
+	selectedKey := modelCatalogKey(acct, secret)
+	coolUntil := r.accountCooldowns[selectedKey]
+	snapshot, listed := r.accountModels[selectedKey]
+	missing := req.CatalogModelResolved && listed && snapshot.generation == r.bridgeGeneration[acct.ID] && snapshot.expires.After(time.Now()) && !snapshot.models[model]
 	cooling := time.Now().Before(coolUntil)
 	r.mu.Unlock()
-	if cooling {
-		candidate, e := r.nextAccountBridge(ctx, acct.Region, model, tried, requestedModel)
+	if cooling || missing {
+		candidate, e := r.nextAccountBridge(ctx, acct.Region, model, tried, permissionModel)
 		if candidate == nil {
 			if e == nil {
 				e = fmt.Errorf("Qoder 账号暂时不可用，请稍后重试")
-				if req.Writer != nil {
+				if missing && !cooling {
+					e = provider.NewAPIError(503, "当前账号目录没有该 Qoder 模型", "model_unavailable")
+				}
+				if cooling && req.Writer != nil {
 					req.Writer.Header().Set("Retry-After", fmt.Sprintf("%d", max(1, int(time.Until(coolUntil).Seconds()+0.999))))
 				}
 			}
@@ -704,7 +778,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 		if len(tried) >= 3 {
 			return nil, nil
 		}
-		candidate, err := r.nextAccountBridge(ctx, acct.Region, model, tried, requestedModel)
+		candidate, err := r.nextAccountBridge(ctx, acct.Region, model, tried, permissionModel)
 		if candidate == nil {
 			return nil, err
 		}
@@ -714,9 +788,9 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 		return candidate.bridge, nil
 	}
 	ctx = bridge.WithAccountFallback(ctx, next)
-	ctx = bridge.WithQueueDispatchCheck(ctx, func(ctx context.Context) error { return accountAllowed(ctx, selected.ID, requestedModel) })
+	ctx = bridge.WithQueueDispatchCheck(ctx, func(ctx context.Context) error { return accountAllowed(ctx, selected.ID, permissionModel) })
 
-	if err := accountAllowed(ctx, acct.ID, str(req.Payload["model"])); err != nil {
+	if err := accountAllowed(ctx, acct.ID, permissionModel); err != nil {
 		writeServeError(req, err)
 		return provider.UsageReport{Status: "error", Error: err.Error()}, err
 	}
@@ -741,7 +815,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 		req.Payload["model"] = strings.TrimPrefix(m, runtimePrefix)
 	}
 
-	if err := accountAllowed(ctx, selected.ID, requestedModel); err != nil {
+	if err := accountAllowed(ctx, selected.ID, permissionModel); err != nil {
 		writeServeError(req, err)
 		return provider.UsageReport{Status: "error", Error: err.Error()}, err
 	}
@@ -794,12 +868,13 @@ func writeServeError(req provider.ServeRequest, err error) {
 		return
 	}
 	req.Writer.Header().Set("Content-Type", "application/json")
-	status := http.StatusServiceUnavailable
 	var api *provider.APIError
 	if errors.As(err, &api) {
-		status = api.Status
+		req.Writer.WriteHeader(api.Status)
+		_ = json.NewEncoder(req.Writer).Encode(api.Body)
+		return
 	}
-	req.Writer.WriteHeader(status)
+	req.Writer.WriteHeader(http.StatusServiceUnavailable)
 	body, _ := json.Marshal(map[string]interface{}{
 		"error": map[string]interface{}{"message": err.Error(), "type": "qoder_error"},
 	})

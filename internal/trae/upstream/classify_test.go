@@ -144,12 +144,95 @@ func TestEnterpriseAgentRequestsUseConsoleGateway(t *testing.T) {
 	if _, err := c.FetchModels(a); err != nil {
 		t.Fatal("enterprise catalog did not use console gateway", err)
 	}
-	rc, status, _, _, err := c.ChatPreparedStreamWithHeaders(a, []byte(`{}`))
+	rc, status, _, _, err := c.ChatPreparedStreamWithHeaders(a, []byte(`{}`), a.UsesEnterpriseConsole())
 	if err != nil || status != 200 {
 		t.Fatal("enterprise chat did not use console gateway", status, err)
 	}
 	if rc != nil {
 		rc.Close()
+	}
+}
+
+func TestEnterpriseCatalogControlsWireIdentityAndLimits(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"config_info_list":[
+		{"config_name":"personal","display_config":{"display_name":"Personal"}},
+		{"config_name":"seat","config_source":"2","is_custom_model":true,"display_name":"Seat","multimodal":false,"display_config":{"multimodal":true},"model_detail_list":[{"model_name":"variant","max_tokens":128},{"model_name":"native__dev","provider":"vendor","max_tokens":8192,"prompt_max_tokens":90000}]},
+		{"config_name":"disabled","config_source":2,"status":false}, {"config_name":"off","config_source":2,"config_switch":false},
+		{"config_name":"internal","config_source":2,"is_invisible_to_user":true},{"config_name":"embedding","config_source":2,"usage":"embed"},
+		{"config_name":"local","config_source":3,"display_config":{"display_name":"local"}}]}`)
+	}))
+	defer server.Close()
+	c := New()
+	c.AgentHost, c.EnterpriseHost = server.URL, server.URL
+	for _, enterprise := range []bool{false, true} {
+		models, err := c.FetchModels(&auth.Auth{AccessToken: "fixture", Variant: "cn", EnterpriseConsole: enterprise})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(models) == 0 || models[0].ID != "personal" || models[0].Enterprise != nil {
+			t.Fatal(models)
+		}
+		if !enterprise {
+			if len(models) != 1 {
+				t.Fatal("personal catalog includes seat", models)
+			}
+			continue
+		}
+		if len(models) != 2 || models[1].ID != "seat" || models[1].Name != "Seat" || models[1].MaxTokens != 8192 {
+			t.Fatal(models)
+		}
+		for _, tc := range []struct {
+			request string
+			want    int
+		}{{`{}`, 8192}, {`{"max_tokens":256}`, 256}, {`{"max_tokens":32,"max_completion_tokens":40000}`, 8192}} {
+			raw, limits := PrepareBodyResolvedWithLimits([]byte(tc.request), "cn", "seat", models[1])
+			var body map[string]any
+			if err := json.Unmarshal(raw, &body); err != nil {
+				t.Fatal(err)
+			}
+			hyper, _ := body["enterprise_custom_hyper_params"].(map[string]any)
+			if body["model_name"] != "native__dev" || body["provider"] != "vendor" || body["config_source"] != 2.0 || body["is_custom_model"] != true || limits["max_tokens"] != tc.want || body["max_tokens"] != float64(tc.want) || hyper["max_tokens"] != body["max_tokens"] || hyper["prompt_max_tokens"] != 90000.0 || hyper["multimodal"] != false {
+				t.Fatal(body, limits)
+			}
+		}
+		raw, _ := PrepareBodyResolvedWithLimits([]byte(`{"provider":"client","config_source":2,"enterprise_custom_hyper_params":{"max_tokens":7}}`), "cn", "personal", models[0])
+		if strings.Contains(string(raw), "provider") || strings.Contains(string(raw), "config_source") || strings.Contains(string(raw), "hyper_params") {
+			t.Fatal(string(raw))
+		}
+	}
+}
+
+func TestPreparedEnterpriseRequestKeepsItsEndpoint(t *testing.T) {
+	consoleCalls, consumerCalls := 0, 0
+	console := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		consoleCalls++
+		body, _ := io.ReadAll(req.Body)
+		if !strings.Contains(string(body), `"config_source":2`) {
+			t.Error("enterprise parameters missing")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: done\ndata: {}\n\n")
+	}))
+	defer console.Close()
+	consumer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		consumerCalls++
+		w.WriteHeader(400)
+	}))
+	defer consumer.Close()
+	client := New()
+	client.EnterpriseHost, client.AgentHost = console.URL, consumer.URL
+	a := &auth.Auth{Variant: "cn", AccessToken: "fixture", EnterpriseConsole: true}
+	body, _ := PrepareBodyResolvedWithLimits([]byte(`{}`), "cn", "seat", ModelInfo{ID: "seat", ConsoleRoute: true, Enterprise: &EnterpriseModel{ModelName: "native"}, MaxTokens: 128})
+	if changed, err := a.FallbackToConsumer(); !changed || err != nil {
+		t.Fatal(changed, err)
+	}
+	rc, status, _, _, err := client.ChatPreparedStreamWithHeaders(a, body, true)
+	if rc != nil {
+		rc.Close()
+	}
+	if err != nil || status != 200 || consoleCalls != 1 || consumerCalls != 0 {
+		t.Fatal("prepared request changed billing endpoint", consoleCalls, consumerCalls, status, err)
 	}
 }
 

@@ -62,7 +62,55 @@ func Cached(u map[string]any) *int {
 }
 
 func Created(u map[string]any) *int {
-	return cacheCount(u["cache_creation_input_tokens"], u["prompt_cache_write_tokens"], detail(u, "prompt_tokens_details", "cache_creation_input_tokens"), detail(u, "prompt_tokens_details", "cache_write_tokens"), detail(u, "input_tokens_details", "cache_creation_input_tokens"))
+	for _, value := range []any{
+		u["cache_creation_input_tokens"], u["cache_write_tokens"], u["cache_creation_tokens"],
+		detail(u, "input_tokens_details", "cache_write_tokens"), detail(u, "prompt_tokens_details", "cache_write_tokens"),
+		detail(u, "input_tokens_details", "cache_creation_tokens"), detail(u, "prompt_tokens_details", "cache_creation_tokens"),
+		u["prompt_cache_write_tokens"], detail(u, "prompt_tokens_details", "cache_creation_input_tokens"), detail(u, "input_tokens_details", "cache_creation_input_tokens"),
+	} {
+		if n := number(value); n != nil && *n >= 0 {
+			return n
+		}
+	}
+	b := CreationBreakdown(u)
+	if b.FiveMinutes == nil {
+		return b.OneHour
+	}
+	if b.OneHour == nil {
+		return b.FiveMinutes
+	}
+	if *b.OneHour > math.MaxInt-*b.FiveMinutes {
+		return nil
+	}
+	total := *b.FiveMinutes + *b.OneHour
+	return &total
+}
+
+type CacheCreationBreakdown struct{ FiveMinutes, OneHour *int }
+
+func CreationBreakdown(u map[string]any) CacheCreationBreakdown {
+	m, _ := u["cache_creation"].(map[string]any)
+	read := func(key string) *int {
+		if n := number(m[key]); n != nil && *n >= 0 {
+			return n
+		}
+		return nil
+	}
+	return CacheCreationBreakdown{read("ephemeral_5m_input_tokens"), read("ephemeral_1h_input_tokens")}
+}
+
+func (b CacheCreationBreakdown) WriteTo(u map[string]any) {
+	if b.FiveMinutes == nil && b.OneHour == nil {
+		return
+	}
+	m := map[string]any{}
+	if b.FiveMinutes != nil {
+		m["ephemeral_5m_input_tokens"] = *b.FiveMinutes
+	}
+	if b.OneHour != nil {
+		m["ephemeral_1h_input_tokens"] = *b.OneHour
+	}
+	u["cache_creation"] = m
 }
 
 // Reasoning preserves a valid observed output count; absent observations stay unknown.
@@ -116,12 +164,21 @@ func nativeAnthropic(u map[string]any) bool {
 	}
 	_, read := u["cache_read_input_tokens"]
 	_, write := u["cache_creation_input_tokens"]
-	return read || write
+	_, breakdown := u["cache_creation"].(map[string]any)
+	if _, inclusive := u["total_tokens"]; inclusive {
+		return false
+	}
+	return read || write || breakdown
 }
 
 // ValidCache excludes impossible counts from client-facing cache calculations.
 func ValidCache(u map[string]any) (*int, *int) {
 	i, _ := Totals(u)
+	return ValidCacheForInput(u, i)
+}
+
+// ValidCacheForInput uses the known protocol's inclusive input count.
+func ValidCacheForInput(u map[string]any, i int) (*int, *int) {
 	r, w := Cached(u), Created(u)
 	if r != nil && (*r < 0 || *r > i) {
 		r = nil

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"work2api/internal/jsonutil"
+	"work2api/internal/tokenusage"
 )
 
 const (
@@ -87,6 +88,8 @@ type bridgeRequest struct {
 }
 
 type Usage struct {
+	InputKnown   bool
+	OutputKnown  bool
 	FinishReason string // observed canonical termination, independent of token availability
 	// Input is the total prompt input, including cache reads and writes. This
 	// matches OpenAI's prompt_tokens semantics and lets each output encoder
@@ -98,6 +101,7 @@ type Usage struct {
 	CachedKnown        bool
 	CacheCreation      int
 	CacheCreationKnown bool
+	CreationBreakdown  tokenusage.CacheCreationBreakdown
 	Reasoning          int
 	ReasoningKnown     bool
 }

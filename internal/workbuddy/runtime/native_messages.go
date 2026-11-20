@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"work2api/internal/core/protocol"
+	"work2api/internal/tokenusage"
 	"work2api/internal/workbuddy/siterouting"
 	"work2api/internal/workbuddy/upstream"
 )
@@ -304,12 +305,7 @@ func (n *nativeMessageResult) observe(event map[string]any) {
 		}
 		if usage, ok := event["usage"].(map[string]any); ok {
 			current, _ := n.message["usage"].(map[string]any)
-			current = maps.Clone(current)
-			if current == nil {
-				current = map[string]any{}
-			}
-			maps.Copy(current, usage)
-			n.message["usage"] = current
+			n.message["usage"] = tokenusage.Merge(current, usage)
 		}
 	case "message_stop":
 		if n.message == nil {

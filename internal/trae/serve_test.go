@@ -196,6 +196,55 @@ func TestLiveTraeImage(t *testing.T) {
 	t.Logf("%s image recognized correctly; input=%d output=%d", target, report.InputTokens, report.OutputTokens)
 }
 
+func TestEnterpriseAndPersonalLoginUseTheirOwnOrigins(t *testing.T) {
+	r := fixtureRuntime(t, nil)
+	for _, typ := range []string{"enterprise", "personal"} {
+		out, err := r.BeginOwnedLogin(map[string]any{"product": "cn", "account_type": typ}, 7)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := out["login_id"].(string)
+		t.Cleanup(func() { _ = r.CancelOwnedLogin(id, 7) })
+		login, err := url.Parse(out["login_url"].(string))
+		if err != nil {
+			t.Fatal(err)
+		}
+		origin, other := "https://www.trae.cn", "https://console.enterprise.trae.cn"
+		if typ == "enterprise" {
+			origin, other = other, origin
+		}
+		if login.Scheme+"://"+login.Host != origin || login.Path != "/authorization" || login.Query().Get("code_challenge") == "" {
+			t.Fatal("incorrect authorization endpoint")
+		}
+		cb := out["callback_url"].(string)
+		for _, check := range []struct {
+			origin string
+			status int
+		}{{other, 403}, {origin, 204}} {
+			req, err := http.NewRequest(http.MethodOptions, cb, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Origin", check.origin)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != check.status {
+				t.Fatal(typ, check.origin, resp.StatusCode)
+			}
+		}
+		cb += "?login_trace_id=" + id + "&code=test"
+		if err := r.captureCallback(id, cb, 7); err != nil {
+			t.Fatal(err)
+		}
+		if got := r.logins[id].EnterpriseConsole; got != (typ == "enterprise") {
+			t.Fatal(typ, got)
+		}
+	}
+}
+
 func TestNativeCallbackCredentialShapes(t *testing.T) {
 	for _, query := range []url.Values{
 		{"refreshToken": {"test-refresh"}},
@@ -800,6 +849,32 @@ func TestNativeStreamCompletion(t *testing.T) {
 // input_tokens_details, which is what an upstream without cache reporting
 // produced. An upstream may omit cache or reasoning counters, so the detail
 // objects must be omitted rather than sent empty.
+func TestStreamReportsLengthOnlyAtEffectiveLimit(t *testing.T) {
+	for _, tc := range []struct {
+		output, finish string
+		limit          int
+		want           string
+	}{
+		{`{"response":"answer"}`, "stop", 2000, "length"}, {`{"response":"answer"}`, "stop", 4096, "stop"},
+		{`{"response":"answer"}`, "stop", 0, "stop"}, {`{"response":"answer"}`, "content_filter", 2000, "content_filter"},
+		{`{"tool_calls":[{"id":"call","function_call":{"name":"lookup","arguments":"{}"}}]}`, "stop", 2000, "tool_calls"},
+	} {
+		wire := fmt.Sprintf("event: output\ndata: %s\n\nevent: token_usage\ndata: {\"completion_tokens\":2000}\n\nevent: done\ndata: {\"finish_reason\":%q}\n\n", tc.output, tc.finish)
+		ev := newEvents(strings.NewReader(wire))
+		first, err := ev.next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var w bytes.Buffer
+		if err = normalizeStream(&w, ev, first, "trae/seat", nil, tc.limit); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(w.String(), `"finish_reason":"`+tc.want+`"`) {
+			t.Fatal(tc, w.String())
+		}
+	}
+}
+
 func TestResponsesUsageOmitsUnreportedDetails(t *testing.T) {
 	input := "event: output\ndata: {\"response\":\"answer\"}\n\nevent: token_usage\ndata: {\"prompt_tokens\":12,\"completion_tokens\":7,\"total_tokens\":19}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n"
 	for _, stream := range []bool{false, true} {

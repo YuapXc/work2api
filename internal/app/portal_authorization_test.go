@@ -1005,6 +1005,69 @@ func TestMediaHTTPTaskOwnershipAndSingleSubmit(t *testing.T) {
 
 type decisionFixtureRuntime struct{}
 
+type namedCatalogFixture struct {
+	decisionFixtureRuntime
+	calls int
+}
+
+func (*namedCatalogFixture) Name() string         { return "catalogfixture" }
+func (*namedCatalogFixture) Prefix() string       { return "catalogfixture/" }
+func (*namedCatalogFixture) SupportsPortal() bool { return true }
+func (*namedCatalogFixture) PortalModels(_ context.Context, _ map[string]bool, _ bool, _ func(string) bool) []provider.PortalModel {
+	return []provider.PortalModel{provider.NewPortalModel("catalogfixture/sku", []string{"catalogfixture:a"}, false)}
+}
+func (*namedCatalogFixture) ResolveCatalogName(proto provider.Protocol, name string, visible func(string, string) bool) (string, bool, error) {
+	if name == "catalogfixture/Shown" && proto == provider.ProtocolResponses && (visible == nil || visible("catalogfixture/sku", "catalogfixture:a")) {
+		return "catalogfixture/sku", true, nil
+	}
+	return name, true, nil
+}
+func (f *namedCatalogFixture) Serve(ctx context.Context, req provider.ServeRequest) (provider.UsageReport, error) {
+	id := strOr(req.Payload["model"], "")
+	if !req.CatalogModelResolved || id != "catalogfixture/sku" {
+		return provider.UsageReport{}, fmt.Errorf("model not pinned: %s", id)
+	}
+	if err := provider.CheckDispatch(ctx, provider.AccountRef{Provider: f.Name(), LocalID: "catalogfixture:a"}, id); err != nil {
+		return provider.UsageReport{}, err
+	}
+	f.calls++
+	writeJSON(req.Writer, 200, map[string]any{"model": id})
+	return provider.UsageReport{Recorded: true}, nil
+}
+
+func TestPortalDisplayNameUsesPhysicalGrantThroughDispatch(t *testing.T) {
+	s, u := portalFixture(t)
+	s.o.cfg.ModelLimitsDisabled = true
+	f := &namedCatalogFixture{}
+	if err := s.o.runtimes.Register(f); err != nil {
+		t.Fatal(err)
+	}
+	const key = "named-credential"
+	if _, err := s.o.db.CreateApp("named", s.o.hashKey(key), "portal", "", "", `["catalogfixture/sku"]`, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.o.db.SetUserPublicModels(u.ID, []string{"catalogfixture/sku"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	h := s.Handler()
+	call := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "http://127.0.0.1/v1/responses", strings.NewReader(`{"model":"catalogfixture/Shown","input":"hi","store":false}`))
+		req.Header.Set("Authorization", "Bearer "+key)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w
+	}
+	if w := call(); w.Code != 200 || !strings.Contains(w.Body.String(), "catalogfixture/sku") {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	if err := s.o.db.SetUserPublicModels(u.ID, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if w := call(); w.Code != 403 || f.calls != 1 {
+		t.Fatal("revoked key dispatched", w.Code, f.calls)
+	}
+}
+
 type portalFixtureRuntime struct {
 	decisionFixtureRuntime
 	catalogReads int

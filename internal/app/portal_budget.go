@@ -43,6 +43,8 @@ func (s *Server) refreshPortalRequest(w http.ResponseWriter, r *http.Request, p 
 				return errBody(403, "统一模型配置已撤销", "model_not_allowed")
 			}
 			requested = route.Members
+		} else if p.catalogModelResolved {
+			requested = []string{admittedModel}
 		} else if model := strOr(payload["model"], ""); model != "" {
 			requested = []string{model}
 		}
@@ -73,13 +75,13 @@ func (s *Server) refreshPortalRequest(w http.ResponseWriter, r *http.Request, p 
 			}
 			fresh.RouteModel, fresh.EffectiveModel = routeName, routeName
 			fresh.routeFacts = &routeFacts
-		} else if aerr := s.prepareModel(fresh, payload); aerr != nil {
+		} else if aerr := s.prepareModel(fresh, payload, p.modelProtocol); aerr != nil {
 			return aerr
 		}
 		if admittedModel != "" && fresh.EffectiveModel != admittedModel {
 			return errBody(403, "模型映射已改变，请重新发起请求", "model_not_allowed")
 		}
-		if routeName == "" && actualModel != "" && s.o.resolveModel(strOr(payload["model"], "")) != s.o.resolveModel(actualModel) {
+		if routeName == "" && actualModel != "" && fresh.EffectiveModel != s.o.resolveModel(actualModel) {
 			return errBody(403, "模型映射已改变，请重新发起请求", "model_not_allowed")
 		}
 		if fresh.UserID > 0 && uid != "" && !fresh.AccountScope[uid] {

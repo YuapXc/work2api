@@ -534,10 +534,14 @@ func deltaDispatcher(onDelta func(Delta), upstreamErr *error) func(string) bool 
 }
 
 func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages []interface{}, model string, tools interface{}, opts CallOpts, onDelta func(Delta)) error {
+	physical, _ := ctx.Value(resolvedModelKey{}).(string)
+	if physical == "" {
+		physical = MapModel(agent, model)
+	}
 	current := b
 	for {
 		emitted := false
-		err := current.callQoderWithOpts(ctx, agent, messages, model, tools, opts, func(d Delta) {
+		err := current.callQoderWithOpts(ctx, messages, model, physical, tools, opts, func(d Delta) {
 			if d.Content != "" || d.Reasoning != "" || streamwatch.HasToolArguments(d.ToolCalls) {
 				streamwatch.Generation(ctx)
 			}
@@ -550,7 +554,7 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 		if err == nil || emitted || ctx.Err() != nil || next == nil {
 			return err
 		}
-		other, nextErr := next(ctx, MapModel(agent, model), err)
+		other, nextErr := next(ctx, physical, err)
 		if nextErr != nil {
 			return nextErr
 		}
@@ -564,12 +568,17 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 // AccountFallback is request-local; cached bridges never retain routing state.
 type AccountFallback func(context.Context, string, error) (*Bridge, error)
 type accountFallbackKey struct{}
+type resolvedModelKey struct{}
+
+func WithResolvedModel(ctx context.Context, model string) context.Context {
+	return context.WithValue(ctx, resolvedModelKey{}, model)
+}
 
 func WithAccountFallback(ctx context.Context, next AccountFallback) context.Context {
 	return context.WithValue(ctx, accountFallbackKey{}, next)
 }
 
-func (b *Bridge) callQoderWithOpts(ctx context.Context, agent string, messages []interface{}, model string, tools interface{}, opts CallOpts, onDelta func(Delta)) error {
+func (b *Bridge) callQoderWithOpts(ctx context.Context, messages []interface{}, originalModel, model string, tools interface{}, opts CallOpts, onDelta func(Delta)) error {
 	budget := 4 * time.Minute
 	if opts.Stream {
 		budget = time.Hour
@@ -577,11 +586,6 @@ func (b *Bridge) callQoderWithOpts(ctx context.Context, agent string, messages [
 	began := time.Now()
 	// 将客户端模型名（claude-sonnet-4-6 等）映射成 Qoder 上游内部 model.key（auto/qmodel_38max/gmodel/dmodel 等）。
 	// 上游对未知 key 会走兜底返回内容，但不会把这次调用计入 quota，这是「请求成功但 dashboard 无用量」的根因。
-	originalModel := model
-	model = MapModel(agent, model)
-	if model != originalModel {
-		logger.Debug("mapModel %s/%s -> %s", agent, originalModel, model)
-	}
 	if strings.HasPrefix(strings.ToLower(model), "kmodel") || strings.Contains(strings.ToLower(model+" "+originalModel), "kimi") {
 		messages = kimiToolCallText(messages)
 	}
@@ -908,23 +912,49 @@ var defaultModelMapping = map[string]string{
 	"gemini": "gmodel",
 }
 
-// MapModel 解析顺序（参考 ccx 的 RedirectModel 算法）：
-//  1. 用户 Settings.ModelMappings[agent] 精确命中
-//  2. 用户 Settings.ModelMappings[agent] 双向 substring 模糊匹配（按 source 长度倒序，最长优先）
-//  3. 用户旧 Settings.ModelMapping (deprecated 扁平表) 命中
-//  4. defaultModelMapping 精确命中
-//  5. defaultModelMapping 双向 substring 模糊匹配
-//  6. ToLower 兜底（如客户端传 "Performance" 这种 display_name 大小写）
-//
-// agent 取值 "claude" / "codex" / "gemini"，由 handler 入口决定；空串表示未知 agent，跳过 agent 桶。
-//
-// 双向 substring 含义：source 包含 model（短关键字匹配长模型名，如 "sonnet" → "claude-sonnet-4-6"）
-// 或 model 包含 source（长别名匹配短模型名，反向也能命中）。
+var displaySeparators = strings.NewReplacer("-", "", "_", "", " ", "")
+
+func DisplayNameKey(name string) string {
+	return displaySeparators.Replace(strings.ToLower(strings.TrimSpace(name)))
+}
+
+// Directory display aliases from qoder2api c8e0aea, indexed by DisplayNameKey.
+var upstreamDisplayAliases = map[string]string{
+	"qwen4maxpreview": "qmodel_latest", "qwen4max": "qmodel_latest",
+	"qwen3.8max": "qmodel_38max", "qwen3.8maxpreview": "qmodel_38max", "qwen3.8flash": "qfmodel",
+	"qwen3.7plus": "qmodel", "qwen3.7flash": "q37fmodel",
+	"step5preview": "jmodel", "step5": "jmodel",
+	"deepseekv4pro": "dmodel", "deepseekflash": "dfmodel",
+	"glm5.3": "gmodel", "glm5.3flash": "gfmodel", "glm5.2": "gm51model",
+	"kimik3.1pro": "kmodel_latest", "kimik2.8preview": "kmodel", "minimaxm3.1flash": "mmodel",
+	"ultimate": "ultimate", "efficient": "efficient", "sonus": "smodel", "cantus": "cmodel", "fast": "fast",
+}
+
+func BuiltinModelAlias(model string) string {
+	if model == "" {
+		return ""
+	}
+	if mapped := upstreamDisplayAliases[DisplayNameKey(model)]; mapped != "" {
+		return mapped
+	}
+	return lookupMapping(model, defaultModelMapping)
+}
+
 func MapModel(agent, model string) string {
 	if model == "" {
 		return model
 	}
 
+	if mapped := ConfiguredModel(agent, model); mapped != "" {
+		return mapped
+	}
+	if mapped := BuiltinModelAlias(model); mapped != "" {
+		return mapped
+	}
+	return strings.ToLower(strings.TrimSpace(model))
+}
+
+func ConfiguredModel(agent, model string) string {
 	settings, _ := account.LoadSettings()
 
 	// 1. agent 维度的用户配置优先（信任用户配置值，UI 已限制为上游合法 key）
@@ -943,13 +973,7 @@ func MapModel(agent, model string) string {
 		}
 	}
 
-	// 3. 内置默认映射兜底
-	if mapped := lookupMapping(model, defaultModelMapping); mapped != "" {
-		return mapped
-	}
-
-	// 4. 大小写归一化兜底（客户端可能直接传 Qoder key 如 "Performance"/"dmodel"）
-	return strings.ToLower(model)
+	return ""
 }
 
 // lookupMapping 在单张映射表内执行：精确匹配 → 长度倒序 + 双向 substring 模糊匹配。

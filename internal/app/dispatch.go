@@ -29,7 +29,10 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 	if rawModel == "" {
 		return false
 	}
-	resolved := s.o.resolveModel(rawModel)
+	resolved := principal.EffectiveModel
+	if resolved == "" {
+		resolved = s.o.resolveModel(rawModel)
+	}
 	rt, ok := s.o.runtimes.Resolve(resolved)
 	if !ok {
 		return false
@@ -41,7 +44,6 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 	}
 	// Hand the runtime the alias-resolved, still-namespaced id; the runtime
 	// strips its own prefix before talking to its upstream.
-	payload["model"] = resolved
 	var customNames map[string]bool
 	var namespaceNames map[string]protocol.NamespaceName
 	if proto == provider.ProtocolResponses {
@@ -87,9 +89,11 @@ func (s *Server) dispatchRuntimeTo(w http.ResponseWriter, r *http.Request, proto
 	// Channel normalization must not mutate the body captured by authorization
 	// refresh callbacks (in particular, stripping a model namespace).
 	request.Payload = make(map[string]any, len(payload))
+	request.CatalogModelResolved = principal.catalogModelResolved
 	for key, value := range payload {
 		request.Payload[key] = value
 	}
+	request.Payload["model"] = resolved
 	var report provider.UsageReport
 	if native, ok := rt.(provider.NativeSessionObserver); !ok || !native.OwnsSessionObservations() {
 		finish := s.o.observations.Begin(rt.Name(), request)

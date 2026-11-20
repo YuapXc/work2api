@@ -1225,6 +1225,51 @@ func TestResponsesUsageOmitsUnreportedDetails(t *testing.T) {
 	}
 }
 
+func TestSplitCacheCreationAcrossProtocols(t *testing.T) {
+	for _, tc := range []struct {
+		total string
+		want  int
+	}{{"", 7}, {`,"cache_creation_input_tokens":12`, 12}, {`,"cache_creation_input_tokens":0`, 0}} {
+		wire := "data: " + `{"type":"message_start","message":{"id":"m","usage":{"input_tokens":10,"cache_creation":{"ephemeral_5m_input_tokens":3}}}}` + "\n\ndata: " + `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2,"cache_creation":{"ephemeral_1h_input_tokens":4}` + tc.total + `}}` + "\n\ndata: " + `{"type":"message_stop"}` + "\n\n"
+		var w = httptest.NewRecorder()
+		u, known, err := TranscodeStream(t.Context(), w, strings.NewReader(wire), Anthropic, Responses, "test")
+		if err != nil || !known || u.Input != 10+tc.want || u.Total != 12+tc.want || !u.CacheCreationKnown || u.CacheCreation != tc.want {
+			t.Fatal(tc, u, err)
+		}
+		doc, after, _, err := CollapseStreamWithUsageContext(t.Context(), strings.NewReader(w.Body.String()), Responses, "test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var resp map[string]any
+		if err = json.Unmarshal(doc, &resp); err != nil {
+			t.Fatal(err)
+		}
+		usage := jsonutil.MapAt(resp, "usage")
+		if after.Total != u.Total || usage["input_tokens_details"] != nil || usage["cache_creation_input_tokens"] != float64(tc.want) || !reflect.DeepEqual(usage["cache_creation"], map[string]any{"ephemeral_5m_input_tokens": 3.0, "ephemeral_1h_input_tokens": 4.0}) {
+			t.Fatal(tc, usage)
+		}
+		chat, err := ConvertResponse(Responses, Chat, doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		native, err := ConvertResponse(Chat, Anthropic, chat)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var n map[string]any
+		_ = json.Unmarshal(native, &n)
+		nu := jsonutil.MapAt(n, "usage")
+		if nu["input_tokens"] != 10.0 || nu["cache_creation_input_tokens"] != float64(tc.want) || !reflect.DeepEqual(nu["cache_creation"], usage["cache_creation"]) {
+			t.Fatal(tc, nu)
+		}
+	}
+	wire := "data: " + `{"type":"response.created","response":{"id":"resp","usage":{"input_tokens":10,"input_tokens_details":{"cache_write_tokens":0},"cache_creation":{"ephemeral_5m_input_tokens":4}}}}` + "\n\ndata: " + `{"type":"response.completed","response":{"id":"resp","status":"completed","output":[],"usage":{"output_tokens":2,"cache_creation":{"ephemeral_1h_input_tokens":2}}}}` + "\n\n"
+	_, u, known, err := CollapseStreamWithUsageContext(t.Context(), strings.NewReader(wire), Responses, "test")
+	if err != nil || !known || !u.CacheCreationKnown || u.CacheCreation != 0 || u.Input != 10 || u.Total != 12 || u.CreationBreakdown.OneHour == nil || u.CreationBreakdown.FiveMinutes == nil {
+		t.Fatal("Responses usage lost", u, err)
+	}
+}
+
 func TestCollapseDoesNotInventMissingUsage(t *testing.T) {
 	wire := `data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}` + "\n\n" + "data: [DONE]\n\n"
 	body, usage, known, err := CollapseStreamWithUsage(strings.NewReader(wire), Chat, "test")
