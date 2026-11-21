@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -66,7 +67,9 @@ func collapseStream(ctx context.Context, reader io.Reader, protocol, target Prot
 	acc.response.Created = time.Now().Unix()
 	acc.response.Model = model
 	var terminalResponse map[string]any
+	var outputSlots responseOutputSlots
 	if protocol == Responses {
+		parser.captureResponsesEvent = outputSlots.observe
 		parser.captureResponsesTerminal = func(response map[string]any) {
 			terminalResponse = response
 		}
@@ -105,17 +108,25 @@ func collapseStream(ctx context.Context, reader io.Reader, protocol, target Prot
 		}
 		return nil, acc.response.Usage, acc.reported, errSSEUnexpectedEOF
 	}
-	if output, ok := terminalResponse["output"].([]any); ok {
-		// The terminal snapshot has the native item types, IDs and order.
-		response := acc.response
-		response.Tools = nil
-		response.Reasoning = nil
-		doc := encodeBridgeResponse(protocol, response)
-		doc["output"] = output
-		if id := jsonutil.StringAt(terminalResponse, "id"); id != "" {
-			doc["id"] = id
+	if protocol == Responses && terminalResponse != nil {
+		output, _ := terminalResponse["output"].([]any)
+		if len(output) == 0 {
+			output = outputSlots.output()
 		}
-		return marshalCollapsedResponse(doc, response.Usage, acc.reported)
+		if len(output) == 0 {
+			terminalResponse = nil
+		} else {
+			// The terminal snapshot has the native item types, IDs and order.
+			response := acc.response
+			response.Tools = nil
+			response.Reasoning = nil
+			doc := encodeBridgeResponse(protocol, response)
+			doc["output"] = output
+			if id := jsonutil.StringAt(terminalResponse, "id"); id != "" {
+				doc["id"] = id
+			}
+			return marshalCollapsedResponse(doc, response.Usage, acc.reported)
+		}
 	}
 	acc.response.Text = acc.text.String()
 	for index, builder := range acc.arguments {
@@ -278,4 +289,202 @@ func appendReasoningDelta(builders *map[int]*strings.Builder, index int, delta s
 		(*builders)[index] = &strings.Builder{}
 	}
 	(*builders)[index].WriteString(delta)
+}
+
+type responseOutputSlot struct {
+	id          string
+	kind        string
+	index       int
+	indexed     bool
+	added, done map[string]any
+	parts       map[int]*responseOutputPart
+	args        strings.Builder
+	argsDone    string
+}
+type responseOutputPart struct {
+	kind string
+	text strings.Builder
+}
+type responseOutputSlots struct {
+	slots     []*responseOutputSlot
+	ids       map[string]*responseOutputSlot
+	indexes   map[int]*responseOutputSlot
+	unindexed map[string]*responseOutputSlot
+}
+
+func (o *responseOutputSlots) observe(kind string, event map[string]any) {
+	switch kind {
+	case "response.output_item.added", "response.output_item.done",
+		"response.output_text.delta", "response.refusal.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta",
+		"response.function_call_arguments.delta", "response.custom_tool_call_input.delta",
+		"response.function_call_arguments.done", "response.custom_tool_call_input.done":
+	default:
+		return
+	}
+	item := jsonutil.MapAt(event, "item")
+	id := jsonutil.FirstString(jsonutil.StringAt(item, "id"), jsonutil.StringAt(event, "item_id"))
+	index, indexed := event["output_index"].(float64)
+
+	itemKind := jsonutil.StringAt(item, "type")
+	if itemKind == "" {
+		switch {
+		case strings.Contains(kind, "reasoning"):
+			itemKind = "reasoning"
+		case strings.Contains(kind, "custom_tool_call"):
+			itemKind = "custom_tool_call"
+		case strings.Contains(kind, "function_call"):
+			itemKind = "function_call"
+		default:
+			itemKind = "message"
+		}
+	}
+	if o.ids == nil {
+		o.ids = map[string]*responseOutputSlot{}
+		o.indexes = map[int]*responseOutputSlot{}
+		o.unindexed = map[string]*responseOutputSlot{}
+	}
+	var slot *responseOutputSlot
+	if id != "" {
+		slot = o.ids[id]
+	}
+	if slot == nil && kind != "response.output_item.added" {
+		candidate := o.unindexed[itemKind]
+		if indexed {
+			candidate = o.indexes[int(index)]
+		}
+		if candidate != nil && candidate.kind == itemKind && (id == "" || candidate.id == "" || candidate.id == id) {
+			slot = candidate
+		}
+	}
+	if slot == nil {
+		slot = &responseOutputSlot{id: id, kind: itemKind, index: int(index), indexed: indexed}
+		o.slots = append(o.slots, slot)
+	}
+	if slot.id == "" {
+		slot.id = id
+	}
+	if slot.id != "" {
+		o.ids[slot.id] = slot
+	}
+	if indexed {
+		slot.index, slot.indexed = int(index), true
+		o.indexes[int(index)] = slot
+	} else {
+		o.unindexed[itemKind] = slot
+	}
+	switch kind {
+	case "response.output_item.added":
+		slot.added = item
+	case "response.output_item.done":
+		slot.done = item
+	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
+		slot.args.WriteString(jsonutil.StringAt(event, "delta"))
+	case "response.function_call_arguments.done":
+		slot.argsDone = jsonutil.StringAt(event, "arguments")
+	case "response.custom_tool_call_input.done":
+		slot.argsDone = jsonutil.StringAt(event, "input")
+	default:
+		field := "content_index"
+		partKind := "output_text"
+		if kind == "response.refusal.delta" {
+			partKind = "refusal"
+		}
+		if strings.Contains(kind, "reasoning") {
+			field = "summary_index"
+			partKind = "summary_text"
+		}
+		n, _ := event[field].(float64)
+		if slot.parts == nil {
+			slot.parts = map[int]*responseOutputPart{}
+		}
+		part := slot.parts[int(n)]
+		if part == nil {
+			part = &responseOutputPart{kind: partKind}
+			slot.parts[int(n)] = part
+		}
+		part.text.WriteString(jsonutil.StringAt(event, "delta"))
+	}
+}
+func (o *responseOutputSlots) output() []any {
+	slots := append([]*responseOutputSlot(nil), o.slots...)
+	sort.SliceStable(slots, func(i, j int) bool {
+		if slots[i].indexed && slots[j].indexed {
+			return slots[i].index < slots[j].index
+		}
+		return slots[i].indexed && !slots[j].indexed
+	})
+	var output []any
+	for _, slot := range slots {
+
+		item := make(map[string]any, len(slot.added)+len(slot.done)+3)
+		for key, value := range slot.added {
+			item[key] = value
+		}
+		for key, value := range slot.done {
+			item[key] = value
+		}
+		if slot.id != "" && item["id"] == nil {
+			item["id"] = slot.id
+		}
+		if item["type"] == nil {
+			item["type"] = slot.kind
+			if slot.kind == "message" {
+				item["role"] = "assistant"
+			}
+		}
+		if item["type"] == "function_call" || item["type"] == "custom_tool_call" {
+			field := "arguments"
+			if item["type"] == "custom_tool_call" {
+				field = "input"
+			}
+			if jsonutil.StringAt(item, field) == "" {
+				value := slot.argsDone
+				if value == "" {
+					value = slot.args.String()
+				}
+				item[field] = value
+			}
+		}
+		if len(slot.parts) > 0 {
+			field := "content"
+			if item["type"] == "reasoning" {
+				field = "summary"
+			}
+			keys := make([]int, 0, len(slot.parts))
+			for key := range slot.parts {
+				keys = append(keys, key)
+			}
+			sort.Ints(keys)
+			existing := jsonutil.SliceAt(item, field)
+			parts := append([]any(nil), existing...)
+			for _, key := range keys {
+				part := slot.parts[key]
+				textField := "text"
+				if part.kind == "refusal" {
+					textField = "refusal"
+				}
+				value := part.text.String()
+				if key < len(parts) && key >= 0 {
+					previous, _ := parts[key].(map[string]any)
+					if jsonutil.StringAt(previous, textField) != "" {
+						continue
+					}
+					merged := map[string]any{}
+					for k, v := range previous {
+						merged[k] = v
+					}
+					merged["type"] = part.kind
+					merged[textField] = value
+					parts[key] = merged
+				} else {
+					parts = append(parts, map[string]any{"type": part.kind, textField: value})
+				}
+			}
+			item[field] = parts
+		}
+		if jsonutil.StringAt(item, "type") != "" {
+			output = append(output, item)
+		}
+	}
+	return output
 }

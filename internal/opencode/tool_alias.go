@@ -59,7 +59,7 @@ func aliasClientTools(input map[string]any, proto protocol.Protocol, anonymous, 
 		}
 	}
 
-	reword := false
+	reword := compatibilityTools
 	for _, raw := range jsonutil.SliceAt(input, "tools") {
 		tool, _ := raw.(map[string]any)
 		if proto == protocol.Chat {
@@ -98,7 +98,14 @@ func aliasClientTools(input map[string]any, proto protocol.Protocol, anonymous, 
 		if obj == nil {
 			return
 		}
-		if value := zenToolDescriptions[strings.TrimSpace(jsonutil.StringAt(obj, "description"))]; value != "" {
+		value := jsonutil.StringAt(obj, "description")
+		if replacement := zenToolDescriptions[strings.TrimSpace(value)]; replacement != "" {
+			value = replacement
+		}
+		if compatibilityTools {
+			value = strings.ReplaceAll(value, " ", "\u00a0")
+		}
+		if _, exists := obj["description"].(string); exists {
 			obj["description"] = value
 		}
 	}

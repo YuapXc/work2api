@@ -16,6 +16,8 @@ import (
 
 type bridgeStreamParser struct {
 	chatIndexes              ToolCallIndexes
+	chatOutput, chatFinish   bool
+	captureResponsesEvent    func(string, map[string]any)
 	usageSnapshot            map[string]any
 	responseReasonHashes     map[string]hash.Hash
 	responseReasoningDone    map[string]bool
@@ -42,6 +44,9 @@ func (parser *bridgeStreamParser) Parse(eventName, data string) ([]bridgeStreamE
 			if err := parser.rewrite(nil); err != nil {
 				return nil, err
 			}
+		}
+		if !parser.chatOutput && !parser.chatFinish {
+			return []bridgeStreamEvent{{Kind: "error", Error: "upstream returned an empty Chat stream without finish_reason", ErrorType: "empty_response"}}, nil
 		}
 		return []bridgeStreamEvent{{Kind: "done"}}, nil
 	}
@@ -128,6 +133,18 @@ func (parser *bridgeStreamParser) parseChatEvent(eventName string, value map[str
 	for _, raw := range jsonutil.SliceAt(value, "choices") {
 		choice, _ := raw.(map[string]any)
 		delta := jsonutil.MapAt(choice, "delta")
+		if !parser.chatOutput {
+			for _, key := range []string{"content", "refusal", "reasoning", "reasoning_content", "reasoning_details", "tool_calls", "function_call"} {
+				switch v := delta[key].(type) {
+				case string:
+					parser.chatOutput = parser.chatOutput || v != ""
+				case []any:
+					parser.chatOutput = parser.chatOutput || len(v) > 0
+				case map[string]any:
+					parser.chatOutput = parser.chatOutput || len(v) > 0
+				}
+			}
+		}
 		reasoning := jsonutil.StringAt(delta, "reasoning_content")
 		if reasoning == "" {
 			reasoning = jsonutil.StringAt(delta, "reasoning")
@@ -165,6 +182,7 @@ func (parser *bridgeStreamParser) parseChatEvent(eventName string, value map[str
 			}
 		}
 		if stop := jsonutil.StringAt(choice, "finish_reason"); stop != "" {
+			parser.chatFinish = true
 			if isStreamErrorFinish(stop) {
 				events = append(events, bridgeStreamEvent{Kind: "error", Error: jsonutil.FirstString(jsonutil.StringAt(choice, "error", "message"), "upstream Chat stream failed"), ErrorType: "upstream_error"})
 				continue
@@ -287,6 +305,9 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 	typeName := jsonutil.StringAt(value, "type")
 	if typeName == "" {
 		typeName = eventName
+	}
+	if parser.captureResponsesEvent != nil {
+		parser.captureResponsesEvent(typeName, value)
 	}
 	switch typeName {
 	case "error":

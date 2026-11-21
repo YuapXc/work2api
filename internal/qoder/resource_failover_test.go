@@ -20,3 +20,28 @@ func TestWorkspaceQuotaAndQueueDoNotCoolOrSwitchAccounts(t *testing.T) {
 		t.Fatal("transient fallback regressed")
 	}
 }
+
+func TestQuota112AllowsOutputBeforeAccountFallback(t *testing.T) {
+	for _, raw := range []string{`{"code":112}`, `{"code":"112"}`, `{"body":"{\"code\":112}"}`} {
+		if !canFailover(bridge.NewStreamBusinessError(raw)) || !canFailover(bridge.NewUpstreamError(403, raw)) {
+			t.Fatal(raw)
+		}
+	}
+}
+
+func TestQueueExitCanRotateWithoutCoolingWholeAccount(t *testing.T) {
+	for _, kind := range []string{bridge.ErrTypeQueueStalled, bridge.ErrTypeQueueTimeout} {
+		err := &bridge.UpstreamError{Status: 503, ErrType: kind, Message: "queue wait ended"}
+		if !canFailover(err) {
+			t.Fatal(kind)
+		}
+		runtime := New("error")
+		runtime.coolAccount(nil, "", err)
+		if len(runtime.accountCooldowns) != 0 {
+			t.Fatal("queue failure cooled whole account")
+		}
+	}
+	if canFailover(bridge.NewStreamBusinessError(`{"subCode":"RESOURCE_LIMIT","isQueued":true}`)) {
+		t.Fatal("ordinary queue unexpectedly rotates")
+	}
+}

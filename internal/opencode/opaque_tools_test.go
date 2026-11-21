@@ -1,6 +1,7 @@
 package opencode
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
@@ -57,7 +58,7 @@ func TestAnonymousOpaqueToolNamesPreserveContract(t *testing.T) {
 			}
 		}
 		raw, _ := json.Marshal(out["tools"])
-		if strings.Contains(string(raw), "ReportFindings") || strings.Contains(string(raw), "ScheduleWakeup") || !strings.Contains(string(raw), "Must preserve instructions") {
+		if strings.Contains(string(raw), "ReportFindings") || strings.Contains(string(raw), "ScheduleWakeup") || !strings.Contains(string(raw), "Must\u00a0preserve\u00a0instructions") {
 			t.Fatal(string(raw))
 		}
 		after, _ := json.Marshal(body)
@@ -159,6 +160,31 @@ func TestZenExactDescriptionsKeepToolContracts(t *testing.T) {
 			if !strings.Contains(string(raw), "additional user instruction") {
 				t.Fatal("rewrote unknown description")
 			}
+		}
+	}
+}
+
+func TestFreeDescriptionsOnlyShapeTopLevel(t *testing.T) {
+	for _, proto := range []protocol.Protocol{protocol.Chat, protocol.Responses, protocol.Anthropic} {
+		definition := map[string]any{"name": "lookup", "description": "Read a file", "parameters": map[string]any{"description": "Keep normal spaces", "const": "a b"}}
+		var tool any = definition
+		if proto == protocol.Chat {
+			tool = map[string]any{"type": "function", "function": definition}
+		}
+		input := map[string]any{"tools": []any{tool}}
+		before, _ := json.Marshal(input)
+		shaped, _ := aliasClientTools(input, proto, false, true)
+		again, _ := aliasClientTools(shaped, proto, false, true)
+		a, _ := json.Marshal(shaped)
+		b, _ := json.Marshal(again)
+		after, _ := json.Marshal(input)
+		if string(before) != string(after) || string(a) != string(b) || !bytes.Contains(a, []byte("Read\u00a0a\u00a0file")) || !bytes.Contains(a, []byte("Keep normal spaces")) {
+			t.Fatal(string(a), string(b))
+		}
+		paid, _ := aliasClientTools(input, proto, false, false)
+		v, _ := json.Marshal(paid)
+		if !bytes.Contains(v, []byte("Read a file")) {
+			t.Fatal(string(v))
 		}
 	}
 }

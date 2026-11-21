@@ -602,6 +602,9 @@ func (rt *Runtime) doKeyUpstream(ctx context.Context, route Route, bodies routeB
 }
 
 func (rt *Runtime) observeKeyResult(ctx context.Context, nodes *nodePool, node *upstreamNode, proxy *proxyTransport, base string, resp *http.Response, err error) {
+	if resp != nil && resp.Request != nil && resp.Request.Context().Value(emptyReplyContextKey{}) == true {
+		return
+	}
 	status := upstreamStatus(resp)
 	proxyFailed := rt.syncProxyResult(ctx, proxy, base, status, err)
 	if err == nil && status/100 == 2 || isNonRetryableClientResponse(resp, err) {
@@ -614,6 +617,9 @@ func (rt *Runtime) observeKeyResult(ctx context.Context, nodes *nodePool, node *
 }
 
 func (rt *Runtime) observeAnonymousResult(ctx context.Context, node *anonymousNode, base string, resp *http.Response, err error) {
+	if resp != nil && resp.Request != nil && resp.Request.Context().Value(emptyReplyContextKey{}) == true {
+		return
+	}
 	status := upstreamStatus(resp)
 	rt.syncProxyResult(ctx, node.proxy, base, status, err)
 	if err == nil && status/100 == 2 {

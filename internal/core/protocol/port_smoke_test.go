@@ -316,7 +316,7 @@ func TestCollapseResponsesPreservesTerminalOutput(t *testing.T) {
 	}{
 		{"missing output", `{"type":"response.completed","response":{}}`, `"text":"incremental text"`},
 		{"null output", `{"type":"response.completed","response":{"output":null}}`, `"text":"incremental text"`},
-		{"explicit empty output", `{"type":"response.completed","response":{"output":[]}}`, `"output":[]`},
+		{"explicit empty output", `{"type":"response.completed","response":{"output":[]}}`, `"text":"incremental text"`},
 		{"incomplete", `{"type":"response.done","response":{"status":"incomplete","output":` + output + `,"incomplete_details":{"reason":"content_filter"}}}`, `"incomplete_details":{"reason":"content_filter"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -521,6 +521,7 @@ func TestSSEEventLimitsPreserveUnlimitedAggregateAndTerminalCutoff(t *testing.T)
 			t.Fatal("aggregate stream bounded", err)
 		}
 	}
+	observer.Write([]byte(`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}` + "\n\n"))
 	terminal := "data: [DONE]\n\n"
 	accepted, err := observer.Write([]byte(terminal + oversized))
 	if err != nil || accepted != len(terminal) || !observer.NormalTermination() {
@@ -671,7 +672,7 @@ func TestForwardStreamStopsAtTerminalWithoutEOF(t *testing.T) {
 		proto Protocol
 		wire  string
 	}{
-		{Chat, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\ndata: [DONE]\n\n"},
+		{Chat, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\ndata: [DONE]\n\n"},
 		{Anthropic, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"},
 		{Responses, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"},
 	} {
@@ -1309,7 +1310,7 @@ func TestCollapseDoesNotInventMissingUsage(t *testing.T) {
 
 func TestUsageObserverFragmentationAndBufferRelease(t *testing.T) {
 	for _, delimiter := range []string{"\n\n", "\r\n\r\n"} {
-		frame := `data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}` + delimiter
+		frame := `data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}` + delimiter
 		wire := ":" + strings.Repeat("x", 160<<10) + delimiter + frame + "data: [DONE]" + delimiter
 		for _, size := range []int{1, 3, 65536, len(wire)} {
 			observer := newStreamUsageObserver(Chat)
@@ -1893,5 +1894,88 @@ func TestResponsesAssistantBlocksStayInOneTurn(t *testing.T) {
 	after, _ := json.Marshal(body)
 	if !bytes.Equal(before, after) {
 		t.Fatal("mutated input")
+	}
+}
+
+func TestEmptyChatRequiresContentOrFinish(t *testing.T) {
+	for _, delta := range []string{`{"role":"assistant"}`, `{"content":"OK"}`, `{"reasoning":"think"}`, `{"refusal":"no"}`, `{"reasoning_details":[{"text":"think"}]}`, `{"tool_calls":[{"index":0,"id":"c","function":{"name":"run"}}]}`, `{"function_call":{"name":"run","arguments":"{}"}}`} {
+		wire := "data: {\"choices\":[{\"delta\":" + delta + "}]}\n\ndata: [DONE]\n\n"
+		empty := strings.Contains(delta, `"role"`)
+		probe := NewEmptyReplyProbe(Chat)
+		probe.Observe([]byte(wire))
+		if probe.Empty != empty {
+			t.Fatal(delta, probe)
+		}
+		_, _, _, err := CollapseStreamWithUsage(strings.NewReader(wire), Chat, "test")
+		if (err != nil) != empty {
+			t.Fatal(delta, err)
+		}
+	}
+	for _, stop := range []string{"stop", "length", "content_filter", "tool_calls"} {
+		wire := fmt.Sprintf("data: {\"choices\":[{\"delta\":{},\"finish_reason\":%q}]}\n\ndata: [DONE]\n\n", stop)
+		if _, err := CollapseStream(strings.NewReader(wire), Chat, "test"); err != nil {
+			t.Fatal(stop, err)
+		}
+	}
+}
+
+func TestCollapseResponsesRebuildsDoneItems(t *testing.T) {
+	frames := []string{
+		`{"type":"response.output_item.done","output_index":2,"item":{"type":"function_call","id":"f","call_id":"c","name":"run","arguments":"{}"}}`,
+		`{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"r","encrypted_content":"signature","summary":[{"type":"summary_text","text":"think"}]}}`,
+		`{"type":"response.output_text.delta","output_index":1,"item_id":"m","content_index":1,"delta":"second"}`,
+		`{"type":"response.output_text.delta","output_index":1,"item_id":"m","content_index":0,"delta":"first"}`,
+		`{"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"m","role":"assistant","content":[{"type":"output_text","text":""},{"type":"output_text","text":"authoritative"}]}}`,
+		`{"type":"response.output_item.done","output_index":2,"item":{"type":"function_call","id":"f","call_id":"c","name":"run","arguments":"{\"value\":1}"}}`,
+		`{"type":"response.output_item.done","output_index":2,"item":{"type":"custom_tool_call","id":"other","call_id":"d","name":"patch","input":"raw patch"}}`,
+		`{"type":"response.output_item.done","output_index":3,"item":{"type":"web_search_call","id":"search","status":"completed"}}`,
+		`{"type":"response.completed","response":{"id":"resp_native","status":"completed","output":[]}}`,
+	}
+	var wire strings.Builder
+	for _, frame := range frames {
+		wire.WriteString("data: " + frame + "\n\n")
+	}
+	body, err := CollapseStream(strings.NewReader(wire.String()), Responses, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if json.Unmarshal(body, &doc) != nil {
+		t.Fatal(string(body))
+	}
+	output := doc["output"].([]any)
+	if len(output) != 5 || doc["id"] != "resp_native" {
+		t.Fatal(string(body))
+	}
+	for i, id := range []string{"r", "m", "f", "other", "search"} {
+		if output[i].(map[string]any)["id"] != id {
+			t.Fatal(string(body))
+		}
+	}
+	if !strings.Contains(string(body), `"encrypted_content":"signature"`) || !strings.Contains(string(body), `"text":"first"`) || !strings.Contains(string(body), `"text":"authoritative"`) || !strings.Contains(string(body), `"arguments":"{\"value\":1}"`) {
+		t.Fatal(string(body))
+	}
+
+	doc["output"] = output[:3]
+	supported, _ := json.Marshal(doc)
+	for _, target := range []Protocol{Chat, Anthropic} {
+		converted, err := ConvertResponse(Responses, target, supported)
+		if err != nil || !bytes.Contains(converted, []byte("run")) || !bytes.Contains(converted, []byte("authoritative")) {
+			t.Fatal(target, string(converted), err)
+		}
+	}
+
+}
+
+func TestForwardEmptyChatReportsErrorBeforeDone(t *testing.T) {
+	wire := "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":5}}\n\ndata: [DONE]\n\n"
+	w := httptest.NewRecorder()
+	usage, known, err := ForwardStream(t.Context(), w, strings.NewReader(wire), Chat, "test")
+	if err == nil || !known || usage.Input != 5 || !strings.Contains(w.Body.String(), "empty_response") {
+		t.Fatal(w.Body.String(), usage, known, err)
+	}
+	text := w.Body.String()
+	if strings.Index(text, "[DONE]") >= 0 && strings.Index(text, "[DONE]") < strings.Index(text, "empty_response") {
+		t.Fatal("error after done", text)
 	}
 }

@@ -67,6 +67,9 @@ func ReadStreamHead(reader *bufio.Reader, from Protocol) ([]byte, error) {
 		for _, ev := range events {
 			if ev.Kind == "error" {
 				status := 400
+				if ev.ErrorType == "empty_response" {
+					status = 502
+				}
 				var raw map[string]any
 				_ = json.Unmarshal([]byte(payload), &raw)
 				kind := jsonutil.FirstString(jsonutil.StringAt(raw, "error", "type"), jsonutil.StringAt(raw, "error", "code"), jsonutil.StringAt(raw, "response", "error", "code"))
@@ -167,7 +170,13 @@ func (p *EmptyReplyProbe) Observe(data []byte) {
 				if ev.Text != "" || ev.Encrypted != "" || ev.NativeThinking != nil {
 					p.Ready = true
 				}
-			case "tool_start", "tool_delta", "error":
+			case "error":
+				if ev.ErrorType == "empty_response" {
+					p.Done, p.Empty = true, !p.Ready
+					continue
+				}
+				p.Ready = true
+			case "tool_start", "tool_delta":
 				p.Ready = true
 			case "finish":
 				p.stop = ev.Stop

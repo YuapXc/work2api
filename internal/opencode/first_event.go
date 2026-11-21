@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -213,6 +214,8 @@ type attemptBody struct {
 
 func (b *attemptBody) Close() error { b.cancel(); return b.ReadCloser.Close() }
 
+type emptyReplyContextKey struct{}
+
 func readInferenceAttempt(client *http.Client, req *http.Request, from protocol.Protocol) (*http.Response, error) {
 	resp, err := client.Do(req)
 	streamwatch.AttemptHTTP(req.Context(), resp)
@@ -236,6 +239,14 @@ func readInferenceAttempt(client *http.Client, req *http.Request, from protocol.
 			resp.Header.Del("Content-Length")
 			resp.ContentLength = int64(len(rejection.Body))
 			resp.Body = io.NopCloser(bytes.NewReader(rejection.Body))
+			var detail struct {
+				Error struct {
+					Type string `json:"type"`
+				} `json:"error"`
+			}
+			if json.Unmarshal(rejection.Body, &detail) == nil && detail.Error.Type == "empty_response" {
+				resp.Request = req.WithContext(context.WithValue(req.Context(), emptyReplyContextKey{}, true))
+			}
 			return resp, nil
 		}
 		return nil, err

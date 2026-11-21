@@ -1142,3 +1142,30 @@ func TestNormalizedRoutePreparationMatchesInternalInput(t *testing.T) {
 		}
 	}
 }
+
+func TestEmptyChatHeadDoesNotPenalizeAccount(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	req, _ := http.NewRequestWithContext(t.Context(), "POST", srv.URL, strings.NewReader(`{}`))
+	resp, err := readInferenceAttempt(srv.Client(), req, protocol.Chat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 502 || resp.Request.Context().Value(emptyReplyContextKey{}) != true {
+		t.Fatal(resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(body, []byte("empty_response")) {
+		t.Fatal(string(body))
+	}
+	rt := &Runtime{}
+	node := &upstreamNode{}
+	rt.observeKeyResult(t.Context(), nil, node, nil, "", resp, nil)
+	if node.failures.Load() != 0 || node.cooldownUntil.Load() != 0 {
+		t.Fatal("empty reply cooled account")
+	}
+}

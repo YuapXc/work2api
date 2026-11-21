@@ -199,11 +199,25 @@ func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader,
 	defer release()
 	writer := &sseFlushWriter{writer: w, flush: http.NewResponseController(w).Flush}
 	var copyErr error
+	if protocol == Chat {
+		observer.onFrame = func(frame []byte) error {
+			if observer.empty {
+				emitter := newBridgeStreamEmitter(w, w, protocol, model)
+				return emitter.Emit(bridgeStreamEvent{Kind: "error", Error: "upstream returned an empty Chat stream without finish_reason", ErrorType: "empty_response"})
+			}
+			_, err := writer.Write(frame)
+			return err
+		}
+	}
 	for {
 		n, readErr := reader.Read(buffer)
 		if n > 0 {
 			accepted, observeErr := observer.Write(buffer[:n])
-			written, err := writer.Write(buffer[:accepted])
+			written := accepted
+			var err error
+			if observer.onFrame == nil {
+				written, err = writer.Write(buffer[:accepted])
+			}
 			if err != nil {
 				copyErr = err
 				break
@@ -263,6 +277,8 @@ func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader,
 }
 
 type streamUsageObserver struct {
+	onFrame  func([]byte) error
+	empty    bool
 	parser   *bridgeStreamParser
 	buffer   []byte
 	scan     int
@@ -324,6 +340,12 @@ func (observer *streamUsageObserver) writeFragment(data []byte) (int, error) {
 		}
 		frame := observer.buffer[consumed:end]
 		observer.consume(frame)
+		if observer.onFrame != nil {
+			if err := observer.onFrame(frame); err != nil {
+				observer.buffer = nil
+				return max(0, end-previous), err
+			}
+		}
 		consumed = end
 		observer.scan = 0
 		if observer.normal || observer.error {
@@ -383,6 +405,7 @@ func (observer *streamUsageObserver) consume(frame []byte) {
 				observer.usage.FinishReason = event.Stop
 			case "error":
 				observer.error = true
+				observer.empty = event.ErrorType == "empty_response"
 			}
 			if event.Usage != nil {
 				observer.reported = true

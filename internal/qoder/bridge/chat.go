@@ -328,7 +328,7 @@ func WriteErr(w http.ResponseWriter, err error) {
 	body, _ := json.Marshal(map[string]interface{}{
 		"error": map[string]interface{}{"message": errMsg, "type": errType},
 	})
-	w.Header().Set("Content-Type", "application/json")
+	writeErrorHeaders(w, err)
 	w.WriteHeader(ErrorStatus(err))
 	w.Write(body)
 }

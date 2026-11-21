@@ -109,6 +109,8 @@ func TestResourceRejectionsDoNotReplayOrEmitSuccess(t *testing.T) {
 	}{
 		{"http", outer, 403, 0, false}, {"sse_envelope", outer, 200, 403, false}, {"sse_business", business, 200, 200, false},
 		{"after_output", business, 200, 200, true},
+		{"quota112", `{"code":112,"message":"quota exhausted"}`, 200, 200, false},
+		{"quota112-after-output", `{"code":112,"message":"quota exhausted"}`, 200, 200, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var hits atomic.Int32
@@ -369,5 +371,161 @@ func TestQueuedRequestsAcrossPublicProtocols(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+func TestQuota112AcrossErrorEnvelopes(t *testing.T) {
+	for _, code := range []string{`112`, `"112"`} {
+		raw := `{"code":` + code + `,"message":"quota exhausted","pricingUrl":"https://example.invalid/pricing"}`
+		wrapper, _ := json.Marshal(map[string]any{"statusCodeValue": 200, "body": raw})
+		d := ExtractDelta(string(wrapper))
+		var upstream *UpstreamError
+		if !errors.As(d.Err, &upstream) || upstream.ErrType != ErrTypeQuota || ErrorStatus(d.Err) != 429 || isRetryableStreamError(d.Err) {
+			t.Fatal(d.Err)
+		}
+		for _, status := range []int{401, 402} {
+			if ErrorStatus(NewUpstreamError(status, raw)) != status {
+				t.Fatal(status)
+			}
+		}
+	}
+	if resourceFailure(`{"message":"code 112 quota exhausted"}`, 0) != "" {
+		t.Fatal("matched free text")
+	}
+}
+
+func TestQueueExitPreservesReasonAndDeadline(t *testing.T) {
+	_, raw, _ := queueErrorFixture()
+	initial := NewStreamBusinessError(raw)
+	for _, tc := range []struct {
+		cause   error
+		expired bool
+		status  int
+		kind    string
+	}{
+		{errQueueStalled, false, 503, ErrTypeQueueStalled},
+		{context.DeadlineExceeded, false, 503, ErrTypeQueueTimeout},
+		{context.DeadlineExceeded, true, 504, ErrTypeQueueTimeout},
+	} {
+		err := queueWaitError(initial, tc.cause, tc.expired)
+		var ue *UpstreamError
+		if !errors.As(err, &ue) || ErrorStatus(err) != tc.status || ue.ErrType != tc.kind || ue.Detail != raw || !errors.Is(err, tc.cause) || ue.RetryAfter != 30*time.Second {
+			t.Fatal(err, ue)
+		}
+		for _, write := range []func(http.ResponseWriter, error){WriteErr, WriteClaudeErr, WriteCodexErr} {
+			w := httptest.NewRecorder()
+			write(w, err)
+			if w.Code != tc.status || w.Header().Get("Retry-After") != "30" || !strings.Contains(w.Body.String(), "排队") {
+				t.Fatal(w.Code, w.Body.String())
+			}
+		}
+	}
+	if err := queueWaitError(initial, context.Canceled, true); !errors.Is(err, context.Canceled) || ErrorStatus(err) != 499 {
+		t.Fatal(err)
+	}
+	if ErrorStatus(context.DeadlineExceeded) != 504 {
+		t.Fatal("bare deadline became 500")
+	}
+}
+
+func TestStalledQueueFallsBackOnlyBeforeOutput(t *testing.T) {
+	for _, mode := range []string{"fallback", "revoked", "deadline", "cancel", "after_output"} {
+		t.Run(mode, func(t *testing.T) {
+			previous := queueNow
+			defer func() { queueNow = previous }()
+			now := time.Now()
+			ticks := 0
+			queueNow = func() time.Time {
+				ticks++
+				if ticks > 1 {
+					return now.Add(6 * time.Minute)
+				}
+				return now
+			}
+			var bad, good, queries, nextCalls atomic.Int32
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			if mode == "deadline" {
+				cancel()
+				ctx, cancel = context.WithTimeout(t.Context(), 100*time.Millisecond)
+			}
+			defer cancel()
+			ticket, business, _ := queueErrorFixture()
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" {
+					queries.Add(1)
+					if mode == "deadline" {
+						<-r.Context().Done()
+						return
+					}
+					if mode == "cancel" {
+						cancel()
+						<-r.Context().Done()
+						return
+					}
+					fmt.Fprint(w, ticket)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				emit := func(raw string) {
+					frame, _ := json.Marshal(map[string]any{"statusCodeValue": 200, "body": raw})
+					fmt.Fprintf(w, "data: %s\n\n", frame)
+				}
+				if r.URL.Path == "/good" {
+					good.Add(1)
+					emit(`{"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}`)
+					return
+				}
+				bad.Add(1)
+				if mode == "after_output" {
+					emit(`{"choices":[{"delta":{"content":"first"}}]}`)
+				}
+				emit(business)
+			}))
+			defer srv.Close()
+			sess, e := cosy.NewSession(cosy.AuthIdentity{Uid: "fixture", UserType: "personal_standard"}, "fixture", "fixture", "fixture")
+			if e != nil {
+				t.Fatal(e)
+			}
+			b := &Bridge{sess: sess, client: NewBearerClient(sess), templateBase: map[string]any{}, chatStreamURL: srv.URL}
+			other := &Bridge{sess: sess, client: NewBearerClient(sess), templateBase: map[string]any{}, chatStreamURL: srv.URL + "/good"}
+			ctx = WithAccountFallback(ctx, func(ctx context.Context, model string, err error) (*Bridge, error) {
+				nextCalls.Add(1)
+				var ue *UpstreamError
+				if !errors.As(err, &ue) || ue.ErrType != ErrTypeQueueStalled || ErrorStatus(err) != 503 {
+					t.Fatalf("lost queue exit: %v", err)
+				}
+				if mode == "revoked" {
+					return nil, provider.NewAPIError(403, "revoked", "account_not_allowed")
+				}
+				return other, nil
+			})
+			var content strings.Builder
+			err := b.CallQoderWithOpts(ctx, "codex", nil, "qfmodel", nil, CallOpts{}, func(d Delta) { content.WriteString(d.Content) })
+			if bad.Load() != 1 {
+				t.Fatal("replayed queued request", bad.Load())
+			}
+			switch mode {
+			case "fallback":
+				if err != nil || good.Load() != 1 || nextCalls.Load() != 1 || content.String() != "OK" {
+					t.Fatal(err, good.Load(), nextCalls.Load(), content.String())
+				}
+			case "deadline":
+				if !errors.Is(err, context.DeadlineExceeded) || ErrorStatus(err) != 504 || nextCalls.Load() != 0 {
+					t.Fatal(err, nextCalls.Load())
+				}
+			case "cancel":
+				if !errors.Is(err, context.Canceled) || ErrorStatus(err) != 499 || nextCalls.Load() != 0 {
+					t.Fatal(err, nextCalls.Load())
+				}
+			case "revoked":
+				if err == nil || good.Load() != 0 || nextCalls.Load() != 1 {
+					t.Fatal(err, good.Load())
+				}
+			case "after_output":
+				if err == nil || good.Load() != 0 || nextCalls.Load() != 0 || queries.Load() != 0 || content.String() != "first" {
+					t.Fatal(err, good.Load(), nextCalls.Load(), content.String())
+				}
+			}
+		})
 	}
 }

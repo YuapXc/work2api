@@ -127,6 +127,7 @@ func queueStuckKey(state queueState) string {
 }
 
 var errQueueStalled = errors.New("queue stalled")
+var queueNow = time.Now
 
 func queueProgress(state queueState, previous string, since, now time.Time) (string, time.Time, bool) {
 	key := queueStuckKey(state)
@@ -187,7 +188,7 @@ func (b *Bridge) pollQueue(ctx context.Context, endpoint string, body map[string
 	if requestSet == "" || state.Model == "" {
 		return false, nil
 	}
-	key, since, failures := queueStuckKey(state), time.Now(), 0
+	key, since, failures := queueStuckKey(state), queueNow(), 0
 	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
 			if err := sleepCtx(ctx, queuePause(state)); err != nil {
@@ -265,7 +266,7 @@ func (b *Bridge) pollQueue(ctx context.Context, endpoint string, body map[string
 		}
 		state = next
 		var stalled bool
-		key, since, stalled = queueProgress(state, key, since, time.Now())
+		key, since, stalled = queueProgress(state, key, since, queueNow())
 		if stalled {
 			return false, errQueueStalled
 		}
@@ -282,4 +283,38 @@ func (b *Bridge) pollQueue(ctx context.Context, endpoint string, body map[string
 		}
 		return false, nil
 	}
+}
+
+func queueWaitError(previous, cause error, requestExpired bool) error {
+	if errors.Is(cause, context.Canceled) {
+		return cause
+	}
+	var original *UpstreamError
+	if !errors.As(previous, &original) {
+		return cause
+	}
+	copy := *original
+	if copy.RetryAfter <= 0 {
+		if state, ok := readQueueState([]byte(copy.Detail)); ok && state.Retry != nil && *state.Retry > 0 && *state.Retry < float64(math.MaxInt64)/float64(time.Second) {
+			copy.RetryAfter = time.Duration(*state.Retry * float64(time.Second))
+		}
+	}
+	copy.cause = cause
+	switch {
+	case errors.Is(cause, errQueueStalled):
+		copy.Status = 503
+		copy.ErrType = ErrTypeQueueStalled
+		copy.Message += "（队列5分钟无进展且前方无人，已停止等待）"
+	case errors.Is(cause, context.DeadlineExceeded):
+		copy.Status = 503
+		copy.ErrType = ErrTypeQueueTimeout
+		copy.Message += "（上游排队等待已达上限）"
+		if requestExpired {
+			copy.Status = 504
+			copy.Message = original.Message + "（请求在等待上游队列期间超时）"
+		}
+	default:
+		return cause
+	}
+	return &copy
 }

@@ -2493,6 +2493,7 @@ func TestRouteEmptyReplyGateNeverReplaysOutput(t *testing.T) {
 	}{
 		{"json-empty", `{"choices":[{"message":{"content":""},"finish_reason":"stop"}]}`, false, true},
 		{"json-length", `{"choices":[{"message":{"content":""},"finish_reason":"length"}]}`, false, false},
+		{"sse-no-finish", `data: {"choices":[{"delta":{"role":"assistant"}}]}` + "\n\ndata: [DONE]\n\n", true, true},
 		{"sse-empty", "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", true, true},
 		{"sse-text", "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\ndata: [DONE]\n\n", true, false},
 		{"sse-reasoning", "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n", true, false},

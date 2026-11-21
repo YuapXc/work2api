@@ -39,6 +39,9 @@ func canFailover(err error) bool {
 	}
 	var upstream *bridge.UpstreamError
 	if errors.As(err, &upstream) {
+		if upstream.ErrType == bridge.ErrTypeQuota || upstream.ErrType == bridge.ErrTypeQueueStalled || upstream.ErrType == bridge.ErrTypeQueueTimeout {
+			return true
+		}
 		if upstream.ErrType == "upstream_queued" || upstream.ErrType == "resource_limit" || upstream.ErrType == bridge.ErrTypeWorkspaceQuota {
 			return false
 		}
@@ -124,7 +127,10 @@ func (r *Runtime) affinityAccount(key [32]byte, enabled bool, preferred [32]byte
 func (r *Runtime) coolAccount(acct *account.Account, secret string, cause error) {
 	duration := 15 * time.Second
 	var upstream *bridge.UpstreamError
-	if errors.As(cause, &upstream) && upstream.Status == 429 {
+	if errors.As(cause, &upstream) && (upstream.ErrType == bridge.ErrTypeQueueStalled || upstream.ErrType == bridge.ErrTypeQueueTimeout) {
+		return
+	}
+	if errors.As(cause, &upstream) && bridge.ErrorStatus(upstream) == 429 {
 		duration = time.Minute
 		if upstream.RetryAfter > 0 {
 			duration = upstream.RetryAfter

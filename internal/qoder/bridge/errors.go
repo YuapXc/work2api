@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"strings"
 	"time"
 )
@@ -26,6 +27,9 @@ const (
 	ErrTypeUpstream       = "upstream_error"
 	ErrTypeWorkspaceQuota = "workspace_quota"
 	ErrTypeCallCount      = "call_count_limit"
+	ErrTypeQuota          = "quota_exhausted"
+	ErrTypeQueueStalled   = "upstream_queue_stalled"
+	ErrTypeQueueTimeout   = "upstream_queue_timeout"
 )
 
 type ClientDeliveryError struct{ Err error }
@@ -186,6 +190,9 @@ func FriendlyUpstreamError(code int, detail string) (string, string) {
 		if kind == "upstream_queued" {
 			return "上游模型正在排队，请稍后重试或选择其他模型", kind
 		}
+		if kind == ErrTypeQuota {
+			return "上游账号额度已用尽，请补充额度或使用其他账号", kind
+		}
 		if kind == ErrTypeCallCount {
 			return "上游调用次数受限，请稍后重试", kind
 		}
@@ -225,7 +232,7 @@ func NewStreamBusinessError(detail string) *UpstreamError {
 	if kind := resourceFailure(detail, 0); kind != "" {
 		msg, _ := FriendlyUpstreamError(0, detail)
 		status := 403
-		if kind == "upstream_queued" || kind == ErrTypeWorkspaceQuota || kind == ErrTypeCallCount {
+		if kind == "upstream_queued" || kind == ErrTypeWorkspaceQuota || kind == ErrTypeCallCount || kind == ErrTypeQuota {
 			status = 429
 		}
 		return &UpstreamError{Status: status, Detail: detail, ErrType: kind, Message: msg}
@@ -254,7 +261,7 @@ func resourceFailure(detail string, depth int) string {
 	if len(detail) > 65536 {
 		return ""
 	}
-	resource, countLimited, queued, workspace := false, false, false, false
+	resource, countLimited, queued, workspace, quota := false, false, false, false, false
 	nodes := 64
 	var walk func(string, int, bool)
 	walk = func(text string, level int, inLimit bool) {
@@ -270,6 +277,9 @@ func resourceFailure(detail string, depth int) string {
 		if json.Unmarshal([]byte(text), &m) != nil {
 			return
 		}
+		var code any
+		_ = json.Unmarshal(m["code"], &code)
+		quota = quota || businessCode(code) == "112"
 		var sub string
 		_ = json.Unmarshal(m["subCode"], &sub)
 		isResource := strings.EqualFold(strings.TrimSpace(sub), "RESOURCE_LIMIT")
@@ -298,6 +308,9 @@ func resourceFailure(detail string, depth int) string {
 		}
 	}
 	walk(detail, depth, false)
+	if quota {
+		return ErrTypeQuota
+	}
 	if (resource || countLimited) && queued {
 		return "upstream_queued"
 	}
@@ -336,6 +349,12 @@ func FriendlyError(err error) (string, string) {
 	if errors.As(err, &ue) {
 		return ue.Message, ue.ErrType
 	}
+	if errors.Is(err, context.Canceled) {
+		return "客户端已取消请求", "request_canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "等待上游响应超时", "upstream_timeout"
+	}
 	return err.Error(), "qoder_error"
 }
 
@@ -352,7 +371,7 @@ func ErrorStatus(err error) int {
 			return 400
 		case ErrTypeTransient:
 			return 502
-		case "upstream_queued", ErrTypeWorkspaceQuota, ErrTypeCallCount:
+		case "upstream_queued", ErrTypeWorkspaceQuota, ErrTypeCallCount, ErrTypeQuota:
 			return 429
 		case "resource_limit":
 			return 403
@@ -361,5 +380,19 @@ func ErrorStatus(err error) int {
 			return ue.Status
 		}
 	}
+	if errors.Is(err, context.Canceled) {
+		return 499
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return 504
+	}
 	return 500
+}
+
+func writeErrorHeaders(w http.ResponseWriter, err error) {
+	w.Header().Set("Content-Type", "application/json")
+	var upstream *UpstreamError
+	if errors.As(err, &upstream) && upstream.RetryAfter > 0 {
+		w.Header().Set("Retry-After", fmt.Sprint(max(1, int(upstream.RetryAfter.Seconds()+.999))))
+	}
 }

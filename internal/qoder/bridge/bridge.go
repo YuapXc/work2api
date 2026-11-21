@@ -539,9 +539,10 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 		physical = MapModel(agent, model)
 	}
 	current := b
+	began := time.Now()
 	for {
 		emitted := false
-		err := current.callQoderWithOpts(ctx, messages, model, physical, tools, opts, func(d Delta) {
+		err := current.callQoderWithOpts(ctx, messages, model, physical, tools, opts, began, func(d Delta) {
 			if d.Content != "" || d.Reasoning != "" || streamwatch.HasToolArguments(d.ToolCalls) {
 				streamwatch.Generation(ctx)
 			}
@@ -578,12 +579,11 @@ func WithAccountFallback(ctx context.Context, next AccountFallback) context.Cont
 	return context.WithValue(ctx, accountFallbackKey{}, next)
 }
 
-func (b *Bridge) callQoderWithOpts(ctx context.Context, messages []interface{}, originalModel, model string, tools interface{}, opts CallOpts, onDelta func(Delta)) error {
+func (b *Bridge) callQoderWithOpts(ctx context.Context, messages []interface{}, originalModel, model string, tools interface{}, opts CallOpts, began time.Time, onDelta func(Delta)) error {
 	budget := 4 * time.Minute
 	if opts.Stream {
 		budget = time.Hour
 	}
-	began := time.Now()
 	// 将客户端模型名（claude-sonnet-4-6 等）映射成 Qoder 上游内部 model.key（auto/qmodel_38max/gmodel/dmodel 等）。
 	// 上游对未知 key 会走兜底返回内容，但不会把这次调用计入 quota，这是「请求成功但 dashboard 无用量」的根因。
 	if strings.HasPrefix(strings.ToLower(model), "kmodel") || strings.Contains(strings.ToLower(model+" "+originalModel), "kimi") {
@@ -765,17 +765,14 @@ func (b *Bridge) callQoderWithOpts(ctx context.Context, messages []interface{}, 
 				queueCtx, cancel := context.WithDeadline(ctx, began.Add(budget))
 				ready, err := b.waitQueued(queueCtx, qurl, body, extra, state)
 				cancel()
-				if errors.Is(err, errQueueStalled) {
-					var upstream *UpstreamError
-					if errors.As(lastErr, &upstream) {
-						copy := *upstream
-						copy.Message += "（队列5分钟无进展且前方无人，已停止等待）"
-						return &copy
+				if ctx.Err() != nil {
+					if errors.Is(ctx.Err(), context.Canceled) {
+						return ctx.Err()
 					}
-					return lastErr
+					return queueWaitError(lastErr, ctx.Err(), true)
 				}
-				if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-					return lastErr
+				if errors.Is(err, errQueueStalled) || errors.Is(err, context.DeadlineExceeded) {
+					return queueWaitError(lastErr, err, ctx.Err() != nil)
 				}
 				if err != nil {
 					return err
