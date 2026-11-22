@@ -819,6 +819,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 		writeServeError(req, err)
 		return provider.UsageReport{Status: "error", Error: err.Error()}, err
 	}
+	ctx, queueSnapshot := bridge.WithQueueDiagnostics(ctx)
 	var res bridge.ServeResult
 	switch req.Protocol {
 	case provider.ProtocolChat:
@@ -832,6 +833,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 		writeServeError(req, err)
 	}
 
+	report.Queue = queueSnapshot()
 	report.InputTokens = res.InputTokens
 	report.TokensKnown = &res.UsageKnown
 	report.OutputTokens = res.OutputTokens

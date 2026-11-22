@@ -626,7 +626,7 @@ func TestRuntimeUsageGetsWholeRequestTiming(t *testing.T) {
 	streamwatch.StartAttempt(ctx)
 	reasoning, creation := 3, 0
 	known := true
-	s.o.logRuntimeUsageDiagnostic(provider.UsageReport{Status: "ok", TokensKnown: &known, InputTokens: 10, OutputTokens: 5, ReasoningTokens: &reasoning, CacheCreationTokens: &creation, FinishReason: "stop", RequestedLimits: map[string]int{"max_output_tokens": 256}, EffectiveLimits: map[string]int{"max_tokens": 256}}, "responses", "trae/test", time.Now(), "key", user.ID, 1, nil, ctx)
+	s.o.logRuntimeUsageDiagnostic(provider.UsageReport{Status: "ok", TokensKnown: &known, InputTokens: 10, OutputTokens: 5, ReasoningTokens: &reasoning, CacheCreationTokens: &creation, FinishReason: "stop", RequestedLimits: map[string]int{"max_output_tokens": 256}, EffectiveLimits: map[string]int{"max_tokens": 256}, Queue: &provider.QueueDiagnostics{Waits: 2, WaitMS: 3000, Queries: 3, ExitReason: "ready"}}, "responses", "trae/test", time.Now(), "key", user.ID, 1, nil, ctx)
 	if len(rows.pending) != 1 {
 		t.Fatal("runtime usage bypassed timing tracker")
 	}
@@ -645,6 +645,9 @@ func TestRuntimeUsageGetsWholeRequestTiming(t *testing.T) {
 	}
 	if !diag.Started || diag.FinishReason != "stop" || diag.RequestedLimits["max_output_tokens"] != 256 || diag.EffectiveLimits["max_tokens"] != 256 {
 		t.Fatal("runtime termination or budgets lost", diag)
+	}
+	if diag.Queue == nil || diag.Queue.Waits != 2 || diag.Queue.WaitMS != 3000 || diag.Queue.Queries != 3 || diag.Queue.ExitReason != "ready" {
+		t.Fatal("queue diagnostic not persisted", diag)
 	}
 	public := portalLog(row)
 	details := public["diagnostics"].(store.UsageDiagnostics).TokenDetails

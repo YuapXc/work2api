@@ -99,3 +99,59 @@ func TestClaimAcceptedWaitsForConfirmationAndSurvivesRestart(t *testing.T) {
 		t.Fatal("canceled maintenance continued")
 	}
 }
+
+func TestCheckinRewardUsesConfirmedKnownAmountsOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name, claim, status string
+		known               bool
+		want                int64
+		confirmed           bool
+	}{
+		{"claim", `{"code":0,"credits_granted":7}`, `"credits":10,"extra_credits":2`, true, 7, true},
+		{"fallback", `{"code":0}`, `"credits":10,"extra_credits":2`, true, 12, true},
+		{"explicit_zero", `{"code":0,"credits_granted":0}`, `"credits":10`, true, 0, true},
+		{"status_zero", `{"code":0}`, `"credits":0`, true, 0, true},
+		{"unknown", `{"code":0}`, `"unknown":true`, false, 0, true},
+		{"pending", `{"code":0,"credits_granted":7}`, `"credits":10`, false, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var claims atomic.Int32
+			r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+				if req.URL.Path == upstream.EpCheckinClaim {
+					claims.Add(1)
+					fmt.Fprint(w, tc.claim)
+					return
+				}
+				fmt.Fprintf(w, `{"code":0,"enable":true,"checked_in":%v,%s}`, claims.Load() > 0 && tc.confirmed, tc.status)
+			})
+			a := &auth.Auth{UID: "reward", Variant: "cn", AccessToken: "fixture", DeviceID: "1234567890123456", ExpiresAt: time.Now().Add(time.Hour).Unix(), FilePath: filepath.Join(r.dir, "reward.json")}
+			if e := a.SaveAtomic(); e != nil {
+				t.Fatal(e)
+			}
+			id := accountID(a.UID)
+			r.accounts[id] = &accountState{Auth: a, Enabled: true, Identities: map[string]*auth.Auth{"cn": a}}
+			result, err := r.AdminCheckin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			row := result["results"].([]map[string]any)[0]
+			credit, known := row["credit"].(int64)
+			if known != tc.known || known && credit != tc.want || claims.Load() != 1 {
+				t.Fatal(row, claims.Load())
+			}
+			if tc.confirmed && row["ok"] != true {
+				t.Fatal(row)
+			}
+			if !tc.confirmed && (row["status"] != "pending" || row["ok"] == false) {
+				t.Fatal(row)
+			}
+			next, err := r.AdminCheckin(t.Context())
+			if err != nil || claims.Load() != 1 {
+				t.Fatal(err, claims.Load())
+			}
+			if _, exists := next["results"].([]map[string]any)[0]["credit"]; exists {
+				t.Fatal("reward counted twice")
+			}
+		})
+	}
+}

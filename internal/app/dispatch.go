@@ -172,6 +172,10 @@ func (o *Orchestrator) logRuntimeUsageDiagnostic(rep provider.UsageReport, proto
 	if rep.EffectiveLimits != nil {
 		diagnostics.EffectiveLimits = rep.EffectiveLimits
 	}
+	diagnostics.Queue = rep.Queue
+	diagnostics.UpstreamRoute = rep.UpstreamRoute
+	diagnostics.UpstreamModel = rep.UpstreamModel
+	diagnostics.UpstreamFinishReason = rep.UpstreamFinishReason
 	if ctx != nil {
 		if timing := streamwatch.TimingFrom(ctx); timing != nil {
 			diagnostics.Started = diagnostics.Started || timing.Snapshot().Attempts > 0

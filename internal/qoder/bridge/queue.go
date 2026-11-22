@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 
 	"work2api/internal/core/provider"
@@ -22,6 +23,112 @@ func WithQueueDispatchCheck(ctx context.Context, check func(context.Context) err
 }
 func withQueueHeartbeat(ctx context.Context, beat func()) context.Context {
 	return context.WithValue(ctx, queueHeartbeatKey{}, beat)
+}
+
+type queueDiagnosticsKey struct{}
+type queueDiagnostics struct {
+	mu    sync.Mutex
+	value *provider.QueueDiagnostics
+}
+type queueObservation struct {
+	mu      sync.Mutex
+	closed  bool
+	started time.Time
+	value   provider.QueueDiagnostics
+}
+
+func WithQueueDiagnostics(ctx context.Context) (context.Context, func() *provider.QueueDiagnostics) {
+	d := &queueDiagnostics{}
+	return context.WithValue(ctx, queueDiagnosticsKey{}, d), func() *provider.QueueDiagnostics {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if d.value == nil {
+			return nil
+		}
+		value := *d.value
+		return &value
+	}
+}
+
+func queueCount(n *float64) *float64 {
+	if n == nil || *n < 0 || math.IsNaN(*n) || math.IsInf(*n, 0) || math.Trunc(*n) != *n {
+		return nil
+	}
+	v := *n
+	return &v
+}
+func (o *queueObservation) observe(state queueState) {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		return
+	}
+	o.value.LastCount = queueCount(state.Count)
+	o.value.Queued, o.value.Available = state.Queued, state.Available
+}
+func (o *queueObservation) query() {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		return
+	}
+	o.value.Queries++
+	o.value.LastHTTPStatus = 0
+}
+func (o *queueObservation) queryStatus(status int) {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !o.closed {
+		o.value.LastHTTPStatus = status
+	}
+}
+func (o *queueObservation) reason(reason string) {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !o.closed {
+		o.value.ExitReason = reason
+	}
+}
+func (d *queueDiagnostics) finish(o *queueObservation, ready bool, err error) {
+	o.mu.Lock()
+	o.closed = true
+	value := o.value
+	o.mu.Unlock()
+	value.Waits = 1
+	value.WaitMS = max(0, time.Since(o.started).Milliseconds())
+	switch {
+	case errors.Is(err, context.Canceled):
+		value.ExitReason = "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		value.ExitReason = "timeout"
+	case errors.Is(err, errQueueStalled):
+		value.ExitReason = "stalled"
+	case ready:
+		value.ExitReason = "ready"
+	case value.ExitReason == "":
+		value.ExitReason = "wait_failed"
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.value != nil {
+		value.Waits += d.value.Waits
+		value.WaitMS += d.value.WaitMS
+		value.Queries += d.value.Queries
+		value.FirstCount = d.value.FirstCount
+	}
+	d.value = &value
 }
 
 type queueState struct {
@@ -137,12 +244,17 @@ func queueProgress(state queueState, previous string, since, now time.Time) (str
 	return key, since, now.Sub(since) >= 5*time.Minute && (state.Queued == nil || *state.Queued)
 }
 
-func (b *Bridge) waitQueued(ctx context.Context, endpoint string, body map[string]interface{}, extra map[string]string, first queueState) (bool, error) {
+func (b *Bridge) waitQueued(ctx context.Context, endpoint string, body map[string]interface{}, extra map[string]string, first queueState) (ready bool, err error) {
 	if provider.CurrentInvocation(ctx).Diagnostic {
 		return false, nil
 	}
-	ready := false
-	err := provider.Wait(ctx, func(ctx context.Context) error {
+	var observation *queueObservation
+	if diagnostics, _ := ctx.Value(queueDiagnosticsKey{}).(*queueDiagnostics); diagnostics != nil {
+		observation = &queueObservation{started: time.Now(), value: provider.QueueDiagnostics{FirstCount: queueCount(first.Count)}}
+		observation.observe(first)
+		defer func() { diagnostics.finish(observation, ready, err) }()
+	}
+	err = provider.Wait(ctx, func(ctx context.Context) error {
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		type result struct {
@@ -150,7 +262,10 @@ func (b *Bridge) waitQueued(ctx context.Context, endpoint string, body map[strin
 			err   error
 		}
 		done := make(chan result, 1)
-		go func() { ok, err := b.pollQueue(ctx, endpoint, body, extra, first); done <- result{ok, err} }()
+		go func() {
+			ok, err := b.pollQueue(ctx, endpoint, body, extra, first, observation)
+			done <- result{ok, err}
+		}()
 		beat, _ := ctx.Value(queueHeartbeatKey{}).(func())
 		if beat != nil {
 			beat()
@@ -174,9 +289,10 @@ func (b *Bridge) waitQueued(ctx context.Context, endpoint string, body map[strin
 	return ready, err
 }
 
-func (b *Bridge) pollQueue(ctx context.Context, endpoint string, body map[string]interface{}, extra map[string]string, state queueState) (bool, error) {
+func (b *Bridge) pollQueue(ctx context.Context, endpoint string, body map[string]interface{}, extra map[string]string, state queueState, observation *queueObservation) (bool, error) {
 	base, err := url.Parse(endpoint)
 	if err != nil {
+		observation.reason("request_error")
 		return false, err
 	}
 	base.Path, base.RawPath, base.RawQuery = "/algo/api/v2/service/ask/queue/status", "", ""
@@ -186,6 +302,7 @@ func (b *Bridge) pollQueue(ctx context.Context, endpoint string, body map[string
 	}
 	requestSet := StrVal(body, "request_set_id")
 	if requestSet == "" || state.Model == "" {
+		observation.reason("invalid_ticket")
 		return false, nil
 	}
 	key, since, failures := queueStuckKey(state), queueNow(), 0
@@ -197,6 +314,7 @@ func (b *Bridge) pollQueue(ctx context.Context, endpoint string, body map[string
 		}
 		if check, _ := ctx.Value(queueCheckKey{}).(func(context.Context) error); check != nil {
 			if err := check(ctx); err != nil {
+				observation.reason("dispatch_denied")
 				return false, err
 			}
 		}
@@ -227,6 +345,7 @@ func (b *Bridge) pollQueue(ctx context.Context, endpoint string, body map[string
 		req.Header.Del("Content-Type")
 		req.Header.Set("X-Request-ID", StrVal(body, "request_id"))
 		req.Header.Set("X-Session-ID", StrVal(body, "session_id"))
+		observation.query()
 		resp, err := streamHTTPClient.Do(req)
 		var raw []byte
 		status := 0
@@ -236,18 +355,22 @@ func (b *Bridge) pollQueue(ctx context.Context, endpoint string, body map[string
 			resp.Body.Close()
 		}
 		cancel()
+		observation.queryStatus(status)
 		if ctx.Err() != nil {
 			return false, ctx.Err()
 		}
 		if err == nil && status == 404 {
+			observation.reason("unsupported")
 			return false, nil
 		}
 		if err == nil && status >= 400 && status < 500 && status != 429 {
+			observation.reason("rejected")
 			return false, NewUpstreamError(status, string(raw))
 		}
 		if err != nil || status != 200 || len(raw) > 65536 {
 			failures++
 			if failures >= 3 {
+				observation.reason("query_failed")
 				return false, nil
 			}
 			state.Retry = nil
@@ -255,6 +378,7 @@ func (b *Bridge) pollQueue(ctx context.Context, endpoint string, body map[string
 		}
 		next, ok := readQueueState(raw)
 		if !ok {
+			observation.reason("invalid_status")
 			return false, nil
 		}
 		failures = 0
@@ -265,6 +389,7 @@ func (b *Bridge) pollQueue(ctx context.Context, endpoint string, body map[string
 			next.Type = state.Type
 		}
 		state = next
+		observation.observe(state)
 		var stalled bool
 		key, since, stalled = queueProgress(state, key, since, queueNow())
 		if stalled {
@@ -281,6 +406,7 @@ func (b *Bridge) pollQueue(ctx context.Context, endpoint string, body map[string
 		if state.Queued != nil && *state.Queued || state.Available != nil && !*state.Available {
 			continue
 		}
+		observation.reason("not_waiting")
 		return false, nil
 	}
 }

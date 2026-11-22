@@ -19,10 +19,11 @@ import (
 )
 
 type eventReader struct {
-	scanner *bufio.Scanner
-	event   string
-	data    []string
-	budget  streamwatch.SSEEventBudget
+	observeFinish func(string)
+	scanner       *bufio.Scanner
+	event         string
+	data          []string
+	budget        streamwatch.SSEEventBudget
 }
 
 func newEvents(reader io.Reader) *eventReader {
@@ -42,7 +43,7 @@ func (r *eventReader) next() (*upstream.SOLOEvent, error) {
 				name, data := r.event, strings.Join(r.data, "\n")
 				r.event = ""
 				r.data = nil
-				return upstream.ParseSOLOLine(name, data)
+				return r.parse(name, data)
 			}
 			r.event = ""
 			continue
@@ -63,10 +64,18 @@ func (r *eventReader) next() (*upstream.SOLOEvent, error) {
 		name, data := r.event, strings.Join(r.data, "\n")
 		r.event = ""
 		r.data = nil
-		return upstream.ParseSOLOLine(name, data)
+		return r.parse(name, data)
 	}
 	return nil, io.ErrUnexpectedEOF
 }
+func (r *eventReader) parse(name, data string) (*upstream.SOLOEvent, error) {
+	event, err := upstream.ParseSOLOLine(name, data)
+	if err == nil && event != nil && event.Event == "done" && r.observeFinish != nil {
+		r.observeFinish(event.FinishReason)
+	}
+	return event, err
+}
+
 func eventError(e *upstream.SOLOEvent) error {
 	return &upstream.SOLOStreamError{Code: e.ErrorCode, Msg: e.ErrorMessage}
 }
@@ -263,6 +272,15 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 		streamwatch.StartAttempt(ctx)
 		prepared, limits := upstream.PrepareBodyResolvedWithLimits(encoded, identity.Variant, identityModel, identityInfo)
 		report.EffectiveLimits = limits
+		report.UpstreamRoute = "consumer"
+		if consoleRoute {
+			report.UpstreamRoute = "enterprise"
+		}
+		report.UpstreamModel = identityModel
+		if consoleRoute && identityInfo.Enterprise != nil && identityInfo.Enterprise.ModelName != "" {
+			report.UpstreamModel = identityInfo.Enterprise.ModelName
+		}
+		report.UpstreamFinishReason = ""
 		stream, status, errorBody, headers, sendErr, beforeSend := r.sendPreparedChat(ctx, identity, prepared, consoleRoute)
 		streamwatch.AttemptHeaders(ctx, status, headers)
 		streamwatch.AttemptResult(ctx, status)
@@ -330,6 +348,14 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 		watch := streamwatch.NewWatch(stream, ctx, 0, 0)
 		defer watch.Close()
 		events := newEvents(watch.Reader(stream))
+		events.observeFinish = func(reason string) {
+			switch reason {
+			case "stop", "length", "tool_calls", "function_call", "content_filter", "aborted", "insufficient_system_resource", "":
+				report.UpstreamFinishReason = reason
+			default:
+				report.UpstreamFinishReason = "other"
+			}
+		}
 		var first *upstream.SOLOEvent
 		var initialUsage map[string]any
 		for {
@@ -591,6 +617,7 @@ func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent
 				return err
 			}
 		case "done":
+
 			if err := emitText("", true); err != nil {
 				return err
 			}

@@ -33,12 +33,14 @@ const (
 var errExportBudget = errors.New("CSV 超过 128 MiB，请缩小筛选范围后重试")
 
 type usageExportInput struct {
-	Protocol string  `json:"protocol"`
-	Model    string  `json:"model"`
-	AppName  *string `json:"app_name"`
-	Status   string  `json:"status"`
-	Search   string  `json:"search"`
-	Timezone string  `json:"timezone"`
+	Channel    string  `json:"channel"`
+	AccountUID string  `json:"account_uid"`
+	Protocol   string  `json:"protocol"`
+	Model      string  `json:"model"`
+	AppName    *string `json:"app_name"`
+	Status     string  `json:"status"`
+	Search     string  `json:"search"`
+	Timezone   string  `json:"timezone"`
 }
 
 type usageExport struct {
@@ -334,7 +336,7 @@ func (s *Server) writeUsageExport(ctx context.Context, path string, input usageE
 		}
 		count++
 		return writer.Write(usageCSVRow(row, location))
-	})
+	}, store.UsageAccountFilter{Channel: input.Channel, AccountUID: input.AccountUID})
 	if err != nil {
 		return 0, err
 	}

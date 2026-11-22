@@ -24,7 +24,7 @@ import SessionsPanel from '@/components/SessionsPanel.vue'
 const route = useRoute()
 const router = useRouter()
 const tab = ref(['logs', 'sessions'].includes(String(route.query.tab)) ? String(route.query.tab) : 'analytics')
-watch(tab, (t) => { router.replace({ query: t !== 'analytics' ? { tab: t } : {} }); loadTab(t) })
+watch(tab, (t) => { router.replace({ query: {...route.query, tab: t !== 'analytics' ? t : undefined} }); loadTab(t) })
 watch(() => route.query.tab, (value) => { tab.value = ['logs', 'sessions'].includes(String(value)) ? String(value) : 'analytics' })
 
 // ================= 分析 =================
@@ -73,9 +73,12 @@ const pageSize = 20
 const detailError = ref('')
 let logVersion=0, detailVersion=0, disposed=false
 onUnmounted(()=>{disposed=true;logVersion++;detailVersion++})
-const filters = ref<{ protocol?: string; model?: string; app_name?: string; status?: string; search?: string }>({})
-const filterOpts = ref<{ protocols: string[]; models: string[]; apps: string[]; apps_history: string[]; statuses: string[] }>({
-  protocols: [], models: [], apps: [], apps_history: [], statuses: [],
+const filters = ref<{ channel?: string; account_uid?: string; protocol?: string; model?: string; app_name?: string; status?: string; search?: string }>({
+ channel:typeof route.query.channel==='string'?route.query.channel:undefined,
+ account_uid:typeof route.query.channel==='string' && typeof route.query.account_uid==='string'?route.query.account_uid:undefined,
+})
+const filterOpts = ref<{ accounts:{channel:string;id:string}[]; protocols: string[]; models: string[]; apps: string[]; apps_history: string[]; statuses: string[] }>({
+  accounts:[], protocols: [], models: [], apps: [], apps_history: [], statuses: [],
 })
 const searchInput = ref('')
 
@@ -106,8 +109,25 @@ function acctLabel(uid?: string | null, model = ''): string {
   return labelMap.value[channel + '/' + uid] || uid.slice(0, 8)
 }
 
+const channelOptions=computed(()=>[...new Set([...labelProviders.value,...filterOpts.value.accounts.map(a=>a.channel)])].sort().map(value=>({value,label:value})))
+const accountOptions=computed(()=>{
+ const channel=filters.value.channel
+ if(!channel)return []
+ const ids=new Set(filterOpts.value.accounts.filter(a=>a.channel===channel).map(a=>a.id))
+ if(filters.value.account_uid)ids.add(filters.value.account_uid)
+ return [...ids].map(id=>({value:id,label:labelMap.value[channel+'/'+id] || id+'（历史记录）'}))
+})
+function changeChannel(){filters.value.account_uid=undefined;applyFilter()}
+watch(()=>[route.query.channel,route.query.account_uid],([channel,uid])=>{
+ const c=typeof channel==='string'?channel:undefined
+ const a=c && typeof uid==='string'?uid:undefined
+ if(c===filters.value.channel && a===filters.value.account_uid)return
+ filters.value.channel=c;filters.value.account_uid=a
+ if(page.value===1)loadLogs();else page.value=1
+})
+
 const filtersRead=useLiveRead(signal=>api.usageFilters(signal), f=>{
-  filterOpts.value={protocols:f.protocols||[],models:f.models||[],apps:f.apps||[],apps_history:f.apps_history||[],statuses:f.statuses||[]}
+  filterOpts.value={accounts:f.accounts||[],protocols:f.protocols||[],models:f.models||[],apps:f.apps||[],apps_history:f.apps_history||[],statuses:f.statuses||[]}
 }, { interval:60000, immediate:false, enabled:()=>tab.value==='logs' })
 const loadFilters=()=>filtersRead.refresh()
 const logsRead = useLiveRead(signal => api.usageRecent(page.value, pageSize, { ...filters.value }, signal), res => {
@@ -117,7 +137,9 @@ const logLoading = logsRead.loading
 const logError = logsRead.error
 const loadLogs = () => logsRead.refresh()
 
+function syncAccountFilter(){void router.replace({query:{...route.query,channel:filters.value.channel || undefined,account_uid:filters.value.account_uid || undefined}})}
 function applyFilter() {
+ syncAccountFilter()
   filters.value.search = searchInput.value.trim() || undefined
   // page 变化会触发 watch 加载；已在第 1 页时手动加载一次，避免重复请求
   if (page.value === 1) loadLogs()
@@ -125,6 +147,7 @@ function applyFilter() {
 }
 function resetFilter() {
   filters.value = {}
+  syncAccountFilter()
   searchInput.value = ''
   if (page.value === 1) loadLogs()
   else page.value = 1
@@ -298,6 +321,8 @@ onMounted(() => loadTab(tab.value))
           <template #prefix><WIcon name="search" :size="16" class="text-faint" /></template>
         </WInput>
         <WSelect v-model="filters.protocol" :options="filterOpts.protocols.map((p) => ({ value: p, label: p }))" placeholder="全部协议" class="w-32" @update:model-value="applyFilter" />
+        <WSelect v-model="filters.channel" :options="channelOptions" placeholder="全部渠道" class="w-36" aria-label="筛选渠道" @update:model-value="changeChannel" />
+        <WSelect v-model="filters.account_uid" :options="accountOptions" :disabled="!filters.channel" placeholder="全部账号" class="w-48" aria-label="筛选账号" @update:model-value="applyFilter" />
         <WSelect v-model="filters.model" :options="filterOpts.models.map((m) => ({ value: m, label: m }))" placeholder="全部模型" class="w-44" @update:model-value="applyFilter" />
         <WSelect v-model="filters.status" :options="filterOpts.statuses.map((s) => ({ value: s, label: s }))" placeholder="全部状态" class="w-28" @update:model-value="applyFilter" />
         <WButton variant="subtle" size="sm" @click="resetFilter">重置</WButton>
@@ -320,6 +345,7 @@ onMounted(() => loadTab(tab.value))
         <span v-else-if="exportJob.status === 'cancelled'">已取消导出。</span>
         <span v-else class="text-fault">{{ exportJob.error || '导出失败，请重试。' }}</span>
       </div>
+      <p v-if="filters.account_uid" class="mb-3 text-micro text-muted">匹配包含此账号尝试的请求，列表保留最终结果。</p>
       <p v-if="logError" class="mb-3 text-small text-fault">{{ logError }}</p>
       <WCard flush>
         <WSpinner v-if="logLoading && !records.length" center label="加载中" />

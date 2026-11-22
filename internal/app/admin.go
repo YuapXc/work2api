@@ -646,7 +646,7 @@ func (s *Server) adminUsageRecent(w http.ResponseWriter, r *http.Request) {
 	}
 	if q.Get("group") == "request" {
 		page, pageSize = logPage(r)
-		rows, total, err := s.o.db.UsageRequestsContext(r.Context(), nil, pageSize, (page-1)*pageSize, q.Get("protocol"), q.Get("model"), appName, q.Get("status"), q.Get("search"))
+		rows, total, err := s.o.db.UsageRequestsContext(r.Context(), nil, pageSize, (page-1)*pageSize, q.Get("protocol"), q.Get("model"), appName, q.Get("status"), q.Get("search"), store.UsageAccountFilter{Channel: q.Get("channel"), AccountUID: q.Get("account_uid")})
 		if err != nil {
 			writeAPIErr(w, errBody(500, "查询调用日志失败", "server_error"))
 			return
@@ -654,13 +654,25 @@ func (s *Server) adminUsageRecent(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"records": rows, "total": total, "page": page, "page_size": pageSize})
 		return
 	}
-	rows, _ := s.o.db.UsageRecent(pageSize, q.Get("protocol"), q.Get("model"), appName, q.Get("status"), true, (page-1)*pageSize, q.Get("search"))
-	total, _ := s.o.db.UsageCount(q.Get("protocol"), q.Get("model"), appName, q.Get("status"), q.Get("search"))
+	rows, err := s.o.db.UsageRecent(pageSize, q.Get("protocol"), q.Get("model"), appName, q.Get("status"), true, (page-1)*pageSize, q.Get("search"), store.UsageAccountFilter{Channel: q.Get("channel"), AccountUID: q.Get("account_uid")})
+	if err != nil {
+		writeAPIErr(w, errBody(500, "查询调用日志失败", "server_error"))
+		return
+	}
+	total, err := s.o.db.UsageCount(q.Get("protocol"), q.Get("model"), appName, q.Get("status"), q.Get("search"), store.UsageAccountFilter{Channel: q.Get("channel"), AccountUID: q.Get("account_uid")})
+	if err != nil {
+		writeAPIErr(w, errBody(500, "查询调用日志失败", "server_error"))
+		return
+	}
 	writeJSON(w, 200, map[string]any{"records": rows, "total": total, "page": page, "page_size": pageSize})
 }
 
 func (s *Server) adminUsageFilters(w http.ResponseWriter, r *http.Request) {
-	f, _ := s.o.db.UsageFilters()
+	f, err := s.o.db.UsageFilters()
+	if err != nil {
+		writeAPIErr(w, errBody(500, "查询日志筛选条件失败", "server_error"))
+		return
+	}
 	writeJSON(w, 200, f)
 }
 

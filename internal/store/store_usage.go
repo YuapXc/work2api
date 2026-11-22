@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"work2api/internal/core/provider"
 )
 
 // BudgetSample contains aggregate billing evidence only, never prompt content.
@@ -150,25 +152,29 @@ type UsageCacheReuse struct {
 }
 
 type UsageDiagnostics struct {
-	CacheReuse         *UsageCacheReuse   `json:"cache_reuse,omitempty"`
-	MediaTaskID        string             `json:"media_task_id,omitempty"`
-	Media              map[string]any     `json:"media,omitempty"`
-	ImagesRemoved      int                `json:"images_removed,omitempty"`
-	ImagesRepaired     int                `json:"images_repaired,omitempty"`
-	ImageRecovery      string             `json:"image_recovery,omitempty"`
-	BillingDomain      string             `json:"billing_domain,omitempty"`
-	BillingCoefficient *float64           `json:"billing_coefficient,omitempty"`
-	ContentCleared     bool               `json:"content_cleared,omitempty"`
-	TokenDetails       *UsageTokenDetails `json:"token_details,omitempty"`
-	RequestedModel     string             `json:"requested_model,omitempty"`
-	PhysicalModel      string             `json:"physical_model,omitempty"`
-	FinishReason       string             `json:"finish_reason,omitempty"`
-	RequestedLimits    map[string]int     `json:"requested_output_limits,omitempty"`
-	EffectiveLimits    map[string]int     `json:"effective_output_limits,omitempty"`
-	Compatibility      string             `json:"compatibility,omitempty"`
-	ErrorKind          string             `json:"error_kind,omitempty"`
-	Started            bool               `json:"upstream_started"`
-	Performance        *UsagePerformance  `json:"performance,omitempty"`
+	Queue                *provider.QueueDiagnostics `json:"queue,omitempty"`
+	UpstreamRoute        string                     `json:"upstream_route,omitempty"`
+	UpstreamModel        string                     `json:"upstream_model,omitempty"`
+	UpstreamFinishReason string                     `json:"upstream_finish_reason,omitempty"`
+	CacheReuse           *UsageCacheReuse           `json:"cache_reuse,omitempty"`
+	MediaTaskID          string                     `json:"media_task_id,omitempty"`
+	Media                map[string]any             `json:"media,omitempty"`
+	ImagesRemoved        int                        `json:"images_removed,omitempty"`
+	ImagesRepaired       int                        `json:"images_repaired,omitempty"`
+	ImageRecovery        string                     `json:"image_recovery,omitempty"`
+	BillingDomain        string                     `json:"billing_domain,omitempty"`
+	BillingCoefficient   *float64                   `json:"billing_coefficient,omitempty"`
+	ContentCleared       bool                       `json:"content_cleared,omitempty"`
+	TokenDetails         *UsageTokenDetails         `json:"token_details,omitempty"`
+	RequestedModel       string                     `json:"requested_model,omitempty"`
+	PhysicalModel        string                     `json:"physical_model,omitempty"`
+	FinishReason         string                     `json:"finish_reason,omitempty"`
+	RequestedLimits      map[string]int             `json:"requested_output_limits,omitempty"`
+	EffectiveLimits      map[string]int             `json:"effective_output_limits,omitempty"`
+	Compatibility        string                     `json:"compatibility,omitempty"`
+	ErrorKind            string                     `json:"error_kind,omitempty"`
+	Started              bool                       `json:"upstream_started"`
+	Performance          *UsagePerformance          `json:"performance,omitempty"`
 }
 
 // UsageTokenDetails stores observed counts, never estimates. Nil means unreported.
@@ -439,9 +445,14 @@ func groupCount(db interface {
 	return out, rows.Err()
 }
 
+type UsageAccountFilter struct{ Channel, AccountUID string }
+
+const usagePhysicalModelExpression = `COALESCE(NULLIF(json_extract(CASE WHEN json_valid(diagnostics) THEN diagnostics ELSE '{}' END,'$.physical_model'),''),model,'')`
+const usageChannelExpression = `CASE WHEN instr(` + usagePhysicalModelExpression + `,'/')>0 THEN substr(` + usagePhysicalModelExpression + `,1,instr(` + usagePhysicalModelExpression + `,'/')-1) ELSE 'workbuddy' END`
+
 // usageWhere builds the shared WHERE clause. app_name "" (non-nil) matches
 // the unnamed bucket; pass nil (empty string with useApp=false) to skip.
-func usageWhere(protocol, model string, appName *string, status, search string) (string, []any) {
+func usageWhere(protocol, model string, appName *string, status, search string, accounts ...UsageAccountFilter) (string, []any) {
 	var clauses []string
 	var params []any
 	if protocol != "" {
@@ -465,6 +476,16 @@ func usageWhere(protocol, model string, appName *string, status, search string) 
 		clauses = append(clauses, `(input_content LIKE ? ESCAPE '\' OR output_content LIKE ? ESCAPE '\' OR reasoning_content LIKE ? ESCAPE '\')`)
 		params = append(params, like, like, like)
 	}
+	if len(accounts) > 0 {
+		if accounts[0].Channel != "" {
+			clauses = append(clauses, usageChannelExpression+" = ?")
+			params = append(params, accounts[0].Channel)
+		}
+		if accounts[0].AccountUID != "" {
+			clauses = append(clauses, "account_uid = ?")
+			params = append(params, accounts[0].AccountUID)
+		}
+	}
 	if len(clauses) == 0 {
 		return "", params
 	}
@@ -474,8 +495,8 @@ func usageWhere(protocol, model string, appName *string, status, search string) 
 const usageLightCols = "id, ts, model, protocol, account_uid, input_tokens, output_tokens, total_tokens, latency_ms, status, error, credits, app_name, user_id, reasoning_effort, tokens_known, cached_tokens, app_id, diagnostics"
 
 // UsageRecent returns recent usage records with optional filters.
-func (d *DB) UsageRecent(limit int, protocol, model string, appName *string, status string, light bool, offset int, search string) ([]map[string]any, error) {
-	where, params := usageWhere(protocol, model, appName, status, search)
+func (d *DB) UsageRecent(limit int, protocol, model string, appName *string, status string, light bool, offset int, search string, accounts ...UsageAccountFilter) ([]map[string]any, error) {
+	where, params := usageWhere(protocol, model, appName, status, search, accounts...)
 	params = append(params, limit, offset)
 	cols := "*"
 	if light {
@@ -501,8 +522,8 @@ func (d *DB) UsageRecent(limit int, protocol, model string, appName *string, sta
 }
 
 // UsageCount returns the count matching filters.
-func (d *DB) UsageCount(protocol, model string, appName *string, status, search string) (int, error) {
-	where, params := usageWhere(protocol, model, appName, status, search)
+func (d *DB) UsageCount(protocol, model string, appName *string, status, search string, accounts ...UsageAccountFilter) (int, error) {
+	where, params := usageWhere(protocol, model, appName, status, search, accounts...)
 	db, release := d.analyticsReader()
 	defer release()
 	var c int
@@ -613,6 +634,25 @@ func (d *DB) usageFilterValues() (map[string]any, error) {
 	if err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM usage_logs WHERE app_name IS NULL OR app_name='')").Scan(&unnamed); err != nil {
 		return nil, err
 	}
+	rows, err := db.Query("SELECT DISTINCT " + usageChannelExpression + " AS channel, account_uid FROM usage_logs WHERE account_uid IS NOT NULL AND account_uid!='' ORDER BY channel,account_uid")
+	if err != nil {
+		return nil, err
+	}
+	accounts := []map[string]any{}
+	for rows.Next() {
+		var channel, uid string
+		if err = rows.Scan(&channel, &uid); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		accounts = append(accounts, map[string]any{"channel": channel, "id": uid})
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	out["accounts"] = accounts
 	out["has_unnamed"] = unnamed
 	return out, nil
 }

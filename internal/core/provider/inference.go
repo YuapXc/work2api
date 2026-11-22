@@ -29,26 +29,42 @@ type CatalogModel struct {
 	Extra      map[string]any // merged verbatim into the exposed catalog entry
 }
 
+type QueueDiagnostics struct {
+	Waits          int      `json:"waits"`
+	WaitMS         int64    `json:"wait_ms"`
+	Queries        int      `json:"queries"`
+	FirstCount     *float64 `json:"first_count,omitempty"`
+	LastCount      *float64 `json:"last_count,omitempty"`
+	Queued         *bool    `json:"queued,omitempty"`
+	Available      *bool    `json:"available,omitempty"`
+	LastHTTPStatus int      `json:"last_http_status,omitempty"`
+	ExitReason     string   `json:"exit_reason"`
+}
+
 // UsageReport is what Serve returns for the shared usage logger + pool bookkeeping.
 type UsageReport struct {
-	Recorded            bool // runtime emitted attempt and final records through the shared logger
-	TokensKnown         *bool
-	AccountUID          string
-	InputTokens         int
-	OutputTokens        int
-	Status              string // "ok" | "incomplete" | "error"
-	Error               string
-	Input               string
-	Output              string
-	Reasoning           string
-	Effort              string
-	Credits             *float64
-	CachedTokens        *int
-	ReasoningTokens     *int
-	CacheCreationTokens *int
-	FinishReason        string
-	RequestedLimits     map[string]int
-	EffectiveLimits     map[string]int
+	Queue                *QueueDiagnostics
+	Recorded             bool // runtime emitted attempt and final records through the shared logger
+	TokensKnown          *bool
+	AccountUID           string
+	InputTokens          int
+	OutputTokens         int
+	Status               string // "ok" | "incomplete" | "error"
+	Error                string
+	Input                string
+	Output               string
+	Reasoning            string
+	Effort               string
+	Credits              *float64
+	CachedTokens         *int
+	ReasoningTokens      *int
+	CacheCreationTokens  *int
+	FinishReason         string
+	RequestedLimits      map[string]int
+	EffectiveLimits      map[string]int
+	UpstreamRoute        string
+	UpstreamModel        string
+	UpstreamFinishReason string
 }
 
 // ServeRequest carries a single inference call to a Runtime.

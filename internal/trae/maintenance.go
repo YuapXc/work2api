@@ -408,7 +408,8 @@ func (r *Runtime) AdminCheckin(ctx context.Context) (map[string]any, error) {
 						}
 						r.mu.Unlock()
 						fingerprint := a.Auth.MaintenanceIdentity()
-						_, err = c.CheckinClaim(a.Auth)
+						var claim *upstream.CheckinClaimResult
+						claim, err = c.CheckinClaim(a.Auth)
 						r.observeMaintenance(a.Auth, "checkin", fingerprint, err)
 						if err != nil {
 							var rejection *upstream.Error
@@ -433,6 +434,11 @@ func (r *Runtime) AdminCheckin(ctx context.Context) (map[string]any, error) {
 							r.observeMaintenance(a.Auth, "checkin", fingerprint, readErr)
 							if readErr == nil && after.CheckedIn {
 								result["status"] = "ok"
+								if claim != nil && claim.ClaimCredits != nil {
+									result["credit"] = *claim.ClaimCredits
+								} else if after.RewardCredits != nil {
+									result["credit"] = *after.RewardCredits
+								}
 								delete(result, "message")
 							}
 						}
@@ -476,6 +482,9 @@ func (r *Runtime) AdminCheckin(ctx context.Context) (map[string]any, error) {
 				a.CheckinDate = today
 			}
 			r.mu.Unlock()
+		}
+		if result["status"] == "ok" || result["status"] == "already" {
+			result["ok"] = true
 		}
 		results = append(results, result)
 	}

@@ -1867,3 +1867,26 @@ func TestStaleEnterpriseFallbackCannotOverwriteNewCredentials(t *testing.T) {
 		t.Fatal("overwrote new credentials", err)
 	}
 }
+
+func TestServeRecordsRouteAndOriginalFinishWithoutContent(t *testing.T) {
+	for _, enterprise := range []bool{false, true} {
+		r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+			io.WriteString(w, "event: output\ndata: {\"response\":\"private answer\"}\n\nevent: token_usage\ndata: {\"completion_tokens\":5}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n")
+		})
+		a := &auth.Auth{UID: "diag", Variant: "cn", AccessToken: "private-token", ExpiresAt: time.Now().Add(time.Hour).Unix(), EnterpriseConsole: enterprise}
+		info := upstream.ModelInfo{ID: "m", Name: "M"}
+		if enterprise {
+			info.Enterprise = &upstream.EnterpriseModel{ModelName: "vendor-custom"}
+		}
+		r.accounts[accountID(a.UID)] = &accountState{Auth: a, Enabled: true, Identities: map[string]*auth.Auth{"cn": a}, Catalogs: map[string][]upstream.ModelInfo{"cn": {info}}}
+		w := httptest.NewRecorder()
+		report, err := r.Serve(t.Context(), provider.ServeRequest{Protocol: provider.ProtocolChat, Writer: w, Payload: map[string]any{"model": "trae/m", "max_tokens": 5, "messages": []any{map[string]any{"role": "user", "content": "private prompt"}}}})
+		route, model := "consumer", "m"
+		if enterprise {
+			route, model = "enterprise", "vendor-custom"
+		}
+		if err != nil || report.UpstreamRoute != route || report.UpstreamModel != model || report.UpstreamFinishReason != "stop" || report.FinishReason != "length" {
+			t.Fatal(report, err)
+		}
+	}
+}

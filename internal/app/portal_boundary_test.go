@@ -137,6 +137,15 @@ func TestAdminUsageExportMatchesGroupedLogsAndCleansUp(t *testing.T) {
 		rows[2][7] != "12" || rows[2][9] != "0" || rows[2][10] != "0" || rows[2][16] != "0" || rows[2][21] != "stop" {
 		t.Fatalf("CSV: %v %v", rows, err)
 	}
+
+	filtered := request("GET", "/admin/usage/recent?group=request&channel=trae&account_uid=test-account", "", owner, "")
+	if filtered.Code != 200 || !strings.Contains(filtered.Body.String(), `"total":1`) {
+		t.Fatal(filtered.Code, filtered.Body.String())
+	}
+	count, filterErr := s.writeUsageExport(t.Context(), filepath.Join(t.TempDir(), "filtered.csv"), usageExportInput{Channel: "trae", AccountUID: "test-account"}, time.UTC)
+	if filterErr != nil || count != 1 {
+		t.Fatal(count, filterErr)
+	}
 	if w := request("DELETE", path, "", owner, ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"status":"cancelled"`) {
 		t.Fatalf("cancel: %d %s", w.Code, w.Body)
 	}

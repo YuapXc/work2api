@@ -55,7 +55,7 @@ const columns=computed<Column[]>(()=>[
    <template #cell-model="{row}">
     <div class="max-w-64 truncate font-medium text-ink" :title="row.diagnostics?.requested_model || row.model">{{row.diagnostics?.requested_model || row.model}}</div>
     <div v-if="row.diagnostics?.physical_model && row.diagnostics.physical_model!==(row.diagnostics.requested_model || row.model)" class="max-w-64 truncate text-micro text-faint" :title="row.diagnostics.physical_model">↳ {{row.diagnostics.physical_model}}</div>
-    <div class="mt-1 flex items-center gap-2"><span class="text-micro text-faint">{{channelName(row)}}</span><span v-if="admin && row.account_uid" class="max-w-40 truncate text-micro text-faint" :title="accountLabel?.(row.account_uid,row.model) || row.account_uid">{{accountLabel?.(row.account_uid,row.model) || row.account_uid.slice(0,8)}}</span></div>
+    <div class="mt-1 flex items-center gap-2"><span class="text-micro text-faint">{{channelName(row)}}</span><span v-if="admin && row.account_uid" class="max-w-40 truncate text-micro text-faint" :title="accountLabel?.(row.account_uid,row.diagnostics?.physical_model || row.model) || row.account_uid">{{accountLabel?.(row.account_uid,row.diagnostics?.physical_model || row.model) || row.account_uid.slice(0,8)}}</span></div>
    </template>
    <template #cell-app_name="{row}"><div class="max-w-40 truncate font-medium text-ink" :title="row.app_name">{{row.app_name || '未命名 Key'}}</div><div class="text-micro text-faint">{{row.protocol}}<template v-if="row.diagnostics?.performance?.response_stream!=null"> · {{row.diagnostics.performance.response_stream?'流式':'非流式'}}</template></div><div v-if="admin && row.user_id" class="text-micro text-faint">用户 #{{row.user_id}}</div></template>
    <template #cell-tokens="{row}">

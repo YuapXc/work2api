@@ -154,7 +154,7 @@ func TestResourceRejectionsDoNotReplayOrEmitSuccess(t *testing.T) {
 }
 
 func TestQueueRecoveryAndTermination(t *testing.T) {
-	for _, mode := range []string{"ready", "unsupported", "rejected", "invalid", "cancel", "revoke", "diagnostic", "after_output", "budget"} {
+	for _, mode := range []string{"ready", "progress", "unsupported", "rejected", "invalid", "cancel", "revoke", "diagnostic", "after_output", "budget"} {
 		t.Run(mode, func(t *testing.T) {
 			var sends, queries atomic.Int32
 			ctx, cancel := context.WithCancel(t.Context())
@@ -166,6 +166,12 @@ func TestQueueRecoveryAndTermination(t *testing.T) {
 						t.Error("lost queue identity")
 					}
 					switch mode {
+					case "progress":
+						if queries.Load() == 1 {
+							fmt.Fprint(w, `{"isQueued":true,"queueCount":2,"retryAfterSeconds":0}`)
+						} else {
+							fmt.Fprint(w, `{"isQueued":false,"queueCount":0,"serviceAvailable":true}`)
+						}
 					case "unsupported":
 						w.WriteHeader(404)
 					case "rejected":
@@ -209,6 +215,7 @@ func TestQueueRecoveryAndTermination(t *testing.T) {
 			var beats, waits atomic.Int32
 			call := provider.Invocation{Diagnostic: mode == "diagnostic", Wait: func(ctx context.Context, fn func(context.Context) error) error { waits.Add(1); return fn(ctx) }}
 			ctx = provider.WithInvocation(ctx, call)
+			ctx, snapshot := WithQueueDiagnostics(ctx)
 			ctx = WithQueueDispatchCheck(ctx, func(context.Context) error {
 				if mode == "revoke" && queries.Load() > 0 {
 					return errors.New("revoked")
@@ -218,7 +225,35 @@ func TestQueueRecoveryAndTermination(t *testing.T) {
 			ctx = withQueueHeartbeat(ctx, func() { beats.Add(1) })
 			var out strings.Builder
 			err := b.CallQoderWithOpts(ctx, "codex", nil, "qfmodel", nil, CallOpts{Stream: true}, func(d Delta) { out.WriteString(d.Content) })
+			diagnostic := snapshot()
+			if mode == "diagnostic" || mode == "after_output" {
+				if diagnostic != nil {
+					t.Fatal("non-waiting call produced queue diagnostic", diagnostic)
+				}
+			} else {
+				if diagnostic == nil || diagnostic.WaitMS < 0 || diagnostic.Queries != int(queries.Load()) {
+					t.Fatal("lost queue observation", diagnostic, queries.Load())
+				}
+				reasons := map[string]string{"ready": "ready", "progress": "ready", "unsupported": "unsupported", "rejected": "rejected", "invalid": "invalid_status", "cancel": "canceled", "revoke": "ready", "budget": "ready"}
+				if diagnostic.ExitReason != reasons[mode] {
+					t.Fatal("wrong wait result", diagnostic)
+				}
+				expectedWaits := 1
+				if mode == "budget" {
+					expectedWaits = 2
+				}
+				if diagnostic.Waits != expectedWaits {
+					t.Fatal("waits not accumulated", diagnostic)
+				}
+				if mode == "progress" && (diagnostic.FirstCount != nil || diagnostic.LastCount == nil || *diagnostic.LastCount != 0 || diagnostic.Available == nil || !*diagnostic.Available || diagnostic.Queued == nil || *diagnostic.Queued || diagnostic.Queries != 2 || diagnostic.WaitMS < 450) {
+					t.Fatal("progress or zero state lost", diagnostic)
+				}
+			}
 			switch mode {
+			case "progress":
+				if err != nil || sends.Load() != 2 || out.String() != "OK" {
+					t.Fatal(err, sends.Load(), out.String())
+				}
 			case "ready":
 				if err != nil || out.String() != "OK" || sends.Load() != 2 || queries.Load() != 1 || beats.Load() != 1 || waits.Load() != 1 {
 					t.Fatal(err, out.String(), sends.Load(), queries.Load(), beats.Load(), waits.Load())
@@ -499,8 +534,26 @@ func TestStalledQueueFallsBackOnlyBeforeOutput(t *testing.T) {
 				}
 				return other, nil
 			})
+			ctx, snapshot := WithQueueDiagnostics(ctx)
 			var content strings.Builder
 			err := b.CallQoderWithOpts(ctx, "codex", nil, "qfmodel", nil, CallOpts{}, func(d Delta) { content.WriteString(d.Content) })
+			diagnostic := snapshot()
+			if mode == "after_output" {
+				if diagnostic != nil {
+					t.Fatal("output replay acquired diagnostic", diagnostic)
+				}
+			} else {
+				reason := "stalled"
+				if mode == "deadline" {
+					reason = "timeout"
+				}
+				if mode == "cancel" {
+					reason = "canceled"
+				}
+				if diagnostic == nil || diagnostic.ExitReason != reason || diagnostic.Queries != 1 || diagnostic.Waits != 1 {
+					t.Fatal("queue exit observation lost", diagnostic)
+				}
+			}
 			if bad.Load() != 1 {
 				t.Fatal("replayed queued request", bad.Load())
 			}
@@ -528,4 +581,77 @@ func TestStalledQueueFallsBackOnlyBeforeOutput(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestQueueDiagnosticsRemainBoundedAndIgnoreLateUpdates(t *testing.T) {
+	ctx, snapshot := WithQueueDiagnostics(t.Context())
+	d := ctx.Value(queueDiagnosticsKey{}).(*queueDiagnostics)
+	if snapshot() != nil {
+		t.Fatal("normal request has queue diagnostic")
+	}
+	n := float64(3)
+	queued := true
+	first := &queueObservation{started: time.Now().Add(-2 * time.Second), value: provider.QueueDiagnostics{FirstCount: queueCount(&n)}}
+	first.observe(queueState{Count: &n, Queued: &queued})
+	first.query()
+	first.queryStatus(200)
+	d.finish(first, false, errQueueStalled)
+	previous := snapshot()
+	zero := float64(0)
+	ready := false
+	second := &queueObservation{started: time.Now().Add(-time.Second)}
+	for i := 0; i < 10000; i++ {
+		second.observe(queueState{Count: &zero, Queued: &ready})
+		second.query()
+		second.queryStatus(200)
+	}
+	d.finish(second, true, nil)
+	second.observe(queueState{Count: &n, Queued: &queued})
+	second.query()
+	second.queryStatus(500)
+	second.reason("rejected")
+	got := snapshot()
+	if got.Waits != 2 || got.WaitMS < 3000 || got.Queries != 10001 || got.FirstCount == nil || *got.FirstCount != 3 || got.LastCount == nil || *got.LastCount != 0 || got.LastHTTPStatus != 200 || got.ExitReason != "ready" || previous.Waits != 1 || previous.ExitReason != "stalled" {
+		t.Fatal(got, previous)
+	}
+	raw, err := json.Marshal(got)
+	if err != nil || len(raw) > 512 {
+		t.Fatal("unbounded observation", len(raw), err)
+	}
+	for _, n := range []float64{-1, .5} {
+		if queueCount(&n) != nil {
+			t.Fatal("invalid queue count accepted", n)
+		}
+	}
+}
+
+func BenchmarkQueueDiagnostics(b *testing.B) {
+	b.Run("no_queue", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_, snapshot := WithQueueDiagnostics(b.Context())
+			if snapshot() != nil {
+				b.Fatal("unexpected queue")
+			}
+		}
+	})
+	b.Run("100_queries", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			ctx, snapshot := WithQueueDiagnostics(b.Context())
+			d := ctx.Value(queueDiagnosticsKey{}).(*queueDiagnostics)
+			o := &queueObservation{started: time.Now()}
+			waiting := true
+			count := float64(2)
+			for j := 0; j < 100; j++ {
+				o.query()
+				o.queryStatus(200)
+				o.observe(queueState{Queued: &waiting, Count: &count})
+			}
+			d.finish(o, true, nil)
+			if snapshot().Queries != 100 {
+				b.Fatal("missing queries")
+			}
+		}
+	})
 }

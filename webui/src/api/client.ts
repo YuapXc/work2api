@@ -151,14 +151,16 @@ export const api = {
       { signal },
     ),
   // 服务端分页：page/page_size + 筛选条件，返回 records + total（总数驱动分页器）
-  startUsageExport: (input: { protocol?: string; model?: string; app_name?: string; status?: string; search?: string; timezone: string }) =>
+  startUsageExport: (input: { channel?: string; account_uid?: string; protocol?: string; model?: string; app_name?: string; status?: string; search?: string; timezone: string }) =>
     http.post<unknown, UsageExport>('/admin/usage/exports', input),
   usageExport: (id: string, signal?: AbortSignal) =>
     http.get<unknown, UsageExport>(`/admin/usage/exports/${encodeURIComponent(id)}`, { signal }),
   cancelUsageExport: (id: string) =>
     http.delete<unknown, UsageExport>(`/admin/usage/exports/${encodeURIComponent(id)}`),
-  usageRecent: (page = 1, pageSize = 20, filters: { protocol?: string; model?: string; app_name?: string; status?: string; search?: string } = {}, signal?: AbortSignal) => {
+  usageRecent: (page = 1, pageSize = 20, filters: { channel?: string; account_uid?: string; protocol?: string; model?: string; app_name?: string; status?: string; search?: string } = {}, signal?: AbortSignal) => {
     const p = new URLSearchParams({ page: String(page), page_size: String(pageSize), light: '1', group: 'request' })
+    if (filters.channel) p.set('channel', filters.channel)
+    if (filters.account_uid) p.set('account_uid', filters.account_uid)
     if (filters.protocol) p.set('protocol', filters.protocol)
     if (filters.model) p.set('model', filters.model)
     // app_name 允许空字符串（筛"未记录应用"的旧记录），用 != null 判断而非真值
@@ -172,6 +174,7 @@ export const api = {
   usageDetail: (id: number) => http.get<unknown, { record: UsageRecord }>(`/admin/usage/${id}`),
   usageFilters: (signal?: AbortSignal) =>
     http.get<unknown, {
+      accounts: {channel:string;id:string}[]
       protocols: string[]
       models: string[]
       apps: string[]          // 现存应用（与应用页一致）

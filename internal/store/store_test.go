@@ -775,3 +775,84 @@ func TestMediaResultRetentionKeepsUsageAndTaskState(t *testing.T) {
 		t.Fatal(row, err)
 	}
 }
+
+func TestUsageChannelAccountFiltersKeepRequestOutcome(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "account-filters.db")
+	db, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	insert := func(uid, model, physical, status, request string, user int64) int64 {
+		id, e := db.LogUsageWithID(UsageParams{AccountUID: uid, Model: model, Status: status, UserID: user, AppID: 1, Diagnostics: &UsageDiagnostics{PhysicalModel: physical, Performance: &UsagePerformance{RequestID: request}}})
+		if e != nil {
+			t.Fatal(e)
+		}
+		return id
+	}
+	request := strings.Repeat("a", 32)
+	insert("removed", "group/shared", "workbuddy/m", "error", request, 1)
+	final := insert("winner", "group/shared", "trae/m", "ok", request, 1)
+	insert("removed", "qoder/m", "qoder/m", "ok", "", 1)
+	insert("removed", "m", "", "ok", "", 2)
+	filter := UsageAccountFilter{Channel: "workbuddy", AccountUID: "removed"}
+	user := int64(1)
+	rows, total, err := db.UsageRequests(&user, 20, 0, "", "", nil, "ok", "", filter)
+	if err != nil || total != 1 || len(rows) != 1 || rows[0]["id"] != final || rows[0]["account_uid"] != "winner" || rows[0]["logged_attempts"] != int64(2) {
+		t.Fatal(rows, total, err)
+	}
+	raw, e := db.UsageRecent(20, "", "", nil, "", true, 0, "", filter)
+	if e != nil || len(raw) != 2 {
+		t.Fatal(raw, e)
+	}
+	n, e := db.UsageCount("", "", nil, "", "", filter)
+	if e != nil || n != len(raw) {
+		t.Fatal(n, e)
+	}
+	exported := []int64{}
+	err = db.VisitUsageExport(t.Context(), path, "", "", nil, "ok", "", func(row map[string]any) error { exported = append(exported, row["total_tokens"].(int64)); return nil }, filter)
+	if err != nil || len(exported) != 2 {
+		t.Fatal(exported, err)
+	}
+
+	cte, where, args := usageRequestQuery(&user, "", "", nil, "", "", filter)
+	plan, e := db.db.Query("EXPLAIN QUERY PLAN "+cte+"SELECT id FROM final "+where, args...)
+	if e != nil {
+		t.Fatal(e)
+	}
+	indexed := false
+	for plan.Next() {
+		var id, parent, unused int
+		var detail string
+		if e = plan.Scan(&id, &parent, &unused, &detail); e != nil {
+			t.Fatal(e)
+		}
+		indexed = indexed || strings.Contains(detail, "idx_usage_account")
+	}
+	plan.Close()
+	if !indexed {
+		t.Fatal("account lookup did not use its index")
+	}
+	missing := UsageAccountFilter{Channel: "qoder", AccountUID: "winner"}
+	_, total, err = db.UsageRequests(nil, 20, 0, "", "", nil, "", "", missing)
+	if err != nil || total != 0 {
+		t.Fatal(total, err)
+	}
+	filters, e := db.UsageFilters()
+	if e != nil {
+		t.Fatal(e)
+	}
+	pairs := filters["accounts"].([]map[string]any)
+	seen := map[string]bool{}
+	for _, a := range pairs {
+		seen[a["channel"].(string)+"/"+a["id"].(string)] = true
+	}
+	if !seen["workbuddy/removed"] || !seen["qoder/removed"] || !seen["trae/winner"] {
+		t.Fatal(pairs)
+	}
+	pairs[0]["id"] = "mutated"
+	again, e := db.UsageFilters()
+	if e != nil || again["accounts"].([]map[string]any)[0]["id"] == "mutated" {
+		t.Fatal("cache alias", again, e)
+	}
+}

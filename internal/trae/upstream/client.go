@@ -533,6 +533,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 }
 
 type CheckinStatusResult struct {
+	RewardCredits *int64 `json:"-"`
 	CheckedIn     bool   `json:"checked_in"`
 	DidCheckedIn  bool   `json:"did_checked_in"`
 	Credits       int64  `json:"credits"`
@@ -687,6 +688,7 @@ func (c *Client) CheckinStatus(a *auth.Auth, deviceID ...string) (*CheckinStatus
 				if err := json.Unmarshal(data, &resp); err != nil {
 					return nil, fmt.Errorf("checkin status parse: %w", err)
 				}
+				resp.RewardCredits = checkinReward(data)
 				resp.SchemeUsed = scheme
 				resp.ReqSourceUsed = body
 				return &resp, nil
@@ -751,7 +753,7 @@ func pickCreditField(data []byte) *int64 {
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return nil
 	}
-	candidates := []string{"credits", "add_credits", "reward_credits", "credited", "award_credits", "obtain_credits"}
+	candidates := []string{"credits_granted", "credits", "add_credits", "reward_credits", "credited", "award_credits", "obtain_credits", "extra_credits"}
 	for _, prefix := range []string{"", "data"} {
 		var m map[string]any
 		if prefix == "" {
@@ -764,7 +766,7 @@ func pickCreditField(data []byte) *int64 {
 			m = inner
 		}
 		for _, k := range candidates {
-			if v, ok := m[k].(float64); ok {
+			if v, ok := m[k].(float64); ok && v >= 0 && v <= 1<<53-1 && math.Trunc(v) == v {
 				n := int64(v)
 				return &n
 			}
@@ -1506,4 +1508,24 @@ func parseEnterpriseQuota(quota, spent, core map[string]any) (*EnterpriseQuota, 
 		}
 	}
 	return result, nil
+}
+
+func checkinReward(data []byte) *int64 {
+	var value struct {
+		Credits *int64 `json:"credits"`
+		Extra   *int64 `json:"extra_credits"`
+	}
+	if json.Unmarshal(data, &value) != nil || value.Credits == nil && value.Extra == nil {
+		return nil
+	}
+	var total int64
+	for _, n := range []*int64{value.Credits, value.Extra} {
+		if n != nil {
+			if *n < 0 || *n > math.MaxInt64-total {
+				return nil
+			}
+			total += *n
+		}
+	}
+	return &total
 }
