@@ -44,7 +44,7 @@ func transientConnectError(err error) bool {
 }
 
 func retryable(kind upstream.ErrKind) bool {
-	return kind == upstream.ErrSoftRate || kind == upstream.ErrServer || kind == upstream.ErrSessionDead || kind == upstream.ErrPlanLimit
+	return kind == upstream.ErrSoftRate || kind == upstream.ErrServer || kind == upstream.ErrSessionDead || kind == upstream.ErrPlanLimit || kind == upstream.ErrModelPlan
 }
 
 func retryAfter(value string, now time.Time) time.Duration {
@@ -76,6 +76,8 @@ func rejectionError(kind upstream.ErrKind, status int, code int64) error {
 	switch kind {
 	case upstream.ErrInputTooLarge:
 		status, message, errorType = 400, "Trae 上游拒绝过大的输入，请压缩上下文或缩小请求", "context_length_exceeded"
+	case upstream.ErrModelPlan:
+		status, message, errorType = 403, "该模型不在当前 Trae 账号套餐权益内，请选择其他模型或有权账号", "model_unavailable"
 	case upstream.ErrModelUnavailable:
 		status, message, errorType = 400, "该模型不在当前 Trae 产品聊天通道可用，请刷新模型目录并选择可用模型", "model_unavailable"
 	case upstream.ErrPlanLimit:
@@ -173,4 +175,44 @@ func (r *Runtime) switchToConsumer(identity *auth.Auth) bool {
 		r.invalidateConsoleRoute(identity)
 	}
 	return true
+}
+
+func (r *Runtime) modelIdentityAvailableLocked(a *accountState, identity *auth.Auth, model string) bool {
+	return r.identityAvailableLocked(identity) && !time.Now().Before(a.ModelCooldowns[identity][strings.ToLower(model)])
+}
+func (r *Runtime) coolRejection(id, model string, identity *auth.Auth, kind upstream.ErrKind, delay time.Duration) {
+	if kind != upstream.ErrModelPlan {
+		r.coolWithDelay(id, kind, delay)
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a := r.accounts[id]
+	if a == nil || a.Identities[identity.Variant] != identity {
+		return
+	}
+	if a.ModelCooldowns == nil {
+		a.ModelCooldowns = map[*auth.Auth]map[string]time.Time{}
+	}
+	if a.ModelCooldowns[identity] == nil {
+		a.ModelCooldowns[identity] = map[string]time.Time{}
+	}
+	values := a.ModelCooldowns[identity]
+	now := time.Now().In(time.FixedZone("Asia/Shanghai", 8*3600))
+	for key, until := range values {
+		if !now.Before(until) {
+			delete(values, key)
+		}
+	}
+	if len(values) >= 256 {
+		var oldest string
+		var at time.Time
+		for key, until := range values {
+			if at.IsZero() || until.Before(at) {
+				oldest, at = key, until
+			}
+		}
+		delete(values, oldest)
+	}
+	values[strings.ToLower(model)] = time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
 }

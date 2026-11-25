@@ -762,6 +762,10 @@ func (s *Server) adminSaveSettings(w http.ResponseWriter, r *http.Request) {
 	for k, v := range body {
 		kv[k] = toStrLoose(v)
 	}
+	if raw, present := kv["trae_max_mode"]; present && raw != "0" && raw != "1" {
+		writeAPIErr(w, errBody(400, "Trae Max 开关需为0或1", "invalid_request_error"))
+		return
+	}
 	if raw, present := kv["account_check_enabled"]; present && raw != "0" && raw != "1" {
 		writeAPIErr(w, errBody(400, "检查开关需为0或1", "invalid_request_error"))
 		return

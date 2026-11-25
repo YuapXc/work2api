@@ -24,6 +24,7 @@ import (
 )
 
 type accountState struct {
+	ModelCooldowns           map[*auth.Auth]map[string]time.Time
 	Auth                     *auth.Auth
 	Identities               map[string]*auth.Auth
 	Catalogs                 map[string][]upstream.ModelInfo
@@ -53,6 +54,7 @@ type accountState struct {
 }
 
 type Runtime struct {
+	directRefusals    map[string][32]byte
 	maintenanceGuard  *provider.MaintenanceGuard
 	mu                sync.Mutex
 	writeMu           sync.Mutex
@@ -327,12 +329,15 @@ func (r *Runtime) Models(context.Context) []provider.CatalogModel {
 }
 
 func (r *Runtime) modelsLocked(requested map[string]bool) []provider.CatalogModel {
+	maxMode := r.maxModeEnabled()
 	merged := map[string]provider.CatalogModel{}
 	for id, a := range r.accounts {
 		if !a.Enabled {
 			continue
 		}
 		for _, m := range a.Models {
+			m = m.WithMaxMode(maxMode)
+			m.ContextWindow = m.EffectiveContextWindow()
 			name := "trae/" + strings.ToLower(m.ID)
 			if requested != nil && !requested[name] {
 				continue
@@ -652,7 +657,7 @@ func (r *Runtime) AdminData(context.Context) provider.AdminData {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	data := provider.AdminData{DisplayName: "Trae", Capabilities: []string{"accounts", "models", "credits", "checkin", "add_account", "oauth", "local_import"}, Accounts: []map[string]any{}, Resources: []provider.ResourceSummary{}, Notes: "添加国内 IDE 或 Work/SOLO 账号；产品身份保留，模型调用自动选择符合条件的账号。"}
-	data.Maintenance = []provider.MaintenanceOption{{Key: "trae_auto_quota", Label: "自动刷新 Trae 额度", Description: "启动自动读取一次；开启后每 30 分钟刷新，未知额度保持未知"}, {Key: "trae_auto_checkin", Label: "自动 Trae 签到", Description: "仅使用已授权设备身份，不轮换设备"}}
+	data.Maintenance = []provider.MaintenanceOption{{Key: "trae_max_mode", Label: "Trae Max 大窗口", Description: "实时目录明确支持且窗口更大时启用；关闭后使用默认窗口，更多输入可能增加消费"}, {Key: "trae_auto_quota", Label: "自动刷新 Trae 额度", Description: "启动自动读取一次；开启后每 30 分钟刷新，未知额度保持未知"}, {Key: "trae_auto_checkin", Label: "自动 Trae 签到", Description: "仅使用已授权设备身份，不轮换设备"}}
 	for id, a := range r.accounts {
 		label := a.Alias
 		if label == "" {
@@ -816,6 +821,7 @@ func (r *Runtime) selectAccountFor(req provider.ServeRequest, model, session str
 	defer r.mu.Unlock()
 	choices := []provider.Candidate{}
 	waiting := false
+	modelBlocked := false
 	now := time.Now()
 	nowFloat := float64(now.UnixNano()) / 1e9
 	for id, a := range r.accounts {
@@ -829,7 +835,10 @@ func (r *Runtime) selectAccountFor(req provider.ServeRequest, model, session str
 		} else if excluded[id] {
 			continue
 		}
-		if identity, _ := a.modelIdentityFor(model, image, r.identityAvailableLocked); identity == nil {
+		if identity, _ := a.modelIdentityFor(model, image, func(candidate *auth.Auth) bool { return r.modelIdentityAvailableLocked(a, candidate, model) }); identity == nil {
+			if eligible, _ := a.modelIdentityFor(model, image, r.identityAvailableLocked); eligible != nil {
+				modelBlocked = true
+			}
 			continue
 		}
 		budget := a.creditBudget(nowFloat)
@@ -866,6 +875,9 @@ func (r *Runtime) selectAccountFor(req provider.ServeRequest, model, session str
 		if waiting {
 			return "", nil
 		}
+		if modelBlocked {
+			return "", provider.NewAPIError(403, "当前账号套餐暂不支持该 Trae 模型，请选择其他模型或有权账号", "model_unavailable")
+		}
 		return "", provider.NewAPIError(503, "当前没有可用且有权调用该模型的 Trae 账号", "account_unavailable")
 	}
 	r.accounts[id].LastUsed = nowSec()
@@ -873,3 +885,11 @@ func (r *Runtime) selectAccountFor(req provider.ServeRequest, model, session str
 }
 
 var _ provider.Runtime = (*Runtime)(nil)
+
+func (r *Runtime) maxModeEnabled() bool {
+	if r.db == nil {
+		return true
+	}
+	settings, err := r.db.GetSettings()
+	return err != nil || settings["trae_max_mode"] != "0"
+}

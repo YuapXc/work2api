@@ -158,6 +158,13 @@ func unionBool(a, b *bool) *bool {
 }
 
 func mergeModelInfo(a, b upstream.ModelInfo) upstream.ModelInfo {
+	maxA, maxB := a.WithMaxMode(true).EffectiveContextWindow(), b.WithMaxMode(true).EffectiveContextWindow()
+	hasMax := a.SupportsMaxMode || b.SupportsMaxMode
+	a.MaxContextWindow = maxA
+	if maxB > 0 && (maxA == 0 || maxB < maxA) {
+		a.MaxContextWindow = maxB
+	}
+
 	a.Pricing = append(append([]upstream.ModelPrice(nil), a.Pricing...), b.Pricing...)
 	a.EntitlementCosts = append(append([]float64(nil), a.EntitlementCosts...), b.EntitlementCosts...)
 	a.Multimodal = unionBool(a.Multimodal, b.Multimodal)
@@ -178,6 +185,7 @@ func mergeModelInfo(a, b upstream.ModelInfo) upstream.ModelInfo {
 	if b.ContextWindow > 0 && (a.ContextWindow == 0 || b.ContextWindow < a.ContextWindow) {
 		a.ContextWindow = b.ContextWindow
 	}
+	a.SupportsMaxMode = hasMax && a.MaxContextWindow > a.ContextWindow
 	if b.MaxTokens > 0 && (a.MaxTokens == 0 || b.MaxTokens < a.MaxTokens) {
 		a.MaxTokens = b.MaxTokens
 	}

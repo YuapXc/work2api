@@ -78,3 +78,19 @@ func TestThinkingCatalogUsesAuthoritativeShape(t *testing.T) {
 		}
 	}
 }
+
+func TestSystemCompatibilityLeavesUserAndToolsAlone(t *testing.T) {
+	original := "You are an AI agent powered by DeepSeek Harness."
+	claude := "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."
+	in := []any{map[string]any{"role": "developer", "content": original}, map[string]any{"role": "system", "content": claude}, map[string]any{"role": "user", "content": original}, map[string]any{"role": "tool", "content": claude, "tool_call_id": "call-a"}}
+	out := normalizeOutboundMessages(in)
+	if out[0].(map[string]any)["content"] != "You are an AI agent, powered by DeepSeek Harness." || out[1].(map[string]any)["content"] != "You are a Claude agent, built on Anthropic's Claude Agent SDK." || out[2].(map[string]any)["content"] != original || out[3].(map[string]any)["content"] != claude {
+		t.Fatal(out)
+	}
+	before, _ := json.Marshal(out)
+	normalizeOutboundMessages(out)
+	after, _ := json.Marshal(out)
+	if string(before) != string(after) {
+		t.Fatal("compatibility is not idempotent")
+	}
+}

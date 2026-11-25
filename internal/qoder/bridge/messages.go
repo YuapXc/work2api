@@ -2,8 +2,17 @@ package bridge
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 )
+
+var claudeCodeIdentity = regexp.MustCompile(`You\s+are\s+Claude\s+Code,\s+Anthropic's\s+official\s+CLI\s+for\s+Claude(?:,\s+running\s+within\s+the\s+Claude\s+Agent\s+SDK)?\.`)
+var harnessOpener = regexp.MustCompile(`(?i)(\bYou are (?:an?|the)\s[^\n.,]{0,60}?\b(?:agent|assistant))\s+(powered by|running on|running in|built on|based on)\b`)
+
+func compatibleSystemText(text string) string {
+	text = claudeCodeIdentity.ReplaceAllString(text, "You are a Claude agent, built on Anthropic's Claude Agent SDK.")
+	return harnessOpener.ReplaceAllString(text, "${1}, ${2}")
+}
 
 func textBlocks(blocks []interface{}, separator string) string {
 	var text strings.Builder
@@ -219,6 +228,11 @@ func normalizeOutboundMessages(msgs []interface{}) []interface{} {
 		mm, ok := m.(map[string]interface{})
 		if !ok {
 			continue
+		}
+		if role, _ := mm["role"].(string); role == "system" || role == "developer" {
+			if text, ok := mm["content"].(string); ok {
+				mm["content"] = compatibleSystemText(text)
+			}
 		}
 		// content 修正必须在摘 tool_calls 之前：摘掉后判据永远不成立
 		if mm["tool_calls"] != nil && mm["content"] == nil {

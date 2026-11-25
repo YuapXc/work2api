@@ -127,7 +127,9 @@ func routeCatalogEntry(route store.ModelRoute, members []string, catalog map[str
 	if vision {
 		modality = "multimodal"
 	}
-	return map[string]any{"id": route.Model, "name": route.Name, "provider": "unified", "owned_by": "unified", "object": "model", "vision": vision, "supports_image": vision, "modality": modality, "context_length": contextLimit, "max_output_tokens": outputLimit, "members": members, "route_id": route.ID}
+	out := map[string]any{"id": route.Model, "name": route.Name, "provider": "unified", "owned_by": "unified", "object": "model", "vision": vision, "supports_image": vision, "modality": modality, "context_length": contextLimit, "max_output_tokens": outputLimit, "members": members, "route_id": route.ID}
+	routeDiscoveryCapabilities(out, members, catalog)
+	return out
 }
 
 func (s *Server) routeCandidates(p *Principal, route store.ModelRoute, payload map[string]any) ([]string, *apiError) {

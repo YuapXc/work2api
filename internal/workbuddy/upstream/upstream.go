@@ -305,8 +305,9 @@ func streamSSE(resp *http.Response, yield LineFunc, names ...map[string]string) 
 		if json.Unmarshal([]byte(data), &chunk) != nil {
 			return invalidStream("上游返回了无效 SSE 数据")
 		}
+		tidied := dropEmptyToolCalls(chunk)
 		remapped := state.toolIndexes.NormalizeChunk(chunk)
-		renamed := restore.restore(chunk) || remapped
+		renamed := restore.restore(chunk) || remapped || tidied
 		if usage, ok := chunk["usage"].(map[string]any); ok {
 			if normalized := tokenusage.ChatUsage(usage); normalized != nil {
 				chunk["usage"] = normalized
@@ -596,4 +597,18 @@ func sortInts(s []int) {
 			s[j-1], s[j] = s[j], s[j-1]
 		}
 	}
+}
+
+func dropEmptyToolCalls(chunk map[string]any) bool {
+	changed := false
+	choices, _ := chunk["choices"].([]any)
+	for _, raw := range choices {
+		choice, _ := raw.(map[string]any)
+		delta, _ := choice["delta"].(map[string]any)
+		if calls, ok := delta["tool_calls"].([]any); ok && len(calls) == 0 {
+			delete(delta, "tool_calls")
+			changed = true
+		}
+	}
+	return changed
 }

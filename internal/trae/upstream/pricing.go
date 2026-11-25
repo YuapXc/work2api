@@ -36,6 +36,7 @@ func catalogObject(raw json.RawMessage) json.RawMessage {
 }
 
 type modelDisplay struct {
+	MaxMode                bool            `json:"max_mode"`
 	DisplayName            string          `json:"display_name"`
 	Multimodal             *bool           `json:"multimodal"`
 	Capability             string          `json:"model_capability"`

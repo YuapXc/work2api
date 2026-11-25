@@ -58,6 +58,7 @@ type DB struct {
 
 // DefaultSettings mirror db.py DEFAULT_SETTINGS.
 var DefaultSettings = map[string]string{
+	"trae_max_mode":              "1",
 	"trae_auto_quota":            "0",
 	"trae_auto_checkin":          "0",
 	"checkin_hours":              "9,21",

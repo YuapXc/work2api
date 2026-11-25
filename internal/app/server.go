@@ -483,7 +483,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			if clean == nil {
 				continue
 			}
-			out = append(out, clean)
+			out = append(out, publicModelEntry(clean))
 			continue
 		}
 		resolved := s.o.resolveModel(id)
@@ -496,13 +496,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		} else if !modelAllowed(principal, id, resolved) {
 			continue
 		}
-		clean := map[string]any{}
-		for k, v := range item {
-			if k != "account_uids" {
-				clean[k] = v
-			}
-		}
-		out = append(out, clean)
+		out = append(out, publicModelEntry(item))
 	}
 	sort.SliceStable(out, func(i, j int) bool { return str2(out[i]["id"]) < str2(out[j]["id"]) })
 	body, err := json.Marshal(map[string]any{"object": "list", "data": out})

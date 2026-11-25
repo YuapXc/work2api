@@ -13,7 +13,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"work2api/internal/trae/auth"
@@ -238,29 +237,22 @@ func (r *Runtime) captureCallback(id, callback string, ownerID int64) error {
 	if state.RefreshToken != "" && state.RefreshToken != refresh {
 		return errors.New("登录态已提交")
 	}
-	enterpriseHost := query.Get("host")
 	var userInfo map[string]any
 	_ = json.Unmarshal([]byte(query.Get("userInfo")), &userInfo)
-	if enterpriseHost == "" {
-		enterpriseHost, _ = userInfo["Host"].(string)
+	hosts := []string{query.Get("host")}
+	for _, key := range []string{"Host", "host", "APIHost", "apiHost"} {
+		h, _ := userInfo[key].(string)
+		hosts = append(hosts, h)
 	}
-	if enterpriseHost == "" {
-		enterpriseHost, _ = userInfo["host"].(string)
+	if state.EnterpriseLogin {
+		hosts = append(hosts, query.Get("consoleHost"), "console.enterprise.trae.cn")
 	}
-	if enterpriseHost == "" {
-		enterpriseHost, _ = userInfo["APIHost"].(string)
-	}
-	if enterpriseHost == "" {
-		enterpriseHost, _ = userInfo["apiHost"].(string)
-	}
-	if enterpriseHost == "" && state.EnterpriseLogin {
-		enterpriseHost = query.Get("consoleHost")
-	}
-	parsed, e := url.Parse(enterpriseHost)
-	if enterpriseHost == "" {
-		state.EnterpriseConsole = state.EnterpriseConsole || state.EnterpriseLogin
-	} else {
-		state.EnterpriseConsole = e == nil && parsed.Scheme == "https" && strings.EqualFold(parsed.Host, "console.enterprise.trae.cn") && parsed.User == nil
+	state.EnterpriseConsole = state.EnterpriseLogin
+	for _, host := range hosts {
+		if auth.IsEnterpriseHost(host) {
+			state.EnterpriseConsole = true
+			break
+		}
 	}
 	state.Code = code
 	state.RefreshToken = refresh

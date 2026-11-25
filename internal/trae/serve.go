@@ -14,6 +14,7 @@ import (
 	"work2api/internal/core/protocol"
 	"work2api/internal/core/provider"
 	"work2api/internal/streamwatch"
+	"work2api/internal/tokenusage"
 	"work2api/internal/trae/auth"
 	"work2api/internal/trae/upstream"
 )
@@ -77,7 +78,7 @@ func (r *eventReader) parse(name, data string) (*upstream.SOLOEvent, error) {
 }
 
 func eventError(e *upstream.SOLOEvent) error {
-	return &upstream.SOLOStreamError{Code: e.ErrorCode, Msg: e.ErrorMessage}
+	return &upstream.SOLOStreamError{Code: e.ErrorCode, Msg: e.ErrorMessage, PlanPresent: e.PlanPresent}
 }
 
 var errTraeEmptyReply = errors.New("Trae 上游返回空回复")
@@ -222,11 +223,11 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 		var identity *auth.Auth
 		var identityInfo upstream.ModelInfo
 		if a != nil {
-			identity, identityModel = a.modelIdentityFor(model, image, r.identityAvailableLocked)
+			identity, identityModel = a.modelIdentityFor(model, image, func(candidate *auth.Auth) bool { return r.modelIdentityAvailableLocked(a, candidate, model) })
 			effort := protocol.ExplicitReasoningEffort(body)
 			if effort != "" {
 				preferred, preferredModel := a.modelIdentityFor(model, image, func(candidate *auth.Auth) bool {
-					if !r.identityAvailableLocked(candidate) {
+					if !r.modelIdentityAvailableLocked(a, candidate, model) {
 						return false
 					}
 					for _, info := range a.Catalogs[candidate.Variant] {
@@ -255,6 +256,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 		if a == nil || identity == nil {
 			continue
 		}
+		identityInfo = identityInfo.WithMaxMode(r.maxModeEnabled())
 		consoleRoute := identity.UsesEnterpriseConsole()
 		if identityInfo.Enterprise != nil && !consoleRoute {
 			continue
@@ -268,6 +270,33 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 		}
 		if err = provider.CheckDispatch(ctx, ref, "trae/"+model); err != nil {
 			return report, err
+		}
+		if ent := identityInfo.Enterprise; consoleRoute && ent != nil && ent.Direct != nil && ent.ModelName != "" {
+			key := ref.LocalID + ":" + identity.Variant + ":" + identityModel
+			if r.directAllowed(key, ent.Direct) {
+				report.UpstreamRoute, report.UpstreamModel = "enterprise_direct", ent.ModelName
+				streamwatch.StartAttempt(ctx)
+				report.EffectiveLimits = map[string]int{}
+				directStream, status, directErr := r.openDirect(ctx, ent.Direct, encoded, identityInfo, report.EffectiveLimits)
+				streamwatch.AttemptHeaders(ctx, status, nil)
+				streamwatch.AttemptResult(ctx, status)
+				if directErr == nil {
+					usage, known, readErr := deliverDirect(ctx, req, directStream, "trae/"+model)
+					report.UpstreamFinishReason = usage.FinishReason
+					return r.finishUsage(report, usage, known, readErr, a, session, ref.LocalID)
+				}
+				r.rememberDirectRefusal(key, ent.Direct, status)
+				if ctx.Err() != nil {
+					return report, ctx.Err()
+				}
+				if attempt >= 2 {
+					return report, provider.NewAPIError(502, "Trae 专用端点调用失败，已达本次尝试上限", "upstream_error")
+				}
+				attempt++
+				if err = provider.CheckDispatch(ctx, ref, "trae/"+model); err != nil {
+					return report, err
+				}
+			}
 		}
 		streamwatch.StartAttempt(ctx)
 		prepared, limits := upstream.PrepareBodyResolvedWithLimits(encoded, identity.Variant, identityModel, identityInfo)
@@ -338,7 +367,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 						lastRetryDelay = time.Minute
 					}
 				}
-				r.coolWithDelay(ref.LocalID, kind, lastRetryDelay)
+				r.coolRejection(ref.LocalID, model, identity, kind, lastRetryDelay)
 				if retryable(kind) && attempt < 2 {
 					continue
 				}
@@ -394,7 +423,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 				if kind == upstream.ErrSoftRate {
 					lastRetryDelay = time.Minute
 				}
-				r.cool(ref.LocalID, kind)
+				r.coolRejection(ref.LocalID, model, identity, kind, lastRetryDelay)
 				if retryable(kind) && attempt < 2 {
 					continue
 				}
@@ -437,38 +466,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 		pipeReader.Close()
 		stream.Close()
 		<-readerDone
-		report.InputTokens = usage.Input
-		report.FinishReason = usage.FinishReason
-		report.OutputTokens = usage.Output
-		if usage.ReasoningKnown {
-			n := usage.Reasoning
-			report.ReasoningTokens = &n
-		}
-		if usage.CacheCreationKnown {
-			n := usage.CacheCreation
-			report.CacheCreationTokens = &n
-		}
-		report.TokensKnown = &known
-		if usage.CachedKnown {
-			cached := usage.Cached
-			report.CachedTokens = &cached
-		}
-		if err != nil {
-			report.Status = "incomplete"
-			return report, err
-		}
-		report.Status = "ok"
-		if report.FinishReason == "length" || report.FinishReason == "content_filter" {
-			report.Status = "incomplete"
-		}
-		r.mu.Lock()
-		a.Failures = 0
-		a.LastUsed = nowSec()
-		if session != "" {
-			r.rememberAffinity(session, ref.LocalID)
-		}
-		r.mu.Unlock()
-		return report, nil
+		return r.finishUsage(report, usage, known, err, a, session, ref.LocalID)
 	}
 	if lastRejection != nil {
 		return returnRejection()
@@ -482,7 +480,7 @@ func (r *Runtime) cool(id string, kind upstream.ErrKind) {
 	r.coolWithDelay(id, kind, 0)
 }
 func (r *Runtime) coolWithDelay(id string, kind upstream.ErrKind, delay time.Duration) {
-	if !retryable(kind) {
+	if !retryable(kind) || kind == upstream.ErrModelPlan {
 		return
 	}
 	r.mu.Lock()
@@ -548,10 +546,14 @@ func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent
 	}
 	toolsSeen := false
 	completionTokens, _ := initialUsage["completion_tokens"].(float64)
+	reasoningTokens := 0
+	if n := tokenusage.Reasoning(initialUsage); n != nil {
+		reasoningTokens = *n
+	}
 	for e := first; e != nil; {
 		switch e.Event {
 		case "error":
-			return rejectionError((&upstream.SOLOStreamError{Code: e.ErrorCode, Msg: e.ErrorMessage}).Kind(), 0, e.ErrorCode)
+			return rejectionError((&upstream.SOLOStreamError{Code: e.ErrorCode, Msg: e.ErrorMessage, PlanPresent: e.PlanPresent}).Kind(), 0, e.ErrorCode)
 		case "output":
 			delta := map[string]any{}
 			if e.Response != "" {
@@ -613,6 +615,9 @@ func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent
 			if n, ok := e.Usage["completion_tokens"].(float64); ok {
 				completionTokens = n
 			}
+			if n := tokenusage.Reasoning(e.Usage); n != nil {
+				reasoningTokens = *n
+			}
 			if err := emit(map[string]any{}, nil, e.Usage); err != nil {
 				return err
 			}
@@ -627,7 +632,7 @@ func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent
 			}
 			if (toolsSeen || textTools.Seen) && finish == "stop" {
 				finish = "tool_calls"
-			} else if finish == "stop" && len(sentLimit) != 0 && sentLimit[0] > 0 && completionTokens >= float64(sentLimit[0]) {
+			} else if finish == "stop" && len(sentLimit) != 0 && sentLimit[0] > 0 && (completionTokens == float64(sentLimit[0]) || completionTokens-float64(reasoningTokens) >= float64(sentLimit[0])) {
 				finish = "length"
 			}
 			if err := emit(map[string]any{}, finish, nil); err != nil {
@@ -643,4 +648,39 @@ func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent
 		}
 	}
 	return io.ErrUnexpectedEOF
+}
+
+func (r *Runtime) finishUsage(report provider.UsageReport, usage protocol.Usage, known bool, err error, a *accountState, session, id string) (provider.UsageReport, error) {
+	report.InputTokens = usage.Input
+	report.FinishReason = usage.FinishReason
+	report.OutputTokens = usage.Output
+	if usage.ReasoningKnown {
+		n := usage.Reasoning
+		report.ReasoningTokens = &n
+	}
+	if usage.CacheCreationKnown {
+		n := usage.CacheCreation
+		report.CacheCreationTokens = &n
+	}
+	report.TokensKnown = &known
+	if usage.CachedKnown {
+		cached := usage.Cached
+		report.CachedTokens = &cached
+	}
+	if err != nil {
+		report.Status = "incomplete"
+		return report, err
+	}
+	report.Status = "ok"
+	if report.FinishReason == "length" || report.FinishReason == "content_filter" {
+		report.Status = "incomplete"
+	}
+	r.mu.Lock()
+	a.Failures = 0
+	a.LastUsed = nowSec()
+	if session != "" {
+		r.rememberAffinity(session, id)
+	}
+	r.mu.Unlock()
+	return report, nil
 }

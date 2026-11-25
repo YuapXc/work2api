@@ -164,7 +164,7 @@ func TestCatalogNameResolvesOnlyOneVisiblePhysicalModel(t *testing.T) {
 		known        bool
 	}{
 		{"Qwen4-Max-Preview", "qmodel_latest", true}, {"Qwen4 Max", "qmodel_latest", true},
-		{"Step_5 Preview", "jmodel", true}, {"DeepSeek-V4-Pro", "dmodel", true}, {"Sonus", "smodel", true},
+		{"Step_5 Preview", "jmodel", true}, {"DeepSeek-V4-Pro", "dmodel", true}, {"Sonus", "sonus", false},
 		{"Future-SKU", "future-sku", false}, {"Qwen4-Max-Unlisted", "qwen4-max-unlisted", false},
 	} {
 		if key, known, err := cold.ResolveCatalogName(provider.ProtocolChat, "qoder/"+tc.name, nil); err != nil || known != tc.known || key != "qoder/"+tc.target || bridge.MapModel("codex", tc.name) != tc.target {

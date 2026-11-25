@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"work2api/internal/jsonutil"
@@ -1271,7 +1273,9 @@ func FunctionToolSubset(input map[string]any, from Protocol) (map[string]any, er
 	return out, nil
 }
 
-func IsForeignResponseIDRejection(rejection []byte, status int) bool {
+var responseItemIDLengthError = regexp.MustCompile(`(?i)invalid ['"]input\[([0-9]+)\]\.id['"][^\n]{0,1000}expected a string with maximum length`)
+
+func IsResponseIDRejection(rejection []byte, status int) bool {
 	if status != 400 && status != 404 && status != 422 {
 		return false
 	}
@@ -1286,12 +1290,12 @@ func IsForeignResponseIDRejection(rejection []byte, status int) bool {
 		return false
 	}
 	message := strings.ToLower(failure.Message)
-	return strings.Contains(message, "created under a different") && strings.Contains(message, "resource")
+	return strings.Contains(message, "created under a different") && strings.Contains(message, "resource") || responseItemIDLengthError.MatchString(message)
 }
 
-// RecoverForeignResponseIDs preserves tool links while removing refused resource IDs.
-func RecoverForeignResponseIDs(body, rejection []byte, status int) ([]byte, bool) {
-	if !IsForeignResponseIDRejection(rejection, status) {
+// RecoverResponseIDs preserves tool links while removing refused optional item IDs.
+func RecoverResponseIDs(body, rejection []byte, status int) ([]byte, bool) {
+	if !IsResponseIDRejection(rejection, status) {
 		return body, false
 	}
 	var payload map[string]json.RawMessage
@@ -1301,8 +1305,18 @@ func RecoverForeignResponseIDs(body, rejection []byte, status int) ([]byte, bool
 	if id := bytes.TrimSpace(payload["previous_response_id"]); len(id) > 0 && string(id) != "null" && string(id) != `""` {
 		return body, false
 	}
+	var failure struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(rejection, &failure)
+	lengthMatch := responseItemIDLengthError.FindStringSubmatch(failure.Error.Message)
 	var items []json.RawMessage
-	if json.Unmarshal(payload["input"], &items) != nil || len(items) < 2 {
+	if json.Unmarshal(payload["input"], &items) != nil || len(items) == 0 {
+		return body, false
+	}
+	if len(lengthMatch) == 0 && len(items) < 2 {
 		return body, false
 	}
 	optional := func(item map[string]json.RawMessage) bool {
@@ -1320,6 +1334,31 @@ func RecoverForeignResponseIDs(body, rejection []byte, status int) ([]byte, bool
 			return true
 		}
 		return false
+	}
+	if len(lengthMatch) > 1 {
+		index, err := strconv.Atoi(lengthMatch[1])
+		if err != nil || index >= len(items) {
+			return body, false
+		}
+		var item map[string]json.RawMessage
+		if json.Unmarshal(items[index], &item) != nil || item["id"] == nil || !optional(item) {
+			return body, false
+		}
+		if string(item["type"]) == `"reasoning"` {
+			var encrypted string
+			_ = json.Unmarshal(item["encrypted_content"], &encrypted)
+			if encrypted == "" {
+				return body, false
+			}
+		}
+		delete(item, "id")
+		items[index], _ = json.Marshal(item)
+		payload["input"], _ = json.Marshal(items)
+		fixed, err := json.Marshal(payload)
+		if err != nil {
+			return body, false
+		}
+		return fixed, true
 	}
 	replay := false
 	for _, raw := range items[:len(items)-1] {

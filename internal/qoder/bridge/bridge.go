@@ -919,12 +919,11 @@ func DisplayNameKey(name string) string {
 var upstreamDisplayAliases = map[string]string{
 	"qwen4maxpreview": "qmodel_latest", "qwen4max": "qmodel_latest",
 	"qwen3.8max": "qmodel_38max", "qwen3.8maxpreview": "qmodel_38max", "qwen3.8flash": "qfmodel",
-	"qwen3.7plus": "qmodel", "qwen3.7flash": "q37fmodel",
 	"step5preview": "jmodel", "step5": "jmodel",
 	"deepseekv4pro": "dmodel", "deepseekflash": "dfmodel",
-	"glm5.3": "gmodel", "glm5.3flash": "gfmodel", "glm5.2": "gm51model",
+	"glm5.4": "gmodel_latest", "glm5.3": "gmodel", "glm5.3flash": "gfmodel",
 	"kimik3.1pro": "kmodel_latest", "kimik2.8preview": "kmodel", "minimaxm3.1flash": "mmodel",
-	"ultimate": "ultimate", "efficient": "efficient", "sonus": "smodel", "cantus": "cmodel", "fast": "fast",
+	"ultimate": "ultimate", "efficient": "efficient",
 }
 
 func BuiltinModelAlias(model string) string {

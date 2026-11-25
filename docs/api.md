@@ -29,6 +29,9 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 - 渠道前缀为 `workbuddy/`、`qoder/`、`opencode/`、`trae/`；旧裸模型名仍指向 WorkBuddy。
 - 同一地址和 Key 下，切换模型 ID 即可切换渠道；跨渠道共用调用名见 [统一模型路由](model-routing.md)。
 - Key 的模型白名单始终生效；用户 Key 还受当前用户权限及全局禁用约束。
+- `/v1/models` 的 `modalities` 使用 `{ "input": [...], "output": [...] }`，同时保留渠道已有的平铺模态字段。`supported_endpoints` 列出网关可用接口，`native_endpoints` 仅在已知上游原生协议时提供。媒体模型按实际操作暴露生成、编辑、视频或转写接口，不作为聊天接口发布。
+- 已知思考档位通过 `supported_reasoning_levels` 发布，默认档位通过 `think_efforts.default_effort` 发布；强制思考模型使用 `supports_thinking_type: "only"`，不会因目录中相冲突的可关闭标记而发布关闭档位。统一组只汇总当前 Key 可见成员的共同档位和原生接口，默认档位仅在成员一致时发布。未报告的能力不补成支持，积分倍率不转换为货币单价。
+- 客户端对扩展属性的支持各不相同。例如，部分客户端仍按模型 ID 判断音频转写用途，即使目录返回 `/audio/transcriptions`，也可能把 `wb-asr` 显示在聊天列表；调用时应使用对应转写接口。
 - 建议始终显式传入 `model`。省略时，单模型 Key 使用唯一获准模型；多模型受限 Key 返回 400；不限制模型的 Key 使用 WorkBuddy `auto`。显式 `auto` 仍需授权，它表示上游选模，不是按白名单自动选择。
 
 Claude Code 等会使用多个模型的客户端，主模型及辅助模型均应填写网关可用的调用名。

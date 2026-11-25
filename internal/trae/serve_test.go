@@ -1890,3 +1890,265 @@ func TestServeRecordsRouteAndOriginalFinishWithoutContent(t *testing.T) {
 		}
 	}
 }
+
+func TestReasoningDoesNotTurnWholeAnswerIntoLength(t *testing.T) {
+	for _, tc := range []struct {
+		completion, reasoning, limit int
+		want                         string
+	}{{55, 52, 16, "stop"}, {176, 173, 16, "stop"}, {16, 13, 16, "length"}, {55, 0, 16, "length"}, {55, 20, 16, "length"}} {
+		input := fmt.Sprintf("event: output\ndata: {\"response\":\"OK\"}\n\nevent: token_usage\ndata: {\"completion_tokens\":%d,\"completion_tokens_details\":{\"reasoning_tokens\":%d}}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n", tc.completion, tc.reasoning)
+		events := newEvents(strings.NewReader(input))
+		first, err := events.next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out bytes.Buffer
+		if err = normalizeStream(&out, events, first, "trae/m", nil, tc.limit); err != nil {
+			t.Fatal(err)
+		}
+		reply, _, _, err := protocol.CollapseStreamWithUsage(&out, protocol.Chat, "trae/m")
+		if err != nil || !bytes.Contains(reply, []byte(`"finish_reason":"`+tc.want+`"`)) {
+			t.Fatal(tc, string(reply), err)
+		}
+	}
+}
+func TestBareEnterpriseHostAndSavedSeatScope(t *testing.T) {
+	jwt := "head." + base64.RawURLEncoding.EncodeToString([]byte(`{"scope":"saas"}`)) + ".sig"
+	for _, host := range []string{"console.enterprise.trae.cn", "https://console.enterprise.trae.cn", "https://console.enterprise.trae.cn:443"} {
+		raw, _ := json.Marshal(map[string]any{"accessToken": "fixture", "variant": "cn", "host": host})
+		a, err := auth.Parse(raw)
+		if err != nil || !a.EnterpriseConsole {
+			t.Fatal(host, err)
+		}
+	}
+	for _, host := range []string{"http://console.enterprise.trae.cn", "https://console.enterprise.trae.cn.evil", "https://console.enterprise.trae.cn:444"} {
+		if auth.IsEnterpriseHost(host) {
+			t.Fatal(host)
+		}
+	}
+	raw, _ := json.Marshal(map[string]any{"accessToken": jwt, "variant": "cn", "consoleChat": false})
+	a, err := auth.Parse(raw)
+	if err != nil || !a.EnterpriseConsole || a.UsesEnterpriseConsole() {
+		t.Fatal("seat recovery lost explicit fallback", a, err)
+	}
+}
+func TestTraeModelPlanRejectionLeavesOtherModelsUsable(t *testing.T) {
+	var sent atomic.Int32
+	var maxEnabled atomic.Bool
+	maxEnabled.Store(true)
+	r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+		sent.Add(1)
+		var body map[string]any
+		json.NewDecoder(req.Body).Decode(&body)
+		if body["model"] == "allowed" && (body["is_max_mode"] == true) != maxEnabled.Load() {
+			t.Error("wire max mode differs from active policy")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		if body["model"] == "denied" {
+			io.WriteString(w, "event: error\ndata: {\"code\":1005,\"extra\":{\"plan\":2}}\n\n")
+			return
+		}
+		io.WriteString(w, "event: output\ndata: {\"response\":\"OK\"}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n")
+	})
+	identity := &auth.Auth{AccessToken: "fixture", UID: "model-plan", Variant: "cn", ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	id := accountID(identity.UID)
+	models := []upstream.ModelInfo{{ID: "denied", Name: "Denied"}, {ID: "allowed", Name: "Allowed", ContextWindow: 116000, SupportsMaxMode: true, MaxContextWindow: 1000000}}
+	state := &accountState{Auth: identity, Enabled: true, Identities: map[string]*auth.Auth{"cn": identity}, Models: models, Catalogs: map[string][]upstream.ModelInfo{"cn": models}}
+	r.accounts[id] = state
+	for _, model := range []string{"denied", "allowed"} {
+		w := httptest.NewRecorder()
+		report, err := r.Serve(t.Context(), provider.ServeRequest{Protocol: provider.ProtocolChat, Writer: w, Payload: map[string]any{"model": "trae/" + model, "messages": []any{map[string]any{"role": "user", "content": "test"}}}})
+		if model == "denied" {
+			var api *provider.APIError
+			if !errors.As(err, &api) || api.Status != 403 {
+				t.Fatal(report, err)
+			}
+		} else if err != nil || !strings.Contains(w.Body.String(), "OK") {
+			t.Fatal(report, err, w.Body.String())
+		}
+	}
+	if !state.Cooldown.IsZero() || state.Failures != 0 || sent.Load() != 2 {
+		t.Fatal("model refusal penalized account", state.Cooldown, state.Failures, sent.Load())
+	}
+	if got := r.Models(t.Context()); len(got) != 2 {
+		t.Fatal(got)
+	} else {
+		for _, m := range got {
+			if m.ID == "trae/allowed" && m.Context != 1000000 {
+				t.Fatal("max window not declared", m)
+			}
+		}
+	}
+	maxEnabled.Store(false)
+	if err := r.db.SaveSettings(map[string]string{"trae_max_mode": "0"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range r.Models(t.Context()) {
+		if m.ID == "trae/allowed" && m.Context != 116000 {
+			t.Fatal("disabled max retained large window", m)
+		}
+	}
+	for _, model := range []string{"denied", "allowed"} {
+		w := httptest.NewRecorder()
+		_, err := r.Serve(t.Context(), provider.ServeRequest{Protocol: provider.ProtocolChat, Writer: w, Payload: map[string]any{"model": "trae/" + model, "messages": []any{map[string]any{"role": "user", "content": "test"}}}})
+		if model == "denied" {
+			var api *provider.APIError
+			if !errors.As(err, &api) || api.Status != 403 {
+				t.Fatal(err)
+			}
+		} else if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if sent.Load() != 3 {
+		t.Fatal("blocked model reached upstream", sent.Load())
+	}
+
+}
+
+func TestEnterpriseDirectBoundaryAndFallback(t *testing.T) {
+	for _, mode := range []string{"ok", "json", "401", "403", "500", "stream_error", "after_output", "redirect", "canceled", "revoked", "tool", "nonstream"} {
+		for _, proto := range []provider.Protocol{provider.ProtocolChat, provider.ProtocolAnthropic, provider.ProtocolResponses} {
+			if mode != "ok" && mode != "tool" && mode != "nonstream" && proto != provider.ProtocolChat {
+				continue
+			}
+			t.Run(mode+string(proto), func(t *testing.T) {
+				var direct, native atomic.Int32
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+					var b map[string]json.RawMessage
+					json.NewDecoder(req.Body).Decode(&b)
+					if req.Host == "direct.example" {
+						direct.Add(1)
+						if req.Header.Get("Authorization") != "Bearer direct-secret" || req.Header.Get("X-Cloudide-Token") != "" || req.Header.Get("X-Ide-Token") != "" || req.Header.Get("X-Model-Provider") != "custom_openai_compatible" || req.Header.Get("User-Agent") != "hertz" || string(b["model"]) != `"physical"` || string(b["max_tokens"]) != "9000" || len(b["config_source"]) > 0 || len(b["enterprise_custom_hyper_params"]) > 0 {
+							t.Error("direct contract or credential boundary failed")
+						}
+						if mode == "tool" && (!bytes.Contains(b["tools"], []byte(`"required":["n"]`)) || !bytes.Contains(b["tools"], []byte(`"const":42`)) || string(b["tool_choice"]) != `"required"`) {
+							t.Error("client tool contract changed")
+						}
+						switch mode {
+						case "401", "revoked":
+							w.WriteHeader(401)
+							return
+						case "403":
+							w.WriteHeader(403)
+							return
+						case "500":
+							w.WriteHeader(500)
+							return
+						case "redirect":
+							w.Header().Set("Location", "https://untrusted.example/chat/completions")
+							w.WriteHeader(302)
+							return
+						case "canceled":
+							cancel()
+							<-req.Context().Done()
+							return
+						case "json":
+							w.Header().Set("Content-Type", "application/json")
+							io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":8274}}`)
+							return
+						}
+						w.Header().Set("Content-Type", "text/event-stream")
+						if mode == "stream_error" {
+							io.WriteString(w, `data: {"error":{"message":"rejected","type":"invalid_request_error"}}`+"\n\n")
+							return
+						}
+						io.WriteString(w, `data: {"choices":[{"index":0,"delta":{"content":"OK"}}]}`+"\n\n")
+						if mode == "after_output" {
+							w.(http.Flusher).Flush()
+							io.WriteString(w, `data: {"error":{"message":"late error direct-secret","type":"invalid_request_error"}}`+"\n\n")
+							return
+						}
+						if mode == "tool" {
+							io.WriteString(w, `data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-a","type":"function","function":{"name":"lookup","arguments":"{\"n\":9007199254740993}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":8274}}`+"\n\ndata: [DONE]\n\n")
+							return
+						}
+						io.WriteString(w, `data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":8274}}`+"\n\ndata: [DONE]\n\n")
+					} else {
+						native.Add(1)
+						if req.Header.Get("Authorization") != "Cloud-IDE-JWT ide-secret" || req.Header.Get("X-Cloudide-Token") != "ide-secret" {
+							t.Error("native fallback credential incorrect")
+						}
+						w.Header().Set("Content-Type", "text/event-stream")
+						io.WriteString(w, "event: output\ndata: {\"response\":\"fallback\"}\n\nevent: token_usage\ndata: {\"prompt_tokens\":1,\"completion_tokens\":2}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n")
+					}
+				})
+				identity := &auth.Auth{AccessToken: "ide-secret", UID: "direct-account", Variant: "cn", EnterpriseConsole: true, ExpiresAt: time.Now().Add(time.Hour).Unix()}
+				id := accountID(identity.UID)
+				model := upstream.ModelInfo{ID: "seat", Name: "Seat", ConsoleRoute: true, MaxTokens: 32768, Enterprise: &upstream.EnterpriseModel{ModelName: "physical", Provider: "custom_openai_compatible", Direct: &upstream.DirectConfig{URL: "https://direct.example/v1/chat/completions", Key: "direct-secret"}}}
+				state := &accountState{Auth: identity, Enabled: true, Identities: map[string]*auth.Auth{"cn": identity}, Models: []upstream.ModelInfo{model}, Catalogs: map[string][]upstream.ModelInfo{"cn": {model}}}
+				r.accounts[id] = state
+				chat := map[string]any{"model": "trae/seat", "stream": mode != "nonstream", "max_tokens": float64(9000), "messages": []any{map[string]any{"role": "user", "content": "test"}}}
+				if mode == "tool" {
+					chat["tools"] = []any{map[string]any{"type": "function", "function": map[string]any{"name": "lookup", "parameters": map[string]any{"type": "object", "properties": map[string]any{"n": map[string]any{"type": "integer", "const": float64(42)}}, "required": []any{"n"}}}}}
+					chat["tool_choice"] = "required"
+				}
+				payload, err := protocol.ConvertRequest(protocol.Chat, protocol.Protocol(proto), chat)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if mode == "revoked" {
+					ctx = provider.WithInvocation(ctx, provider.Invocation{Check: func(context.Context, provider.AccountRef, string) error {
+						if direct.Load() > 0 {
+							return &provider.DispatchError{Status: 403, Message: "revoked", Type: "account_not_allowed"}
+						}
+						return nil
+					}})
+				}
+				w := httptest.NewRecorder()
+				report, err := r.Serve(ctx, provider.ServeRequest{Protocol: proto, Writer: w, Payload: payload})
+				if strings.Contains(w.Body.String(), "direct-secret") || strings.Contains(w.Body.String(), "ide-secret") {
+					t.Fatal("credential leaked into reply")
+				}
+				switch mode {
+				case "tool":
+					if err != nil || native.Load() != 0 || report.FinishReason != "tool_calls" || !strings.Contains(w.Body.String(), "lookup") || !strings.Contains(w.Body.String(), "9007199254740993") {
+						t.Fatal(report, err, w.Body.String())
+					}
+				case "revoked":
+					var denied *provider.DispatchError
+					if !errors.As(err, &denied) || native.Load() != 0 {
+						t.Fatal(err, native.Load())
+					}
+				case "ok", "json", "nonstream":
+					if err != nil || direct.Load() != 1 || native.Load() != 0 || report.UpstreamRoute != "enterprise_direct" || report.FinishReason != "stop" || report.OutputTokens != 8274 || !strings.Contains(w.Body.String(), "OK") {
+						t.Fatal(report, err, w.Body.String(), direct.Load(), native.Load())
+					}
+				case "after_output":
+					if err == nil || native.Load() != 0 || direct.Load() != 1 || !strings.Contains(w.Body.String(), "OK") {
+						t.Fatal(report, err, direct.Load(), native.Load())
+					}
+				case "canceled":
+					if !errors.Is(err, context.Canceled) || native.Load() != 0 {
+						t.Fatal(err, native.Load())
+					}
+				default:
+					if err != nil || native.Load() != 1 || direct.Load() != 1 || report.UpstreamRoute != "enterprise" || !strings.Contains(w.Body.String(), "fallback") {
+						t.Fatal(report, err, direct.Load(), native.Load(), w.Body.String())
+					}
+				}
+				if !state.Cooldown.IsZero() {
+					t.Fatal("direct failure cooled account")
+				}
+				if mode == "401" || mode == "403" {
+					w = httptest.NewRecorder()
+					_, err = r.Serve(t.Context(), provider.ServeRequest{Protocol: proto, Writer: w, Payload: payload})
+					if err != nil || direct.Load() != 1 || native.Load() != 2 {
+						t.Fatal("rejected key was retried", err, direct.Load(), native.Load())
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestMergedTraeWindowsFollowEffectivePolicy(t *testing.T) {
+	a := upstream.ModelInfo{ContextWindow: 1000000}
+	b := upstream.ModelInfo{ContextWindow: 116000, SupportsMaxMode: true, MaxContextWindow: 1000000}
+	merged := mergeModelInfo(a, b)
+	if merged.WithMaxMode(true).EffectiveContextWindow() != 1000000 || merged.WithMaxMode(false).EffectiveContextWindow() != 116000 {
+		t.Fatal(merged)
+	}
+}

@@ -263,3 +263,58 @@ func TestEnterpriseDirectory4245Fallback(t *testing.T) {
 		})
 	}
 }
+
+func TestModelPlanRejectionAndMaxModeCatalog(t *testing.T) {
+	for _, raw := range []string{`{"code":1005,"extra":{"plan":2}}`, `{"code":1005,"extra":"{\"plan\":0}"}`} {
+		if Classify(400, raw) != ErrModelPlan || Classify(401, raw) != ErrSessionDead {
+			t.Fatal(raw)
+		}
+		event, err := ParseSOLOLine("error", raw)
+		if err != nil || (&SOLOStreamError{Code: event.ErrorCode, PlanPresent: event.PlanPresent}).Kind() != ErrModelPlan {
+			t.Fatal(event, err)
+		}
+	}
+	if Classify(400, `{"code":1005,"extra":{"plan":null}}`) != ErrPlanLimit {
+		t.Fatal("unreported plan invented")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"config_info_list":[{"config_name":"wide","display_config":{"display_name":"Wide","max_mode":true},"context_window_tokens":{"dev":116000,"max":1000000},"model_detail_list":[{"max_tokens":64000}]}]}`)
+	}))
+	defer srv.Close()
+	client := New()
+	client.AgentHost = srv.URL
+	models, err := client.FetchModels(&auth.Auth{Variant: "cn", AccessToken: "fixture"})
+	if err != nil || len(models) != 1 {
+		t.Fatal(models, err)
+	}
+	for _, enabled := range []bool{false, true} {
+		m := models[0].WithMaxMode(enabled)
+		want := int64(116000)
+		if enabled {
+			want = 1000000
+		}
+		if m.EffectiveContextWindow() != want {
+			t.Fatal(m)
+		}
+		raw, _ := PrepareBodyResolvedWithLimits([]byte(`{"messages":[]}`), "cn", "wide", m)
+		var body map[string]any
+		json.Unmarshal(raw, &body)
+		if (body["is_max_mode"] == true) != enabled {
+			t.Fatal(string(raw))
+		}
+	}
+	cfg := directConfig("custom_openai_compatible", []byte(`{"status":true,"auth_type":"0","ak":"private-key","base_url":"https://model.example/v1/chat/completions"}`))
+	if cfg == nil {
+		t.Fatal("valid direct catalog discarded")
+	}
+	secretModel := ModelInfo{Enterprise: &EnterpriseModel{ModelName: "custom", Direct: cfg}}
+	raw, _ := json.Marshal(secretModel)
+	if strings.Contains(string(raw), "private-key") || strings.Contains(string(raw), "model.example") {
+		t.Fatal("direct secret escaped catalog", string(raw))
+	}
+	for _, raw := range []string{`{"status":false,"auth_type":0,"ak":"key","base_url":"https://model.example/chat/completions"}`, `{"status":true,"auth_type":1,"ak":"key","base_url":"https://model.example/chat/completions"}`, `{"status":true,"auth_type":0,"ak":"key","base_url":"https://user:pass@model.example/chat/completions"}`} {
+		if directConfig("custom_openai_compatible", []byte(raw)) != nil {
+			t.Fatal(raw)
+		}
+	}
+}

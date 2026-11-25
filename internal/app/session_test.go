@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"work2api/internal/config"
 	"work2api/internal/core/protocol"
 	"work2api/internal/core/provider"
+	"work2api/internal/store"
 	"work2api/internal/workbuddy/credentials"
 	"work2api/internal/workbuddy/models"
 	"work2api/internal/workbuddy/pool"
@@ -80,6 +82,148 @@ func TestModelsETagRevalidatesKeyAndScope(t *testing.T) {
 	}
 	if deleted := ask("*"); deleted.Code == 304 || deleted.Code == 200 {
 		t.Fatal("deleted key bypassed auth", deleted.Code)
+	}
+}
+
+func TestPublicModelDiscoveryPreservesKnownCapabilities(t *testing.T) {
+	for _, tc := range []struct {
+		name                                     string
+		item                                     map[string]any
+		input, output, levels, endpoints, native []string
+		def                                      string
+		only                                     bool
+	}{
+		{"forced-thinking", map[string]any{"modalities": []any{"text", "image"}, "reasoning": map[string]any{"supportsReasoning": true, "canDisableThinking": true, "onlyReasoning": true, "supportedEfforts": []string{"low", "high", "off"}, "defaultEffort": "high"}, "native_protocol": "chat"}, []string{"text", "image"}, []string{"text"}, []string{"low", "high"}, []string{"/chat/completions", "/messages", "/responses"}, []string{"/chat/completions"}, "high", true},
+		{"optional-thinking", map[string]any{"modalities": []string{"text"}, "reasoning": map[string]any{"supportsReasoning": true, "canDisableThinking": true, "supportedEfforts": []any{"high", "high"}}}, []string{"text"}, []string{"text"}, []string{"high", "off"}, []string{"/chat/completions", "/messages", "/responses"}, nil, "", false},
+		{"unknown-levels", map[string]any{"reasoning": true, "native_protocol": "anthropic"}, nil, []string{"text"}, nil, []string{"/chat/completions", "/messages", "/responses"}, []string{"/messages"}, "", false},
+		{"explicit-false", map[string]any{"reasoning": false, "reasoning_efforts": []string{"high"}, "supportsToolCall": false}, nil, []string{"text"}, nil, []string{"/chat/completions", "/messages", "/responses"}, nil, "", false},
+		{"flat-efforts", map[string]any{"reasoning": true, "reasoning_efforts": []string{"high", "max"}, "default_reasoning_effort": "max", "native_protocol": "responses"}, nil, []string{"text"}, []string{"high", "max"}, []string{"/chat/completions", "/messages", "/responses"}, []string{"/responses"}, "max", false},
+		{"edit-only", map[string]any{"model_type": "image", "media_tags": []any{"image-to-image"}, "input_modalities": []string{"text", "image"}, "output_modalities": []string{"image"}}, []string{"text", "image"}, []string{"image"}, nil, []string{"/images/edits"}, nil, "", false},
+		{"video", map[string]any{"model_type": "video", "input_modalities": []string{"text"}, "output_modalities": []string{"video"}}, []string{"text"}, []string{"video"}, nil, []string{"/videos"}, nil, "", false},
+		{"transcription", map[string]any{"model_type": "audio", "input_modalities": []string{"audio", "video"}, "output_modalities": []string{"text"}}, []string{"audio", "video"}, []string{"text"}, nil, []string{"/audio/transcriptions"}, nil, "", false},
+		{"decision", map[string]any{"native_protocol": "systemone"}, nil, nil, nil, []string{"/systemone"}, []string{"/systemone"}, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.item["id"] = tc.name
+			tc.item["account_uids"] = []string{"private-account"}
+			before, _ := json.Marshal(tc.item)
+			out := publicModelEntry(tc.item)
+			encoded, err := json.Marshal(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var client struct {
+				Modalities struct{ Input, Output []string } `json:"modalities"`
+				Levels     []string                         `json:"supported_reasoning_levels"`
+				Endpoints  []string                         `json:"supported_endpoints"`
+				Native     []string                         `json:"native_endpoints"`
+				Think      struct {
+					Default string `json:"default_effort"`
+				} `json:"think_efforts"`
+				ThinkingType string `json:"supports_thinking_type"`
+			}
+			if err = json.Unmarshal(encoded, &client); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(client.Modalities.Input, tc.input) || !reflect.DeepEqual(client.Modalities.Output, tc.output) || !reflect.DeepEqual(client.Levels, tc.levels) || !reflect.DeepEqual(client.Endpoints, tc.endpoints) || !reflect.DeepEqual(client.Native, tc.native) || client.Think.Default != tc.def || (client.ThinkingType == "only") != tc.only {
+				t.Fatalf("incorrect public metadata: %s", encoded)
+			}
+			if _, ok := out["account_uids"]; ok {
+				t.Fatal("account scope exposed")
+			}
+			if tc.item["supportsToolCall"] == false && out["supports_tool_calls"] != false {
+				t.Fatal("false tool capability lost")
+			}
+			after, _ := json.Marshal(tc.item)
+			if !bytes.Equal(before, after) {
+				t.Fatal("provider catalog mutated")
+			}
+			again, _ := json.Marshal(publicModelEntry(out))
+			if !bytes.Equal(encoded, again) {
+				t.Fatalf("projection not idempotent: %s", again)
+			}
+		})
+	}
+}
+
+type discoveryCatalogProbe struct {
+	routeProtocolProbe
+	entries []provider.CatalogModel
+}
+
+func (p *discoveryCatalogProbe) Models(context.Context) []provider.CatalogModel { return p.entries }
+
+func TestPublicModelDiscoveryScopesAliasesAndGroups(t *testing.T) {
+	o, _ := newDNSFailoverOrch(t, &failingUpstream{})
+	for i, name := range []string{"first", "second"} {
+		levels, def, native := []string{"low", "high"}, "high", "chat"
+		if i == 1 {
+			levels, def, native = []string{"high", "max"}, "max", "responses"
+		}
+		err := o.runtimes.Register(&discoveryCatalogProbe{routeProtocolProbe: routeProtocolProbe{registryProbe: registryProbe{name: name, prefix: name + "/"}}, entries: []provider.CatalogModel{{ID: name + "/model", Name: name, Context: 200000 - i*100000, Modalities: []string{"text"}, Extra: map[string]any{"account_uids": []string{"private"}, "reasoning": map[string]any{"supportsReasoning": true, "onlyReasoning": true, "supportedEfforts": levels, "defaultEffort": def}, "native_protocol": native}}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := o.db.SaveModelRoute(store.ModelRoute{Model: "group/test", Name: "Group", Enabled: true, Members: []string{"first/model", "second/model"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.db.SaveSettings(map[string]string{"model_aliases": "friendly=first/model"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"limited", "full"} {
+		allowed := ""
+		if key == "limited" {
+			allowed = `["first/model"]`
+		}
+		if _, err := o.db.CreateApp(key, o.hashKey(key), "", "", "", allowed, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := NewServer(o)
+	var priorTag string
+	for _, key := range []string{"limited", "full"} {
+		r := httptest.NewRequest("GET", "/v1/models", nil)
+		r.Header.Set("X-Api-Key", key)
+		r.Header.Set("If-None-Match", priorTag)
+		w := httptest.NewRecorder()
+		s.handleModels(w, r)
+		if w.Code != 200 {
+			t.Fatal(w.Code, w.Body.String())
+		}
+		priorTag = w.Header().Get("ETag")
+		var body struct {
+			Data []map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		byID := map[string]map[string]any{}
+		for _, item := range body.Data {
+			byID[str2(item["id"])] = item
+			if _, ok := item["account_uids"]; ok {
+				t.Fatal("private account exposed")
+			}
+		}
+		alias, group := byID["friendly"], byID["group/test"]
+		if alias == nil || group == nil || alias["modalities"] == nil {
+			t.Fatal("alias/group metadata missing", byID)
+		}
+		want := []string{"high"}
+		if key == "limited" {
+			want = []string{"low", "high"}
+			if byID["second/model"] != nil || len(discoveryStrings(group["members"])) != 1 {
+				t.Fatal("unauthorized member exposed", group)
+			}
+			if len(discoveryStrings(group["native_endpoints"])) != 1 || group["think_efforts"] == nil {
+				t.Fatal("authorized metadata lost", group)
+			}
+		} else if group["native_endpoints"] != nil || group["think_efforts"] != nil {
+			t.Fatal("group overstates shared native/default capabilities", group)
+		}
+		if !reflect.DeepEqual(discoveryStrings(group["supported_reasoning_levels"]), want) {
+			t.Fatal("incorrect shared levels", group)
+		}
 	}
 }
 

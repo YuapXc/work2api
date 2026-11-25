@@ -13,6 +13,7 @@ import (
 	"math"
 	"math/big"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -33,6 +34,7 @@ const (
 	ErrClient                       // 其他 4xx
 	ErrInputTooLarge                // v0.12.50: 413/过大文案 → 请求级问题，不冷却账号
 	ErrModelUnavailable
+	ErrModelPlan
 )
 
 func (k ErrKind) String() string {
@@ -51,6 +53,8 @@ func (k ErrKind) String() string {
 		return "client"
 	case ErrInputTooLarge:
 		return "input_too_large"
+	case ErrModelPlan:
+		return "model_plan_unavailable"
 	case ErrModelUnavailable:
 		return "model_unavailable"
 	default:
@@ -106,7 +110,6 @@ func MsgIndicatesInputTooLarge(s string) bool {
 	return false
 }
 func Classify(status int, body string) ErrKind {
-	lower := strings.ToLower(body)
 	code := BusinessCode([]byte(body))
 	if status == http.StatusRequestEntityTooLarge {
 		return ErrInputTooLarge
@@ -118,7 +121,10 @@ func Classify(status int, body string) ErrKind {
 	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
 	}
-	if code == 1005 || (strings.Contains(body, "1005") && strings.Contains(lower, "plan")) {
+	if code == 1005 {
+		if HasPlan([]byte(body)) {
+			return ErrModelPlan
+		}
 		return ErrPlanLimit
 	}
 	if code == 4008 || status == http.StatusPaymentRequired {
@@ -140,6 +146,24 @@ func Classify(status int, body string) ErrKind {
 		return ErrClient
 	}
 	return ErrNone
+}
+
+func HasPlan(body []byte) bool {
+	var node map[string]json.RawMessage
+	if json.Unmarshal(body, &node) != nil {
+		return false
+	}
+	raw := node["extra"]
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		raw = []byte(text)
+	}
+	var extra map[string]json.RawMessage
+	if json.Unmarshal(raw, &extra) != nil {
+		return false
+	}
+	plan := bytes.TrimSpace(extra["plan"])
+	return len(plan) > 0 && string(plan) != "null"
 }
 
 func BusinessCode(body []byte) int64 {
@@ -326,6 +350,9 @@ func (c *Client) ChatPreparedStreamWithHeaders(a *auth.Auth, prepared []byte, co
 }
 
 type ModelInfo struct {
+	SupportsMaxMode        bool             `json:"supports_max_mode,omitempty"`
+	MaxContextWindow       int64            `json:"max_context_window,omitempty"`
+	UseMaxMode             bool             `json:"-"`
 	ConsoleRoute           bool             `json:"-"`
 	Enterprise             *EnterpriseModel `json:"enterprise,omitempty"`
 	ReasoningOptions       []string         `json:"reasoning_options,omitempty"`
@@ -342,10 +369,12 @@ type ModelInfo struct {
 	Pricing                []ModelPrice `json:"pricing,omitempty"`
 }
 
+type DirectConfig struct{ URL, Key string }
 type EnterpriseModel struct {
-	ModelName string `json:"model_name,omitempty"`
-	Provider  string `json:"provider,omitempty"`
-	PromptMax int64  `json:"prompt_max_tokens,omitempty"`
+	Direct    *DirectConfig `json:"-"`
+	ModelName string        `json:"model_name,omitempty"`
+	Provider  string        `json:"provider,omitempty"`
+	PromptMax int64         `json:"prompt_max_tokens,omitempty"`
 }
 
 var soloAgentOnlyDeadNames = map[string]struct{}{
@@ -414,6 +443,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			IsInvisibleToUser   *bool           `json:"is_invisible_to_user"`
 			ContextWindowTokens struct {
 				Dev int64 `json:"dev"`
+				Max int64 `json:"max"`
 			} `json:"context_window_tokens"`
 			DisplayConfig         modelDisplay    `json:"display_config"`
 			Contact               json.RawMessage `json:"display_contact_config"`
@@ -424,6 +454,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			} `json:"reasoning_effort_config"`
 			Details []struct {
 				ModelName       string          `json:"model_name"`
+				CustomConfig    json.RawMessage `json:"custom_config"`
 				Provider        string          `json:"provider"`
 				PromptMax       int64           `json:"prompt_max_tokens"`
 				MaxTokens       int64           `json:"max_tokens"`
@@ -503,6 +534,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 					enterpriseInfo.Provider = d.Provider
 				}
 				maxTokens = max(d.MaxTokens, 0)
+				enterpriseInfo.Direct = directConfig(enterpriseInfo.Provider, d.CustomConfig)
 			}
 		}
 		options := []string{}
@@ -513,7 +545,8 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			}
 		}
 		out = append(out, ModelInfo{
-			Enterprise:             enterpriseInfo,
+			Enterprise:      enterpriseInfo,
+			SupportsMaxMode: cfg.DisplayConfig.MaxMode, MaxContextWindow: cfg.ContextWindowTokens.Max,
 			ConsoleRoute:           enterpriseRoute,
 			ReasoningOptions:       options,
 			DefaultReasoning:       cfg.ReasoningEffortConfig.DefaultLevel,
@@ -1528,4 +1561,39 @@ func checkinReward(data []byte) *int64 {
 		}
 	}
 	return &total
+}
+
+func (m ModelInfo) WithMaxMode(enabled bool) ModelInfo {
+	m.UseMaxMode = enabled && m.SupportsMaxMode && m.MaxContextWindow > m.ContextWindow
+	return m
+}
+func (m ModelInfo) EffectiveContextWindow() int64 {
+	if m.UseMaxMode {
+		return m.MaxContextWindow
+	}
+	return m.ContextWindow
+}
+
+func directConfig(provider string, raw []byte) *DirectConfig {
+	if provider != "custom_openai_compatible" {
+		return nil
+	}
+	var cfg struct {
+		Status   bool            `json:"status"`
+		AuthType json.RawMessage `json:"auth_type"`
+		Key      string          `json:"ak"`
+		URL      string          `json:"base_url"`
+	}
+	if json.Unmarshal(raw, &cfg) != nil || !cfg.Status || strings.TrimSpace(cfg.Key) == "" {
+		return nil
+	}
+	authType := strings.TrimSpace(string(cfg.AuthType))
+	if authType != "0" && authType != `"0"` {
+		return nil
+	}
+	u, err := url.Parse(strings.TrimSpace(cfg.URL))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.Fragment != "" || !strings.HasSuffix(strings.TrimSuffix(u.Path, "/"), "/chat/completions") {
+		return nil
+	}
+	return &DirectConfig{URL: u.String(), Key: strings.TrimSpace(cfg.Key)}
 }

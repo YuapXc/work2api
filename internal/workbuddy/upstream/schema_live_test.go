@@ -502,3 +502,31 @@ func TestAlternateCacheUsageReachesStreamingAndCollectedClients(t *testing.T) {
 		t.Fatal("collected cache lost", usage)
 	}
 }
+
+func TestEmptyToolListsDoNotBreakReasoningStream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for i := 0; i < 50; i++ {
+			fmt.Fprint(w, `data: {"choices":[{"index":0,"delta":{"reasoning_content":"thinking","tool_calls":[]}}]}`+"\n\n")
+		}
+		fmt.Fprint(w, `data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-a","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}]}`+"\n\n")
+		fmt.Fprint(w, `data: {"choices":[{"index":0,"delta":{"tool_calls":[]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":50}}`+"\n\ndata: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	count, calls := 0, 0
+	err := upstream.NewClient(srv.Client()).StreamUpstream(t.Context(), nil, map[string]any{"model": "test", "tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": "lookup", "parameters": map[string]any{"type": "object"}}}}}, srv.URL, func(line string) error {
+		if strings.Contains(line, `"tool_calls":[]`) {
+			t.Fatal("empty tool field survived", line)
+		}
+		if strings.Contains(line, `"reasoning_content":"thinking"`) {
+			count++
+		}
+		if strings.Contains(line, `"name":"lookup"`) {
+			calls++
+		}
+		return nil
+	})
+	if err != nil || count != 50 || calls != 1 {
+		t.Fatal(err, count, calls)
+	}
+}

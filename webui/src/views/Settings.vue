@@ -164,7 +164,7 @@ async function exportCreds() {
           </div>
           <p v-if="maintenanceFailed" role="status" class="text-small text-warn">渠道维护选项暂不可用，保存其他设置时会保留当前维护配置。</p>
           <div v-for="p in maintenanceProviders" :key="p.name" class="space-y-3 rounded-lg border border-line p-3">
-            <div class="text-small font-medium text-ink">{{ p.display_name }} 维护</div>
+            <div class="text-small font-medium text-ink">{{ p.display_name }} 设置与维护</div>
             <div v-for="option in p.maintenance" :key="option.key" class="flex items-center justify-between gap-3">
               <div><label :for="option.key" class="text-small text-muted">{{ option.label }}</label><p class="text-micro text-faint">{{ option.description }}</p></div>
               <WToggle :id="option.key" v-model="maintenanceValues[option.key]" />

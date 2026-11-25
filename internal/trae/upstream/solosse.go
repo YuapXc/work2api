@@ -15,11 +15,13 @@ type SOLOEvent struct {
 	Usage        map[string]any  // token_usage
 	FinishReason string          // done
 	ErrorCode    int64           // error
-	ErrorMessage string          // error
+	PlanPresent  bool
+	ErrorMessage string // error
 }
 type SOLOStreamError struct {
-	Code int64
-	Msg  string
+	PlanPresent bool
+	Code        int64
+	Msg         string
 }
 
 func (e *SOLOStreamError) Error() string {
@@ -43,6 +45,9 @@ func (e *SOLOStreamError) Kind() ErrKind {
 	}
 	if e.Code == 401 {
 		return ErrSessionDead
+	}
+	if e.Code == 1005 && e.PlanPresent {
+		return ErrModelPlan
 	}
 	if _, ok := soloPlanLimitCodes[e.Code]; ok {
 		return ErrPlanLimit
@@ -100,6 +105,7 @@ func ParseSOLOLine(eventName, dataLine string) (*SOLOEvent, error) {
 			ev.FinishReason = v
 		}
 	case "error":
+		ev.PlanPresent = HasPlan([]byte(dataLine))
 		if v, ok := raw["code"].(float64); ok {
 			ev.ErrorCode = int64(v)
 		}

@@ -62,7 +62,7 @@ func doCompatibleInferenceAttempt(client *http.Client, req *http.Request, from p
 		rejected, errBody := io.ReadAll(saved.Body)
 		_ = saved.Body.Close()
 		saved.Body = io.NopCloser(bytes.NewReader(rejected))
-		if errBody == nil && protocol.IsForeignResponseIDRejection(rejected, saved.StatusCode) {
+		if errBody == nil && protocol.IsResponseIDRejection(rejected, saved.StatusCode) {
 			original, readErr := req.GetBody()
 			if readErr != nil {
 				return saved, nil
@@ -70,7 +70,7 @@ func doCompatibleInferenceAttempt(client *http.Client, req *http.Request, from p
 			raw, readErr := io.ReadAll(original)
 			_ = original.Close()
 			if readErr == nil && errBody == nil {
-				if corrected, changed := protocol.RecoverForeignResponseIDs(raw, rejected, saved.StatusCode); changed {
+				if corrected, changed := protocol.RecoverResponseIDs(raw, rejected, saved.StatusCode); changed {
 					remaining := timeout
 					if timeout > 0 {
 						remaining -= time.Since(start)

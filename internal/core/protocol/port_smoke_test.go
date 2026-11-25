@@ -1740,16 +1740,16 @@ func TestPDFDataURIConversionPreservesBytes(t *testing.T) {
 func TestForeignResponseIDRecoveryPreservesToolContract(t *testing.T) {
 	rejection := []byte(`{"error":{"message":"Item was created under a different API resource"}}`)
 	body := []byte(`{"store":false,"input":[{"type":"function_call","id":"old","call_id":"call","name":"f","arguments":"{\"n\":9007199254740993}"},{"type":"reasoning","id":"ref"},{"type":"reasoning","id":"sealed","encrypted_content":"cipher"},{"type":"function_call_output","call_id":"call","output":"ok"}]}`)
-	got, changed := RecoverForeignResponseIDs(body, rejection, 400)
+	got, changed := RecoverResponseIDs(body, rejection, 400)
 	if !changed || bytes.Contains(got, []byte(`"id":`)) || !bytes.Contains(got, []byte(`"call_id":"call"`)) || !bytes.Contains(got, []byte("9007199254740993")) || !bytes.Contains(got, []byte(`"encrypted_content":"cipher"`)) {
 		t.Fatal(string(got), changed)
 	}
 	for _, b := range []string{`{"input":[{"type":"message","id":"one","role":"user"}]}`, `{"previous_response_id":"resp","input":[{"id":"old","role":"assistant"},{"role":"user"}]}`} {
-		if _, changed := RecoverForeignResponseIDs([]byte(b), rejection, 400); changed {
+		if _, changed := RecoverResponseIDs([]byte(b), rejection, 400); changed {
 			t.Fatal("unsafe recovery", b)
 		}
 	}
-	if _, changed := RecoverForeignResponseIDs(body, []byte(`{"error":{"message":"permission denied"}}`), 400); changed {
+	if _, changed := RecoverResponseIDs(body, []byte(`{"error":{"message":"permission denied"}}`), 400); changed {
 		t.Fatal("unrelated error recovered")
 	}
 }
@@ -1977,5 +1977,22 @@ func TestForwardEmptyChatReportsErrorBeforeDone(t *testing.T) {
 	text := w.Body.String()
 	if strings.Index(text, "[DONE]") >= 0 && strings.Index(text, "[DONE]") < strings.Index(text, "empty_response") {
 		t.Fatal("error after done", text)
+	}
+}
+
+func TestResponseItemIDLengthRecoveryDoesNotTouchOtherFields(t *testing.T) {
+	body := []byte(`{"store":false,"input":[{"type":"message","id":"valid","role":"user","content":"hello"},{"type":"function_call","id":"long-foreign-id","call_id":"call-a","name":"lookup","arguments":"{\"n\":9007199254740993}"},{"type":"function_call_output","id":"valid-result","call_id":"call-a","output":"result"}]}`)
+	rejection := []byte(`{"error":{"message":"Invalid 'input[1].id': string too long. Expected a string with maximum length 64, but got a string with length 484 instead."}}`)
+	fixed, ok := RecoverResponseIDs(body, rejection, 400)
+	if !ok || bytes.Contains(fixed, []byte("long-foreign-id")) || !bytes.Contains(fixed, []byte("valid-result")) || !bytes.Contains(fixed, []byte("9007199254740993")) || !bytes.Contains(fixed, []byte("call-a")) {
+		t.Fatal(string(fixed), ok)
+	}
+	for _, raw := range []string{`{"error":{"message":"Invalid 'input[1].content': Expected a string with maximum length 64"}}`, `{"error":{"message":"permission denied"}}`, `{"error":{"message":"Invalid 'input[100].id': Expected a string with maximum length 64"}}`} {
+		if _, ok := RecoverResponseIDs(body, []byte(raw), 400); ok {
+			t.Fatal("unrelated rejection changed request", raw)
+		}
+	}
+	if _, ok := RecoverResponseIDs([]byte(`{"input":[{"type":"reasoning","id":"reference-only"}]}`), []byte(`{"error":{"message":"Invalid 'input[0].id': Expected a string with maximum length 64"}}`), 400); ok {
+		t.Fatal("reference-only reasoning silently discarded")
 	}
 }

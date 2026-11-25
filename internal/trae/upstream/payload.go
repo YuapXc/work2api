@@ -90,6 +90,9 @@ func PrepareBodyResolvedWithLimits(src []byte, variant, resolvedModel string, mo
 	}
 	if len(models) > 0 {
 		info := models[0]
+		if info.ID == model && info.UseMaxMode {
+			out["is_max_mode"] = true
+		}
 		if info.ID == model && info.ConsoleRoute && info.Enterprise != nil {
 			ent := info.Enterprise
 			out["config_source"], out["is_custom_model"] = 2, true

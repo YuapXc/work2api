@@ -187,8 +187,7 @@ func Parse(raw []byte) (*Auth, error) {
 	if host == "" {
 		host, _ = node["apiHost"].(string)
 	}
-	parsed, _ := url.Parse(host)
-	a.EnterpriseConsole = parsed != nil && parsed.Scheme == "https" && parsed.User == nil && strings.EqualFold(parsed.Hostname(), "console.enterprise.trae.cn") || node["enterpriseConsole"] == true
+	a.EnterpriseConsole = IsEnterpriseHost(host) || node["enterpriseConsole"] == true || strings.TrimSpace(host) == "" && SaaSToken(a.AccessToken)
 	if v, ok := node["consoleChat"].(bool); ok {
 		a.ConsoleChat = &v
 	}
@@ -334,4 +333,27 @@ func (a *Auth) TryUsesEnterpriseConsole() (bool, bool) {
 	}
 	defer a.mu.RUnlock()
 	return a.EnterpriseConsole && (a.ConsoleChat == nil || *a.ConsoleChat), true
+}
+
+func IsEnterpriseHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if host != "" && !strings.Contains(host, "://") {
+		host = "https://" + host
+	}
+	parsed, err := url.Parse(host)
+	return err == nil && parsed.Scheme == "https" && parsed.User == nil && strings.EqualFold(parsed.Hostname(), "console.enterprise.trae.cn") && (parsed.Port() == "" || parsed.Port() == "443")
+}
+func SaaSToken(token string) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 || len(parts[1]) > 32768 {
+		return false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return false
+	}
+	var claims struct {
+		Scope string `json:"scope"`
+	}
+	return json.Unmarshal(raw, &claims) == nil && strings.EqualFold(claims.Scope, "saas")
 }
