@@ -270,6 +270,23 @@ func hasImageInput(body map[string]any) bool {
 }
 
 // Successful activity extends affinity, bounded by idle TTL and LRU eviction.
+type affinitySnapshot struct {
+	account string
+	version uint64
+}
+
+func (r *Runtime) affinitySnapshot(session string) affinitySnapshot {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return affinitySnapshot{r.affinities[session], r.affinityOrder[session]}
+}
+
+func (r *Runtime) commitAffinity(session, account string, expected affinitySnapshot) {
+	if r.affinities[session] == account || r.affinities[session] == expected.account && r.affinityOrder[session] == expected.version {
+		r.rememberAffinity(session, account)
+	}
+}
+
 func (r *Runtime) rememberAffinity(session, account string) {
 	if r.affinities == nil {
 		r.affinities = map[string]string{}

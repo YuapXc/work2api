@@ -9,10 +9,12 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"work2api/internal/core/provider"
+	"work2api/internal/qoder/cosy"
 )
 
 type queueCheckKey struct{}
@@ -241,7 +243,53 @@ func queueProgress(state queueState, previous string, since, now time.Time) (str
 	if key == "" || key != previous {
 		return key, now, false
 	}
-	return key, since, now.Sub(since) >= 5*time.Minute && (state.Queued == nil || *state.Queued)
+	return key, since, now.Sub(since) >= 5*time.Minute && !queueReady(state)
+}
+
+func queueReady(state queueState) bool {
+	return state.Queued != nil && !*state.Queued && (state.Available == nil || *state.Available)
+}
+
+func (b *Bridge) finishQueue(endpoint, model, requestSet string, began time.Time) {
+	if requestSet == "" || model == "" || b.sess.Identity.Uid == "" {
+		return
+	}
+	base, err := url.Parse(endpoint)
+	if err != nil {
+		return
+	}
+	base.Path, base.RawPath, base.RawQuery = "/algo/api/v2/service/ask/finish", "", "Encode=1"
+	payload, _ := json.Marshal(map[string]any{"model_key": model, "request_set_id": requestSet, "user_id": b.sess.Identity.Uid, "time_consumed": max(0, time.Since(began).Milliseconds())})
+	plain, _ := json.Marshal(map[string]any{"payload": string(payload), "encodeVersion": "1"})
+	wire, err := cosy.Encode(plain)
+	if err != nil {
+		return
+	}
+	path, err := PathSigFrom(base.String())
+	if err != nil {
+		return
+	}
+	headers, err := b.client.buildHeaders(path, wire, "application/json", nil)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base.String(), strings.NewReader(wire))
+	if err != nil {
+		return
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	client := *streamHTTPClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 65536))
 }
 
 func (b *Bridge) waitQueued(ctx context.Context, endpoint string, body map[string]interface{}, extra map[string]string, first queueState) (ready bool, err error) {
@@ -395,7 +443,7 @@ func (b *Bridge) pollQueue(ctx context.Context, endpoint string, body map[string
 		if stalled {
 			return false, errQueueStalled
 		}
-		if state.Queued != nil && !*state.Queued {
+		if queueReady(state) {
 			if state.Retry != nil && *state.Retry > 0 {
 				if err := sleepCtx(ctx, queuePause(state)); err != nil {
 					return false, err

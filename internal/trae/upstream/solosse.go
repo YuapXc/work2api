@@ -46,6 +46,9 @@ func (e *SOLOStreamError) Kind() ErrKind {
 	if e.Code == 401 {
 		return ErrSessionDead
 	}
+	if e.Code == 4026 {
+		return ErrContextWindow
+	}
 	if e.Code == 1005 && e.PlanPresent {
 		return ErrModelPlan
 	}

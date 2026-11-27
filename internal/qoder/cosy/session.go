@@ -15,6 +15,7 @@ import (
 )
 
 const Version = "1.0.10"
+const AppVersion = "1.1.96-hotfix.8"
 
 const ServerPubKeyPEM = `-----BEGIN PUBLIC KEY-----
 MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDA8iMH5c02LilrsERw9t6Pv5Nc

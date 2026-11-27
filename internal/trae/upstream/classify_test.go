@@ -318,3 +318,44 @@ func TestModelPlanRejectionAndMaxModeCatalog(t *testing.T) {
 		}
 	}
 }
+
+func TestEnterpriseTwinIDsPreservePhysicalConfig(t *testing.T) {
+	for _, reverse := range []bool{false, true} {
+		preset := `{"config_name":"kimi","config_source":1,"display_config":{"display_name":"Preset"},"model_detail_list":[{"model_name":"preset__dev"}]}`
+		tenant := `{"config_name":"kimi","config_source":2,"provider":"aliyuncs","display_name":"Tenant","model_detail_list":[{"model_name":"tenant","max_tokens":4096}]}`
+		if reverse {
+			preset, tenant = tenant, preset
+		}
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintf(w, `{"config_info_list":[%s,%s,{"config_name":"AI/model","config_source":2,"provider":"vendor","display_name":"Other","model_detail_list":[{"model_name":"other"}]}]}`, preset, tenant)
+		}))
+		c := New()
+		c.EnterpriseHost = server.URL
+		models, err := c.FetchModels(&auth.Auth{AccessToken: "fixture", Variant: "cn", EnterpriseConsole: true})
+		server.Close()
+		if err != nil || len(models) != 3 {
+			t.Fatal(models, err)
+		}
+		var twin, other ModelInfo
+		for _, m := range models {
+			if m.ID == "aliyuncs//kimi" {
+				twin = m
+			}
+			if m.ID == "AI/model" {
+				other = m
+			}
+		}
+		if twin.Enterprise == nil || !other.MatchesID("vendor//AI/model") {
+			t.Fatal("enterprise model hidden or renamed", models)
+		}
+		raw, _ := PrepareBodyResolvedWithLimits([]byte(`{}`), "cn", twin.ID, twin)
+		var wire map[string]any
+		json.Unmarshal(raw, &wire)
+		if wire["config_name"] != "kimi" || wire["model"] != "kimi" || wire["config_source"] != float64(2) || wire["model_name"] != "tenant" {
+			t.Fatal(string(raw))
+		}
+	}
+	if Classify(400, `{"code":4026}`) != ErrContextWindow || (&SOLOStreamError{Code: 4026}).Kind() != ErrContextWindow {
+		t.Fatal("4026 classification lost")
+	}
+}

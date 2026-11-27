@@ -530,3 +530,109 @@ func TestEmptyToolListsDoNotBreakReasoningStream(t *testing.T) {
 		t.Fatal(err, count, calls)
 	}
 }
+
+func TestReasoningCoalescingKeepsFirstAndAllBoundaries(t *testing.T) {
+	for _, mode := range []string{"enabled", "disabled", "error", "cancel", "timer"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			firstSeen := make(chan struct{})
+			secondSeen := make(chan struct{})
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, `data: {"choices":[{"index":0,"delta":{"reasoning_content":"first"}}]}`+"\n\n")
+				w.(http.Flusher).Flush()
+				select {
+				case <-firstSeen:
+				case <-r.Context().Done():
+					return
+				}
+				if mode == "timer" {
+					fmt.Fprint(w, `data: {"choices":[{"index":0,"delta":{"reasoning_content":"timer"}}]}`+"\n\n")
+					w.(http.Flusher).Flush()
+					select {
+					case <-secondSeen:
+					case <-r.Context().Done():
+						return
+					}
+				} else {
+					for i := 0; i < 120; i++ {
+						fmt.Fprint(w, `data: {"choices":[{"index":0,"delta":{"reasoning_content":"","reasoning":"x"}}]}`+"\n\n")
+					}
+					if mode == "error" {
+						fmt.Fprint(w, `data: {"error":{"code":11135,"message":"Image not recognized"}}`+"\n\n")
+						return
+					}
+				}
+				fmt.Fprint(w, `data: {"choices":[{"index":0,"delta":{"content":"OK"}}]}`+"\n\n"+`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":20}}`+"\n\ndata: [DONE]\n\n")
+			}))
+			defer srv.Close()
+			if mode != "disabled" {
+				ctx = upstream.WithReasoningCoalescing(upstream.WithParsedFrames(ctx))
+			}
+			var reasoning strings.Builder
+			frames := 0
+			last := ""
+			first := true
+			err := upstream.NewClient(srv.Client()).StreamUpstream(ctx, nil, map[string]any{"model": "test"}, srv.URL, func(line string) error {
+				last = line
+				chunk := upstream.DecodeFrame(ctx, line)
+				choices, _ := chunk["choices"].([]any)
+				if len(choices) > 0 {
+					choice, _ := choices[0].(map[string]any)
+					delta, _ := choice["delta"].(map[string]any)
+					part, _ := delta["reasoning_content"].(string)
+					if part == "" {
+						part, _ = delta["reasoning"].(string)
+					}
+					if part != "" {
+						frames++
+						reasoning.WriteString(part)
+						if first {
+							if part != "first" {
+								t.Error("first reasoning delayed into a block")
+							}
+							first = false
+							close(firstSeen)
+							if mode == "cancel" {
+								cancel()
+								return ctx.Err()
+							}
+						}
+						if mode == "timer" && part == "timer" {
+							close(secondSeen)
+						}
+					}
+				}
+				return nil
+			})
+			if mode == "cancel" {
+				if err == nil {
+					t.Fatal("cancel ignored")
+				}
+				return
+			}
+			if mode == "error" {
+				if err == nil || !strings.Contains(reasoning.String(), "x") {
+					t.Fatal("held reasoning lost on failure", err)
+				}
+				return
+			}
+			want := "first" + strings.Repeat("x", 120)
+			if mode == "timer" {
+				want = "firsttimer"
+			}
+			if err != nil || reasoning.String() != want || last != "data: [DONE]" {
+				t.Fatal(err, reasoning.String(), last)
+			}
+			if mode == "enabled" && frames > 4 || mode == "disabled" && frames != 121 {
+				t.Fatal("unexpected reasoning event count", frames)
+			}
+			inputFrames := 121
+			if mode == "timer" {
+				inputFrames = 2
+			}
+			t.Logf("reasoning_mode=%s fragments_in=%d fragments_out=%d", mode, inputFrames, frames)
+		})
+	}
+}

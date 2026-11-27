@@ -29,6 +29,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 - 渠道前缀为 `workbuddy/`、`qoder/`、`opencode/`、`trae/`；旧裸模型名仍指向 WorkBuddy。
 - 同一地址和 Key 下，切换模型 ID 即可切换渠道；跨渠道共用调用名见 [统一模型路由](model-routing.md)。
 - Key 的模型白名单始终生效；用户 Key 还受当前用户权限及全局禁用约束。
+- 聊天模型同时提供 `api_capabilities.anthropic_messages` 对象及已知的 `context_window` 别名，供读取该契约的客户端使用；媒体和决策模型不声明 Messages 能力。未知窗口或输出上限保持未知，不使用固定值填补，也不为适配客户端压缩算法而改写真实上限。
 - `/v1/models` 的 `modalities` 使用 `{ "input": [...], "output": [...] }`，同时保留渠道已有的平铺模态字段。`supported_endpoints` 列出网关可用接口，`native_endpoints` 仅在已知上游原生协议时提供。媒体模型按实际操作暴露生成、编辑、视频或转写接口，不作为聊天接口发布。
 - 已知思考档位通过 `supported_reasoning_levels` 发布，默认档位通过 `think_efforts.default_effort` 发布；强制思考模型使用 `supports_thinking_type: "only"`，不会因目录中相冲突的可关闭标记而发布关闭档位。统一组只汇总当前 Key 可见成员的共同档位和原生接口，默认档位仅在成员一致时发布。未报告的能力不补成支持，积分倍率不转换为货币单价。
 - 客户端对扩展属性的支持各不相同。例如，部分客户端仍按模型 ID 判断音频转写用途，即使目录返回 `/audio/transcriptions`，也可能把 `wb-asr` 显示在聊天列表；调用时应使用对应转写接口。
@@ -128,3 +129,8 @@ SystemOne 仅用于 OpenCode 目录标记为 `native_protocol=systemone` 的模�
 默认历史仅存于当前进程，预算 256 MiB、有效期 6 小时。重启、过期、淘汰或无法保存后，返回 `previous_response_not_found`，客户端需重新发送完整历史。显式 `store:false` 不保存该次新响应，但可读取已有 ID；失败或断流且没有完整终态的响应不保存。恢复后的完整请求仍遵守现有字节和 JSON 结构保护。
 
 该功能减少客户端到网关的重复上传；需要完整历史的上游仍会收到完整上下文，输入 Tokens 计费不会因此减少。关闭缓存时，原生 Responses 上游按其自身能力处理续接，跨协议调用仍需提供完整历史。
+
+
+跨协议转换到 Chat 或 Responses 时，超过 64 字节的工具调用 ID 使用稳定映射，对应工具结果使用同一映射；正文、参数、短 ID 及上游返回的工具 ID 保持原值。原生 Responses 的明确 `input[n].call_id` 长度拒绝可触发既有一次输出前恢复，有 `previous_response_id` 时不改写未知的服务端前史关联。
+
+Chat 转 Messages 时，已发生回复或工具结果之后的系统／开发者提醒保留在原轮次，并以 `system-reminder` 内容表达；前导系统指令保留在顶层，避免后续提醒不断改变缓存前缀。原生 Chat 透传不提升或搬动这些消息。

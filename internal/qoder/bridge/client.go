@@ -67,7 +67,7 @@ func (c *BearerClient) buildHeaders(pathSig, body, accept string, extra map[stri
 	}
 	if fp := c.fingerprint; fp != nil {
 		h["cosy-machineid"], h["cosy-machinetoken"], h["cosy-machinetype"] = fp.MachineID, fp.MachineToken, fp.MachineType
-		h["cosy-clienttype"], h["cosy-version"], h["user-agent"] = "10", "1.1.69", "undici"
+		h["cosy-clienttype"], h["cosy-version"], h["user-agent"] = "10", cosy.AppVersion, "undici"
 		h["cosy-scene"], h["cosy-business-product"] = "app", "app"
 		h["cosy-clientip"] = fp.ClientIP
 		if fp.ClientIP == "" {

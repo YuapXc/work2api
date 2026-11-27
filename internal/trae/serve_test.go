@@ -2152,3 +2152,211 @@ func TestMergedTraeWindowsFollowEffectivePolicy(t *testing.T) {
 		t.Fatal(merged)
 	}
 }
+
+func TestNestedSeatClaimsAndLateAffinity(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want bool
+	}{
+		{`{"data":{"scope":"saas"}}`, true}, {`{"scope":"personal","data":{"scope":"saas"}}`, false}, {`{"scope":"","data":{"scope":"saas"}}`, false}, {`{"scope":null,"data":{"scope":"saas"}}`, true}, {`{"tenant_id":"tob_online"}`, false},
+	} {
+		token := "x." + base64.RawURLEncoding.EncodeToString([]byte(tc.raw)) + ".x"
+		if auth.SaaSToken(token) != tc.want {
+			t.Fatal(tc.raw)
+		}
+	}
+	r := fixtureRuntime(t, nil)
+	first := r.affinitySnapshot("session")
+	r.mu.Lock()
+	r.commitAffinity("session", "new", first)
+	r.commitAffinity("session", "old", first)
+	r.mu.Unlock()
+	if r.affinitySnapshot("session").account != "new" {
+		t.Fatal("late completion overwrote newer binding")
+	}
+	admitted := r.affinitySnapshot("session")
+	r.mu.Lock()
+	r.commitAffinity("session", "failover", admitted)
+	r.mu.Unlock()
+	if r.affinitySnapshot("session").account != "failover" {
+		t.Fatal("legitimate failover lost")
+	}
+}
+func TestSettledBillingIsOptionalAndTracksOwnTurns(t *testing.T) {
+	var billing, chat atomic.Int32
+	var session string
+	r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/api/v1/commercial/get_session_usage" {
+			n := billing.Add(1)
+			if req.Header.Get("Authorization") != "Cloud-IDE-JWT fixture" {
+				t.Error("billing credential changed")
+			}
+			var b map[string]string
+			json.NewDecoder(req.Body).Decode(&b)
+			if b["session_id"] != session {
+				t.Error("wrong conversation billed")
+			}
+			fmt.Fprintf(w, `{"data":{"user_usage_group_by_session":{"credits_by_source":{"paid":"%.3f"},"extra_info":{"input_token":%d,"output_token":%d,"cache_read_token":%d}}}}`, float64(n)*.125, n*100, n*10, n*30)
+			return
+		}
+		chat.Add(1)
+		var b map[string]any
+		json.NewDecoder(req.Body).Decode(&b)
+		if got, _ := b["session_id"].(string); got != "" {
+			if session != "" && session != got {
+				t.Error("conversation changed between turns")
+			}
+			session = got
+			if b["request_id"] == nil {
+				t.Error("physical request id missing")
+			}
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: output\ndata: {\"response\":\"OK\"}\n\nevent: token_usage\ndata: {\"prompt_tokens\":100,\"completion_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":0}}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n")
+	})
+	identity := &auth.Auth{AccessToken: "fixture", UID: "billing", Variant: "cn", ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	id := accountID(identity.UID)
+	models := []upstream.ModelInfo{{ID: "m", Name: "M"}}
+	r.accounts[id] = &accountState{Auth: identity, Enabled: true, Identities: map[string]*auth.Auth{"cn": identity}, Models: models, Catalogs: map[string][]upstream.ModelInfo{"cn": models}}
+	for i := 0; i < 7; i++ {
+		if i == 1 {
+			if err := r.db.SaveSettings(map[string]string{"trae_settled_usage": "1"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		w := httptest.NewRecorder()
+		proto := []protocol.Protocol{protocol.Chat, protocol.Anthropic, protocol.Responses}[i%3]
+		payload, err := protocol.ConvertRequest(protocol.Chat, proto, map[string]any{"model": "trae/m", "stream": i%2 == 0, "messages": []any{map[string]any{"role": "user", "content": "hello"}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		report, err := r.Serve(t.Context(), provider.ServeRequest{Protocol: provider.Protocol(proto), Writer: w, Headers: http.Header{"X-Session-Id": []string{"billing-session"}}, Payload: payload})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			if billing.Load() != 0 || report.Credits != nil {
+				t.Fatal("disabled billing queried")
+			}
+		} else if report.Credits == nil || *report.Credits != .125 || report.CachedTokens == nil || *report.CachedTokens != 30 {
+			t.Fatal(report, w.Body.String())
+		}
+	}
+	if chat.Load() != 7 || billing.Load() != 6 {
+		t.Fatal(chat.Load(), billing.Load())
+	}
+	l := r.beginSettlement("overlap")
+	other := r.beginSettlement("overlap")
+	defer l.close()
+	defer other.close()
+	if !l.state.overlap {
+		t.Fatal("concurrent turns not detected")
+	}
+	rec, retry := parseSettlement([]byte(`{"data":{"user_usage_group_by_session":{"credits_by_source":{"paid":"0.125"},"extra_info":{"input_token":100}}}}`))
+	if !retry || rec == nil || rec.cache != nil || *rec.credits != .125 {
+		t.Fatal("unknown cache fabricated", rec)
+	}
+}
+
+func TestSettlementRejectsStaleResetOverlapAndRefusals(t *testing.T) {
+	var payload atomic.Value
+	stopSlow := make(chan struct{})
+	payload.Store(`{"data":{"user_usage_group_by_session":{"credits_float":"0.375","extra_info":{"input_token":300,"output_token":30,"cache_read_token":90}}}}`)
+	var asks atomic.Int32
+	r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+		asks.Add(1)
+		value := payload.Load().(string)
+		if value == "refused" {
+			w.WriteHeader(401)
+			return
+		}
+		if value == "timeout" {
+			_, _ = io.Copy(io.Discard, req.Body)
+			select {
+			case <-req.Context().Done():
+			case <-stopSlow:
+			}
+			return
+		}
+		io.WriteString(w, value)
+	})
+	t.Cleanup(func() { close(stopSlow) })
+	a := &auth.Auth{AccessToken: "fixture", UID: "bill", Variant: "cn"}
+	call := func(key string, cached float64) *float64 {
+		lease := r.beginSettlement(key)
+		defer lease.close()
+		usage := map[string]any{"prompt_tokens": 100.0, "completion_tokens": 10.0, "prompt_tokens_details": map[string]any{"cached_tokens": cached}}
+		credit := lease.settle(t.Context(), a, "fixture", usage, true)
+		if cached > 0 && usage["prompt_tokens_details"].(map[string]any)["cached_tokens"] != cached {
+			t.Fatal("stream cache overwritten")
+		}
+		return credit
+	}
+	if call("session", 0) != nil {
+		t.Fatal("old cumulative record charged as this turn")
+	}
+	payload.Store(`{"data":{"user_usage_group_by_session":{"credits_float":"0.5","extra_info":{"input_token":400,"output_token":40,"cache_read_token":120}}}}`)
+	if c := call("session", 50); c == nil || *c != .125 {
+		t.Fatal("baseline difference missing", c)
+	}
+	before := asks.Load()
+	if call("session", 0) != nil || asks.Load()-before > 2 {
+		t.Fatal("unchanged bill counted or unbounded polling")
+	}
+	payload.Store(`{"data":{"user_usage_group_by_session":{"credits_float":"0.1","extra_info":{"input_token":100,"output_token":10,"cache_read_token":30}}}}`)
+	if call("session", 0) != nil {
+		t.Fatal("reset counted as consumption")
+	}
+	l := r.beginSettlement("overlap")
+	other := r.beginSettlement("overlap")
+	if l.settle(t.Context(), a, "fixture", map[string]any{"prompt_tokens": 100.0, "completion_tokens": 10.0}, true) != nil {
+		t.Fatal("overlapping turns double charged")
+	}
+	l.close()
+	other.close()
+	payload.Store("refused")
+	before = asks.Load()
+	if call("denied", 0) != nil || asks.Load() != before+1 {
+		t.Fatal("refused bill retried")
+	}
+	payload.Store("timeout")
+	before = asks.Load()
+	started := time.Now()
+	if call("slow", 0) != nil || asks.Load() != before+1 || time.Since(started) > 2*time.Second {
+		t.Fatal("billing timeout not bounded")
+	}
+}
+func TestTraeContext4026UsesAnotherAccountWithoutGlobalCooldown(t *testing.T) {
+	var calls atomic.Int32
+	r := fixtureRuntime(t, func(w http.ResponseWriter, req *http.Request) {
+		n := calls.Add(1)
+		if n == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(400)
+			io.WriteString(w, `{"code":4026,"message":"model context exceeded"}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: output\ndata: {\"response\":\"OK\"}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n")
+	})
+	for _, uid := range []string{"window-a", "window-b"} {
+		a := &auth.Auth{AccessToken: "fixture", UID: uid, Variant: "cn", ExpiresAt: time.Now().Add(time.Hour).Unix()}
+		m := []upstream.ModelInfo{{ID: "m", Name: "M"}}
+		r.accounts[accountID(uid)] = &accountState{Auth: a, Enabled: true, Identities: map[string]*auth.Auth{"cn": a}, Models: m, Catalogs: map[string][]upstream.ModelInfo{"cn": m}}
+	}
+	for i := 0; i < 2; i++ {
+		w := httptest.NewRecorder()
+		_, err := r.Serve(t.Context(), provider.ServeRequest{Protocol: provider.ProtocolChat, Writer: w, Payload: map[string]any{"model": "trae/m", "messages": []any{map[string]any{"role": "user", "content": "hello"}}}})
+		if err != nil || !strings.Contains(w.Body.String(), "OK") {
+			t.Fatal(err, w.Body.String())
+		}
+	}
+	if calls.Load() != 3 {
+		t.Fatal("unexpected send budget", calls.Load())
+	}
+	for _, a := range r.accounts {
+		if !a.Cooldown.IsZero() || a.Failures != 0 || len(a.ModelCooldowns) > 0 {
+			t.Fatal("shorter requests poisoned by a context refusal")
+		}
+	}
+}

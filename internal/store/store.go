@@ -58,6 +58,8 @@ type DB struct {
 
 // DefaultSettings mirror db.py DEFAULT_SETTINGS.
 var DefaultSettings = map[string]string{
+	"workbuddy_merge_reasoning":  "1",
+	"trae_settled_usage":         "0",
 	"trae_max_mode":              "1",
 	"trae_auto_quota":            "0",
 	"trae_auto_checkin":          "0",

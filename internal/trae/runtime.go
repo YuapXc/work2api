@@ -54,6 +54,10 @@ type accountState struct {
 }
 
 type Runtime struct {
+	billingURL        string
+	settlements       map[string]settlementEntry
+	settlementFlights map[string]*settlementFlight
+	settlementClock   uint64
 	directRefusals    map[string][32]byte
 	maintenanceGuard  *provider.MaintenanceGuard
 	mu                sync.Mutex
@@ -110,7 +114,7 @@ func (a *accountState) modelIdentityFor(model string, image bool, available ...f
 			continue
 		}
 		for _, m := range a.Catalogs[product] {
-			if strings.EqualFold(m.ID, model) {
+			if m.MatchesID(model) {
 				if !image {
 					return a.Identities[product], m.ID
 				}
@@ -657,7 +661,7 @@ func (r *Runtime) AdminData(context.Context) provider.AdminData {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	data := provider.AdminData{DisplayName: "Trae", Capabilities: []string{"accounts", "models", "credits", "checkin", "add_account", "oauth", "local_import"}, Accounts: []map[string]any{}, Resources: []provider.ResourceSummary{}, Notes: "添加国内 IDE 或 Work/SOLO 账号；产品身份保留，模型调用自动选择符合条件的账号。"}
-	data.Maintenance = []provider.MaintenanceOption{{Key: "trae_max_mode", Label: "Trae Max 大窗口", Description: "实时目录明确支持且窗口更大时启用；关闭后使用默认窗口，更多输入可能增加消费"}, {Key: "trae_auto_quota", Label: "自动刷新 Trae 额度", Description: "启动自动读取一次；开启后每 30 分钟刷新，未知额度保持未知"}, {Key: "trae_auto_checkin", Label: "自动 Trae 签到", Description: "仅使用已授权设备身份，不轮换设备"}}
+	data.Maintenance = []provider.MaintenanceOption{{Key: "trae_settled_usage", Label: "回填已结算用量", Description: "默认关闭；国内个人网关额外查询已结算账单，流式最多等待400毫秒，非流式最多等待2.5秒；企业额度与直连不参与"}, {Key: "trae_max_mode", Label: "Trae Max 大窗口", Description: "实时目录明确支持且窗口更大时启用；关闭后使用默认窗口，更多输入可能增加消费"}, {Key: "trae_auto_quota", Label: "自动刷新 Trae 额度", Description: "启动自动读取一次；开启后每 30 分钟刷新，未知额度保持未知"}, {Key: "trae_auto_checkin", Label: "自动 Trae 签到", Description: "仅使用已授权设备身份，不轮换设备"}}
 	for id, a := range r.accounts {
 		label := a.Alias
 		if label == "" {

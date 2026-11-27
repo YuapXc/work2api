@@ -353,7 +353,17 @@ func SaaSToken(token string) bool {
 		return false
 	}
 	var claims struct {
-		Scope string `json:"scope"`
+		Scope any `json:"scope"`
+		Data  struct {
+			Scope string `json:"scope"`
+		} `json:"data"`
 	}
-	return json.Unmarshal(raw, &claims) == nil && strings.EqualFold(claims.Scope, "saas")
+	if json.Unmarshal(raw, &claims) != nil {
+		return false
+	}
+	scope, ok := claims.Scope.(string)
+	if !ok {
+		scope = claims.Data.Scope
+	}
+	return strings.EqualFold(scope, "saas")
 }

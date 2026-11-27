@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -80,24 +81,28 @@ type Session struct {
 
 // Manager manages one account's credentials: read, expiry, refresh, write-back.
 type Manager struct {
-	authGuard   *provider.MaintenanceGuard
-	authKey     string
-	path        string
-	client      *http.Client
-	mu          sync.Mutex
-	cached      *Session
-	mtime       time.Time
-	retired     bool
-	flight      *refreshTask
-	deniedToken [32]byte
-	deniedAt    time.Time
-	deniedErr   error
+	authGuard     *provider.MaintenanceGuard
+	authKey       string
+	path          string
+	client        *http.Client
+	mu            sync.Mutex
+	cached        *Session
+	mtime         time.Time
+	retired       bool
+	flight        *refreshTask
+	deniedToken   [32]byte
+	deniedAt      time.Time
+	deniedErr     error
+	aheadAt       time.Time
+	aheadFailures int
+	aheadIdentity [32]byte
 }
 
 type refreshTask struct {
-	done   chan struct{}
-	err    error
-	cancel context.CancelFunc
+	proactive bool
+	done      chan struct{}
+	err       error
+	cancel    context.CancelFunc
 }
 
 var ErrLoginRequired = errors.New("账号登录态失效，请重新授权")
@@ -188,6 +193,40 @@ func (m *Manager) isExpired() bool {
 		expiresAt = v
 	}
 	return float64(time.Now().UnixMilli()) >= (expiresAt - 60_000)
+}
+
+func tokenTimes(token any) (issued, expires float64) {
+	text, _ := token.(string)
+	parts := strings.Split(text, ".")
+	if len(parts) != 3 || len(parts[1]) > 32768 {
+		return
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return
+	}
+	var claims struct{ Iat, Exp float64 }
+	if json.Unmarshal(raw, &claims) == nil {
+		return claims.Iat, claims.Exp
+	}
+	return
+}
+
+func (m *Manager) refreshAhead(s *Session) bool {
+	if s.raw["kind"] == "desktop" || s.raw["source"] == "desktop" || strings.Contains(strings.ToLower(filepath.ToSlash(m.path)), "/codebuddyextension/data/public/auth/") {
+		return false
+	}
+	issued, expires := tokenTimes(s.Auth["accessToken"])
+	now := float64(time.Now().Unix())
+	if issued <= 0 || expires-issued < 20*86400 || issued > now || expires <= now {
+		return false
+	}
+	token, _ := s.Auth["accessToken"].(string)
+	identity := sha256.Sum256([]byte(token))
+	if m.aheadIdentity != identity {
+		m.aheadIdentity, m.aheadFailures, m.aheadAt = identity, 0, time.Time{}
+	}
+	return !time.Now().Before(m.aheadAt) && (expires-now <= 10*86400 || now-issued >= 86400)
 }
 
 // Profile returns the current credential's profile (falls back to default).
@@ -317,6 +356,8 @@ func (m *Manager) refreshContext(ctx context.Context) error {
 	if empty(newAuth["refreshExpiresAt"]) {
 		if in, ok := newAuth["refreshExpiresIn"].(float64); ok {
 			newAuth["refreshExpiresAt"] = float64(now) + in*1000
+		} else if _, exp := tokenTimes(newAuth["refreshToken"]); exp > 0 {
+			newAuth["refreshExpiresAt"] = exp * 1000
 		}
 	}
 	m.mu.Lock()
@@ -413,13 +454,14 @@ func (m *Manager) ensureFresh(ctx context.Context, force bool, rejected ...strin
 			return err
 		}
 	}
-	if task == nil && !force && !m.isExpired() {
+	early := !force && !m.isExpired()
+	if task == nil && early && !m.refreshAhead(s) {
 		m.mu.Unlock()
 		return nil
 	}
 	if task == nil {
 		sharedCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		task = &refreshTask{done: make(chan struct{}), cancel: cancel}
+		task = &refreshTask{done: make(chan struct{}), cancel: cancel, proactive: early}
 		m.flight = task
 		if len(rejected) > 0 {
 			m.deniedToken = rejectedHash
@@ -432,7 +474,15 @@ func (m *Manager) ensureFresh(ctx context.Context, force bool, rejected ...strin
 			defer cancel()
 			err := m.refreshContext(sharedCtx)
 			m.mu.Lock()
-			if guard != nil && errors.Is(err, ErrLoginRequired) {
+			if early {
+				if err != nil {
+					m.aheadFailures = min(m.aheadFailures+1, 6)
+					m.aheadAt = time.Now().Add(min(time.Minute*time.Duration(1<<uint(m.aheadFailures-1)), 30*time.Minute))
+				} else {
+					m.aheadFailures, m.aheadAt = 0, time.Time{}
+				}
+			}
+			if !early && guard != nil && errors.Is(err, ErrLoginRequired) {
 				if current, e := m.session(); e == nil && maintenanceIdentity(current) == identity {
 					guard.Observe(key, identity, "authorization_expired", true)
 				}
@@ -453,6 +503,14 @@ func (m *Manager) ensureFresh(ctx context.Context, force bool, rejected ...strin
 	case <-task.done:
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if early && task.proactive && task.err != nil && !errors.Is(task.err, ErrCredentialsChanged) {
+			m.mu.Lock()
+			usable := !m.retired && !m.isExpired()
+			m.mu.Unlock()
+			if usable {
+				return nil
+			}
 		}
 		return task.err
 	}

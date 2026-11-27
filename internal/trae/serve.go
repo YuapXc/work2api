@@ -20,6 +20,7 @@ import (
 )
 
 type eventReader struct {
+	settle        func(map[string]any)
 	observeFinish func(string)
 	scanner       *bufio.Scanner
 	event         string
@@ -171,16 +172,23 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 	}
 	body["model"] = model
 	image := hasImageInput(body)
-	encoded, err := json.Marshal(body)
-	if err != nil {
-		return report, err
-	}
 	explicit := provider.ExplicitSessionID(req.Headers, req.Payload)
 	session := ""
 	if explicit != "" {
 		session = provider.ScopedSessionID(req.Caller, req.Headers, "trae", model, explicit)
 	}
+	settledUsage := r.settledUsageEnabled() && !provider.CurrentInvocation(ctx).Diagnostic
+	wireSession := ""
+	if settledUsage {
+		wireSession = conversationID(session)
+		body["session_id"] = wireSession
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return report, err
+	}
 	tried := map[string]bool{}
+	admittedAffinity := r.affinitySnapshot(session)
 	refreshed := map[*auth.Auth]bool{}
 	var lastRejection error
 	var lastTransportFailure error
@@ -231,7 +239,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 						return false
 					}
 					for _, info := range a.Catalogs[candidate.Variant] {
-						if strings.EqualFold(info.ID, model) {
+						if info.MatchesID(model) {
 							if _, ok := info.NativeEffort(effort); ok {
 								return true
 							}
@@ -283,7 +291,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 				if directErr == nil {
 					usage, known, readErr := deliverDirect(ctx, req, directStream, "trae/"+model)
 					report.UpstreamFinishReason = usage.FinishReason
-					return r.finishUsage(report, usage, known, readErr, a, session, ref.LocalID)
+					return r.finishUsage(report, usage, known, readErr, a, session, ref.LocalID, admittedAffinity)
 				}
 				r.rememberDirectRefusal(key, ent.Direct, status)
 				if ctx.Err() != nil {
@@ -310,6 +318,11 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 			report.UpstreamModel = identityInfo.Enterprise.ModelName
 		}
 		report.UpstreamFinishReason = ""
+		var settlement *settlementLease
+		if settledUsage && !consoleRoute {
+			settlement = r.beginSettlement(ref.LocalID + "\x00" + identity.Variant + "\x00" + wireSession)
+			defer settlement.close()
+		}
 		stream, status, errorBody, headers, sendErr, beforeSend := r.sendPreparedChat(ctx, identity, prepared, consoleRoute)
 		streamwatch.AttemptHeaders(ctx, status, headers)
 		streamwatch.AttemptResult(ctx, status)
@@ -440,6 +453,12 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 		// Cancellation closes both sides and the HTTP body; no detached reader
 		// survives the downstream consumer or service shutdown.
 		pipeReader, pipeWriter := io.Pipe()
+		if settlement != nil && !consoleRoute {
+			clientStream, _ := req.Payload["stream"].(bool)
+			events.settle = func(usage map[string]any) {
+				report.Credits = settlement.settle(ctx, identity, wireSession, usage, clientStream)
+			}
+		}
 		readerDone := make(chan struct{})
 		go func() {
 			defer close(readerDone)
@@ -466,7 +485,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (report 
 		pipeReader.Close()
 		stream.Close()
 		<-readerDone
-		return r.finishUsage(report, usage, known, err, a, session, ref.LocalID)
+		return r.finishUsage(report, usage, known, err, a, session, ref.LocalID, admittedAffinity)
 	}
 	if lastRejection != nil {
 		return returnRejection()
@@ -480,7 +499,7 @@ func (r *Runtime) cool(id string, kind upstream.ErrKind) {
 	r.coolWithDelay(id, kind, 0)
 }
 func (r *Runtime) coolWithDelay(id string, kind upstream.ErrKind, delay time.Duration) {
-	if !retryable(kind) || kind == upstream.ErrModelPlan {
+	if !retryable(kind) || kind == upstream.ErrModelPlan || kind == upstream.ErrContextWindow {
 		return
 	}
 	r.mu.Lock()
@@ -545,6 +564,10 @@ func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent
 		return nil
 	}
 	toolsSeen := false
+	var settlementUsage map[string]any
+	if events.settle != nil {
+		settlementUsage = tokenusage.Merge(nil, initialUsage)
+	}
 	completionTokens, _ := initialUsage["completion_tokens"].(float64)
 	reasoningTokens := 0
 	if n := tokenusage.Reasoning(initialUsage); n != nil {
@@ -612,6 +635,9 @@ func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent
 				}
 			}
 		case "token_usage":
+			if events.settle != nil {
+				settlementUsage = tokenusage.Merge(settlementUsage, e.Usage)
+			}
 			if n, ok := e.Usage["completion_tokens"].(float64); ok {
 				completionTokens = n
 			}
@@ -638,6 +664,12 @@ func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent
 			if err := emit(map[string]any{}, finish, nil); err != nil {
 				return err
 			}
+			if events.settle != nil {
+				events.settle(settlementUsage)
+				if err := emit(map[string]any{}, nil, settlementUsage); err != nil {
+					return err
+				}
+			}
 			_, err := io.WriteString(w, "data: [DONE]\n\n")
 			return err
 		}
@@ -650,7 +682,7 @@ func normalizeStream(w io.Writer, events *eventReader, first *upstream.SOLOEvent
 	return io.ErrUnexpectedEOF
 }
 
-func (r *Runtime) finishUsage(report provider.UsageReport, usage protocol.Usage, known bool, err error, a *accountState, session, id string) (provider.UsageReport, error) {
+func (r *Runtime) finishUsage(report provider.UsageReport, usage protocol.Usage, known bool, err error, a *accountState, session, id string, admitted affinitySnapshot) (provider.UsageReport, error) {
 	report.InputTokens = usage.Input
 	report.FinishReason = usage.FinishReason
 	report.OutputTokens = usage.Output
@@ -679,7 +711,7 @@ func (r *Runtime) finishUsage(report provider.UsageReport, usage protocol.Usage,
 	a.Failures = 0
 	a.LastUsed = nowSec()
 	if session != "" {
-		r.rememberAffinity(session, id)
+		r.commitAffinity(session, id, admitted)
 	}
 	r.mu.Unlock()
 	return report, nil

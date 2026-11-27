@@ -35,6 +35,7 @@ const (
 	ErrInputTooLarge                // v0.12.50: 413/过大文案 → 请求级问题，不冷却账号
 	ErrModelUnavailable
 	ErrModelPlan
+	ErrContextWindow
 )
 
 func (k ErrKind) String() string {
@@ -55,6 +56,8 @@ func (k ErrKind) String() string {
 		return "input_too_large"
 	case ErrModelPlan:
 		return "model_plan_unavailable"
+	case ErrContextWindow:
+		return "account_context_window"
 	case ErrModelUnavailable:
 		return "model_unavailable"
 	default:
@@ -120,6 +123,9 @@ func Classify(status int, body string) ErrKind {
 	}
 	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
+	}
+	if code == 4026 {
+		return ErrContextWindow
 	}
 	if code == 1005 {
 		if HasPlan([]byte(body)) {
@@ -350,6 +356,7 @@ func (c *Client) ChatPreparedStreamWithHeaders(a *auth.Auth, prepared []byte, co
 }
 
 type ModelInfo struct {
+	ConfigName             string           `json:"config_name,omitempty"`
 	SupportsMaxMode        bool             `json:"supports_max_mode,omitempty"`
 	MaxContextWindow       int64            `json:"max_context_window,omitempty"`
 	UseMaxMode             bool             `json:"-"`
@@ -545,6 +552,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			}
 		}
 		out = append(out, ModelInfo{
+			ConfigName:      cfg.ConfigName,
 			Enterprise:      enterpriseInfo,
 			SupportsMaxMode: cfg.DisplayConfig.MaxMode, MaxContextWindow: cfg.ContextWindowTokens.Max,
 			ConsoleRoute:           enterpriseRoute,
@@ -562,7 +570,37 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			Pricing:                []ModelPrice{parseModelPrice(cfg.Contact, a.Variant)},
 		})
 	}
+	presets := map[string]bool{}
+	for _, m := range out {
+		if m.Enterprise == nil {
+			presets[strings.ToLower(m.ID)] = true
+		}
+	}
+	for i := range out {
+		if out[i].Enterprise != nil && presets[strings.ToLower(out[i].ID)] {
+			out[i].ID = out[i].EnterpriseID()
+		}
+	}
 	return out, nil
+}
+
+func (m ModelInfo) EnterpriseID() string {
+	if m.Enterprise == nil {
+		return ""
+	}
+	name := m.ConfigName
+	if name == "" {
+		name = m.ID
+	}
+	provider := strings.TrimSpace(m.Enterprise.Provider)
+	if provider == "" {
+		provider = "enterprise"
+	}
+	return provider + "//" + name
+}
+
+func (m ModelInfo) MatchesID(id string) bool {
+	return strings.EqualFold(m.ID, id) || m.Enterprise != nil && strings.EqualFold(m.EnterpriseID(), id)
 }
 
 type CheckinStatusResult struct {

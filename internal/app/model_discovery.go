@@ -63,6 +63,12 @@ func publicModelEntry(item map[string]any) map[string]any {
 		}
 	}
 	out["modalities"] = map[string]any{"input": input, "output": output}
+	if window := firstInt(item, "context_window", "context_length"); window > 0 {
+		out["context_window"] = window
+	}
+	if slices.Contains(endpoints, "/messages") {
+		out["api_capabilities"] = map[string]any{"anthropic_messages": map[string]any{}}
+	}
 	if len(endpoints) > 0 {
 		out["supported_endpoints"] = endpoints
 	}

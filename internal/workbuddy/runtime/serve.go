@@ -465,6 +465,11 @@ func (o *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 		return provider.UsageReport{}, errBody(400, "该模型用于媒体生成，请使用图片或视频接口", "invalid_request_error")
 	}
 	ctx = upstream.WithParsedFrames(ctx)
+	if BoolVal(req.Payload["stream"]) && o.db != nil {
+		if settings, err := o.db.GetSettings(); err == nil && settings["workbuddy_merge_reasoning"] != "0" {
+			ctx = upstream.WithReasoningCoalescing(ctx)
+		}
+	}
 	caller := req.Caller
 	r := (&http.Request{Header: req.Headers}).WithContext(ctx)
 	switch req.Protocol {

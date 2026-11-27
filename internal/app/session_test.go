@@ -1800,3 +1800,19 @@ func TestLiveDomesticResponsesCacheContinuation(t *testing.T) {
 
 	t.Log("real upstream SSE and immediate previous_response_id continuation verified")
 }
+
+func TestPublicDiscoveryDSHUsesKnownWindowOnly(t *testing.T) {
+	known := publicModelEntry(map[string]any{"context_length": 123000, "max_output_tokens": 8192})
+	caps, _ := known["api_capabilities"].(map[string]any)
+	if _, ok := caps["anthropic_messages"].(map[string]any); !ok || known["context_window"] != 123000 || known["max_output_tokens"] != 8192 {
+		t.Fatal(known)
+	}
+	unknown := publicModelEntry(map[string]any{})
+	if unknown["context_window"] != nil || unknown["max_output_tokens"] != nil {
+		t.Fatal("invented a window/output limit")
+	}
+	media := publicModelEntry(map[string]any{"model_type": "video", "output_modalities": []string{"video"}})
+	if media["api_capabilities"] != nil {
+		t.Fatal("media advertised as messages model")
+	}
+}

@@ -598,6 +598,15 @@ func (b *Bridge) callQoderWithOpts(ctx context.Context, messages []interface{}, 
 	body["session_id"] = cosy.NewUUID()
 	body["stream"] = true
 	body["aliyun_user_type"] = b.sess.Identity.UserType
+	if b.client.fingerprint != nil {
+		body["chat_task"], body["is_reply"], body["is_retry"], body["source"], body["version"], body["aliyun_user_type"] = "FREE_INPUT", true, false, 1, "3", ""
+		business, _ := body["business"].(map[string]any)
+		if business == nil {
+			business = map[string]any{}
+			body["business"] = business
+		}
+		business["product"], business["version"], business["model_key"] = "app", cosy.AppVersion, model
+	}
 
 	mc, _ := body["model_config"].(map[string]interface{})
 	if mc == nil {
@@ -715,6 +724,12 @@ func (b *Bridge) callQoderWithOpts(ctx context.Context, messages []interface{}, 
 	// 说明：连接阶段错误已在 openStreamLines 内部重试过；此处重开是
 	// 已耗尽的连接重试不会再次进入外层；外层仅覆盖建流后的信封/读取错误。
 	var lastErr error
+	leased := false
+	defer func() {
+		if leased {
+			go b.finishQueue(qurl, model, StrVal(body, "request_set_id"), began)
+		}
+	}()
 	queuedResume := false
 	for attempt := 0; attempt <= TransientMaxRetries; attempt++ {
 		if attempt > 0 && !queuedResume {
@@ -759,6 +774,9 @@ func (b *Bridge) callQoderWithOpts(ctx context.Context, messages []interface{}, 
 			lastErr = upstreamErr
 		} else {
 			lastErr = streamErr
+		}
+		if _, queued := queuedFailure(lastErr); queued {
+			leased = true
 		}
 		if !emitted && attempt < TransientMaxRetries && ctx.Err() == nil {
 			if state, ok := queuedFailure(lastErr); ok {

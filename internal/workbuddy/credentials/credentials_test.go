@@ -2,8 +2,10 @@ package credentials
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -317,5 +319,48 @@ func TestEnterpriseRenewalRetainsAccountOrigin(t *testing.T) {
 	}
 	if m.Endpoint() != "https://team.sso.codebuddy.cn" {
 		t.Fatal("renewal lost enterprise", m.Endpoint())
+	}
+}
+
+func TestLongLivedSignInRefreshesBeforeExpiryAndBacksOff(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		path := filepath.Join(t.TempDir(), "account.info")
+		now := time.Now().Unix()
+		jwt := func(iat, exp int64) string {
+			return "x." + base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"iat":%d,"exp":%d}`, iat, exp))) + ".x"
+		}
+		token := jwt(now-2*86400, now+26*86400)
+		writeTestCredential(t, path, token)
+		raw, _ := os.ReadFile(path)
+		var s map[string]any
+		json.Unmarshal(raw, &s)
+		a := s["auth"].(map[string]any)
+		a["expiresAt"] = float64((now + 26*86400) * 1000)
+		a["refreshExpiresAt"] = float64((now + 28*86400) * 1000)
+		raw, _ = json.Marshal(s)
+		os.WriteFile(path, raw, 0600)
+		mgr := NewManager(path)
+		var calls atomic.Int32
+		mgr.client = &http.Client{Transport: refreshTransport(func(req *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			if fail {
+				return &http.Response{StatusCode: 503, Body: io.NopCloser(strings.NewReader(`{}`)), Header: make(http.Header)}, nil
+			}
+			return refreshResponse(req, fmt.Sprintf(`{"code":0,"data":{"accessToken":%q,"refreshToken":%q,"expiresIn":2419200}}`, jwt(now, now+28*86400), jwt(now, now+30*86400))), nil
+		})}
+		for i := 0; i < 2; i++ {
+			if _, err := mgr.GetHeadersContext(t.Context()); err != nil {
+				t.Fatal("valid access blocked by proactive renewal", err)
+			}
+		}
+		if calls.Load() != 1 {
+			t.Fatal("renewal not shared/backed off", calls.Load())
+		}
+		if !fail {
+			s, err := mgr.RawSession()
+			if err != nil || s.Auth["refreshExpiresAt"] != float64((now+30*86400)*1000) {
+				t.Fatal("new refresh expiry not used", s, err)
+			}
+		}
 	}
 }

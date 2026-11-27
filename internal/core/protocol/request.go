@@ -2,6 +2,8 @@ package protocol
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -420,6 +422,7 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any, targets ...Pro
 	}
 	switch protocol {
 	case Chat:
+		replied := false
 		request.MaxTokens = jsonutil.FirstAny(input["max_completion_tokens"], input["max_tokens"])
 		request.Stop = input["stop"]
 		request.Reasoning = jsonutil.FirstAny(input["reasoning_effort"], input["reasoning"])
@@ -457,24 +460,26 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any, targets ...Pro
 			}
 			switch role {
 			case "system":
-				if orderedInstructions && len(request.Messages) > 0 {
+				if orderedInstructions && len(request.Messages) > 0 || len(targets) > 0 && targets[0] == Anthropic && replied {
 					request.Messages = append(request.Messages, bridgeMessage{Role: "developer", Blocks: blocks})
 				} else {
 					request.System = append(request.System, blocks...)
 				}
 			case "developer":
-				if orderedInstructions && len(request.Messages) > 0 {
+				if orderedInstructions && len(request.Messages) > 0 || len(targets) > 0 && targets[0] == Anthropic && replied {
 					request.Messages = append(request.Messages, bridgeMessage{Role: "developer", Blocks: blocks})
 				} else {
 					request.Developer = append(request.Developer, blocks...)
 				}
 			case "tool":
+				replied = true
 				request.Messages = append(request.Messages, bridgeMessage{Role: "user", Blocks: []bridgeBlock{{
 					Kind:   "tool_result",
 					CallID: jsonutil.StringAt(message, "tool_call_id"),
 					Result: message["content"],
 				}}})
 			case "user", "assistant":
+				replied = replied || role == "assistant"
 				request.Messages = append(request.Messages, bridgeMessage{Role: role, Blocks: blocks})
 			default:
 				return request, fmt.Errorf("messages[%d] has unsupported role %q", i, role)
@@ -856,7 +861,7 @@ func encodeChatRequest(request bridgeRequest) (map[string]any, error) {
 					pending[call.ID] = true
 					pendingOrder = append(pendingOrder, call.ID)
 					toolCalls = append(toolCalls, map[string]any{
-						"id":   call.ID,
+						"id":   boundCallID(call.ID),
 						"type": "function",
 						"function": map[string]any{
 							"name":      call.Name,
@@ -903,7 +908,7 @@ func encodeChatRequest(request bridgeRequest) (map[string]any, error) {
 				}
 				messages = append(messages, map[string]any{
 					"role":         "tool",
-					"tool_call_id": id,
+					"tool_call_id": boundCallID(id),
 					"content":      text,
 				})
 			}
@@ -1096,7 +1101,7 @@ func encodeResponsesRequest(request bridgeRequest) map[string]any {
 				flushContent()
 				items = append(items, map[string]any{
 					"type":      "function_call",
-					"call_id":   block.ID,
+					"call_id":   boundCallID(block.ID),
 					"name":      block.Name,
 					"arguments": bridgeArgumentsJSON(block),
 				})
@@ -1104,7 +1109,7 @@ func encodeResponsesRequest(request bridgeRequest) map[string]any {
 				flushContent()
 				items = append(items, map[string]any{
 					"type":    "function_call_output",
-					"call_id": block.CallID,
+					"call_id": boundCallID(block.CallID),
 					"output":  responsesToolContent(block.Result),
 				})
 			}
@@ -1156,6 +1161,10 @@ func encodeAnthropicRequest(request bridgeRequest) map[string]any {
 	messages := make([]any, 0, len(request.Messages))
 	for _, message := range request.Messages {
 		content := encodeAnthropicBlocks(message.Blocks)
+		if message.Role == "system" || message.Role == "developer" {
+			content = append([]any{map[string]any{"type": "text", "text": "<system-reminder>"}}, content...)
+			content = append(content, map[string]any{"type": "text", "text": "</system-reminder>"})
+		}
 		if len(content) == 0 {
 			continue
 		}
@@ -1273,7 +1282,15 @@ func FunctionToolSubset(input map[string]any, from Protocol) (map[string]any, er
 	return out, nil
 }
 
-var responseItemIDLengthError = regexp.MustCompile(`(?i)invalid ['"]input\[([0-9]+)\]\.id['"][^\n]{0,1000}expected a string with maximum length`)
+func boundCallID(id string) string {
+	if len(id) <= 64 {
+		return id
+	}
+	sum := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(sum[:])
+}
+
+var responseItemIDLengthError = regexp.MustCompile(`(?i)invalid ['"]input\[([0-9]+)\]\.(id|call_id)['"][^\n]{0,1000}expected a string with maximum length`)
 
 func IsResponseIDRejection(rejection []byte, status int) bool {
 	if status != 400 && status != 404 && status != 422 {
@@ -1340,6 +1357,41 @@ func RecoverResponseIDs(body, rejection []byte, status int) ([]byte, bool) {
 		if err != nil || index >= len(items) {
 			return body, false
 		}
+		if strings.EqualFold(lengthMatch[2], "call_id") {
+			var rejected map[string]json.RawMessage
+			var id, rejectedKind string
+			if json.Unmarshal(items[index], &rejected) != nil || json.Unmarshal(rejected["call_id"], &id) != nil || len(id) <= 64 {
+				return body, false
+			}
+			_ = json.Unmarshal(rejected["type"], &rejectedKind)
+			if rejectedKind != "function_call" && rejectedKind != "function_call_output" && rejectedKind != "custom_tool_call" && rejectedKind != "custom_tool_call_output" {
+				return body, false
+			}
+			changed := false
+			for i, raw := range items {
+				var item map[string]json.RawMessage
+				if json.Unmarshal(raw, &item) != nil {
+					continue
+				}
+				var kind, callID string
+				_ = json.Unmarshal(item["type"], &kind)
+				if kind != "function_call" && kind != "function_call_output" && kind != "custom_tool_call" && kind != "custom_tool_call_output" {
+					continue
+				}
+				if json.Unmarshal(item["call_id"], &callID) != nil || len(callID) <= 64 {
+					continue
+				}
+				item["call_id"], _ = json.Marshal(boundCallID(callID))
+				items[i], _ = json.Marshal(item)
+				changed = true
+			}
+			if !changed {
+				return body, false
+			}
+			payload["input"], _ = json.Marshal(items)
+			fixed, err := json.Marshal(payload)
+			return fixed, err == nil
+		}
 		var item map[string]json.RawMessage
 		if json.Unmarshal(items[index], &item) != nil || item["id"] == nil || !optional(item) {
 			return body, false
@@ -1375,8 +1427,27 @@ func RecoverResponseIDs(body, rejection []byte, status int) ([]byte, bool) {
 	changed := false
 	for _, raw := range items {
 		var item map[string]json.RawMessage
-		if json.Unmarshal(raw, &item) != nil || item["id"] == nil || !optional(item) {
+		if json.Unmarshal(raw, &item) != nil || !optional(item) {
 			out = append(out, raw)
+			continue
+		}
+		itemChanged := false
+		var kind, callID string
+		_ = json.Unmarshal(item["type"], &kind)
+		if kind == "function_call" || kind == "function_call_output" || kind == "custom_tool_call" || kind == "custom_tool_call_output" {
+			if json.Unmarshal(item["call_id"], &callID) == nil && len(callID) > 64 {
+				item["call_id"], _ = json.Marshal(boundCallID(callID))
+				itemChanged = true
+			}
+		}
+		if item["id"] == nil {
+			if !itemChanged {
+				out = append(out, raw)
+				continue
+			}
+			changed = true
+			v, _ := json.Marshal(item)
+			out = append(out, v)
 			continue
 		}
 		changed = true

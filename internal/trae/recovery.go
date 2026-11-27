@@ -44,7 +44,7 @@ func transientConnectError(err error) bool {
 }
 
 func retryable(kind upstream.ErrKind) bool {
-	return kind == upstream.ErrSoftRate || kind == upstream.ErrServer || kind == upstream.ErrSessionDead || kind == upstream.ErrPlanLimit || kind == upstream.ErrModelPlan
+	return kind == upstream.ErrSoftRate || kind == upstream.ErrServer || kind == upstream.ErrSessionDead || kind == upstream.ErrPlanLimit || kind == upstream.ErrModelPlan || kind == upstream.ErrContextWindow
 }
 
 func retryAfter(value string, now time.Time) time.Duration {
@@ -74,6 +74,8 @@ func retryAfter(value string, now time.Time) time.Duration {
 func rejectionError(kind upstream.ErrKind, status int, code int64) error {
 	message, errorType := "Trae 上游拒绝请求", "upstream_error"
 	switch kind {
+	case upstream.ErrContextWindow:
+		status, message, errorType = 400, "输入超出当前 Trae 账号可接受的窗口，请压缩上下文后重试", "context_length_exceeded"
 	case upstream.ErrInputTooLarge:
 		status, message, errorType = 400, "Trae 上游拒绝过大的输入，请压缩上下文或缩小请求", "context_length_exceeded"
 	case upstream.ErrModelPlan:

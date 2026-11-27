@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -115,6 +116,10 @@ func TestResourceRejectionsDoNotReplayOrEmitSuccess(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var hits atomic.Int32
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/ask/finish") {
+					w.WriteHeader(204)
+					return
+				}
 				if r.Method == "GET" {
 					w.WriteHeader(404)
 					return
@@ -160,6 +165,10 @@ func TestQueueRecoveryAndTermination(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/ask/finish") {
+					w.WriteHeader(204)
+					return
+				}
 				if r.Method == "GET" {
 					queries.Add(1)
 					if r.URL.Path != "/algo/api/v2/service/ask/queue/status" || r.URL.Query().Get("requestSetId") == "" || r.URL.Query().Get("modelKey") != "qfmodel" || r.Header.Get("X-Request-ID") == "" || r.Header.Get("X-Session-ID") == "" {
@@ -346,6 +355,10 @@ func TestQueuedRequestsAcrossPublicProtocols(t *testing.T) {
 				t.Run(fmt.Sprintf("%s/stream=%v/recover=%v", proto, streaming, recover), func(t *testing.T) {
 					var sends atomic.Int32
 					srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if strings.Contains(r.URL.Path, "/ask/finish") {
+							w.WriteHeader(204)
+							return
+						}
 						if r.Method == "GET" {
 							if recover {
 								fmt.Fprint(w, `{"isQueued":false}`)
@@ -486,6 +499,10 @@ func TestStalledQueueFallsBackOnlyBeforeOutput(t *testing.T) {
 			defer cancel()
 			ticket, business, _ := queueErrorFixture()
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/ask/finish") {
+					w.WriteHeader(204)
+					return
+				}
 				if r.Method == "GET" {
 					queries.Add(1)
 					if mode == "deadline" {
@@ -654,4 +671,76 @@ func BenchmarkQueueDiagnostics(b *testing.B) {
 			}
 		}
 	})
+}
+
+func TestQueueUnavailableReadinessAndLeaseRelease(t *testing.T) {
+	no, yes := false, true
+	if queueReady(queueState{Queued: &no, Available: &no}) || !queueReady(queueState{Queued: &no, Available: &yes}) {
+		t.Fatal("service readiness ignored")
+	}
+	now := time.Now()
+	state := queueState{Queued: &no, Available: &no}
+	_, _, stalled := queueProgress(state, queueStuckKey(state), now.Add(-6*time.Minute), now)
+	if !stalled {
+		t.Fatal("unavailable queue never stops")
+	}
+	var sends, queries atomic.Int32
+	finished := make(chan map[string]any, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/ask/finish") {
+			var wire strings.Builder
+			_, _ = io.Copy(&wire, r.Body)
+			plain, err := cosy.Decode(wire.String())
+			if err != nil {
+				t.Error(err)
+			}
+			var outer struct {
+				Payload string `json:"payload"`
+				Version string `json:"encodeVersion"`
+			}
+			if json.Unmarshal(plain, &outer) != nil || outer.Version != "1" || r.URL.Query().Get("Encode") != "1" || r.Header.Get("Authorization") == "" {
+				t.Error("invalid signed finish")
+			}
+			var payload map[string]any
+			json.Unmarshal([]byte(outer.Payload), &payload)
+			finished <- payload
+			w.WriteHeader(204)
+			return
+		}
+		if r.Method == "GET" {
+			n := queries.Add(1)
+			fmt.Fprintf(w, `{"isQueued":false,"serviceAvailable":%t,"retryAfterSeconds":0,"queueCount":0}`, n > 1)
+			return
+		}
+		n := sends.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if n == 1 {
+			_, business, _ := queueErrorFixture()
+			frame, _ := json.Marshal(map[string]any{"statusCodeValue": 403, "body": business})
+			fmt.Fprintf(w, "data: %s\n\n", frame)
+			return
+		}
+		frame, _ := json.Marshal(map[string]any{"statusCodeValue": 200, "body": `{"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}`})
+		fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", frame)
+	}))
+	defer srv.Close()
+	sess, err := cosy.NewSession(cosy.AuthIdentity{Uid: "fixture", UserType: "personal_standard"}, "fixture", "fixture", "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &Bridge{sess: sess, client: NewBearerClient(sess), templateBase: map[string]any{}, chatStreamURL: srv.URL}
+	if err = b.CallQoderWithOpts(t.Context(), "codex", nil, "qfmodel", nil, CallOpts{}, func(Delta) {}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-finished:
+		if got["model_key"] != "qfmodel" || got["user_id"] != "fixture" || got["request_set_id"] == "" || got["time_consumed"].(float64) < 0 {
+			t.Fatal(got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("queue lease not released")
+	}
+	if sends.Load() != 2 || queries.Load() != 2 {
+		t.Fatal("resent before service available", sends.Load(), queries.Load())
+	}
 }

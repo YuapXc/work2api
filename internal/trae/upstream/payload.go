@@ -73,6 +73,10 @@ func PrepareBodyResolvedWithLimits(src []byte, variant, resolvedModel string, mo
 	out["stream"] = true
 	out["config_name"] = model
 	out["model"] = model
+	if session, ok := obj["session_id"].(string); ok && session != "" {
+		out["session_id"] = session
+		out["request_id"] = newRequestID()
+	}
 	if tools, ok := obj["tools"]; ok {
 		out["tools"] = tools
 	}
@@ -151,6 +155,9 @@ func PrepareBodyResolvedWithLimits(src []byte, variant, resolvedModel string, mo
 		out["stop"] = stop
 	case []any:
 		out["stop"] = stop
+	}
+	if len(models) > 0 && models[0].ID == model && models[0].ConfigName != "" {
+		out["config_name"], out["model"] = models[0].ConfigName, models[0].ConfigName
 	}
 	b, err := json.Marshal(out)
 	if err != nil {

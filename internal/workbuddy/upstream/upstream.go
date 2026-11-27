@@ -194,6 +194,9 @@ func (c *Client) StreamPrepared(ctx context.Context, headers map[string]string, 
 		return c.handleJSONResponse(resp, yield, body.toolNames)
 	}
 
+	if enabled, _ := ctx.Value(coalesceKey{}).(bool); enabled {
+		return coalescedSSE(resp, yield, body.toolNames)
+	}
 	return streamSSE(resp, yield, body.toolNames)
 }
 

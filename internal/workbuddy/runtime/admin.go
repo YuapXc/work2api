@@ -279,7 +279,7 @@ func (r *Runtime) AdminData(ctx context.Context) provider.AdminData {
 		}
 		budgets = append(budgets, budget)
 	}
-	return provider.AdminData{Budgets: budgets, Resources: resources, DisplayName: "WorkBuddy", Ready: len(accounts) > 0, Default: true, Capabilities: []string{"accounts", "models", "checkin", "credits", "oauth", "upload"}, Accounts: accounts, Models: models, Status: map[string]any{"account_count": len(accounts), "healthy_count": healthy, "model_count": len(models), "credits_remaining": math.Round(remain*100) / 100, "credits_total": math.Round(total*100) / 100}}
+	return provider.AdminData{Maintenance: []provider.MaintenanceOption{{Key: "workbuddy_merge_reasoning", Label: "合并思考碎片", Description: "首段立即发送，后续按300毫秒或8KB合并；关闭后逐帧转发"}}, Budgets: budgets, Resources: resources, DisplayName: "WorkBuddy", Ready: len(accounts) > 0, Default: true, Capabilities: []string{"accounts", "models", "checkin", "credits", "oauth", "upload"}, Accounts: accounts, Models: models, Status: map[string]any{"account_count": len(accounts), "healthy_count": healthy, "model_count": len(models), "credits_remaining": math.Round(remain*100) / 100, "credits_total": math.Round(total*100) / 100}}
 }
 func SiteLabel(site string) string {
 	switch site {

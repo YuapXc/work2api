@@ -1996,3 +1996,76 @@ func TestResponseItemIDLengthRecoveryDoesNotTouchOtherFields(t *testing.T) {
 		t.Fatal("reference-only reasoning silently discarded")
 	}
 }
+
+func TestPortableCallIDsAndLateInstructions(t *testing.T) {
+	long := strings.Repeat("x", 87)
+	input := map[string]any{"model": "model", "messages": []any{
+		map[string]any{"role": "system", "content": "stable"},
+		map[string]any{"role": "user", "content": "question"},
+		map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{map[string]any{"id": long, "type": "function", "function": map[string]any{"name": "lookup", "arguments": `{"n":9007199254740993}`}}}},
+		map[string]any{"role": "tool", "tool_call_id": long, "content": "unchanged " + long},
+		map[string]any{"role": "system", "content": "late"},
+	}}
+	before, _ := json.Marshal(input)
+	responses, err := ConvertRequest(Chat, Responses, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := responses["input"].([]any)
+	var call, result string
+	for _, raw := range items {
+		m := raw.(map[string]any)
+		if m["type"] == "function_call" {
+			call = m["call_id"].(string)
+			if m["arguments"] != `{"n":9007199254740993}` {
+				t.Fatal(m)
+			}
+		}
+		if m["type"] == "function_call_output" {
+			result = m["call_id"].(string)
+			if m["output"] != "unchanged "+long {
+				t.Fatal(m)
+			}
+		}
+	}
+	if len(call) != 64 || call != result || call != boundCallID(long) || boundCallID("short") != "short" {
+		t.Fatal("tool links not stable", call, result)
+	}
+	chat, err := ConvertRequest(Responses, Chat, responses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(chat)
+	if !bytes.Contains(encoded, []byte("9007199254740993")) {
+		t.Fatal("argument precision lost")
+	}
+	messages, err := ConvertRequest(Chat, Anthropic, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	system, _ := json.Marshal(messages["system"])
+	if bytes.Contains(system, []byte("late")) {
+		t.Fatal("late instruction poisoned cached prefix")
+	}
+	wire, _ := json.Marshal(messages["messages"])
+	if !bytes.Contains(wire, []byte("system-reminder")) || !bytes.Contains(wire, []byte("late")) {
+		t.Fatal(messages)
+	}
+	after, _ := json.Marshal(input)
+	if !bytes.Equal(before, after) {
+		t.Fatal("caller request changed")
+	}
+	body := []byte(fmt.Sprintf(`{"store":false,"input":[{"type":"function_call","id":"keep","call_id":%q,"name":"lookup","arguments":"{\"n\":9007199254740993}"},{"type":"function_call_output","call_id":%q,"output":"keep"}]}`, long, long))
+	rejection := []byte(`{"error":{"message":"Invalid 'input[0].call_id': string too long. Expected a string with maximum length 64"}}`)
+	fixed, changed := RecoverResponseIDs(body, rejection, 400)
+	if !changed || !bytes.Contains(fixed, []byte(`"id":"keep"`)) || !bytes.Contains(fixed, []byte("9007199254740993")) || bytes.Contains(fixed, []byte(long)) {
+		t.Fatal(string(fixed), changed)
+	}
+	if _, again := RecoverResponseIDs(fixed, rejection, 400); again {
+		t.Fatal("recovery loops")
+	}
+	foreign := []byte(`{"error":{"message":"Item was created under a different resource"}}`)
+	if recovered, ok := RecoverResponseIDs(body, foreign, 400); !ok || bytes.Contains(recovered, []byte(long)) {
+		t.Fatal("foreign-resource recovery left incompatible call links", string(recovered))
+	}
+}
