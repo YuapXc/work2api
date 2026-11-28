@@ -30,7 +30,7 @@ npm --prefix webui run build:embed
 npm --prefix webui run check:embed
 ```
 
-`build:embed` 包含类型检查、构建、同步内嵌资源与清理旧哈希文件。修改前端后应同时提交源码和 `internal/app/webui`，再重建 Go 程序。源码统一使用 LF，避免跨平台构建哈希不同。样式规范见 [WebUI 设计约定](../webui/DESIGN.md)。
+`build:embed` 包含源码行尾检查、类型检查、构建、同步内嵌资源与清理旧哈希文件。前端源码须保存为 LF。若构建列出其他行尾的文件，请在编辑器中改为 LF 并保存，然后重新构建。修改前端后应同时提交源码和 `internal/app/webui`，再重建 Go 程序。CI 和 Release 会重新构建前端，并比较提交中的内嵌资源。样式规范见 [WebUI 设计约定](../webui/DESIGN.md)。
 
 ## 验证与产物
 

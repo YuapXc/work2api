@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prebuild": "node scripts/check-source-eol.mjs",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "build:embed": "npm run build && node scripts/sync-embed.mjs",
