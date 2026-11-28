@@ -47,6 +47,11 @@ func publicModelEntry(item map[string]any) map[string]any {
 	case "audio":
 		out["type"] = "transcription"
 		endpoints = []string{"/audio/transcriptions"}
+		if slices.Contains(discoveryStrings(item["media_tags"]), "text-to-audio") {
+			out["type"] = "speech"
+			endpoints = []string{"/audio/speech"}
+		}
+
 	case "decision":
 		out["kind"] = "decision"
 		endpoints = []string{"/systemone"}

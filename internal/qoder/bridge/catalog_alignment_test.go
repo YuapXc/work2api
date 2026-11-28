@@ -3,6 +3,7 @@ package bridge
 import (
 	"encoding/json"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -84,7 +85,7 @@ func TestSystemCompatibilityLeavesUserAndToolsAlone(t *testing.T) {
 	claude := "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."
 	in := []any{map[string]any{"role": "developer", "content": original}, map[string]any{"role": "system", "content": claude}, map[string]any{"role": "user", "content": original}, map[string]any{"role": "tool", "content": claude, "tool_call_id": "call-a"}}
 	out := normalizeOutboundMessages(in)
-	if out[0].(map[string]any)["content"] != "You are an AI agent, powered by DeepSeek Harness." || out[1].(map[string]any)["content"] != "You are a Claude agent, built on Anthropic's Claude Agent SDK." || out[2].(map[string]any)["content"] != original || out[3].(map[string]any)["content"] != claude {
+	if out[0].(map[string]any)["content"] != "[redacted: client identity]" || out[1].(map[string]any)["content"] != "You are a Claude agent, built on Anthropic's Claude Agent SDK." || out[2].(map[string]any)["content"] != original || out[3].(map[string]any)["content"] != claude {
 		t.Fatal(out)
 	}
 	before, _ := json.Marshal(out)
@@ -92,5 +93,16 @@ func TestSystemCompatibilityLeavesUserAndToolsAlone(t *testing.T) {
 	after, _ := json.Marshal(out)
 	if string(before) != string(after) {
 		t.Fatal("compatibility is not idempotent")
+	}
+}
+
+func TestKimiIdentityOnlyInFirstSystemAndExactBoundary(t *testing.T) {
+	for _, value := range []string{"You are Kimi Code CLI, an interactive general AI agent.", "# Role\nYou are Kimi Code CLI, an interactive general AI agent.", "You are Kimi.", "You are Kimi\n", "you are Kimi Code CLI", "You are Kimi123"} {
+		in := []any{map[string]any{"role": "developer", "content": value}, map[string]any{"role": "system", "content": value}, map[string]any{"role": "user", "content": value}}
+		out := normalizeOutboundMessages(in)
+		changed := out[0].(map[string]any)["content"] != value
+		if changed != strings.Contains(value, "You are Kimi ") || out[1].(map[string]any)["content"] != value || out[2].(map[string]any)["content"] != value {
+			t.Fatal(value, out)
+		}
 	}
 }

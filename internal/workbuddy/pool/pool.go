@@ -684,6 +684,17 @@ func (p *Pool) Get(uid string) *Account {
 	return nil
 }
 
+func (p *Pool) EnabledForCredential(uid string, mgr Credential) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, a := range p.accounts {
+		if a.UID == uid {
+			return a.Enabled && a.Mgr == mgr
+		}
+	}
+	return false
+}
+
 func nowSec() float64 { return float64(time.Now().UnixNano()) / 1e9 }
 func max0(n int) int {
 	if n > 0 {

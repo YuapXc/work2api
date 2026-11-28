@@ -24,7 +24,7 @@ async function copyModelName() {
 const pm = computed(() => providerMeta(props.provider))
 const media = computed(() => ['image', 'video', 'audio'].includes(m.value.model_type))
 const video = computed(() => m.value.video_generation || {})
-const mediaTags = computed(() => (m.value.media_tags || []).map((t: string) => ({'text-to-image':'文生图','image-to-image':'图片编辑','text-to-video':'文生视频','image-to-video':'图生视频','audio-to-text':'音频转写'} as Record<string,string>)[t]).filter(Boolean))
+const mediaTags = computed(() => (m.value.media_tags || []).map((t: string) => ({'text-to-image':'文生图','image-to-image':'图片编辑','text-to-video':'文生视频','image-to-video':'图生视频','audio-to-text':'音频转写','text-to-audio':'文本转语音'} as Record<string,string>)[t]).filter(Boolean))
 const multimodal = computed(() => m.value.modality === 'multimodal' || m.value.vision || m.value.supports_image)
 const reasoning = computed(() => {
   const value = m.value.reasoning

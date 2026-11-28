@@ -843,12 +843,7 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 	report.CachedTokens, _ = tokenusage.ValidCache(res.Usage)
 	report.ReasoningTokens = tokenusage.Reasoning(res.Usage)
 	report.CacheCreationTokens = tokenusage.Created(res.Usage)
-	for _, key := range []string{"credit", "credits"} {
-		if value, ok := res.Usage[key].(float64); ok && value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0) {
-			report.Credits = &value
-			break
-		}
-	}
+	report.Credits = billedCredits(res.Usage)
 	if res.FinishReason == "length" || res.FinishReason == "content_filter" {
 		report.Status = "incomplete"
 	}
@@ -861,6 +856,18 @@ func (r *Runtime) Serve(ctx context.Context, req provider.ServeRequest) (provide
 		return report, err
 	}
 	return report, nil
+}
+
+func billedCredits(usage map[string]any) *float64 {
+	if usage["billable"] == false {
+		return new(float64)
+	}
+	for _, key := range []string{"credit", "credits", "original_credits"} {
+		if value, ok := usage[key].(float64); ok && value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0) {
+			return &value
+		}
+	}
+	return nil
 }
 
 // writeServeError emits a minimal OpenAI-style JSON error when the request

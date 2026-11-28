@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"math"
@@ -30,6 +31,9 @@ func mediaError(w http.ResponseWriter, err error) {
 func (s *Server) readMediaRequest(r *http.Request) (map[string]any, error) {
 	if !isMediaMultipart(r) {
 		return readJSON(r)
+	}
+	if buffered, ok := r.Body.(*bufferedRequestBody); ok {
+		defer buffered.Close()
 	}
 	reader, err := r.MultipartReader()
 	if err != nil {
@@ -62,7 +66,7 @@ func (s *Server) readMediaRequest(r *http.Request) (map[string]any, error) {
 			if !strings.HasPrefix(kind, "audio/") && !strings.HasPrefix(kind, "video/") {
 				kind = http.DetectContentType(data)
 			}
-			payload["audio_data"] = map[string]any{"data": base64.StdEncoding.EncodeToString(data), "mime": kind}
+			payload["audio_data"] = map[string]any{"raw": data, "mime": kind, "original_mime": part.Header.Get("Content-Type"), "name": part.FileName()}
 			continue
 		}
 		if name == "image" || name == "image[]" {
@@ -149,6 +153,9 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/v1/images/edits" {
 		operation = "image-edit"
 	}
+	if r.URL.Path == "/v1/audio/speech" {
+		operation, kind = "speech", "audio"
+	}
 	if r.URL.Path == "/v1/audio/transcriptions" {
 		operation, kind = "transcription", "audio"
 	}
@@ -196,6 +203,43 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("X-Media-Task-Id", id)
+	if operation == "speech" || rt.Name() == "workbuddy" && strings.TrimPrefix(resolved, "workbuddy/") == "workbuddy-transcribe" {
+		audio, ok := rt.(provider.AudioProvider)
+		if !ok {
+			mediaError(w, provider.ErrUnsupported)
+			return
+		}
+		result, aerr := audio.CallAudio(ctx, request)
+		if aerr != nil {
+			status := "unknown"
+			var ae *provider.APIError
+			if errors.As(aerr, &ae) && ae.Status >= 400 && ae.Status < 500 {
+				status = "failed"
+			}
+			_ = s.o.db.UpdateMediaTask(id, "", status, map[string]any{"id": id, "status": status}, nil, "语音请求未成功，详情见客户端响应")
+			mediaError(w, aerr)
+			return
+		}
+		stored := map[string]any{"id": id, "status": "completed", "result_ephemeral": true}
+		if operation == "transcription" {
+			text := string(result.Data)
+			if strings.HasPrefix(result.ContentType, "application/json") {
+				var value map[string]any
+				if json.Unmarshal(result.Data, &value) == nil {
+					text, _ = value["text"].(string)
+				}
+			}
+			stored["text"] = text
+			delete(stored, "result_ephemeral")
+		}
+		if err = s.o.db.UpdateMediaTask(id, "", "completed", stored, nil, ""); err != nil {
+			w.Header().Set("X-Media-Log-Status", "pending")
+		}
+		w.Header().Set("Content-Type", result.ContentType)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(result.Data)
+		return
+	}
 	result, err := media.CallMedia(ctx, request)
 	if err != nil {
 		status := "unknown"

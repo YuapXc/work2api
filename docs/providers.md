@@ -69,3 +69,38 @@ Qoder 在确认排队时登记对应请求租约，结束、取消或放弃后�
 Trae 企业 Token 的 SaaS 标记可位于顶层或 `data.scope`，顶层明确值优先。只有与预设重名的企业模型使用 `provider//config_name` 区分，发往上游的仍是原配置名及企业来源；未重名模型不批量改名。明确 4026 窗口拒绝时，可在原尝试预算内换其他有权账号，保留完整历史；不冷却整个账号，也不把其他账号的实测窗口统一当成固定上限。
 
 Trae 的「回填已结算用量」默认关闭，仅用于国内个人网关，不用于企业席位金额或专用端点直连。开启后，流式查询预算为 400 毫秒，非流式为 2.5 秒，单次查询最多 2 秒；拒绝不重试，未更新账单有限等待。按账号、产品和会话保存有界累计基线，只在能归属当前调用时回填积分和缓存；并发重叠、回退、未结算及缺失字段保留未知，不把它们记为零消耗。正的上游缓存读数优先。查询失败不影响已生成回答，关闭时不发账单请求。
+
+
+## 调用兼容与语音来源
+
+WorkBuddy Chat 按官方客户端规则合并 `extra_fields`。客户端下一轮遗漏该字段或传入 `null` 时，网关按工具调用 ID、助手正文或思考内容找回对应轮次。客户端自带的对象、数组和已有思考文字保持原值。记录按调用方、会话、账号、产品及模型隔离，最多 2048 轮、64 MiB；淘汰或重启后不再恢复。上游明确拒绝签名时，只在尚未输出且仍有尝试次数时，移除本地补入的签名再发一次。
+
+WorkBuddy 语音接口、WAV 封装、PCM 采样转换及 Chat 签名合并参考 [magpie-community/plugins](https://github.com/magpie-community/plugins)，对应提交 [6495fb6095a0](https://github.com/magpie-community/plugins/commit/6495fb6095a0) 与 [d06585946264](https://github.com/magpie-community/plugins/commit/d06585946264)。接口参数见 [API 文档](api.md)。这些实现使用 Go 标准库，并复用网关现有的媒体授权、账号凭据和任务记录。
+
+Qoder 目录按 [buddy-proxy 的视图合并规则](https://github.com/jsongo/buddy-proxy/commit/d174f2b) 补充上游系统模型，保留当前设备身份。部分视图失败且没有可展示的模型时，保留上次目录；所有视图均成功时接受空目录。调用明确返回 `billable:false` 时，日志记录实扣为零；其余依次读取 `credit`、`credits`、`original_credits`，缺失时保留未知。精确的 Kimi Code CLI 身份开场兼容参考 [buddy-proxy](https://github.com/jsongo/buddy-proxy/commit/30fa431)，只应用于首条系统消息，保留用户内容和工具结果。
+
+### magpie-community/plugins 许可
+
+```text
+MIT License
+
+Copyright (c) 2026 magpie-community contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```

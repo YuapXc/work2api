@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
@@ -126,6 +127,13 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 			}
 		}
 	}
+	signatureScope := ""
+	var restoredSignatures map[int]*list.Element
+	if nativeBody == nil {
+		signatureScope = r.chatSignatureScope(ctx, acc, model)
+		body, restoredSignatures = r.chatSignatures.restore(signatureScope, body)
+	}
+	var signatureTap *chatSignatureTap
 	started := false
 	var responseBytes int64
 	var preamble []string
@@ -208,7 +216,13 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 			b.remaining--
 		}
 		normalizer := &toolFinishNormalizer{}
+		if signatureScope != "" {
+			signatureTap = &chatSignatureTap{}
+		}
 		yield := func(line string) error {
+			if signatureTap != nil {
+				signatureTap.observe(ctx, line)
+			}
 			for _, normalized := range normalizer.lines(ctx, line) {
 				if e := wrapped(normalized); e != nil {
 					return e
@@ -242,6 +256,18 @@ func (r *Runtime) Stream(ctx context.Context, acc *pool.Account, body map[string
 		if errors.As(err, &rejected) {
 			rejected = rejected.Normalized()
 			err = rejected
+		}
+		if err == nil && signatureTap != nil {
+			r.chatSignatures.keep(signatureScope, signatureTap)
+		}
+		if nativeBody == nil && !started && ctx.Err() == nil && len(restoredSignatures) > 0 && rejected != nil && rejected.StatusCode == 400 && rejectsChatSignature(rejected.Raw) && recoveryAvailable(ctx) {
+			body = r.chatSignatures.unsigned(body, restoredSignatures)
+			restoredSignatures = nil
+			prepared = nil
+			preamble = nil
+			preambleBytes = 0
+			responseBytes = 0
+			continue
 		}
 		if nativeBody == nil && !started && ctx.Err() == nil && rejected != nil && rejected.StatusCode == 400 && BusinessCode(string(rejected.Raw), "11151") && !emptyTextRetried && recoveryAvailable(ctx) {
 			if next, changed := reasoning.GuardEmptyTextParts(body, true); changed {

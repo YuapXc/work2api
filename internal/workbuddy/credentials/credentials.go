@@ -701,3 +701,5 @@ func (m *Manager) ChatIdentityPreview() (map[string]any, error) {
 	}
 	return map[string]any{"profile": profile, "endpoint": endpoint + "/v2/chat/completions", "headers": safe, "present": present, "local_only": true}, nil
 }
+
+func (m *Manager) SupportsSpeech() bool { return true }

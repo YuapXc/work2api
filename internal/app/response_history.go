@@ -522,8 +522,9 @@ func (s *Server) prepareResponseHistory(w http.ResponseWriter, r *http.Request, 
 		var restoredItems []any
 		for _, segment := range parent.segments {
 			for _, raw := range segment.items {
-				var item map[string]any
-				if json.Unmarshal(raw, &item) != nil {
+				v, err := decodeResponseItem(raw)
+				item, ok := v.(map[string]any)
+				if err != nil || !ok {
 					c.release(parent)
 					return w, noop, errors.New("续接历史不可用，请发送完整对话历史")
 				}

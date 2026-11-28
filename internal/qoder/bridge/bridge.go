@@ -282,21 +282,53 @@ func (b *Bridge) ListAvailableModels() ([]QoderModel, error) {
 
 func (b *Bridge) ListAvailableModelsContext(ctx context.Context) ([]QoderModel, error) {
 	modelListURL := qoderModelListURL(b.region)
-	resp, err := b.client.callGetContext(ctx, modelListURL)
-	if err != nil {
-		return nil, err
+	types := []string{"0", "5"}
+	if b.client.fingerprint != nil {
+		types = append(types, "10")
 	}
-	// debug: 打印响应顶层 key
-	keys := make([]string, 0, len(resp))
-	for k := range resp {
-		keys = append(keys, k)
+	type catalogResult struct {
+		index  int
+		models []QoderModel
+		err    error
 	}
-	logger.Debug("model list response keys: %v (region=%s)", keys, b.region)
-	models, err := decodeModelCatalog(resp)
-	if err != nil {
-		return nil, fmt.Errorf("%s -> %w", modelListURL, err)
+	results := make(chan catalogResult, len(types))
+	for index, clientType := range types {
+		go func(index int, clientType string) {
+			resp, err := b.client.callCatalogGet(ctx, modelListURL, clientType)
+			var models []QoderModel
+			if err == nil {
+				models, err = decodeModelCatalog(resp)
+			}
+			results <- catalogResult{index, models, err}
+		}(index, clientType)
+	}
+	ordered := make([]catalogResult, len(types))
+	for range types {
+		read := <-results
+		ordered[read.index] = read
+	}
+	var models []QoderModel
+	seen := map[string]bool{}
+	var lastErr error
+	for _, read := range ordered {
+		if read.err != nil {
+			lastErr = read.err
+			continue
+		}
+		for _, model := range read.models {
+			if !seen[model.Key] {
+				seen[model.Key] = true
+				models = append(models, model)
+			}
+		}
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
 	models = dropRetiredModels(models)
+	if len(models) == 0 && lastErr != nil {
+		return nil, fmt.Errorf("%s -> %w", modelListURL, lastErr)
+	}
 	thinking := make(map[string]qoderThinking, len(models))
 	for _, model := range models {
 		if len(model.thinking.efforts) > 0 || model.thinking.canDisable {
@@ -347,7 +379,7 @@ func parseQoderModels(resp map[string]interface{}) []QoderModel {
 	seen := map[string]bool{}
 	for _, raw := range primary {
 		m, _ := raw.(map[string]interface{})
-		seen[strings.TrimSpace(StrVal(m, "key"))] = true
+		seen[systemCatalogKey(m)] = true
 	}
 	app, _ := resp["app"].([]interface{})
 	for _, raw := range app {
@@ -355,7 +387,7 @@ func parseQoderModels(resp map[string]interface{}) []QoderModel {
 		if !ok {
 			continue
 		}
-		key := strings.TrimSpace(StrVal(m, "key"))
+		key := systemCatalogKey(m)
 		enabled, _ := m["enable"].(bool)
 		if key == "" || key == "auto" || key == "default" || seen[key] || !enabled {
 			continue
@@ -364,6 +396,14 @@ func parseQoderModels(resp map[string]interface{}) []QoderModel {
 		seen[key] = true
 	}
 	return extractModels(merged)
+}
+
+func systemCatalogKey(m map[string]any) string {
+	if source := m["source"]; source != nil && source != "" && source != "system" {
+		return ""
+	}
+	key, _ := m["key"].(string)
+	return strings.TrimSpace(key)
 }
 
 func extractModels(rawList []interface{}) []QoderModel {
@@ -377,12 +417,13 @@ func extractModels(rawList []interface{}) []QoderModel {
 		if v, present := m["enable"]; present {
 			enable, _ = v.(bool)
 		}
-		if !enable {
+		key := systemCatalogKey(m)
+		if !enable || key == "" {
 			continue
 		}
 		model := QoderModel{
 			thinking:       readThinkingConfig(m),
-			Key:            StrVal(m, "key"),
+			Key:            key,
 			DisplayName:    StrVal(m, "display_name"),
 			Enable:         enable,
 			IsDefault:      func() bool { v, _ := m["is_default"].(bool); return v }(),

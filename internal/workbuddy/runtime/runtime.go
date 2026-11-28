@@ -34,6 +34,7 @@ type Streamer interface {
 // Runtime owns the mutable WorkBuddy resources for exactly one gateway.
 // AccountMu coordinates import/delete with the gateway's ownership transaction.
 type Runtime struct {
+	chatSignatures   chatSignatureStore
 	MediaClient      *http.Client
 	creditMu         sync.Mutex
 	maintenanceGuard *provider.MaintenanceGuard

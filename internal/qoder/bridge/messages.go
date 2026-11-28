@@ -224,6 +224,7 @@ func orderToolAttachments(messages []interface{}) []interface{} {
 //     tool 没有 assistant 可配对），所以 developer→system 时连 tool_calls 一起
 //     摘掉（系统消息本就不该发起工具调用，摘掉不丢信息）。
 func normalizeOutboundMessages(msgs []interface{}) []interface{} {
+	firstSystem := true
 	for i, m := range msgs {
 		mm, ok := m.(map[string]interface{})
 		if !ok {
@@ -231,8 +232,14 @@ func normalizeOutboundMessages(msgs []interface{}) []interface{} {
 		}
 		if role, _ := mm["role"].(string); role == "system" || role == "developer" {
 			if text, ok := mm["content"].(string); ok {
+				if firstSystem {
+					for _, marker := range []string{"You are an AI agent powered by DeepSeek Harness.", "You are Claude Code,", "You are Codex,", "You are Kimi "} {
+						text = strings.ReplaceAll(text, marker, "[redacted: client identity]")
+					}
+				}
 				mm["content"] = compatibleSystemText(text)
 			}
+			firstSystem = false
 		}
 		// content 修正必须在摘 tool_calls 之前：摘掉后判据永远不成立
 		if mm["tool_calls"] != nil && mm["content"] == nil {

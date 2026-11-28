@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 	"work2api/internal/qoder/account"
 	"work2api/internal/qoder/cosy"
@@ -64,5 +66,75 @@ func TestAppHeaderAndBodyVersionStayTogether(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestCatalogClientViewsPreserveModelsAndChatIdentity(t *testing.T) {
+	original := http.DefaultTransport
+	defer func() { http.DefaultTransport = original }()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("cosy-clienttype") {
+		case "0":
+			fmt.Fprint(w, `{"chat":[{"key":"hmodel","display_name":"HungerG","enable":true,"price_factor":0,"is_vl":true}]}`)
+		case "5":
+			fmt.Fprint(w, `{"chat":[{"key":"hmodel","enable":true,"price_factor":9},{"key":"old","enable":true}]}`)
+		case "10":
+			w.WriteHeader(503)
+		default:
+			t.Error("unknown view")
+		}
+	}))
+	defer server.Close()
+	target, _ := url.Parse(server.URL)
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	http.DefaultTransport = catalogTestTransport(func(req *http.Request) (*http.Response, error) {
+		clone := req.Clone(req.Context())
+		clone.URL.Scheme = "http"
+		clone.URL.Host = target.Host
+		return transport.RoundTrip(clone)
+	})
+	sess, _ := cosy.NewSession(cosy.AuthIdentity{Uid: "fixture"}, "fixture", "fixture", "windows")
+	c := NewBearerClient(sess)
+	c.fingerprint = &account.CheckinFingerprint{MachineID: "device", MachineToken: "token", MachineType: "windows"}
+	b := &Bridge{client: c, region: account.RegionCN}
+	models, err := b.ListAvailableModelsContext(t.Context())
+	if err != nil || len(models) != 2 || models[0].Key != "hmodel" || models[0].PriceFactor == nil || *models[0].PriceFactor != 0 {
+		t.Fatal(models, err)
+	}
+	headers, _ := c.buildHeaders("/chat", "", "application/json", nil)
+	if headers["cosy-clienttype"] != "10" || headers["cosy-machineid"] != "device" {
+		t.Fatal("chat identity changed")
+	}
+}
+
+type catalogTestTransport func(*http.Request) (*http.Response, error)
+
+func (f catalogTestTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestCatalogEmptyAndFailedViewDoesNotEraseModels(t *testing.T) {
+	original := http.DefaultTransport
+	defer func() { http.DefaultTransport = original }()
+	primary, failed := `{"chat":[]}`, true
+	http.DefaultTransport = catalogTestTransport(func(req *http.Request) (*http.Response, error) {
+		status, body := 200, primary
+		if req.Header.Get("cosy-clienttype") == "5" {
+			body = `{"assistant":[]}`
+			if failed {
+				status, body = 503, `{"message":"unavailable"}`
+			}
+		}
+		return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+	})
+	sess, _ := cosy.NewSession(cosy.AuthIdentity{Uid: "fixture"}, "fixture", "fixture", "windows")
+	bridge := &Bridge{client: NewBearerClient(sess), region: account.RegionCN}
+	for _, view := range []string{primary, `{"chat":[{"key":"kmodel"},{"key":"private","source":"custom"},{"key":" "}]}`} {
+		primary = view
+		if models, err := bridge.ListAvailableModelsContext(t.Context()); err == nil || len(models) != 0 {
+			t.Fatal("partial empty directory published", err, models)
+		}
+	}
+	failed = false
+	if models, err := bridge.ListAvailableModelsContext(t.Context()); err != nil || len(models) != 0 {
+		t.Fatal("confirmed empty directory changed", err, models)
 	}
 }

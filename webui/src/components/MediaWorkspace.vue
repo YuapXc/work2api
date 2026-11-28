@@ -13,7 +13,7 @@ const keys = ref<Row[]>([]), keyID = ref(''), token = ref(''), models = ref<Row[
 const imageParameters = ref('{}')
 const decisionBody = ref('{\n  "state": "",\n  "questions": []\n}')
 const route=useRoute()
-const mode = ref(['image','edit','video','transcription','decision'].includes(String(route.query.mode))?String(route.query.mode):'image'), prompt = ref(''), negative = ref(''), size = ref('1024x1024'), quantity = ref(1)
+const mode = ref(['image','edit','video','transcription','speech','decision'].includes(String(route.query.mode))?String(route.query.mode):'image'), prompt = ref(''), negative = ref(''), size = ref('1024x1024'), quantity = ref(1)
 const seconds = ref(''), resolution = ref(''), ratio = ref(''), audio = ref(true)
 const first = ref(''), last = ref(''), references = ref({ images: '', videos: '', audios: '' }), audioURL = ref('')
 const uploadImages = ref<string[]>([]), audioFile = ref<File | null>(null)
@@ -25,12 +25,14 @@ let listFlight: object | null = null
 const tasks = ref<Row[]>([]), selected = ref<Row | null>(null), error = ref(''), loading = ref(true), submitting = ref(false), querying = ref(false)
 const model = computed(() => models.value.find(m => m.id === modelID.value))
 const config = computed(() => model.value?.video_generation || {})
-const tag = computed(() => ({image:'text-to-image',edit:'image-to-image',video:'text-to-video',transcription:'audio-to-text'} as Row)[mode.value])
+const tag = computed(() => ({image:'text-to-image',edit:'image-to-image',video:'text-to-video',transcription:'audio-to-text',speech:'text-to-audio'} as Row)[mode.value])
 const available = computed(() => models.value.filter(m => mode.value==='decision' ? m.native_protocol==='systemone' : (m.media_tags || []).includes(tag.value) || mode.value === 'video' && (m.media_tags || []).includes('image-to-video')))
 const modelOptions = computed(() => available.value.map(m => ({value:m.id,label:m.name || m.id})))
 const keyOptions = computed(() => keys.value.map(k => ({value:String(k.id),label:k.name})))
 const isVideo = computed(() => mode.value === 'video')
-const mediaOptions = [{value:'image',label:'图片生成'},{value:'edit',label:'图片编辑'},{value:'video',label:'视频生成'},{value:'transcription',label:'音频转写'},{value:'decision',label:'结构化决策'}]
+const fileOnly = computed(() => model.value?.capability_source === 'official_desktop_protocol' && mode.value === 'transcription')
+function releaseAudio() { if (selected.value?.speech_url) URL.revokeObjectURL(selected.value.speech_url) }
+const mediaOptions = [{value:'image',label:'图片生成'},{value:'edit',label:'图片编辑'},{value:'video',label:'视频生成'},{value:'transcription',label:'音频转写'},{value:'speech',label:'文本转语音'},{value:'decision',label:'结构化决策'}]
 let epoch = 0, mounted = true, ticker: ReturnType<typeof setInterval> | undefined, controller: AbortController | null = null
 let confirmingSubmission = false
 const requests = new Set<AbortController>()
@@ -42,12 +44,17 @@ const date = (n: number) => new Date(n * 1000).toLocaleString()
 const safeURL = (s: unknown) => typeof s === 'string' && (s.startsWith('https://') || /^data:image\/(png|jpeg|webp);base64,/.test(s)) ? s : ''
 const results = computed<Row[]>(() => (selected.value?.data || []).map((v: Row) => ({...v, src:safeURL(v.url) || (typeof v.b64_json === 'string' ? `data:image/png;base64,${v.b64_json}` : '')})).filter((v: Row) => v.src))
 async function request(path: string, body?: unknown, signal?: AbortSignal) {
- const key = token.value
+ const key = token.value, requestEpoch = epoch
  if (!key) throw new Error('请先选择可查看的 API Key')
  const abort = new AbortController(); requests.add(abort)
  const stop = () => abort.abort(); signal?.addEventListener('abort', stop, {once:true})
  try {
   const res = await fetch(path,{method:body === undefined ? 'GET':'POST',headers:{Authorization:`Bearer ${key}`,...(body instanceof FormData ? {} : {'Content-Type':'application/json'})},body:body === undefined ? undefined : body instanceof FormData ? body : JSON.stringify(body),signal:abort.signal,credentials:'omit'})
+  if (res.ok && res.headers.get('Content-Type')?.startsWith('audio/')) {
+   const blob = await res.blob()
+   if (!mounted || requestEpoch !== epoch) throw new DOMException('请求已切换','AbortError')
+   return {id:res.headers.get('X-Media-Task-Id'),status:'completed',speech_url:URL.createObjectURL(blob),result_ephemeral:true}
+  }
   const data = await res.json().catch(() => null)
   if (!res.ok) throw new Error(data?.error?.message || data?.msg || `请求失败（HTTP ${res.status}）`)
   if (!data) throw new Error('服务返回了无效响应')
@@ -85,6 +92,7 @@ async function openTask(task: Row, quiet = false) {
  finally { if (current === epoch) querying.value = false }
 }
 async function chooseKey() {
+ releaseAudio()
  const current = ++epoch
  for (const abort of requests) abort.abort()
  listFlight = null; listBusy.value = false; querying.value = false
@@ -102,9 +110,10 @@ async function chooseKey() {
  } catch (e: any) { if (mounted && current === epoch) error.value = e.message }
  finally { if (mounted && current === epoch) { loading.value = false; await refresh().catch((e: Error) => { if (mounted && current === epoch) error.value = e.message }) } }
 }
+watch(selected,(next,previous)=>{if(previous?.speech_url && previous.speech_url!==next?.speech_url) URL.revokeObjectURL(previous.speech_url)})
 watch(keyID,chooseKey)
-watch(mode,() => { modelID.value = available.value[0]?.id || ''; uploadImages.value = []; audioFile.value = null; selected.value = null })
-watch(modelID,() => { const c = config.value; seconds.value = String(c.defaultSeconds || ''); resolution.value = c.defaultResolution || ''; ratio.value = c.defaultAspectRatio || ''; audio.value = c.defaultEnableAudio ?? true; first.value = ''; last.value = ''; references.value = {images:'',videos:'',audios:''} })
+watch(mode,() => { releaseAudio(); modelID.value = available.value[0]?.id || ''; uploadImages.value = []; audioFile.value = null; selected.value = null })
+watch(modelID,() => { releaseAudio(); selected.value=null; const c = config.value; seconds.value = String(c.defaultSeconds || ''); resolution.value = c.defaultResolution || ''; ratio.value = c.defaultAspectRatio || ''; audio.value = c.defaultEnableAudio ?? true; first.value = ''; last.value = ''; references.value = {images:'',videos:'',audios:''} })
 async function imagesChanged(event: Event) {
  const files = [...((event.target as HTMLInputElement).files || [])]
  const current = epoch
@@ -167,14 +176,16 @@ async function submit() {
    for (const [key,value] of Object.entries(references.value)) if (lines(value).length) body[`reference_${key}`] = lines(value)
   }
   if (mode.value === 'decision') {path='/v1/systemone';body={...JSON.parse(decisionBody.value),model:modelID.value,stream:false}}
+  if (mode.value === 'speech') {path='/v1/audio/speech';body={model:modelID.value,input:prompt.value,response_format:'wav'}}
   if (mode.value === 'transcription') {
    path='/v1/audio/transcriptions'
    if (audioFile.value) {const form=new FormData();form.set('model',modelID.value);form.set('async','true');form.set('file',audioFile.value);body=form}
    else body={model:modelID.value,audio_url:audioURL.value,async:true}
   }
   const result = await request(path,body,controller.signal)
-  if (current !== epoch || !mounted) return
-  selected.value={...result,...(mode.value==='decision'?{decision:result}:{}),kind:isVideo.value?'video':mode.value==='transcription'?'audio':mode.value==='decision'?'decision':'image',model:modelID.value,status:result.status || 'completed'}
+  if (current !== epoch || !mounted) { if(result.speech_url) URL.revokeObjectURL(result.speech_url); return }
+  releaseAudio()
+  selected.value={...result,...(mode.value==='decision'?{decision:result}:{}),kind:isVideo.value?'video':(mode.value==='transcription' || mode.value==='speech')?'audio':mode.value==='decision'?'decision':'image',model:modelID.value,status:result.status || 'completed'}
   await refresh()
  } catch (e: any) {if (current === epoch) error.value = e.name === 'AbortError' ? '请求等待已停止，上游任务可能仍在执行。请刷新任务记录，不要重复提交。' : e.message}
  finally {submitting.value=false;controller=null}
@@ -184,10 +195,10 @@ onMounted(async()=>{try {const result=await props.loadKeys();if(!mounted)return;
  if(!keyID.value)loading.value=false
  ticker=setInterval(()=>{if(!document.hidden && !submitting.value && token.value) { if(selected.value?.id && pollable(selected.value)) void openTask(selected.value,true); else if(tasks.value.some(pollable)) void refresh(0,true).catch(()=>{}) }},6000)
 })
-onBeforeUnmount(()=>{mounted=false;epoch++;clearInterval(ticker);controller?.abort();for(const abort of requests)abort.abort();token.value='';uploadImages.value=[]})
+onBeforeUnmount(()=>{releaseAudio();mounted=false;epoch++;clearInterval(ticker);controller?.abort();for(const abort of requests)abort.abort();token.value='';uploadImages.value=[]})
 </script>
 <template>
- <WPage title="非聊天工作台" sub="图片、视频、音频转写与结构化决策，沿用现有模型权限。">
+ <WPage title="非聊天工作台" sub="图片、视频、语音合成与转写、结构化决策，沿用现有模型权限。">
   <div class="mb-4 flex flex-wrap gap-3 items-center"><WSelect v-model="keyID" :options="keyOptions" placeholder="选择 API Key" class="w-full sm:w-64" :disabled="submitting || uploading || reading"/><WSelect v-model="mode" :options="mediaOptions" aria-label="工作台模式" class="w-full sm:w-44" :disabled="submitting || uploading || reading"/><span class="text-micro text-faint">消费按上游实际结算</span></div>
   <p v-if="error" role="alert" class="mb-4 rounded-xl border border-fault/30 bg-fault/5 p-3 text-small text-fault break-words">{{error}}</p>
   <p v-if="!keys.length && loading" class="text-small text-muted" role="status">正在读取 API Key…</p>
@@ -199,7 +210,7 @@ onBeforeUnmount(()=>{mounted=false;epoch++;clearInterval(ticker);controller?.abo
     <p v-else-if="!available.length && !error && token" class="text-small text-muted">当前 Key 没有此类模型权限，请切换 Key 或请管理员授权。</p>
     <template v-if="model">
      <p v-if="model.capability_source==='official_cli_protocol'" class="text-micro text-faint">官方 CLI 专用转写能力，价格由任务结果返回。</p>
-     <label v-if="mode!=='transcription' && mode!=='decision'" class="media-field"><span>提示词</span><textarea v-model="prompt" rows="4" class="media-input resize-y" :required="!isVideo || (!first && !references.images && !references.videos)" :disabled="submitting || uploading" placeholder="描述希望生成或修改的内容"/></label>
+     <label v-if="mode!=='transcription' && mode!=='decision'" class="media-field"><span>{{mode==='speech'?'朗读文本':'提示词'}}</span><textarea v-model="prompt" rows="4" class="media-input resize-y" :required="!isVideo || (!first && !references.images && !references.videos)" :disabled="submitting || uploading" placeholder="描述希望生成或修改的内容"/></label>
      <div v-if="mode==='image' || mode==='edit'" class="grid grid-cols-2 gap-3"><label class="media-field"><span>尺寸</span><input v-model="size" class="media-input" placeholder="1024x1024" :disabled="submitting || uploading"/></label><label class="media-field"><span>数量</span><input v-model.number="quantity" type="number" min="1" step="1" required class="media-input" :disabled="submitting || uploading"/></label></div>
      <details v-if="mode==='image' || mode==='edit'" class="border-t border-line pt-3"><summary class="cursor-pointer text-small text-muted">高级图片参数</summary><label class="media-field mt-3"><span>可选参数（JSON）</span><textarea v-model="imageParameters" rows="3" class="media-input mono resize-y" :disabled="submitting || uploading"/><span class="text-micro text-faint">quality、style、background、footnote、revise、input_fidelity、response_format，具体支持情况以模型为准。</span></label></details>
      <label v-if="mode==='edit'" class="media-field"><span>原始图片</span><input type="file" accept="image/*" multiple required class="media-input" :disabled="submitting || uploading || reading" @change="imagesChanged"/><span class="text-micro text-faint">已选择 {{uploadImages.length}} 张</span></label>
@@ -214,7 +225,7 @@ onBeforeUnmount(()=>{mounted=false;epoch++;clearInterval(ticker);controller?.abo
       </div></details>
      </template>
      <label v-if="mode==='decision'" class="media-field"><span>决策请求（JSON）</span><textarea v-model="decisionBody" rows="10" class="media-input mono resize-y" :disabled="submitting || uploading" required/></label>
-     <template v-if="mode==='transcription'"><label class="media-field"><span>上传音频或视频</span><input type="file" accept="audio/*,video/*" class="media-input" :disabled="submitting || uploading" @change="audioFile=($event.target as HTMLInputElement).files?.[0] || null"/></label><label class="media-field"><span>或使用音频地址</span><input v-model="audioURL" type="url" placeholder="https://…" class="media-input" :disabled="submitting || !!audioFile" :required="!audioFile"/></label></template>
+     <template v-if="mode==='transcription'"><label class="media-field"><span>{{fileOnly?'上传音频':'上传音频或视频'}}</span><input type="file" :accept="fileOnly?'audio/*':'audio/*,video/*'" :required="fileOnly" class="media-input" :disabled="submitting || uploading" @change="audioFile=($event.target as HTMLInputElement).files?.[0] || null"/></label><label v-if="!fileOnly" class="media-field"><span>或使用音频地址</span><input v-model="audioURL" type="url" placeholder="https://…" class="media-input" :disabled="submitting || !!audioFile" :required="!audioFile"/></label></template>
      <p v-if="uploading || reading" class="text-micro text-muted" role="status">{{ uploading ? '正在上传参考素材…' : '正在读取图片…' }}</p><div class="flex flex-wrap items-center gap-3 border-t border-line pt-4"><WButton type="submit" :loading="submitting" :disabled="loading || uploading || reading || !modelID">{{mode==='transcription'?'开始转写':mode==='decision'?'提交决策':'开始生成'}}</WButton><WButton v-if="submitting" variant="ghost" @click="controller?.abort()">停止等待</WButton></div>
      <p class="text-micro text-faint leading-relaxed">停止等待不会取消已受理的上游任务。遇到超时请先查看任务记录，避免重复扣费。</p>
     </template>
@@ -225,6 +236,7 @@ onBeforeUnmount(()=>{mounted=false;epoch++;clearInterval(ticker);controller?.abo
      <template v-else><div class="flex flex-wrap gap-x-4 gap-y-1 text-micro text-muted mb-3"><span class="break-all">{{selected.model}}</span><span v-if="selected.usage?.credit!=null">消耗 {{selected.usage.credit}} 积分</span><span v-if="selected.usage?.output_video_duration">实际时长 {{selected.usage.output_video_duration}} 秒</span></div>
       <p v-if="selected.error" class="text-small text-fault break-words mb-3">{{typeof selected.error==='string'?selected.error:selected.error.message}}</p>
       <pre v-if="selected.decision" class="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words rounded-xl border border-line bg-bg/40 p-4 mono text-small text-ink">{{JSON.stringify(selected.decision,null,2)}}</pre>
+      <div v-if="selected.speech_url" class="space-y-3 rounded-xl border border-line bg-bg/40 p-4"><audio :src="selected.speech_url" controls preload="metadata" class="w-full" aria-label="生成的语音"/><a :href="selected.speech_url" download="speech.wav" class="text-small text-brand">下载 WAV 音频</a></div>
       <pre v-if="selected.text!=null" class="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words rounded-xl border border-line bg-bg/40 p-4 text-small text-ink">{{selected.text}}</pre>
       <div class="grid gap-4" :class="results.length>1?'sm:grid-cols-2':''"><figure v-for="(item,i) in results" :key="i" class="min-w-0 rounded-xl border border-line overflow-hidden"><video v-if="selected.kind==='video' || selected.object==='video'" :src="item.src" controls preload="none" class="max-h-[32rem] w-full bg-bg"/><img v-else :src="item.src" referrerpolicy="no-referrer" class="max-h-[32rem] w-full object-contain bg-bg" :alt="`生成图片 ${i+1}`" loading="lazy"/><figcaption class="p-2 text-right"><a :href="item.src" target="_blank" rel="noopener noreferrer" class="text-small text-brand">打开原始文件</a></figcaption></figure></div>
       <p v-if="selected.result_cleared" class="text-small text-muted mt-3">结果已按正文保留策略清理，任务状态和消费记录仍保留。</p>
@@ -233,7 +245,7 @@ onBeforeUnmount(()=>{mounted=false;epoch++;clearInterval(ticker);controller?.abo
       <p class="text-micro text-faint mt-3">产物链接可能过期，请及时保存。媒体实际计费不按聊天 Tokens 推算。</p>
      </template>
     </section>
-    <section class="rounded-2xl border border-line bg-surface overflow-hidden"><div class="flex items-center justify-between gap-3 p-4"><h2 class="font-semibold text-ink">当前 Key 的任务</h2><WButton size="sm" variant="ghost" :disabled="!token || loading || listBusy" @click="refresh().catch(e=>error=e.message)">刷新</WButton></div><WEmpty v-if="!tasks.length" title="暂无任务" hint="提交后的任务会保留在这里，可在重新打开页面后查询。"/><div v-else class="divide-y divide-line max-h-[32rem] overflow-y-auto"><button v-for="task in tasks" :key="task.id" type="button" class="grid w-full grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-1 px-4 py-3 text-left hover:bg-elevated focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand" :disabled="querying" @click="openTask(task)"><span class="truncate text-small text-ink">{{task.model}}</span><span class="text-micro whitespace-nowrap" :class="task.status==='completed'?'text-live':task.status==='failed'?'text-fault':'text-muted'">{{stateName(task.status)}}</span><span class="text-micro text-faint">{{date(task.created_at)}}</span><span class="text-micro text-faint">{{ {image:'图片',video:'视频',audio:'转写'}[task.kind as 'image'|'video'|'audio'] }}</span><span v-if="task.check_message" class="col-span-2 text-micro text-warn break-words">{{ task.check_message }}</span></button></div><div v-if="nextBefore" class="p-3 border-t border-line"><WButton size="sm" variant="ghost" :disabled="listBusy" @click="refresh(nextBefore).catch(e=>error=e.message)">加载更早任务</WButton></div></section>
+    <section class="rounded-2xl border border-line bg-surface overflow-hidden"><div class="flex items-center justify-between gap-3 p-4"><h2 class="font-semibold text-ink">当前 Key 的任务</h2><WButton size="sm" variant="ghost" :disabled="!token || loading || listBusy" @click="refresh().catch(e=>error=e.message)">刷新</WButton></div><WEmpty v-if="!tasks.length" title="暂无任务" hint="提交后的任务会保留在这里，可在重新打开页面后查询。"/><div v-else class="divide-y divide-line max-h-[32rem] overflow-y-auto"><button v-for="task in tasks" :key="task.id" type="button" class="grid w-full grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-1 px-4 py-3 text-left hover:bg-elevated focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand" :disabled="querying" @click="openTask(task)"><span class="truncate text-small text-ink">{{task.model}}</span><span class="text-micro whitespace-nowrap" :class="task.status==='completed'?'text-live':task.status==='failed'?'text-fault':'text-muted'">{{stateName(task.status)}}</span><span class="text-micro text-faint">{{date(task.created_at)}}</span><span class="text-micro text-faint">{{ {image:'图片',video:'视频',audio:'音频'}[task.kind as 'image'|'video'|'audio'] }}</span><span v-if="task.check_message" class="col-span-2 text-micro text-warn break-words">{{ task.check_message }}</span></button></div><div v-if="nextBefore" class="p-3 border-t border-line"><WButton size="sm" variant="ghost" :disabled="listBusy" @click="refresh(nextBefore).catch(e=>error=e.message)">加载更早任务</WButton></div></section>
    </div>
   </div>
  </WPage>

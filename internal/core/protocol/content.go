@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"strings"
 
@@ -308,7 +309,17 @@ func encodeAnthropicBlocks(blocks []bridgeBlock) []any {
 		case "tool_call":
 			input := block.Arguments
 			if input == nil {
-				input = jsonutil.ParseJSONOrString(block.ArgumentsJSON)
+				if block.ArgumentsJSON == "" {
+					input = map[string]any{}
+				} else {
+					decoder := json.NewDecoder(strings.NewReader(block.ArgumentsJSON))
+					decoder.UseNumber()
+					if err := decoder.Decode(&input); err != nil {
+						input = block.ArgumentsJSON
+					} else if decoder.Decode(new(any)) != io.EOF {
+						input = block.ArgumentsJSON
+					}
+				}
 			}
 			parts = append(parts, map[string]any{"type": "tool_use", "id": block.ID, "name": block.Name, "input": input})
 		case "tool_result":

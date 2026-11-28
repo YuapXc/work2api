@@ -17,3 +17,11 @@ type MediaProvider interface {
 type MediaUploader interface {
 	UploadMedia(context.Context, MediaRequest, map[string]any) (string, error)
 }
+
+type AudioResponse struct {
+	Data        []byte
+	ContentType string
+}
+type AudioProvider interface {
+	CallAudio(context.Context, MediaRequest) (AudioResponse, error)
+}

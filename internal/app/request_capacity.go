@@ -14,6 +14,7 @@ import (
 type bufferedRequestBody struct {
 	mu       sync.Mutex
 	reader   *bytes.Reader
+	raw      []byte
 	budget   *bodyBudget
 	reserved int64
 }
@@ -30,6 +31,7 @@ func (b *bufferedRequestBody) Read(p []byte) (int, error) {
 func (b *bufferedRequestBody) Close() error {
 	b.mu.Lock()
 	b.reader = nil
+	b.raw = nil
 	reserved := b.reserved
 	b.reserved = 0
 	b.mu.Unlock()
@@ -40,7 +42,7 @@ func (b *bufferedRequestBody) Close() error {
 }
 
 func isModelRoute(r *http.Request) bool {
-	return r.Method == "POST" && (r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/responses" || r.URL.Path == "/v1/systemone" || r.URL.Path == "/v1/images/generations" || r.URL.Path == "/v1/images/edits" || r.URL.Path == "/v1/videos" || r.URL.Path == "/v1/audio/transcriptions")
+	return r.Method == "POST" && (r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/responses" || r.URL.Path == "/v1/systemone" || r.URL.Path == "/v1/images/generations" || r.URL.Path == "/v1/images/edits" || r.URL.Path == "/v1/videos" || r.URL.Path == "/v1/audio/transcriptions" || r.URL.Path == "/v1/audio/speech")
 }
 
 func isRefresh(r *http.Request) bool {

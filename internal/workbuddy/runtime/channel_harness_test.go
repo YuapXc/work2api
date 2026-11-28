@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"work2api/internal/core/provider"
 	"work2api/internal/toolschema"
 	"work2api/internal/workbuddy/adapters"
 	"work2api/internal/workbuddy/credentials"
@@ -606,4 +608,74 @@ func TestAssistantDeclarationCompatibilityPreservesBusinessContent(t *testing.T)
 			t.Fatal("ordinary history changed", text)
 		}
 	}
+}
+
+func TestLiveDomesticSpeechAndTranscription(t *testing.T) {
+	if os.Getenv("WORK2API_LIVE_CN_AUDIO") != "1" {
+		t.Skip("explicit domestic audio verification only")
+	}
+	var candidates []*credentials.Manager
+	for _, file := range append(credentials.FindAuthFiles(filepath.Join("..", "..", "..", "auths"), ""), credentials.FindAuthFiles("", "")...) {
+		m := credentials.NewManager(file)
+		if siterouting.ProfileSite(m.Profile()) == siterouting.Domestic {
+			if m.Profile() == "cn-work" {
+				candidates = append([]*credentials.Manager{m}, candidates...)
+			} else {
+				candidates = append(candidates, m)
+			}
+		}
+	}
+	var mgr *credentials.Manager
+	for _, m := range candidates {
+		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+		_, err := m.GetHeadersContext(ctx)
+		cancel()
+		if err == nil {
+			mgr = m
+			break
+		}
+	}
+	if mgr == nil {
+		t.Fatal("domestic credential unavailable")
+	}
+	summary := mgr.Summary()
+	uid, _ := summary["uid"].(string)
+	r := &Runtime{Managers: map[string]*credentials.Manager{uid: mgr}, Pool: pool.New(map[string]pool.Credential{uid: mgr}, "")}
+	client := *defaultMediaClient
+	base := client.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	counts := map[string]int{}
+	client.Transport = maintenanceTransport(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/agenttool/v1/tts" && req.URL.Path != "/agenttool/v1/asr" {
+			return nil, fmt.Errorf("unexpected audio route")
+		}
+		counts[req.URL.Path]++
+		if counts[req.URL.Path] > 1 {
+			return nil, fmt.Errorf("one call per audio route")
+		}
+		return base.RoundTrip(req)
+	})
+	r.MediaClient = &client
+	payload, _ := audioBody("speech", speechModel, map[string]any{"input": "你好，这是语音接口验证。", "response_format": "wav"})
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Second)
+	defer cancel()
+	start := time.Now()
+	speech, err := r.CallAudio(ctx, provider.MediaRequest{Operation: "speech", Model: speechModel, AccountID: uid, Payload: payload})
+	if err != nil {
+		t.Fatalf("domestic TTS: %v", err)
+	}
+	t.Logf("domestic_audio speech=true bytes=%d elapsed_ms=%d profile=%s", len(speech.Data), time.Since(start).Milliseconds(), mgr.Profile())
+	payload, _ = audioBody("transcription", transcribeModel, map[string]any{"audio_data": map[string]any{"raw": speech.Data, "mime": "audio/wav", "name": "verification.wav"}})
+	start = time.Now()
+	transcript, err := r.CallAudio(ctx, provider.MediaRequest{Operation: "transcription", Model: transcribeModel, AccountID: uid, Payload: payload})
+	if err != nil {
+		t.Fatalf("domestic ASR: %v", err)
+	}
+	var result map[string]string
+	if json.Unmarshal(transcript.Data, &result) != nil || strings.TrimSpace(result["text"]) == "" {
+		t.Fatal("empty transcript")
+	}
+	t.Logf("domestic_audio transcription=true characters=%d elapsed_ms=%d", len([]rune(result["text"])), time.Since(start).Milliseconds())
 }

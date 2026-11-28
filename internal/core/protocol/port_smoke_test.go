@@ -2028,7 +2028,7 @@ func TestPortableCallIDsAndLateInstructions(t *testing.T) {
 			}
 		}
 	}
-	if len(call) != 64 || call != result || call != boundCallID(long) || boundCallID("short") != "short" {
+	if len(call) != 64 || call != result || call != BoundCallID(long) || BoundCallID("short") != "short" {
 		t.Fatal("tool links not stable", call, result)
 	}
 	chat, err := ConvertRequest(Responses, Chat, responses)
@@ -2067,5 +2067,26 @@ func TestPortableCallIDsAndLateInstructions(t *testing.T) {
 	foreign := []byte(`{"error":{"message":"Item was created under a different resource"}}`)
 	if recovered, ok := RecoverResponseIDs(body, foreign, 400); !ok || bytes.Contains(recovered, []byte(long)) {
 		t.Fatal("foreign-resource recovery left incompatible call links", string(recovered))
+	}
+}
+
+func TestResponsesObjectArgumentsPreserveContract(t *testing.T) {
+	for _, value := range []any{map[string]any{"value": "keep", "large": json.Number("9007199254740993")}, `{"value":"keep","large":9007199254740993}`} {
+		input := map[string]any{"model": "m", "input": []any{map[string]any{"type": "function_call", "call_id": "a", "name": "echo", "arguments": value}, map[string]any{"type": "function_call_output", "call_id": "a", "output": "ok"}}}
+		before, _ := json.Marshal(input)
+		for _, to := range []Protocol{Chat, Anthropic} {
+			out, err := ConvertRequest(Responses, to, input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, _ := json.Marshal(out)
+			if !bytes.Contains(raw, []byte("9007199254740993")) || !bytes.Contains(raw, []byte("keep")) {
+				t.Fatal("arguments lost", string(raw))
+			}
+		}
+		after, _ := json.Marshal(input)
+		if !bytes.Equal(before, after) {
+			t.Fatal("input changed")
+		}
 	}
 }

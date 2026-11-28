@@ -1,12 +1,15 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1140,5 +1143,86 @@ func TestSystemOnePublicRoutePreservesDecisionPayload(t *testing.T) {
 	h.ServeHTTP(w, r)
 	if w.Code != 200 || !strings.Contains(w.Body.String(), `"state":"keep"`) || !strings.Contains(w.Body.String(), `"questions"`) {
 		t.Fatal(w.Code, w.Body.String())
+	}
+}
+
+func TestSpeechHTTPUsesModelPermissionsAndTaskOwnership(t *testing.T) {
+	o, _ := newDNSFailoverOrch(t, &failingUpstream{})
+	o.wb.Catalog = models.NewWithCatalogClient(o.wb.Pool, o.db, &http.Client{Transport: catalogTransport{}})
+	o.wb.Catalog.Refresh()
+	var app *Server
+	sends := 0
+	o.wb.MediaClient = &http.Client{Transport: mediaAppTransport(func(req *http.Request) (*http.Response, error) {
+		if app.bodies.usage() != 0 {
+			t.Fatal("request body retained during audio dispatch")
+		}
+		sends++
+		body := "event: audio\ndata: AAAAAA==\n\nevent: done\ndata: {}\n\n"
+		if req.URL.Path == "/agenttool/v1/asr" {
+			reader, err := req.MultipartReader()
+			if err != nil {
+				t.Fatal(err)
+			}
+			part, err := reader.NextPart()
+			if err != nil || part.FormName() != "audio" {
+				t.Fatal("audio form lost")
+			}
+			body = `{"code":0,"text":"hello"}`
+		}
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	for _, key := range []string{"audio-owner", "audio-other"} {
+		if _, err := o.db.CreateApp(key, o.hashKey(key), "", "", "", `["workbuddy/workbuddy-tts","workbuddy/workbuddy-transcribe"]`, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := o.db.CreateApp("chat-only", o.hashKey("chat-only"), "", "", "", `["auto"]`, 0); err != nil {
+		t.Fatal(err)
+	}
+	app = NewServer(o)
+	h := app.Handler()
+	ask := func(path, key, body, kind string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "http://127.0.0.1"+path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+key)
+		req.Header.Set("Content-Type", kind)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w
+	}
+	w := ask("/v1/audio/speech", "chat-only", `{"model":"workbuddy/workbuddy-tts","input":"hello"}`, "application/json")
+	if w.Code != 403 || sends != 0 {
+		t.Fatal("speech permission bypassed", w.Code, w.Body.String())
+	}
+	w = ask("/v1/audio/speech", "audio-owner", `{"model":"workbuddy/workbuddy-tts","input":"hello","response_format":"mp3"}`, "application/json")
+	if w.Code != 400 || sends != 0 {
+		t.Fatal("unsupported format submitted", w.Code, w.Body.String())
+	}
+	w = ask("/v1/audio/speech", "audio-owner", `{"model":"workbuddy/workbuddy-tts","input":"hello"}`, "application/json")
+	if w.Code != 200 || w.Header().Get("Content-Type") != "audio/wav" || string(w.Body.Bytes()[:4]) != "RIFF" || sends != 1 {
+		t.Fatal("speech HTTP failed", w.Code, w.Body.String())
+	}
+	id := w.Header().Get("X-Media-Task-Id")
+	if id == "" {
+		t.Fatal("missing task")
+	}
+	request := httptest.NewRequest("GET", "http://127.0.0.1/v1/media/tasks/"+id, nil)
+	request.Header.Set("Authorization", "Bearer audio-other")
+	denied := httptest.NewRecorder()
+	h.ServeHTTP(denied, request)
+	if denied.Code != 404 {
+		t.Fatal("task crossed keys")
+	}
+	var form bytes.Buffer
+	writer := multipart.NewWriter(&form)
+	writer.WriteField("model", "workbuddy/workbuddy-transcribe")
+	header := textproto.MIMEHeader{}
+	header.Set("Content-Disposition", `form-data; name="file"; filename="voice.wav"`)
+	header.Set("Content-Type", "audio/wav")
+	part, _ := writer.CreatePart(header)
+	part.Write([]byte("RIFFfixture"))
+	writer.Close()
+	w = ask("/v1/audio/transcriptions", "audio-owner", form.String(), writer.FormDataContentType())
+	if w.Code != 200 || w.Body.String() != `{"text":"hello"}` || sends != 2 {
+		t.Fatal("transcription HTTP failed", w.Code, w.Body.String())
 	}
 }

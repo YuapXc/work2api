@@ -34,6 +34,8 @@ func (o *Runtime) PrepareMedia(ctx context.Context, operation string, payload ma
 	tag := "text-to-image"
 	kind := "image"
 	switch operation {
+	case "speech":
+		tag, kind = "text-to-audio", "audio"
 	case "transcription":
 		tag, kind = "audio-to-text", "audio"
 	case "image-edit":
@@ -109,6 +111,9 @@ func (o *Runtime) PrepareMedia(ctx context.Context, operation string, payload ma
 func buildMediaBody(operation, model string, payload, entry map[string]any) (map[string]any, error) {
 	bad := func(message string) (map[string]any, error) {
 		return nil, errBody(400, message, "invalid_request_error")
+	}
+	if model == speechModel || model == transcribeModel {
+		return audioBody(operation, model, payload)
 	}
 	if operation == "transcription" {
 		if format, ok := payload["response_format"]; ok && format != "json" && format != "text" {
@@ -456,8 +461,12 @@ var _ provider.MediaProvider = (*Runtime)(nil)
 func mediaArrayLen(v any) int { a, _ := v.([]any); return len(a) }
 
 func (o *Runtime) uploadMediaInput(ctx context.Context, endpoint string, headers map[string]string, input map[string]any) (string, error) {
-	encoded, _ := input["data"].(string)
-	data, err := base64.StdEncoding.DecodeString(encoded)
+	data, _ := input["raw"].([]byte)
+	var err error
+	if data == nil {
+		encoded, _ := input["data"].(string)
+		data, err = base64.StdEncoding.DecodeString(encoded)
+	}
 	if err != nil || len(data) == 0 {
 		return "", errBody(400, "音频文件无效", "invalid_request_error")
 	}

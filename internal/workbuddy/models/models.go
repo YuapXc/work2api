@@ -812,6 +812,22 @@ func (r *Registry) fetchOneContext(ctx context.Context, account *pool.Account) [
 			out = append(out, fetchedModel{id: "wb-asr", entry: builtin, reasoning: map[string]any{}, fresh: true})
 		}
 	}
+	if capable, ok := account.Mgr.(interface{ SupportsSpeech() bool }); ok && capable.SupportsSpeech() {
+		for _, spec := range [][3]string{{"workbuddy-tts", "文本转语音", "text-to-audio"}, {"workbuddy-transcribe", "语音输入转写", "audio-to-text"}} {
+			if _, exists := merged[spec[0]]; exists {
+				continue
+			}
+			builtin := entry(spec[0], spec[1], 0, 0)
+			builtin["model_type"], builtin["media_tags"], builtin["reasoning"] = "audio", []any{spec[2]}, map[string]any{}
+			builtin["profile"], builtin["capability_source"] = account.Profile, "official_desktop_protocol"
+			if spec[0] == "workbuddy-tts" {
+				builtin["response_formats"] = []any{"wav", "pcm"}
+			} else {
+				builtin["response_formats"] = []any{"json", "text"}
+			}
+			out = append(out, fetchedModel{id: spec[0], entry: builtin, reasoning: map[string]any{}, fresh: true})
+		}
+	}
 	costs := map[string]float64{}
 	for _, model := range out {
 		if cost, ok := model.entry["credits"].(float64); ok && cost >= 0 && !math.IsNaN(cost) && !math.IsInf(cost, 0) {
@@ -1010,6 +1026,17 @@ func withStandardFields(e map[string]any) map[string]any {
 		if kind == "audio" {
 			e["input_modalities"] = []string{"audio", "video"}
 			e["output_modalities"] = []string{"text"}
+		}
+		if kind == "audio" && e["capability_source"] == "official_desktop_protocol" {
+			e["input_modalities"] = []string{"audio"}
+		}
+		if tags, ok := e["media_tags"].([]any); ok {
+			for _, tag := range tags {
+				if tag == "text-to-audio" {
+					e["input_modalities"] = []string{"text"}
+					e["output_modalities"] = []string{"audio"}
+				}
+			}
 		}
 		return e
 	}

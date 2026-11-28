@@ -211,9 +211,9 @@ func convertInputItems(items []any, replayThinking bool) ([]any, error) {
 				id = randID("call_")
 			}
 			name, _ := item["name"].(string)
-			args, _ := item["arguments"].(string)
-			if args == "" {
-				args = "{}"
+			args, err := protocol.ResponseCallArguments(item["arguments"])
+			if err != nil {
+				return nil, err
 			}
 			pendingToolCalls = append(pendingToolCalls, map[string]any{
 				"id":       id,

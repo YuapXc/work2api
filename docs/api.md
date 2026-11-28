@@ -133,4 +133,17 @@ SystemOne 仅用于 OpenCode 目录标记为 `native_protocol=systemone` 的模�
 
 跨协议转换到 Chat 或 Responses 时，超过 64 字节的工具调用 ID 使用稳定映射，对应工具结果使用同一映射；正文、参数、短 ID 及上游返回的工具 ID 保持原值。原生 Responses 的明确 `input[n].call_id` 长度拒绝可触发既有一次输出前恢复，有 `previous_response_id` 时不改写未知的服务端前史关联。
 
+`/v1/responses` 接受 `function_call.arguments` 的标准 JSON 字符串，也兼容直接传入 JSON 对象等值。工具历史转换及按 `previous_response_id` 续接均保留参数中的大整数和小数写法，例如 `9007199254740993` 和 `2.0`。
+
 Chat 转 Messages 时，已发生回复或工具结果之后的系统／开发者提醒保留在原轮次，并以 `system-reminder` 内容表达；前导系统指令保留在顶层，避免后续提醒不断改变缓存前缀。原生 Chat 透传不提升或搬动这些消息。
+
+
+## WorkBuddy 语音
+
+`POST /v1/audio/speech` 使用 `workbuddy/workbuddy-tts`，JSON 参数包含 `model`、非空 `input` 和可选 `response_format`。默认返回 16 kHz、单声道、PCM16 的 WAV；`pcm` 返回 24 kHz 原始 PCM16。其他格式在发送前返回错误。上游使用固定声音，`voice`、`speed` 和 `instructions` 不改变合成结果。长文本按官方客户端规则分段，每段不超过 1000 UTF-8 字节。
+
+`MAX_RESPONSE_BYTES` 按最终音频大小计算。WAV 包含 44 字节文件头，PCM 按 24 kHz 采样后的字节数计算；上游传输音频所用的 Base64 和事件头不占这个额度。一次合成的所有分段共用同一账号凭据。
+
+`POST /v1/audio/transcriptions` 可使用 `workbuddy/workbuddy-transcribe`，以 multipart 的 `file` 上传音频，支持 `json` 或 `text`，同步返回识别结果。该接口不提供翻译和时间轴；`language`、`prompt` 不传给上游。原有 `workbuddy/wb-asr` 继续提供音频或视频的任务式转写。
+
+两种语音模型沿用 Key 白名单、账号范围和门户授权。未报告价格的语音模型不会自动授予免费使用权；未报告消费时保留未知。任务归属按 Key 隔离，转写文本沿用媒体结果保留时间。生成音频只在本次响应返回，工作台提供播放与下载，刷新前应下载文件。

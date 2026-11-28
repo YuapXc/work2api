@@ -101,6 +101,10 @@ func (c *BearerClient) callGet(fullURL string) (map[string]interface{}, error) {
 }
 
 func (c *BearerClient) callGetContext(ctx context.Context, fullURL string) (map[string]interface{}, error) {
+	return c.callCatalogGet(ctx, fullURL, "")
+}
+
+func (c *BearerClient) callCatalogGet(ctx context.Context, fullURL, clientType string) (map[string]interface{}, error) {
 	pathSig, err := PathSigFrom(fullURL)
 	if err != nil {
 		return nil, err
@@ -108,6 +112,9 @@ func (c *BearerClient) callGetContext(ctx context.Context, fullURL string) (map[
 	headers, err := c.buildHeaders(pathSig, "", "application/json", nil)
 	if err != nil {
 		return nil, err
+	}
+	if clientType != "" {
+		headers["cosy-clienttype"] = clientType
 	}
 	req, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
 	if err != nil {
@@ -122,14 +129,14 @@ func (c *BearerClient) callGetContext(ctx context.Context, fullURL string) (map[
 		return nil, err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, (8<<20)+1))
+	if readErr != nil || len(data) > 8<<20 {
+		return nil, fmt.Errorf("model directory response incomplete or too large")
+	}
 	if resp.StatusCode != 200 {
 		return nil, NewUpstreamError(resp.StatusCode, string(data))
 	}
-	preview := string(data)
-	if len(preview) > 2000 {
-		preview = preview[:2000]
-	}
+	preview := string(data[:min(len(data), 2000)])
 	logger.Debug("callGet %s response (%d bytes): %s", fullURL, len(data), preview)
 	var result map[string]interface{}
 	err = json.Unmarshal(data, &result)

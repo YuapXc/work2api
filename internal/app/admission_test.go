@@ -79,7 +79,7 @@ func TestBufferedRequestBodyReleasesAfterParsingAcrossClones(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		body := &bufferedRequestBody{reader: bytes.NewReader(data), budget: budget, reserved: reserved}
+		body := &bufferedRequestBody{reader: bytes.NewReader(data), raw: data, budget: budget, reserved: reserved}
 		r := httptest.NewRequest("POST", "/v1/messages", nil)
 		r.Body = body
 		clone := r.WithContext(context.Background())
@@ -1346,6 +1346,7 @@ func TestAdaptiveProtocolCapacity(t *testing.T) {
 				c := &capacityUpstream{started: make(chan struct{}, n), finish: make(chan struct{})}
 				o.wb.UpstreamClient = c
 				s := NewServer(o)
+				s.modelsAdmission.memoryUsage = func() uint64 { return 0 }
 				if _, err := o.db.CreateApp("capacity", o.hashKey("capacity-key"), "", "", "", "", 0); err != nil {
 					t.Fatal(err)
 				}
@@ -2562,5 +2563,83 @@ func TestNormalizationMetadataComesFromTrustedEntry(t *testing.T) {
 	s.dispatchRuntimeTo(httptest.NewRecorder(), httptest.NewRequest("POST", "/", nil), provider.ProtocolChat, body, &Principal{AppID: appID})
 	if len(probe.normalized) != 2 || probe.normalized[1] {
 		t.Fatal("client field bypassed normalization", probe.normalized)
+	}
+}
+
+func BenchmarkBufferedJSONRead(b *testing.B) {
+	data := []byte(`{"model":"test","messages":[{"role":"user","content":"` + strings.Repeat("x", 16<<20) + `"}]}`)
+	for _, direct := range []bool{false, true} {
+		name := "decoder_copy"
+		if direct {
+			name = "buffered_view"
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(data)))
+			for i := 0; i < b.N; i++ {
+				body := &bufferedRequestBody{reader: bytes.NewReader(data), budget: &bodyBudget{}}
+				if direct {
+					body.raw = data
+				}
+				req := &http.Request{Body: body}
+				out, err := readJSON(req)
+				if err != nil || out["model"] != "test" {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestResponseObjectArgumentsKeepWireNumbers(t *testing.T) {
+	const args = `{"integer":9007199254740993, "decimal":2.0,"exponent":1e400}`
+	raw := []byte(`{"model":"m","temperature":0.5,"input":[{"type":"function_call","call_id":"a","name":"echo","arguments":` + args + `},{"type":"function_call_output","call_id":"a","output":"ok"}]}`)
+	for _, buffered := range []bool{false, true} {
+		req := httptest.NewRequest("POST", "/v1/responses", bytes.NewReader(raw))
+		if buffered {
+			req.Body = &bufferedRequestBody{reader: bytes.NewReader(raw), raw: raw, budget: &bodyBudget{}}
+		}
+		payload, err := readJSON(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := protocol.ConvertRequest(protocol.Responses, protocol.Chat, payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		message := out["messages"].([]any)[0].(map[string]any)
+		call := message["tool_calls"].([]any)[0].(map[string]any)
+		if call["function"].(map[string]any)["arguments"] != args || payload["temperature"] != .5 {
+			t.Fatal("converted arguments changed")
+		}
+		native, err := protocol.ConvertRequest(protocol.Responses, protocol.Responses, payload)
+		if err != nil || native["input"].([]any)[0].(map[string]any)["arguments"] != args {
+			t.Fatal("native arguments changed", err)
+		}
+	}
+	mixed := `{"input":[null,"hello",{"type":"extension","arguments":{"x":3}},{"type":"function\u005fcall","argum\u0065nts":[2.0, false]}]}`
+	out, err := decodeResponseRequest([]byte(mixed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := out["input"].([]any)
+	if items[0] != nil || items[1] != "hello" || items[2].(map[string]any)["arguments"].(map[string]any)["x"] != 3.0 || items[3].(map[string]any)["arguments"] != `[2.0, false]` {
+		t.Fatal("unrelated item or arguments changed", items)
+	}
+	for _, invalid := range []string{mixed + ` {}`, `{"temperature":1e400,"input":[{"type":"function_call","arguments":{}}]}`} {
+		if _, err := decodeResponseRequest([]byte(invalid)); err == nil {
+			t.Fatal("invalid request accepted")
+		}
+	}
+	s := historyTestServer(t)
+	w, finish := historyTestPrepare(t, s, "caller", map[string]any{"input": "hello"})
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = io.WriteString(w, `{"id":"resp_args","object":"response","status":"completed","output":[{"type":"function_call","name":"echo","call_id":"a","arguments":`+args+`}]}`)
+	finish()
+	next := map[string]any{"previous_response_id": "resp_args", "input": []any{map[string]any{"type": "function_call_output", "call_id": "a", "output": "ok"}}}
+	_, release := historyTestPrepare(t, s, "caller", next)
+	defer release()
+	if next["input"].([]any)[1].(map[string]any)["arguments"] != args {
+		t.Fatal("continuation lost wire arguments")
 	}
 }

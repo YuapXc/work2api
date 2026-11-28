@@ -533,11 +533,15 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any, targets ...Pro
 						appendBridgeBlock(&request.Messages, "assistant", block)
 					}
 				case "function_call":
+					argumentText, err := ResponseCallArguments(item["arguments"])
+					if err != nil {
+						return request, err
+					}
 					appendBridgeBlock(&request.Messages, "assistant", bridgeBlock{
 						Kind:          "tool_call",
 						ID:            jsonutil.FirstString(jsonutil.StringAt(item, "call_id"), jsonutil.StringAt(item, "id")),
 						Name:          jsonutil.StringAt(item, "name"),
-						ArgumentsJSON: jsonutil.StringAt(item, "arguments"),
+						ArgumentsJSON: argumentText,
 					})
 				case "function_call_output":
 					appendBridgeBlock(&request.Messages, "user", bridgeBlock{
@@ -861,7 +865,7 @@ func encodeChatRequest(request bridgeRequest) (map[string]any, error) {
 					pending[call.ID] = true
 					pendingOrder = append(pendingOrder, call.ID)
 					toolCalls = append(toolCalls, map[string]any{
-						"id":   boundCallID(call.ID),
+						"id":   BoundCallID(call.ID),
 						"type": "function",
 						"function": map[string]any{
 							"name":      call.Name,
@@ -908,7 +912,7 @@ func encodeChatRequest(request bridgeRequest) (map[string]any, error) {
 				}
 				messages = append(messages, map[string]any{
 					"role":         "tool",
-					"tool_call_id": boundCallID(id),
+					"tool_call_id": BoundCallID(id),
 					"content":      text,
 				})
 			}
@@ -1101,7 +1105,7 @@ func encodeResponsesRequest(request bridgeRequest) map[string]any {
 				flushContent()
 				items = append(items, map[string]any{
 					"type":      "function_call",
-					"call_id":   boundCallID(block.ID),
+					"call_id":   BoundCallID(block.ID),
 					"name":      block.Name,
 					"arguments": bridgeArgumentsJSON(block),
 				})
@@ -1109,7 +1113,7 @@ func encodeResponsesRequest(request bridgeRequest) map[string]any {
 				flushContent()
 				items = append(items, map[string]any{
 					"type":    "function_call_output",
-					"call_id": boundCallID(block.CallID),
+					"call_id": BoundCallID(block.CallID),
 					"output":  responsesToolContent(block.Result),
 				})
 			}
@@ -1282,12 +1286,23 @@ func FunctionToolSubset(input map[string]any, from Protocol) (map[string]any, er
 	return out, nil
 }
 
-func boundCallID(id string) string {
+func BoundCallID(id string) string {
 	if len(id) <= 64 {
 		return id
 	}
 	sum := sha256.Sum256([]byte(id))
 	return hex.EncodeToString(sum[:])
+}
+
+func ResponseCallArguments(value any) (string, error) {
+	if value == nil || value == "" {
+		return "{}", nil
+	}
+	if s, ok := value.(string); ok {
+		return s, nil
+	}
+	raw, err := json.Marshal(value)
+	return string(raw), err
 }
 
 var responseItemIDLengthError = regexp.MustCompile(`(?i)invalid ['"]input\[([0-9]+)\]\.(id|call_id)['"][^\n]{0,1000}expected a string with maximum length`)
@@ -1381,7 +1396,7 @@ func RecoverResponseIDs(body, rejection []byte, status int) ([]byte, bool) {
 				if json.Unmarshal(item["call_id"], &callID) != nil || len(callID) <= 64 {
 					continue
 				}
-				item["call_id"], _ = json.Marshal(boundCallID(callID))
+				item["call_id"], _ = json.Marshal(BoundCallID(callID))
 				items[i], _ = json.Marshal(item)
 				changed = true
 			}
@@ -1436,7 +1451,7 @@ func RecoverResponseIDs(body, rejection []byte, status int) ([]byte, bool) {
 		_ = json.Unmarshal(item["type"], &kind)
 		if kind == "function_call" || kind == "function_call_output" || kind == "custom_tool_call" || kind == "custom_tool_call_output" {
 			if json.Unmarshal(item["call_id"], &callID) == nil && len(callID) > 64 {
-				item["call_id"], _ = json.Marshal(boundCallID(callID))
+				item["call_id"], _ = json.Marshal(BoundCallID(callID))
 				itemChanged = true
 			}
 		}

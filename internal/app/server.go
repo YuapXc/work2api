@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -110,6 +111,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/images/edits", s.handleMedia)
 	mux.HandleFunc("POST /v1/videos", s.handleMedia)
 	mux.HandleFunc("POST /v1/audio/transcriptions", s.handleMedia)
+	mux.HandleFunc("POST /v1/audio/speech", s.handleMedia)
 	mux.HandleFunc("POST /v1/media/uploads", s.handleMedia)
 	mux.HandleFunc("GET /v1/videos/{id}", s.handleVideoTask)
 	mux.HandleFunc("GET /v1/media/tasks", s.handleMediaTaskList)
@@ -273,7 +275,7 @@ func (s *Server) requestGuard(next http.Handler) http.Handler {
 				writeJSON(w, 400, errBody(400, "JSON 结构过于复杂或嵌套过深", "invalid_request_error").Body)
 				return
 			}
-			buffered := &bufferedRequestBody{reader: bytes.NewReader(body), budget: bodies, reserved: reserved}
+			buffered := &bufferedRequestBody{reader: bytes.NewReader(body), raw: body, budget: bodies, reserved: reserved}
 			reserved = 0 // ownership transfers to the shared body
 			r.Body = buffered
 			defer buffered.Close()
@@ -647,8 +649,29 @@ func writeAPIErr(w http.ResponseWriter, e *apiError) {
 }
 
 func readJSON(r *http.Request) (map[string]any, error) {
+	responses := r.URL != nil && r.URL.Path == "/v1/responses"
 	if buffered, ok := r.Body.(*bufferedRequestBody); ok {
 		defer buffered.Close()
+		buffered.mu.Lock()
+		if buffered.raw != nil && buffered.reader != nil {
+			data := buffered.raw[len(buffered.raw)-buffered.reader.Len():]
+			buffered.reader.Reset(nil)
+			buffered.mu.Unlock()
+			if responses {
+				return decodeResponseRequest(data)
+			}
+			var body map[string]any
+			err := json.Unmarshal(data, &body)
+			return body, err
+		}
+		buffered.mu.Unlock()
+	}
+	if responses {
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		return decodeResponseRequest(data)
 	}
 	var body map[string]any
 	dec := json.NewDecoder(r.Body)
@@ -670,3 +693,84 @@ func str2(v any) string {
 }
 
 var _ = strings.TrimSpace
+
+func needsResponseArgument(raw any) bool {
+	m, _ := raw.(map[string]any)
+	_, text := m["arguments"].(string)
+	return m["type"] == "function_call" && m["arguments"] != nil && !text
+}
+
+func decodeResponseRequest(data []byte) (map[string]any, error) {
+	var body map[string]any
+	err := json.Unmarshal(data, &body)
+	items, _ := body["input"].([]any)
+	if err == nil {
+		if !slices.ContainsFunc(items, needsResponseArgument) {
+			return body, nil
+		}
+	} else {
+		var numberErr *json.UnmarshalTypeError
+		if !errors.As(err, &numberErr) || !strings.HasPrefix(numberErr.Value, "number ") {
+			return nil, err
+		}
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return nil, err
+	}
+	input := fields["input"]
+	if len(input) == 0 || input[0] != '[' {
+		return body, err
+	}
+	var decoded []responseInputValue
+	if err := json.Unmarshal(input, &decoded); err != nil {
+		return nil, err
+	}
+	values := make([]any, len(decoded))
+	for i, item := range decoded {
+		values[i] = item.v
+	}
+	return responseFieldsWith(fields, "input", values)
+}
+
+type responseInputValue struct{ v any }
+
+func (i *responseInputValue) UnmarshalJSON(raw []byte) (err error) {
+	i.v, err = decodeResponseItem(raw)
+	return err
+}
+
+func decodeResponseItem(data []byte) (any, error) {
+	var v any
+	err := json.Unmarshal(data, &v)
+	if err == nil && !needsResponseArgument(v) {
+		return v, nil
+	}
+	if len(data) != 0 && data[0] == '{' {
+		var fields map[string]json.RawMessage
+		if e := json.Unmarshal(data, &fields); e != nil {
+			return nil, e
+		}
+		var kind string
+		args := fields["arguments"]
+		if len(args) > 0 && args[0] != '"' && args[0] != 'n' && json.Unmarshal(fields["type"], &kind) == nil && kind == "function_call" {
+			return responseFieldsWith(fields, "arguments", string(args))
+		}
+	}
+	return v, err
+}
+
+func responseFieldsWith(fields map[string]json.RawMessage, key string, value any) (map[string]any, error) {
+	out := make(map[string]any, len(fields))
+	out[key] = value
+	for k, raw := range fields {
+		if k != key {
+			var v any
+			if err := json.Unmarshal(raw, &v); err != nil {
+				return nil, err
+			}
+			out[k] = v
+		}
+	}
+	return out, nil
+}

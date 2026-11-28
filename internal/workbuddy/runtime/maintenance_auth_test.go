@@ -1,7 +1,11 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -288,5 +292,310 @@ func TestTranscriptionUploadSeparatesStorageAuthorization(t *testing.T) {
 	})}
 	if _, err = r.uploadMediaInput(context.Background(), "https://copilot.tencent.com", nil, map[string]any{"data": "UklGRg==", "mime": "audio/wav"}); err == nil {
 		t.Fatal("unsafe storage origin accepted")
+	}
+}
+
+type signatureFixtureStream func(context.Context, map[string]string, map[string]any, string, upstream.LineFunc) error
+
+func (f signatureFixtureStream) StreamUpstream(ctx context.Context, h map[string]string, b map[string]any, u string, y upstream.LineFunc) error {
+	return f(ctx, h, b, u, y)
+}
+func TestChatSignaturesRestoreOnlyTheirOwnTurns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.info")
+	os.WriteFile(path, []byte(fmt.Sprintf(`{"auth":{"accessToken":"fixture","domain":"www.workbuddy.cn","expiresAt":%d},"account":{"uid":"fixture"}}`, time.Now().Add(time.Hour).UnixMilli())), 0600)
+	mgr := credentials.NewManager(path)
+	p := pool.New(map[string]pool.Credential{"fixture": mgr}, "")
+	r := &Runtime{Managers: map[string]*credentials.Manager{"fixture": mgr}, Pool: p}
+	acc := p.Get("fixture")
+	body := map[string]any{"model": "test", "messages": []any{map[string]any{"role": "user", "content": "question"}}}
+	req, _ := http.NewRequest("POST", "http://example.invalid", nil)
+	req.Header.Set("Authorization", "Bearer caller-a")
+	req = WithRequestSessionIdentity(req, body)
+	ctx := req.Context()
+	r.UpstreamClient = signatureFixtureStream(func(ctx context.Context, h map[string]string, b map[string]any, u string, y upstream.LineFunc) error {
+		for _, line := range []string{`{"choices":[{"index":0,"delta":{"reasoning_content":"thought","extra_fields":{"reasoning_detail":{"content_signature":"signature"},"_meta":{"a":1}}}}]}`, `{"choices":[{"index":0,"delta":{"content":"answer","extra_fields":{"reasoning_detail":{"text":"thought"},"_meta":{"b":2}}}}]}`, `{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`} {
+			if err := y("data: " + line); err != nil {
+				return err
+			}
+		}
+		return y("data: [DONE]")
+	})
+	if _, err := r.Stream(ctx, acc, body, func(string) error { return nil }, AttemptOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	second := map[string]any{"model": "test", "messages": []any{map[string]any{"role": "assistant", "content": "answer"}, map[string]any{"role": "user", "content": "next"}}}
+	scope := r.chatSignatureScope(ctx, acc, "test")
+	restored, marks := r.chatSignatures.restore(scope, second)
+	m := restored["messages"].([]any)[0].(map[string]any)
+	extra, _ := m["extra_fields"].(map[string]any)
+	detail, _ := extra["reasoning_detail"].(map[string]any)
+	meta, _ := extra["_meta"].(map[string]any)
+	if len(marks) != 1 || m["reasoning"] != "thought" || detail["content_signature"] != "signature" || detail["text"] != "thought" || len(meta) != 2 {
+		t.Fatal("signature merge lost fields", m)
+	}
+	for _, messages := range [][]any{{map[string]any{"role": "assistant", "content": "answer", "reasoning": "different thought", "extra_fields": nil}}, {map[string]any{"role": "assistant", "content": "answer"}, map[string]any{"role": "assistant", "content": "answer"}}} {
+		restored, marks := r.chatSignatures.restore(scope, map[string]any{"messages": messages})
+		if len(marks) != len(messages) {
+			t.Fatal("upstream restoration range narrowed")
+		}
+		if len(messages) == 1 && restored["messages"].([]any)[0].(map[string]any)["reasoning"] != "different thought" {
+			t.Fatal("client reasoning changed")
+		}
+	}
+	clientOwned := map[string]any{"messages": []any{map[string]any{"role": "assistant", "content": "answer", "reasoning": "own thought", "extra_fields": map[string]any{"own": true}}}}
+	if _, marks := r.chatSignatures.restore(scope, clientOwned); len(marks) != 0 {
+		t.Fatal("client fields overwritten")
+	}
+	if _, exists := second["messages"].([]any)[0].(map[string]any)["extra_fields"]; exists {
+		t.Fatal("caller input mutated")
+	}
+	for _, foreign := range []string{scope + "other-key", r.chatSignatureScope(ctx, acc, "other-model")} {
+		if _, found := r.chatSignatures.restore(foreign, second); len(found) > 0 {
+			t.Fatal("scope crossed")
+		}
+	}
+	mixed := map[string]any{"messages": []any{map[string]any{"role": "assistant", "content": []any{"ans", map[string]any{"type": "text", "text": "wer"}}}}}
+	if _, marks := r.chatSignatures.restore(scope, mixed); len(marks) != 1 {
+		t.Fatal("mixed text blocks lost their signature")
+	}
+	for _, partial := range []bool{false, true} {
+		sends := 0
+		r.UpstreamClient = signatureFixtureStream(func(ctx context.Context, h map[string]string, b map[string]any, u string, y upstream.LineFunc) error {
+			sends++
+			if partial {
+				if err := y(`data: {"choices":[{"delta":{"content":"first"}}]}`); err != nil {
+					return err
+				}
+				return &upstream.UpstreamError{StatusCode: 400, Raw: []byte(`{"code":11159}`)}
+			}
+			return &upstream.UpstreamError{StatusCode: 400, Raw: []byte(`{"error":{"message":"invalid request"},"request":{"messages":[{"content":"thinking_signature_invalid"}]}}`)}
+		})
+		started, err := r.Stream(ctx, acc, second, func(string) error { return nil }, AttemptOptions{})
+		if err == nil || sends != 1 || started != partial {
+			t.Fatal("unexpected signature replay", partial, sends, started, err)
+		}
+	}
+	var attempts int
+	r.UpstreamClient = signatureFixtureStream(func(ctx context.Context, h map[string]string, b map[string]any, u string, y upstream.LineFunc) error {
+		attempts++
+		m := b["messages"].([]any)[0].(map[string]any)
+		if attempts == 1 {
+			if m["extra_fields"] == nil {
+				t.Fatal("not restored")
+			}
+			return &upstream.UpstreamError{StatusCode: 400, Raw: []byte(`{"code":11159,"message":"BAD_SIGNATURE"}`)}
+		}
+		if m["extra_fields"] != nil {
+			t.Fatal("rejected local signature retained")
+		}
+		return y(`data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`)
+	})
+	if _, err := r.Stream(ctx, acc, second, func(string) error { return nil }, AttemptOptions{}); err != nil || attempts != 2 {
+		t.Fatal("bounded recovery failed", err, attempts)
+	}
+	if _, marks := r.chatSignatures.restore(scope, second); len(marks) > 0 {
+		t.Fatal("refused signature not evicted")
+	}
+}
+func TestSpeechWireFormatsAndRefusals(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "speech.info")
+	os.WriteFile(path, []byte(fmt.Sprintf(`{"auth":{"accessToken":"fixture","domain":"www.workbuddy.cn","expiresAt":%d},"account":{"uid":"fixture"}}`, time.Now().Add(time.Hour).UnixMilli())), 0600)
+	mgr := credentials.NewManager(path)
+	r := &Runtime{Managers: map[string]*credentials.Manager{"fixture": mgr}, Pool: pool.New(map[string]pool.Credential{"fixture": mgr}, "")}
+	var calls int
+	refuse := false
+	asrFailure := false
+	r.MediaClient = &http.Client{Transport: maintenanceTransport(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if req.Header.Get("User-Agent") != "node" || req.Header.Get("Authorization") != "Bearer fixture" || req.Header.Get("X-User-Id") != "fixture" {
+			t.Fatal("wrong app headers")
+		}
+		if refuse {
+			return &http.Response{StatusCode: 401, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("refused"))}, nil
+		}
+		if req.URL.Path == "/agenttool/v1/tts" {
+			var b map[string]string
+			json.NewDecoder(req.Body).Decode(&b)
+			if len([]byte(b["text"])) > 1000 {
+				t.Fatal("chunk too large")
+			}
+			pcm := []byte{0, 0, 1, 0}
+			return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("event: audio\ndata: " + base64.StdEncoding.EncodeToString(pcm) + "\n\nevent: done\ndata: {}\n\n"))}, nil
+		}
+		if req.URL.Path != "/agenttool/v1/asr" {
+			t.Fatal("unexpected route")
+		}
+		reader, err := req.MultipartReader()
+		if err != nil {
+			t.Fatal(err)
+		}
+		part, err := reader.NextPart()
+		if err != nil || part.FormName() != "audio" || part.Header.Get("Content-Type") != "audio/wav" || part.FileName() != "voice.wav" {
+			t.Fatal("wrong audio form")
+		}
+		data, _ := io.ReadAll(part)
+		if !bytes.Equal(data, []byte("wave")) {
+			t.Fatal("audio changed")
+		}
+		body := `{"code":0,"text":"hello"}`
+		if asrFailure {
+			body = `{"code":15053,"msg":"ASR recognition failed"}`
+		}
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	text := strings.Repeat("你好。", 500)
+	parts := spokenParts(text)
+	for _, part := range parts {
+		if len(part) > 1000 {
+			t.Fatal("UTF8 split oversized")
+		}
+	}
+	for _, format := range []string{"wav", "pcm"} {
+		payload, err := audioBody("speech", speechModel, map[string]any{"input": "你好", "response_format": format})
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := r.CallAudio(t.Context(), provider.MediaRequest{Operation: "speech", Model: speechModel, AccountID: "fixture", Payload: payload})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if format == "wav" {
+			if string(result.Data[:4]) != "RIFF" || binary.LittleEndian.Uint32(result.Data[24:]) != 16000 || len(result.Data) != 48 {
+				t.Fatal("WAV invalid")
+			}
+		} else if result.ContentType != "audio/pcm" || len(result.Data) != 6 {
+			t.Fatal("PCM not 24kHz")
+		}
+	}
+	for _, tc := range []struct {
+		format string
+		limit  int64
+		size   int
+		ok     bool
+	}{{"wav", 100, 92, true}, {"pcm", 80, 72, true}, {"wav", 80, 0, false}} {
+		r.cfg = &config.Config{MaxResponseBytes: tc.limit}
+		payload, _ := audioBody("speech", speechModel, map[string]any{"input": strings.Repeat("x", 12000), "response_format": tc.format})
+		result, err := r.CallAudio(t.Context(), provider.MediaRequest{Operation: "speech", Model: speechModel, AccountID: "fixture", Payload: payload})
+		if (err == nil) != tc.ok || err == nil && len(result.Data) != tc.size {
+			t.Fatal("audio output limit", tc, err, len(result.Data))
+		}
+	}
+	r.cfg = nil
+	for _, tc := range []struct {
+		format string
+		size   int64
+	}{{"wav", 48}, {"pcm", 6}} {
+		p, _ := audioBody("speech", speechModel, map[string]any{"input": "x", "response_format": tc.format})
+		for _, limit := range []int64{tc.size, tc.size - 1} {
+			r.cfg = &config.Config{MaxResponseBytes: limit}
+			got, err := r.CallAudio(t.Context(), provider.MediaRequest{Operation: "speech", Model: speechModel, AccountID: "fixture", Payload: p})
+			if (err == nil) != (limit == tc.size) || err == nil && int64(len(got.Data)) != tc.size {
+				t.Fatal(tc, limit, err)
+			}
+		}
+	}
+	r.cfg = nil
+	if _, err := audioBody("speech", speechModel, map[string]any{"input": "text", "response_format": "mp3"}); err == nil {
+		t.Fatal("MP3 mislabeled")
+	}
+	payload, err := audioBody("transcription", transcribeModel, map[string]any{"audio_data": map[string]any{"raw": []byte("wave"), "mime": "audio/wav", "name": "voice.wav"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := provider.MediaRequest{Operation: "transcription", Model: transcribeModel, AccountID: "fixture", Payload: payload}
+	result, err := r.CallAudio(t.Context(), request)
+	if err != nil || string(result.Data) != `{"text":"hello"}` {
+		t.Fatal("ASR result invalid", err, string(result.Data))
+	}
+	asrFailure = true
+	if _, err = r.CallAudio(t.Context(), request); err == nil {
+		t.Fatal("ASR business error ignored")
+	}
+	refuse = true
+	before := calls
+	if _, err = r.CallAudio(t.Context(), request); err == nil || calls != before+1 {
+		t.Fatal("bare401 renewed or replayed")
+	}
+	before = calls
+	ctx := provider.WithInvocation(t.Context(), provider.Invocation{Check: func(context.Context, provider.AccountRef, string) error { return errors.New("revoked") }})
+	if _, err = r.CallAudio(ctx, request); err == nil || calls != before {
+		t.Fatal("revocation bypassed")
+	}
+	ctx = provider.WithInvocation(t.Context(), provider.Invocation{Check: func(context.Context, provider.AccountRef, string) error {
+		next := credentials.NewManager(path)
+		r.Pool.AddAccount("fixture", next)
+		r.SetManager("fixture", next)
+		return nil
+	}})
+	if _, err = r.CallAudio(ctx, request); err == nil || calls != before {
+		t.Fatal("dispatched with replaced credentials")
+	}
+}
+
+func TestChatSignatureStorageIsBoundedAndSkipsOversizedCapture(t *testing.T) {
+	var cache chatSignatureStore
+	for i := 0; i < 2050; i++ {
+		tap := &chatSignatureTap{extra: map[string]any{"signature": "value"}, ids: []string{fmt.Sprint(i)}}
+		cache.keep("scope", tap)
+	}
+	if cache.order.Len() != 2048 || cache.used <= 0 || cache.used > chatSignatureBytes {
+		t.Fatal("signature budget exceeded")
+	}
+	if _, marks := cache.restore("scope", map[string]any{"messages": []any{map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{"id": "0"}}}}}); len(marks) != 0 {
+		t.Fatal("oldest signature retained")
+	}
+	tap := &chatSignatureTap{extra: map[string]any{"signature": "value"}, failed: true}
+	before := cache.order.Len()
+	cache.keep("scope", tap)
+	if cache.order.Len() != before || !tap.failed {
+		t.Fatal("oversized response cached")
+	}
+}
+
+func TestSpeechAndSignatureUpstreamEdges(t *testing.T) {
+	for _, tc := range []struct{ line, reasoning string }{
+		{`{"choices":[{"delta":{"reasoning":"a"},"message":{"reasoning":"b","extra_fields":{"signature":"s"}}}]}`, "ab"},
+		{`{"choices":[{"delta":{"reasoning":"a","extra_fields":{"signature":"s"}},"message":{"reasoning":"a","extra_fields":{"signature":"s"}}}]}`, "a"},
+	} {
+		var tap chatSignatureTap
+		tap.observe(t.Context(), "data: "+tc.line)
+		if tap.reasoning.String() != tc.reasoning || tap.extra["signature"] != "s" {
+			t.Fatal("signed reply fields changed", tap.reasoning.String(), tap.extra)
+		}
+	}
+	if _, err := audioBody("speech", speechModel, map[string]any{"input": "\ufeff\u2003"}); err == nil {
+		t.Fatal("blank spoken text accepted")
+	}
+	if parts := spokenParts("\ufeff\u2003hello\ufeff"); len(parts) != 1 || parts[0] != "hello" {
+		t.Fatal("unexpected spoken text", parts)
+	}
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer secret")
+	headers.Set("X-API-Key", "private-value")
+	for _, raw := range []string{`{"code":15053,"msg":"speech failed"}`, `{"error":{"message":"token secret and private-value must not leak"}}`, `{"debug":{"account":"hidden"}}`, "plain refusal"} {
+		err := speechFailure(502, []byte(raw), "upstream", headers)
+		body, _ := json.Marshal(err.(*provider.APIError).Body)
+		if strings.Contains(string(body), "secret") || strings.Contains(string(body), "private-value") || strings.Contains(string(body), "hidden") {
+			t.Fatal("credential leaked")
+		}
+	}
+	var got bytes.Buffer
+	err := readSpoken(t.Context(), io.NopCloser(strings.NewReader("event: error\ndata: recognition unavailable\n\n")), &got, "wav", 1024, nil)
+	var errorBody []byte
+	if ae, ok := err.(*provider.APIError); ok {
+		errorBody, _ = json.Marshal(ae.Body)
+	}
+	if err == nil || got.Len() != 0 || !strings.Contains(string(errorBody), "recognition unavailable") {
+		t.Fatal("error event message lost", err)
+	}
+	for _, raw := range []string{"thinking_signature_invalid", `{"error":{"message":"Invalid signature in thinking"}}`, `{"error":{"details":"{\"internal_code\":11159}"}}`, "block is bound to a different conversation"} {
+		if !rejectsChatSignature([]byte(raw)) {
+			t.Fatal("signature recovery missing", raw)
+		}
+	}
+	for _, raw := range []string{"rate limit", "unknown error", `{"error":{"message":"invalid request"},"request":{"messages":[{"content":"thinking_signature_invalid"}]}}`} {
+		if rejectsChatSignature([]byte(raw)) {
+			t.Fatal("unrelated recovery")
+		}
 	}
 }

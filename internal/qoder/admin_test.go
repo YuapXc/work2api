@@ -36,6 +36,25 @@ func TestGlobalAccountCheckinDoesNotSendTokenToCN(t *testing.T) {
 	}
 }
 
+func TestUsageCreditsFollowBillableAndUpstreamOrder(t *testing.T) {
+	for _, tc := range []struct {
+		usage map[string]any
+		want  float64
+	}{
+		{map[string]any{"original_credits": 2.25}, 2.25},
+		{map[string]any{"credits": 1.5, "original_credits": 2.25}, 1.5},
+		{map[string]any{"credit": 0.0, "credits": 1.5}, 0},
+		{map[string]any{"billable": false, "original_credits": 2.25}, 0},
+	} {
+		if got := billedCredits(tc.usage); got == nil || *got != tc.want {
+			t.Fatal(tc, got)
+		}
+	}
+	if got := billedCredits(map[string]any{"billable": true}); got != nil {
+		t.Fatal("unknown credits became zero")
+	}
+}
+
 func TestAccountRowReflectsCredentialScopedCooldown(t *testing.T) {
 	previous := account.DataRoot()
 	account.SetDataRoot(t.TempDir())
